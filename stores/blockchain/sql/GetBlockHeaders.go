@@ -131,10 +131,10 @@ func (s *SQL) GetBlockHeaders(ctx context.Context, blockHashFrom *chainhash.Hash
 
 	defer rows.Close()
 
-	return s.processBlockHeadersRows(rows, numberOfHeaders)
+	return s.processBlockHeadersRows(rows, numberOfHeaders, false)
 }
 
-func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64, hasCoinbaseColumn bool) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	var (
 		hashPrevBlock  []byte
 		hashMerkleRoot []byte
@@ -150,12 +150,6 @@ func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64) ([
 	for rows.Next() {
 		blockHeader := &model.BlockHeader{}
 		blockHeaderMeta := &model.BlockHeaderMeta{}
-
-		// Check column count to determine if miner is included
-		columns, err := rows.Columns()
-		if err != nil {
-			return nil, nil, errors.NewStorageError("failed to get column names", err)
-		}
 
 		// Create scan targets
 		scanTargets := []interface{}{
@@ -179,14 +173,12 @@ func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64) ([
 			&processedAt,
 		}
 
-		// Add coinbase_tx if it's in the columns (19th column now with processed_at)
-		hasCoinbaseColumn := len(columns) > 18
-
+		// Add coinbase_tx if it's in the query
 		if hasCoinbaseColumn {
 			scanTargets = append(scanTargets, &coinbaseBytes)
 		}
 
-		if err = rows.Scan(scanTargets...); err != nil {
+		if err := rows.Scan(scanTargets...); err != nil {
 			return nil, nil, errors.NewStorageError("failed to scan row", err)
 		}
 
@@ -203,6 +195,8 @@ func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64) ([
 
 		bits, _ := model.NewNBitFromSlice(nBits)
 		blockHeader.Bits = *bits
+
+		var err error
 
 		blockHeader.HashPrevBlock, err = chainhash.NewHash(hashPrevBlock)
 		if err != nil {
