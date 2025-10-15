@@ -98,6 +98,7 @@ func (s *SQL) GetBlockHeaders(ctx context.Context, blockHashFrom *chainhash.Hash
 			,b.mined_set
 			,b.subtrees_set
 			,b.invalid
+			,b.processed_at
 		FROM blocks b
 		WHERE id IN (
 			SELECT id FROM blocks
@@ -140,6 +141,7 @@ func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64) ([
 		nBits          []byte
 		insertedAt     time.CustomTime
 		coinbaseBytes  []byte
+		processedAt    *time.CustomTime
 	)
 
 	blockHeaders := make([]*model.BlockHeader, 0, numberOfHeaders)
@@ -174,10 +176,11 @@ func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64) ([
 			&blockHeaderMeta.MinedSet,
 			&blockHeaderMeta.SubtreesSet,
 			&blockHeaderMeta.Invalid,
+			&processedAt,
 		}
 
-		// Add coinbase_tx if it's in the columns (18th column)
-		hasCoinbaseColumn := len(columns) > 17
+		// Add coinbase_tx if it's in the columns (19th column now with processed_at)
+		hasCoinbaseColumn := len(columns) > 18
 
 		if hasCoinbaseColumn {
 			scanTargets = append(scanTargets, &coinbaseBytes)
@@ -220,6 +223,10 @@ func (s *SQL) processBlockHeadersRows(rows *sql.Rows, numberOfHeaders uint64) ([
 
 		// Set the block time to the timestamp in the meta
 		blockHeaderMeta.BlockTime = blockHeader.Timestamp
+
+		if processedAt != nil {
+			blockHeaderMeta.ProcessedAt = &processedAt.Time
+		}
 
 		blockHeaders = append(blockHeaders, blockHeader)
 		blockHeaderMetas = append(blockHeaderMetas, blockHeaderMeta)
