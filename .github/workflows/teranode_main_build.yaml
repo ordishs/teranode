@@ -16,9 +16,9 @@ permissions:
 
 jobs:
   # Tests and code lint
-#  test_and_lint:
-#    uses: ./.github/workflows/teranode_main_tests.yaml
-#    secrets: inherit
+  test_and_lint:
+    uses: ./.github/workflows/teranode_main_tests.yaml
+    secrets: inherit
 
   # Calculate version information
   calculate-version:

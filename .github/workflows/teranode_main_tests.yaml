@@ -117,13 +117,13 @@ jobs:
         version: latest
         args: --timeout=5m --issues-exit-code=0 --output.checkstyle.path=golangci-lint-report.xml
 
-    # Disable Twingate and Sonar, we will switch to public SonarCloud once code is public
-    #- uses: twingate/github-action@4493ffc3806241aa98194a3fa679f874bce013b5
-    #  with:
-    #    service-key: ${{ secrets.TWINGATE_GH_ACTIONS_SERVICE_KEY }} # Required
+    - name: SonarQube Scan
+      uses: SonarSource/sonarqube-scan-action@v6
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-    #- name: SonarQube Scan
-    #  uses: sonarsource/sonarqube-scan-action@v5
-    #  env:
-    #    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-    #    SONAR_HOST_URL: https://sonarqube.prod.ubsv.dev
+    - name: SonarQube Quality Gate check
+      uses: sonarsource/sonarqube-quality-gate-action@v1.2.0
+      timeout-minutes: 10
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
