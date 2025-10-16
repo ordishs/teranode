@@ -47,7 +47,7 @@ type FileStorer struct {
 	// wg tracks the background goroutine
 	wg sync.WaitGroup
 
-	// mu protects readerError
+	// mu protects readerError and bufferedWriter writes
 	mu sync.Mutex
 
 	// done signals when the background goroutine completes
@@ -131,14 +131,14 @@ func NewFileStorer(ctx context.Context, logger ulogger.Logger, tSettings *settin
 // Write writes the provided bytes to the pipe via the buffered writer.
 // Returns the number of bytes written and any error encountered.
 // If the background reader has encountered an error, it will be returned here.
+// This method is safe for concurrent use.
 func (f *FileStorer) Write(b []byte) (n int, err error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.readerError != nil {
-		err = f.readerError
-		f.mu.Unlock()
-		return 0, err
+		return 0, f.readerError
 	}
-	f.mu.Unlock()
 
 	return f.bufferedWriter.Write(b)
 }
@@ -149,9 +149,13 @@ func (f *FileStorer) Write(b []byte) (n int, err error) {
 // Returns any error encountered during the closing process.
 func (f *FileStorer) Close(ctx context.Context) error {
 	// Flush the buffered writer to ensure all data is written to the pipe
-	if err := f.bufferedWriter.Flush(); err != nil {
+	f.mu.Lock()
+	flushErr := f.bufferedWriter.Flush()
+	f.mu.Unlock()
+
+	if flushErr != nil {
 		_ = f.writer.Close()
-		return errors.NewStorageError("Error flushing writer", err)
+		return errors.NewStorageError("Error flushing writer", flushErr)
 	}
 
 	// Close the pipe writer to signal EOF to the reader
