@@ -463,37 +463,42 @@ func (s *File) loadDAHs() error {
 		var cleaned int
 
 		for _, tmpFile := range tmpFiles {
-			// Protect file stat operation
-			ctx := context.Background()
-			if err := acquireReadPermit(ctx); err != nil {
-				s.logger.Warnf("[File] failed to acquire read permit for stat: %v", err)
-				continue
-			}
+			// Use anonymous function to create scope for defer statements.
+			// In Go, defer inside a loop doesn't execute until the outer function returns,
+			// which would cause semaphore permits to accumulate and not be released until
+			// the entire loop completes. The anonymous function ensures defer executes
+			// after each iteration, properly releasing permits and preventing resource exhaustion.
+			func() {
+				// Protect file stat operation
+				ctx := context.Background()
+				if err := acquireReadPermit(ctx); err != nil {
+					s.logger.Warnf("[File] failed to acquire read permit for stat: %v", err)
+					return
+				}
+				defer releaseReadPermit()
 
-			info, err := os.Stat(tmpFile)
-			releaseReadPermit()
-
-			if err != nil {
-				continue
-			}
-
-			// Check if file is older than the threshold
-			if now.Sub(info.ModTime()) > cleanupThreshold {
-				// Protect file removal operation
-				if err := acquireWritePermit(ctx); err != nil {
-					s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
-					continue
+				info, err := os.Stat(tmpFile)
+				if err != nil {
+					return
 				}
 
-				err := os.Remove(tmpFile)
-				releaseWritePermit()
+				// Check if file is older than the threshold
+				if now.Sub(info.ModTime()) > cleanupThreshold {
+					// Protect file removal operation
+					if err := acquireWritePermit(ctx); err != nil {
+						s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
+						return
+					}
+					defer releaseWritePermit()
 
-				if err != nil && !os.IsNotExist(err) {
-					s.logger.Warnf("[File] failed to remove leftover tmp file: %s", tmpFile)
-				} else {
-					cleaned++
+					err := os.Remove(tmpFile)
+					if err != nil && !os.IsNotExist(err) {
+						s.logger.Warnf("[File] failed to remove leftover tmp file: %s", tmpFile)
+					} else {
+						cleaned++
+					}
 				}
-			}
+			}()
 		}
 
 		if cleaned > 0 {
@@ -510,45 +515,51 @@ func (s *File) loadDAHs() error {
 	var dah uint32
 
 	for _, fileName := range files {
-		if fileName[len(fileName)-4:] != ".dah" {
-			continue
-		}
-
-		dah, err = s.readDAHFromFile(fileName)
-		if err != nil {
-			// Log the error but continue processing other files
-			s.logger.Warnf("[File] error reading DAH file %s: %v", fileName, err)
-
-			// If it's an invalid DAH file (0 or corrupt), remove it
-			var terr *errors.Error
-			if errors.As(err, &terr) && terr.Code() == errors.ERR_PROCESSING {
-				s.logger.Warnf("[File] removing invalid DAH file during initialization: %s", fileName)
-				// Protect file removal operation
-				ctx := context.Background()
-				if err := acquireWritePermit(ctx); err != nil {
-					s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
-					continue
-				}
-
-				removeErr := os.Remove(fileName)
-				releaseWritePermit()
-
-				if removeErr != nil && !os.IsNotExist(removeErr) {
-					s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName)
-				}
+		// Use anonymous function to create scope for defer statements.
+		// In Go, defer inside a loop doesn't execute until the outer function returns,
+		// which would cause semaphore permits to accumulate and not be released until
+		// the entire loop completes. The anonymous function ensures defer executes
+		// after each iteration, properly releasing permits and preventing resource exhaustion.
+		func() {
+			if fileName[len(fileName)-4:] != ".dah" {
+				return
 			}
-			continue
-		}
 
-		// This should not happen anymore with the validation in readDAHFromFile
-		if dah == 0 {
-			s.logger.Warnf("[File] unexpected DAH value 0 for file %s", fileName)
-			continue
-		}
+			dah, err = s.readDAHFromFile(fileName)
+			if err != nil {
+				// Log the error but continue processing other files
+				s.logger.Warnf("[File] error reading DAH file %s: %v", fileName, err)
 
-		s.fileDAHsMu.Lock()
-		s.fileDAHs[fileName[:len(fileName)-4]] = dah
-		s.fileDAHsMu.Unlock()
+				// If it's an invalid DAH file (0 or corrupt), remove it
+				var terr *errors.Error
+				if errors.As(err, &terr) && terr.Code() == errors.ERR_PROCESSING {
+					s.logger.Warnf("[File] removing invalid DAH file during initialization: %s", fileName)
+					// Protect file removal operation
+					ctx := context.Background()
+					if err := acquireWritePermit(ctx); err != nil {
+						s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
+						return
+					}
+					defer releaseWritePermit()
+
+					removeErr := os.Remove(fileName)
+					if removeErr != nil && !os.IsNotExist(removeErr) {
+						s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName)
+					}
+				}
+				return
+			}
+
+			// This should not happen anymore with the validation in readDAHFromFile
+			if dah == 0 {
+				s.logger.Warnf("[File] unexpected DAH value 0 for file %s", fileName)
+				return
+			}
+
+			s.fileDAHsMu.Lock()
+			s.fileDAHs[fileName[:len(fileName)-4]] = dah
+			s.fileDAHsMu.Unlock()
+		}()
 	}
 
 	return nil
@@ -684,9 +695,9 @@ func (s *File) cleanupExpiredFile(fileName string) {
 				s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
 				return
 			}
+			defer releaseWritePermit()
 
 			removeErr := os.Remove(fileName + ".dah")
-			releaseWritePermit()
 
 			if removeErr != nil && !os.IsNotExist(removeErr) {
 				s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName+".dah")
@@ -712,10 +723,9 @@ func (s *File) cleanupExpiredFile(fileName string) {
 			s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
 			return
 		}
+		defer releaseWritePermit()
 
 		err := os.Remove(fileName + ".dah")
-		releaseWritePermit()
-
 		if err != nil && !os.IsNotExist(err) {
 			s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName+".dah")
 		}

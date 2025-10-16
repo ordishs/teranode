@@ -113,6 +113,10 @@ func NewFileStorer(ctx context.Context, logger ulogger.Logger, tSettings *settin
 		defer close(fs.done)
 
 		// SetFromReader will create its own temp file and handle atomic rename
+		// Note: Buffered reader is NOT used on the read side despite having a buffered writer
+		// on the write side. This is intentional - adding buffering here causes test hangs
+		// when SetFromReader returns errors without consuming the pipe, as the buffered
+		// reader's interaction with the pipe can create deadlocks in error scenarios.
 		err := store.SetFromReader(ctx, key, fileType, reader, fileOptions...)
 		if err != nil {
 			fs.mu.Lock()
