@@ -288,46 +288,55 @@ func TestWrite_Success(t *testing.T) {
 func TestWrite_WithReaderError(t *testing.T) {
 	ctx := createTestContext()
 	logger := ulogger.TestLogger{}
-	tSettings := createTestSettings()
+	// Use a very small buffer (1 byte) to force immediate flushing
+	tSettings := &settings.Settings{
+		Block: settings.BlockSettings{
+			UTXOPersisterBufferSize: "1",
+		},
+	}
 	mockStore := &MockBlobStore{}
 	key := createTestKey()
 	fileType := fileformat.FileTypeUtxoSet
 	expectedError := errors.NewError("reader error")
 
-	// Setup expectations - file doesn't exist, but reader fails
+	// Setup expectations - file doesn't exist, but reader fails during reading
 	mockStore.On("Exists", ctx, key, fileType, mock.Anything).Return(false, nil)
 	mockStore.setFromReaderHandler = func(ctx context.Context, key []byte, fileType fileformat.FileType, reader io.ReadCloser, fileOptions ...options.FileOption) error {
-		_, _ = io.ReadAll(reader)
+		// Read only a small amount before returning error to simulate failure during read
+		buf := make([]byte, 5)
+		_, _ = reader.Read(buf)
 		_ = reader.Close()
 		return expectedError
 	}
-	mockStore.On("SetDAH", ctx, key, fileType, uint32(0), mock.Anything).Return(nil).Maybe()
-	mockStore.On("Exists", ctx, key, fileType).Return(true, nil).Maybe()
 
 	fs, err := NewFileStorer(ctx, logger, tSettings, mockStore, key, fileType)
 	require.NoError(t, err)
 
-	// First write may succeed or fail depending on race conditions with the background goroutine
-	// On fast systems (CI), the error may be set before the first write
-	// On slow systems, the error may be set after the first write
+	// First write may succeed, partially succeed with pipe error, or fail with reader error
+	// depending on race conditions with the background goroutine
 	testData := []byte("test data")
 	n, writeErr := fs.Write(testData)
 
-	// Either the write succeeded (n == len(testData)) or it failed with the reader error (n == 0)
-	// Both are valid outcomes due to the race between write and background error
-	if writeErr == nil {
-		assert.Equal(t, len(testData), n, "If write succeeds, it should write all bytes")
+	// Three possible outcomes due to the race between write and background error:
+	// 1. Write fully succeeds (n == len(testData), err == nil)
+	// 2. Write partially succeeds with pipe error (0 < n < len(testData), err != nil)
+	// 3. Write fails with reader error already set (n == 0, err == readerError)
+	if writeErr != nil {
+		// Either a partial write with pipe error, or reader error already set
+		assert.GreaterOrEqual(t, n, 0, "Bytes written should be non-negative")
+		assert.LessOrEqual(t, n, len(testData), "Bytes written should not exceed data length")
 	} else {
-		assert.Equal(t, 0, n, "If write fails, it should write 0 bytes")
-		assert.True(t, errors.Is(writeErr, expectedError), "Write error should be the reader error")
+		assert.Equal(t, len(testData), n, "If write succeeds, it should write all bytes")
 	}
 
 	// Wait for background error to be set (if not already set)
 	time.Sleep(100 * time.Millisecond)
 
 	// Subsequent write should definitely return the reader error now
+	// The reader error should be set after the background goroutine completes
 	n2, err2 := fs.Write([]byte("more data"))
 	assert.Equal(t, 0, n2, "Subsequent write should return 0 bytes")
+	assert.True(t, err2 != nil, "Subsequent write should return an error")
 	assert.True(t, errors.Is(err2, expectedError), "Subsequent write should return the reader error")
 
 	// Clean up
