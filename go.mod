@@ -4,6 +4,8 @@ go 1.25.2
 
 replace github.com/in-toto/in-toto-golang => github.com/in-toto/in-toto-golang v0.9.0
 
+replace github.com/bsv-blockchain/go-p2p => ../go-p2p
+
 require (
 	github.com/IBM/sarama v1.45.1
 	github.com/aerospike/aerospike-client-go/v8 v8.2.0

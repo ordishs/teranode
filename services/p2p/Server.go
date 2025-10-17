@@ -1003,6 +1003,7 @@ func (s *Server) handleBlockNotification(ctx context.Context, hash *chainhash.Ha
 		DataHubURL: s.AssetHTTPAddressURL,
 		PeerID:     s.P2PClient.GetID(),
 		Header:     hex.EncodeToString(h.Bytes()),
+		ClientName: s.settings.ClientName,
 	}
 
 	msgBytes, err = json.Marshal(blockMessage)
@@ -1311,6 +1312,7 @@ func (s *Server) handleSubtreeNotification(ctx context.Context, hash *chainhash.
 		Hash:       hash.String(),
 		DataHubURL: s.AssetHTTPAddressURL,
 		PeerID:     s.P2PClient.GetID(),
+		ClientName: s.settings.ClientName,
 	}
 
 	msgBytes, err := json.Marshal(subtreeMessage)
@@ -1564,12 +1566,13 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 
 	select {
 	case s.notificationCh <- &notificationMsg{
-		Timestamp: time.Now().UTC().Format(isoFormat),
-		Type:      "block",
-		Hash:      blockMessage.Hash,
-		Height:    blockMessage.Height,
-		BaseURL:   blockMessage.DataHubURL,
-		PeerID:    blockMessage.PeerID,
+		Timestamp:  time.Now().UTC().Format(isoFormat),
+		Type:       "block",
+		Hash:       blockMessage.Hash,
+		Height:     blockMessage.Height,
+		BaseURL:    blockMessage.DataHubURL,
+		PeerID:     blockMessage.PeerID,
+		ClientName: blockMessage.ClientName,
 	}:
 	default:
 		s.logger.Warnf("[handleBlockTopic] notification channel full, dropped block notification for %s", blockMessage.Hash)
@@ -1680,11 +1683,12 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, from string) {
 
 	select {
 	case s.notificationCh <- &notificationMsg{
-		Timestamp: now.Format(isoFormat),
-		Type:      "subtree",
-		Hash:      subtreeMessage.Hash,
-		BaseURL:   subtreeMessage.DataHubURL,
-		PeerID:    subtreeMessage.PeerID,
+		Timestamp:  now.Format(isoFormat),
+		Type:       "subtree",
+		Hash:       subtreeMessage.Hash,
+		BaseURL:    subtreeMessage.DataHubURL,
+		PeerID:     subtreeMessage.PeerID,
+		ClientName: subtreeMessage.ClientName,
 	}:
 	default:
 		s.logger.Warnf("[handleSubtreeTopic] notification channel full, dropped subtree notification for %s", subtreeMessage.Hash)
