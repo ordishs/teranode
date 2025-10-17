@@ -16,6 +16,7 @@ package blockvalidation
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -318,7 +320,7 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 								continue
 							}
 
-							if notification.Type == model.NotificationType_Block {
+							if notification.Type == model.NotificationType_BlockSubtreesSet {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
 								// push block hash to the setMinedChan
@@ -366,11 +368,11 @@ func (u *BlockValidation) start(ctx context.Context) error {
 	g, gCtx := errgroup.WithContext(ctx)
 
 	if u.blockchainClient != nil {
-		// first check whether all old blocks have their mined_set set
-		u.processBlockMinedNotSet(gCtx, g)
-
-		// then check whether all old blocks have their subtrees_set set
+		// check whether all old blocks have their subtrees_set set
 		u.processSubtreesNotSet(gCtx, g)
+
+		// check whether all old blocks have their mined_set set
+		u.processBlockMinedNotSet(gCtx, g)
 
 		// wait for all blocks to be processed
 		if err := g.Wait(); err != nil {
@@ -379,19 +381,20 @@ func (u *BlockValidation) start(ctx context.Context) error {
 		}
 	}
 
-	// start a ticker that checks every minute whether there are subtrees that need to be set
-	// this is a light routine, since we only remove the dah files from the subtree store
+	// start a ticker that checks every minute whether there are subtrees/mined that need to be set
+	// this is a light routine for periodic cleanup and handling of invalidated blocks
 	go func() {
-		u.logger.Infof("[BlockValidation:start] starting subtree DAH update goroutine")
+		u.logger.Infof("[BlockValidation:start] starting periodic block processing goroutine")
 		ticker := time.NewTicker(1 * time.Minute)
 
 		for {
 			select {
 			case <-ctx.Done():
-				u.logger.Warnf("[BlockValidation:start] exiting subtree DAH update goroutine: %s", ctx.Err())
+				u.logger.Warnf("[BlockValidation:start] exiting periodic block processing goroutine: %s", ctx.Err())
 				return
 			case <-ticker.C:
 				u.processSubtreesNotSet(ctx, g)
+				u.processBlockMinedNotSet(ctx, g)
 			}
 		}
 	}()
@@ -423,14 +426,19 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					continue
 				}
 
-				if blockHeaderMeta != nil && blockHeaderMeta.MinedSet {
+				if blockHeaderMeta == nil {
+					u.logger.Errorf("[BlockValidation:start][%s] blockHeaderMeta is nil", blockHash.String())
+					continue
+				}
+
+				if blockHeaderMeta.MinedSet {
 					u.logger.Infof("[BlockValidation:start][%s] block already has mined_set true, skipping setTxMined", blockHash.String())
 					continue
 				}
 
 				_ = u.blockHashesCurrentlyValidated.Put(*blockHash)
 
-				if err = u.setTxMined(ctx, blockHash); err != nil {
+				if err = u.setTxMinedStatus(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
 					// Check if context is done before logging
 					select {
 					case <-ctx.Done():
@@ -510,6 +518,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 }
 
 func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgroup.Group) {
+	if u.blockchainClient == nil {
+		return
+	}
+
 	// first check whether all old blocks have been processed properly
 	blocksMinedNotSet, err := u.blockchainClient.GetBlocksMinedNotSet(ctx)
 	if err != nil {
@@ -541,7 +553,7 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgro
 						return nil
 					}
 
-					if err = u.setTxMined(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
+					if err = u.setTxMinedStatus(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
 						if errors.Is(err, context.Canceled) {
 							u.logger.Infof("[BlockValidation:start] failed to set block mined: %s", err)
 						} else {
@@ -737,7 +749,7 @@ func (u *BlockValidation) hasValidSubtrees(block *model.Block) bool {
 	return true
 }
 
-// setTxMined marks all transactions within a block as mined in the blockchain system.
+// setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
 //
 // This function updates the mining status of all transactions contained within the specified
 // block, transitioning them from validated to mined state. This is a critical operation
@@ -755,7 +767,7 @@ func (u *BlockValidation) hasValidSubtrees(block *model.Block) bool {
 //
 // Returns:
 //   - error: Any error encountered during the mining status update process
-func (u *BlockValidation) setTxMined(ctx context.Context, blockHash *chainhash.Hash, unsetMined ...bool) (err error) {
+func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chainhash.Hash, unsetMined ...bool) (err error) {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "setTxMined",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[setTxMined][%s] setting tx mined", blockHash.String()),
@@ -1018,7 +1030,19 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// If there's an error checking existence, proceed with validation
 				u.logger.Warnf("[ValidateBlock][%s] error checking block existence: %v, proceeding with validation", block.Header.Hash().String(), err)
 			} else if blockExists {
-				u.logger.Warnf("[ValidateBlock][%s] tried to validate existing block", block.Header.Hash().String())
+				// Block exists - check if it's invalid
+				_, blockMeta, err := u.blockchainClient.GetBlockHeader(ctx, block.Header.Hash())
+				if err != nil {
+					u.logger.Warnf("[ValidateBlock][%s] failed to get block metadata for existing block: %v, assuming valid", block.Header.Hash().String(), err)
+					return nil
+				}
+
+				if blockMeta != nil && blockMeta.Invalid {
+					u.logger.Warnf("[ValidateBlock][%s] block already exists and is marked as invalid", block.Header.Hash().String())
+					return errors.NewBlockInvalidError("[ValidateBlock][%s] block already exists as invalid", block.Header.Hash().String())
+				}
+
+				u.logger.Warnf("[ValidateBlock][%s] tried to validate existing valid block", block.Header.Hash().String())
 				return nil
 			}
 		} else {
@@ -1069,6 +1093,18 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			} else {
 				u.logger.Infof("[ValidateBlock][%s] using %d cached headers", block.Header.Hash().String(), len(blockHeaders))
 			}
+
+			// Check if parent block is invalid - if so, child is automatically invalid
+			// This optimization skips expensive validation when parent is already invalid
+			// For catchup mode with cached headers, we need to query parent metadata
+			_, parentMeta, err := u.blockchainClient.GetBlockHeader(ctx, block.Header.HashPrevBlock)
+			if err != nil {
+				u.logger.Warnf("[ValidateBlock][%s] failed to get parent block metadata: %v, continuing with validation", block.Hash().String(), err)
+				// Continue with validation - this is defensive programming
+			}
+			if err := u.checkParentInvalidAndStore(ctx, block, baseURL, parentMeta); err != nil {
+				return err
+			}
 		} else {
 			// Fetch headers from blockchain service
 			if opts.IsCatchupMode {
@@ -1080,12 +1116,22 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// get all X previous block headers, 100 is the default
 			previousBlockHeaderCount := u.settings.BlockValidation.PreviousBlockHeaderCount
 
-			blockHeaders, _, err = u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, previousBlockHeaderCount)
+			var parentBlockHeadersMeta []*model.BlockHeaderMeta
+			blockHeaders, parentBlockHeadersMeta, err = u.blockchainClient.GetBlockHeaders(ctx, block.Header.HashPrevBlock, previousBlockHeaderCount)
 			if err != nil {
 				u.logger.Errorf("[ValidateBlock][%s] failed to get block headers: %s", block.String(), err)
 				u.ReValidateBlock(block, baseURL)
 
 				return errors.NewServiceError("[ValidateBlock][%s] failed to get block headers", block.String(), err)
+			}
+
+			// Check if parent block is invalid using the metadata we just got
+			var parentMeta *model.BlockHeaderMeta
+			if len(parentBlockHeadersMeta) > 0 {
+				parentMeta = parentBlockHeadersMeta[0]
+			}
+			if err := u.checkParentInvalidAndStore(ctx, block, baseURL, parentMeta); err != nil {
+				return err
 			}
 		}
 
@@ -1120,6 +1166,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		if err = u.validateBlockSubtrees(ctx, block, baseURL); err != nil {
 			if errors.Is(err, errors.ErrTxInvalid) || errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
 				u.logger.Warnf("[ValidateBlock][%s] block contains invalid transactions, marking as invalid: %s", block.Hash().String(), err)
+				reason := fmt.Sprintf("block contains invalid transactions: %s", err.Error())
+				u.storeInvalidBlock(ctx, block, baseURL, reason)
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions: %s", block.Hash().String(), err)
 			}
 
@@ -1154,6 +1202,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 			// Compare the block's nBits with the expected nBits
 			if expectedNBits != nil && block.Header.Bits != *expectedNBits {
+				reason := fmt.Sprintf("incorrect difficulty bits: got %v, expected %v", block.Header.Bits, *expectedNBits)
+				u.storeInvalidBlock(ctx, block, baseURL, reason)
+
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block has incorrect difficulty bits: got %v, expected %v",
 					block.Header.Hash().String(), block.Header.Bits, expectedNBits)
 			}
@@ -1161,6 +1212,12 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// Then check that the block hash meets the difficulty target
 			headerValid, _, err := block.Header.HasMetTargetDifficulty()
 			if !headerValid {
+				reason := "block does not meet target difficulty"
+				if err != nil {
+					reason = fmt.Sprintf("block does not meet target difficulty: %s", err.Error())
+				}
+				u.storeInvalidBlock(ctx, block, baseURL, reason)
+
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block does not meet target difficulty: %s", block.Header.Hash().String(), err)
 			}
 		}
@@ -1250,6 +1307,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// Block validation succeeded - now cache it with subtrees loaded
 				u.logger.Debugf("[ValidateBlock][%s] background validation complete, caching block with subtrees", block.Hash().String())
 				u.lastValidatedBlocks.Set(*block.Hash(), block)
+
+				// Update subtrees DAH now that we know the block is valid
+				if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
+					u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
+				}
 			}()
 		} else {
 			// get all 100 previous block headers on the main chain
@@ -1285,12 +1347,17 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					reason = err.Error()
 				}
 
-				u.kafkaNotifyBlockInvalid(block, reason)
+				u.storeInvalidBlock(ctx, block, baseURL, reason)
 
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err)
 			}
 
 			if iterationError := u.checkOldBlockIDs(ctx, oldBlockIDsMap, block); iterationError != nil {
+				if errors.Is(iterationError, errors.ErrBlockInvalid) {
+					reason := iterationError.Error()
+					u.storeInvalidBlock(ctx, block, baseURL, reason)
+				}
+
 				return iterationError
 			}
 
@@ -1345,18 +1412,14 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// decouple the tracing context to not cancel the context when finalize the block processing in the background
 		decoupledCtx, _, _ := tracing.DecoupleTracingSpan(ctx, "ValidateBlock", "decoupled")
 
-		u.backgroundTasks.Add(1)
-		go func() {
-			defer u.backgroundTasks.Done()
+		// Only update subtrees DAH for non-optimistic mining
+		// (optimistic mining handles this in its background validation goroutine)
+		if !useOptimisticMining {
+			// it's critical that we call updateSubtreesDAH() only when we know the block is valid
 			if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
-				// TODO: what to do here? We have already added the block to the blockchain
 				u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
 			}
-
-			// Block validation succeeded - now cache it with subtrees loaded
-			u.logger.Debugf("[ValidateBlock][%s] background validation complete, caching block with subtrees", block.Hash().String())
-			u.lastValidatedBlocks.Set(*block.Hash(), block)
-		}()
+		}
 
 		// create bloom filter for the block and wait for it
 		if err = u.createAppendBloomFilter(decoupledCtx, block); err != nil {
@@ -1377,6 +1440,46 @@ func (u *BlockValidation) markBlockAsInvalid(ctx context.Context, block *model.B
 	if _, invalidateBlockErr := u.blockchainClient.InvalidateBlock(ctx, block.Header.Hash()); invalidateBlockErr != nil {
 		u.logger.Errorf("[ValidateBlock][%s] Failed to invalidate block: %v", block.String(), invalidateBlockErr)
 	}
+}
+
+// storeInvalidBlock stores a block marked as invalid in the blockchain database.
+// This helper function centralizes the logic for persisting invalid blocks and updating caches.
+func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Block, baseURL string, reason string) {
+	u.logger.Warnf("[ValidateBlock][%s] storing block as invalid: %s", block.Hash().String(), reason)
+
+	// Store the block marked as invalid so we have a record of it
+	if storeErr := u.blockchainClient.AddBlock(ctx, block, baseURL, blockchainoptions.WithInvalid(true)); storeErr != nil {
+		u.logger.Errorf("[ValidateBlock][%s] failed to store invalid block: %v", block.Hash().String(), storeErr)
+	} else {
+		// Update cache to reflect that block exists
+		if cacheErr := u.SetBlockExists(block.Header.Hash()); cacheErr != nil {
+			u.logger.Errorf("[ValidateBlock][%s] failed to set block exists cache: %s", block.Header.Hash().String(), cacheErr)
+		}
+	}
+
+	u.kafkaNotifyBlockInvalid(block, reason)
+}
+
+// checkParentInvalidAndStore checks if the parent block is invalid and stores
+// the child block as invalid if so. This is an optimization to skip expensive
+// validation when the parent is already invalid.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - block: Child block being validated
+//   - baseURL: Source URL for the block
+//   - parentMeta: Metadata of the parent block (can be nil)
+//
+// Returns:
+//   - nil if parent is valid or metadata is nil
+//   - error if parent is invalid (child is stored as invalid)
+func (u *BlockValidation) checkParentInvalidAndStore(ctx context.Context, block *model.Block, baseURL string, parentMeta *model.BlockHeaderMeta) error {
+	if parentMeta != nil && parentMeta.Invalid {
+		reason := fmt.Sprintf("parent block %s is invalid", block.Header.HashPrevBlock.String())
+		u.storeInvalidBlock(ctx, block, baseURL, reason)
+		return errors.NewBlockInvalidError("[ValidateBlock][%s] parent block is invalid", block.Hash().String())
+	}
+	return nil
 }
 
 func (u *BlockValidation) kafkaNotifyBlockInvalid(block *model.Block, reason string) {
@@ -1621,6 +1724,13 @@ func (u *BlockValidation) reValidateBlock(blockData revalidateBlockData) error {
 	blockHeaderIDs := make([]uint32, len(blockHeadersMeta))
 	for i, blockHeaderMeta := range blockHeadersMeta {
 		blockHeaderIDs[i] = blockHeaderMeta.ID
+	}
+
+	// Check if parent block is invalid during revalidation
+	// If parent is invalid, no point revalidating the child
+	if len(blockHeadersMeta) > 0 && blockHeadersMeta[0].Invalid {
+		u.logger.Warnf("[reValidateBlock][%s] parent block %s is invalid, child cannot be revalidated as valid", blockData.block.Hash().String(), blockData.block.Header.HashPrevBlock.String())
+		return errors.NewBlockInvalidError("[reValidateBlock][%s] parent block is invalid", blockData.block.Hash().String())
 	}
 
 	// only get the bloom filters for the current chain

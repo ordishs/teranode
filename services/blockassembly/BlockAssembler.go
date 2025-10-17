@@ -272,20 +272,13 @@ func (b *BlockAssembler) SubtreeCount() int {
 //
 // Parameters:
 //   - ctx: Context for cancellation
-func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
-	var (
-		err       error
-		readyOnce sync.Once
-	)
-
+func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) {
 	// start a subscription for the best block header and the FSM state
 	// this will be used to reset the subtree processor when a new block is mined
 	b.blockchainSubscriptionCh, err = b.blockchainClient.Subscribe(ctx, "BlockAssembler")
 	if err != nil {
 		return errors.NewProcessingError("[BlockAssembler] error subscribing to blockchain notifications: %v", err)
 	}
-
-	readyCh := make(chan struct{})
 
 	go func() {
 		// variables are defined here to prevent unnecessary allocations
@@ -375,21 +368,9 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 				}
 
 				b.setCurrentRunningState(StateRunning)
-
-				readyOnce.Do(func() {
-					readyCh <- struct{}{}
-				})
 			} // select
 		} // for
 	}()
-
-	select {
-	case <-time.After(time.Second * 30):
-		return errors.NewProcessingError("[BlockAssembler] timeout waiting for blockchain subscription to be ready")
-	case <-readyCh:
-	case <-ctx.Done():
-		return nil
-	}
 
 	return nil
 }
@@ -1491,7 +1472,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			}
 
 			if skipAlreadyMined {
-				b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+				// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
 
 				if unminedTransaction.UnminedSince > 0 {
 					markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, *unminedTransaction.Hash)

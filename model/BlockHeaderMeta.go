@@ -87,7 +87,6 @@ func (m *BlockHeaderMeta) Bytes() []byte {
 
 	// append the processed_at timestamp if present
 	if m.ProcessedAt != nil {
-		b64 := make([]byte, 8)
 		binary.LittleEndian.PutUint64(b64, uint64(m.ProcessedAt.Unix()))
 		b = append(b, b64...)
 	}
