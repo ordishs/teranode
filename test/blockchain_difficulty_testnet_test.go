@@ -289,7 +289,7 @@ func TestGetNextWorkRequiredTestnet(t *testing.T) {
 	// Start blockchain service
 	t.Log("Starting blockchain service...")
 	// Use port 0 to let the OS assign an available port
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 
 	// Get the actual port assigned by the OS
