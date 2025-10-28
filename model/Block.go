@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -34,6 +35,13 @@ import (
 	"github.com/greatroar/blobloom"
 	"golang.org/x/sync/errgroup"
 )
+
+// bufioReaderPool reduces GC pressure by reusing bufio.Reader instances for subtree deserialization.
+var bufioReaderPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewReaderSize(nil, 512*1024) // 512KB buffer
+	},
+}
 
 const GenesisBlockID = 0
 
@@ -459,10 +467,15 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 			return false, err
 		}
 
+		// Verify that we have at least one subtree and that it has at least one node
+		if len(b.SubtreeSlices) == 0 || len(b.SubtreeSlices[0].Nodes) == 0 {
+			return false, errors.NewBlockInvalidError("[BLOCK][%s] first subtree has no nodes", b.String())
+		}
+
 		// 7. Check that the first transaction in the first subtree is a coinbase placeholder (zeros)
-		// if !b.SubtreeSlices[0].Nodes[0].Hash.Equal(CoinbasePlaceholder) {
-		// 	return false, errors.NewBlockInvalidError("[BLOCK][%s] first transaction in first subtree is not a coinbase placeholder: %s", b.String(), b.SubtreeSlices[0].Nodes[0].Hash.String())
-		// }
+		if !b.SubtreeSlices[0].Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholder) {
+			return false, errors.NewBlockInvalidError("[BLOCK][%s] first transaction in first subtree is not a coinbase placeholder: %s", b.String(), b.SubtreeSlices[0].Nodes[0].Hash.String())
+		}
 
 		// 8. Calculate the merkle root of the list of subtrees and check it matches the MR in the block header.
 		//    making sure to replace the coinbase placeholder with the coinbase tx hash in the first subtree
@@ -1098,7 +1111,15 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					readCloser, err := subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
 					if err != nil {
 						if errors.Is(err, errors.ErrNotFound) {
-							return subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
+							// Try fallback to SubtreeToCheck - this file exists when CheckBlockSubtrees downloaded
+							// the subtree but couldn't fully validate it (e.g., due to missing parent transactions)
+							readCloser, err = subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+							if err == nil {
+								logger.Debugf("[BLOCK][%s][ID %d] using FileTypeSubtreeToCheck for subtree %s", blockHash, blockID, subtreeHash)
+								return readCloser, nil
+							}
+							// Still not found, return the original NOT_FOUND error
+							return nil, errors.ErrNotFound
 						}
 
 						return nil, err
@@ -1119,10 +1140,18 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					return errors.NewStorageError("[BLOCK][%s][ID %d] failed to get subtree %s", blockHash, blockID, subtreeHash, err)
 				}
 
-				err = subtree.DeserializeFromReader(subtreeReader)
+				// Use pooled bufio.Reader to reduce GC pressure
+				bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+				bufferedReader.Reset(subtreeReader)
+				defer func() {
+					bufferedReader.Reset(nil)
+					bufioReaderPool.Put(bufferedReader)
+				}()
+
+				err = subtree.DeserializeFromReader(bufferedReader)
 				if err != nil {
 					_, err = retry.Retry(gCtx, logger, func() (struct{}, error) {
-						return struct{}{}, subtree.DeserializeFromReader(subtreeReader)
+						return struct{}{}, subtree.DeserializeFromReader(bufferedReader)
 					}, retry.WithMessage(fmt.Sprintf("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash)))
 
 					if err != nil {

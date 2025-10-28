@@ -884,7 +884,14 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 
 	start = gocore.CurrentTime()
 	buffer := make([]byte, chainhash.HashSize)
-	bufferedReader := bufio.NewReaderSize(body, 1024*128)
+
+	// Use pooled bufio.Reader
+	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+	bufferedReader.Reset(body)
+	defer func() {
+		bufferedReader.Reset(nil)
+		bufioReaderPool.Put(bufferedReader)
+	}()
 
 	u.logger.Debugf("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
 
@@ -1630,6 +1637,21 @@ func (u *Server) setPauseProcessing(ctx context.Context) (func(), error) {
 		u.logger.Infof("[setPauseProcessing] Paused Kafka subtree consumer")
 	}
 
+	// Start goroutine to log periodic pause messages
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-pauseCtx.Done():
+				return
+			case <-ticker.C:
+				u.logger.Warnf("[setPauseProcessing] subtree validation paused (elapsed: %.0fs, max: %.0fs)", time.Since(pauseStartTime).Seconds(), maxPauseDuration.Seconds())
+			}
+		}
+	}()
+
 	// If quorum not initialized, just do local pause with consumer paused
 	if q == nil {
 		u.logger.Warnf("[setPauseProcessing] Quorum not initialized - falling back to local-only pause")
@@ -1706,4 +1728,3 @@ func (u *Server) setPauseProcessing(ctx context.Context) (func(), error) {
 		}
 	}, nil
 }
-

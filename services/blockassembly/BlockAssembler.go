@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,7 +25,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
-	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/go-utils"
 	"github.com/ordishs/gocore"
@@ -123,6 +123,10 @@ type BlockAssembler struct {
 	// bestBlockHeight atomically stores the current best block height
 	bestBlockHeight atomic.Uint32
 
+	// lastPersistedHeight tracks the last block height processed by block persister
+	// This is updated via BlockPersisted notifications and used to coordinate with cleanup
+	lastPersistedHeight atomic.Uint32
+
 	// currentChainMap maps block hashes to their heights
 	currentChainMap map[chainhash.Hash]uint32
 
@@ -139,10 +143,7 @@ type BlockAssembler struct {
 	defaultMiningNBits *model.NBit
 
 	// resetCh handles reset requests for the assembler
-	resetCh chan chan error
-
-	// resetFullCh handles full reset requests for the assembler
-	resetFullCh chan chan error
+	resetCh chan resetRequest
 
 	// currentRunningState tracks the current operational state
 	currentRunningState atomic.Value
@@ -232,8 +233,7 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 		currentChainMap:     make(map[chainhash.Hash]uint32, tSettings.BlockAssembly.MaxBlockReorgCatchup),
 		currentChainMapIDs:  make(map[uint32]struct{}, tSettings.BlockAssembly.MaxBlockReorgCatchup),
 		defaultMiningNBits:  defaultMiningBits,
-		resetCh:             make(chan chan error, 2),
-		resetFullCh:         make(chan chan error, 2),
+		resetCh:             make(chan resetRequest, 2),
 		currentRunningState: atomic.Value{},
 		cachedCandidate:     &CachedMiningCandidate{},
 	}
@@ -272,20 +272,13 @@ func (b *BlockAssembler) SubtreeCount() int {
 //
 // Parameters:
 //   - ctx: Context for cancellation
-func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
-	var (
-		err       error
-		readyOnce sync.Once
-	)
-
+func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) {
 	// start a subscription for the best block header and the FSM state
 	// this will be used to reset the subtree processor when a new block is mined
 	b.blockchainSubscriptionCh, err = b.blockchainClient.Subscribe(ctx, "BlockAssembler")
 	if err != nil {
 		return errors.NewProcessingError("[BlockAssembler] error subscribing to blockchain notifications: %v", err)
 	}
-
-	readyCh := make(chan struct{})
 
 	go func() {
 		// variables are defined here to prevent unnecessary allocations
@@ -300,40 +293,21 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 				// it's created by the blockchain client's Subscribe method
 				return
 
-			case errCh := <-b.resetCh:
+			case resetReq := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
 
-				err := b.reset(ctx, false)
+				err := b.reset(ctx, resetReq.FullReset)
 
 				// empty out the reset channel
 				for len(b.resetCh) > 0 {
-					bufferedErrCh := <-b.resetCh
-					if bufferedErrCh != nil {
-						bufferedErrCh <- nil
+					bufferedCh := <-b.resetCh
+					if bufferedCh.ErrCh != nil {
+						bufferedCh.ErrCh <- nil
 					}
 				}
 
-				if errCh != nil {
-					errCh <- err
-				}
-
-				b.setCurrentRunningState(StateRunning)
-
-			case errCh := <-b.resetFullCh:
-				b.setCurrentRunningState(StateResetting)
-
-				err := b.reset(ctx, true)
-
-				// empty out the reset channel
-				for len(b.resetFullCh) > 0 {
-					bufferedErrCh := <-b.resetFullCh
-					if bufferedErrCh != nil {
-						bufferedErrCh <- nil
-					}
-				}
-
-				if errCh != nil {
-					errCh <- err
+				if resetReq.ErrCh != nil {
+					resetReq.ErrCh <- err
 				}
 
 				b.setCurrentRunningState(StateRunning)
@@ -372,24 +346,34 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) error {
 
 				if notification.Type == model.NotificationType_Block {
 					b.processNewBlockAnnouncement(ctx)
+				} else if notification.Type == model.NotificationType_BlockPersisted {
+					// RUNTIME COORDINATION: Update persisted height from block persister
+					//
+					// Block persister sends this notification after successfully persisting a block
+					// and creating its .subtree_data file. We track this height so cleanup can safely
+					// delete transactions from earlier blocks without breaking catchup.
+					//
+					// This notification-based update keeps our persisted height current during normal
+					// operation. Combined with the startup initialization from blockchain state,
+					// we always know how far block persister has progressed.
+					//
+					// Cleanup uses this via GetLastPersistedHeight() to calculate safe deletion height.
+					if notification.Metadata != nil && notification.Metadata.Metadata != nil {
+						if heightStr, ok := notification.Metadata.Metadata["height"]; ok {
+							if height, err := strconv.ParseUint(heightStr, 10, 32); err == nil {
+								b.lastPersistedHeight.Store(uint32(height))
+								b.logger.Debugf("[BlockAssembler] Block persister progress: height %d", height)
+							} else {
+								b.logger.Warnf("[BlockAssembler] Failed to parse persisted height from notification: %v", err)
+							}
+						}
+					}
 				}
 
 				b.setCurrentRunningState(StateRunning)
-
-				readyOnce.Do(func() {
-					readyCh <- struct{}{}
-				})
 			} // select
 		} // for
 	}()
-
-	select {
-	case <-time.After(time.Second * 30):
-		return errors.NewProcessingError("[BlockAssembler] timeout waiting for blockchain subscription to be ready")
-	case <-readyCh:
-	case <-ctx.Done():
-		return nil
-	}
 
 	return nil
 }
@@ -431,7 +415,7 @@ func (b *BlockAssembler) reset(ctx context.Context, fullScan bool) error {
 	b.logger.Warnf("[BlockAssembler][Reset] resetting to new best block header: %d", meta.Height)
 
 	// make sure we have processed all pending blocks before resetting
-	if err = b.waitForPendingBlocks(ctx); err != nil {
+	if err = b.subtreeProcessor.WaitForPendingBlocks(ctx); err != nil {
 		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
@@ -597,6 +581,15 @@ func (b *BlockAssembler) GetCurrentRunningState() State {
 	return b.currentRunningState.Load().(State)
 }
 
+// GetLastPersistedHeight returns the last block height processed by block persister.
+// This is used by cleanup service to avoid deleting transactions before they're persisted.
+//
+// Returns:
+//   - uint32: Last persisted block height
+func (b *BlockAssembler) GetLastPersistedHeight() uint32 {
+	return b.lastPersistedHeight.Load()
+}
+
 // Start initializes and begins the block assembler operations.
 //
 // Parameters:
@@ -611,7 +604,7 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 
 	// Wait for any pending blocks to be processed before loading unmined transactions
 	if !b.skipWaitForPendingBlocks {
-		if err = b.waitForPendingBlocks(ctx); err != nil {
+		if err = b.subtreeProcessor.WaitForPendingBlocks(ctx); err != nil {
 			// we cannot start block assembly if we have not processed all pending blocks
 			return errors.NewProcessingError("[BlockAssembler] failed to wait for pending blocks: %v", err)
 		}
@@ -627,6 +620,42 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewProcessingError("[BlockAssembler] failed to start channel listeners: %v", err)
 	}
 
+	// CRITICAL STARTUP COORDINATION: Initialize persisted height from block persister's state
+	//
+	// PROBLEM: Block persister creates .subtree_data files after a delay (BlockPersisterPersistAge blocks),
+	// but cleanup deletes transactions based only on delete_at_height. If cleanup runs before block persister
+	// has created .subtree_data files, those files will reference deleted transactions, causing catchup failures
+	// with "subtree length does not match tx data length" errors (actually missing transactions).
+	//
+	// SOLUTION: Cleanup coordinates with block persister by limiting deletion to:
+	//   max_cleanup_height = min(requested_cleanup_height, persisted_height + retention)
+	//
+	// STARTUP RACE: Block persister notifications arrive asynchronously after BlockAssembler starts.
+	// If cleanup runs before the first notification arrives, it doesn't know the persisted height and
+	// could delete transactions that block persister still needs.
+	//
+	// PREVENTION: Read block persister's last persisted height from blockchain state on startup.
+	// Block persister publishes this state on its own startup, so we have the current value immediately.
+	//
+	// SCENARIOS:
+	//   1. Block persister running: State available, cleanup immediately coordinates correctly
+	//   2. Block persister not deployed: State missing, cleanup proceeds normally (height=0 disables coordination)
+	//   3. Block persister hasn't started yet: State missing, will get notification soon, cleanup waits
+	//   4. Block persister disabled: State missing, cleanup works without coordination
+	//
+	// All scenarios are safe. This prevents premature cleanup during the startup window.
+	if state, err := b.blockchainClient.GetState(ctx, "BlockPersisterHeight"); err == nil && len(state) >= 4 {
+		height := binary.LittleEndian.Uint32(state)
+		if height > 0 {
+			b.lastPersistedHeight.Store(height)
+			b.logger.Infof("[BlockAssembler] Initialized persisted height from block persister state: %d", height)
+		}
+	} else if err != nil {
+		// State doesn't exist - block persister either not deployed, hasn't started, or first run.
+		// All cases are safe (cleanup checks for height=0 and proceeds normally without coordination).
+		b.logger.Debugf("[BlockAssembler] Block persister state not available: %v", err)
+	}
+
 	// Check if the UTXO store supports cleanup operations
 	if !b.settings.UtxoStore.DisableDAHCleaner {
 		if cleanupServiceProvider, ok := b.utxoStore.(cleanup.CleanupServiceProvider); ok {
@@ -638,6 +667,22 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 			}
 
 			if b.cleanupService != nil {
+				// CLEANUP COORDINATION: Wire up block persister progress tracking
+				//
+				// Cleanup needs to know how far block persister has progressed so it doesn't
+				// delete transactions that block persister still needs to create .subtree_data files.
+				//
+				// The cleanup service will call GetLastPersistedHeight() before each cleanup operation
+				// and limit deletion to: min(requested_height, persisted_height + retention)
+				//
+				// This getter provides the persisted height that was:
+				//   1. Initialized from blockchain state on startup (preventing startup race)
+				//   2. Updated via BlockPersisted notifications during runtime (keeping current)
+				//
+				// See processCleanupJob in cleanup_service.go for the coordination logic.
+				b.cleanupService.SetPersistedHeightGetter(b.GetLastPersistedHeight)
+				b.logger.Infof("[BlockAssembler] Configured cleanup service to coordinate with block persister")
+
 				b.logger.Infof("[BlockAssembler] starting cleanup service")
 				b.cleanupService.Start(ctx)
 			}
@@ -768,6 +813,11 @@ func (b *BlockAssembler) RemoveTx(hash chainhash.Hash) error {
 	return b.subtreeProcessor.Remove(hash)
 }
 
+type resetRequest struct {
+	FullReset bool
+	ErrCh     chan error
+}
+
 // Reset triggers a reset of the block assembler state.
 // This operation runs asynchronously to prevent blocking.
 func (b *BlockAssembler) Reset(fullReset bool) {
@@ -775,10 +825,9 @@ func (b *BlockAssembler) Reset(fullReset bool) {
 	go func() {
 		errCh := make(chan error, 1)
 
-		if fullReset {
-			b.resetFullCh <- errCh
-		} else {
-			b.resetCh <- errCh
+		b.resetCh <- resetRequest{
+			FullReset: fullReset,
+			ErrCh:     errCh,
 		}
 
 		if err := <-errCh; err != nil {
@@ -1491,7 +1540,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			}
 
 			if skipAlreadyMined {
-				b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+				// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
 
 				if unminedTransaction.UnminedSince > 0 {
 					markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, *unminedTransaction.Hash)
@@ -1614,55 +1663,4 @@ func (b *BlockAssembler) invalidateMiningCandidateCache() {
 // This is primarily used in test environments to prevent blocking on pending blocks.
 func (b *BlockAssembler) SetSkipWaitForPendingBlocks(skip bool) {
 	b.skipWaitForPendingBlocks = skip
-}
-
-// waitForPendingBlocks waits for any pending blocks to be processed before loading unmined transactions.
-// This method continuously polls the blockchain client to check if there are any blocks that have not been
-// marked as mined yet. It will wait until the list of blocks returned by GetBlocksMinedNotSet is empty,
-// indicating that all blocks have been processed and marked as mined.
-//
-// The method implements a polling loop with a 1-second interval and includes logging to provide visibility
-// into the waiting process. This ensures that the BlockAssembly service doesn't start loading unmined
-// transactions until all pending blocks have been fully processed.
-//
-// Parameters:
-//   - ctx: Context for cancellation and timeout support
-//
-// Returns:
-//   - error: Any error encountered during the waiting process or blockchain client calls
-func (b *BlockAssembler) waitForPendingBlocks(ctx context.Context) error {
-	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "waitForPendingBlocks",
-		tracing.WithParentStat(b.stats),
-		tracing.WithLogMessage(b.logger, "[waitForPendingBlocks] checking for pending blocks"),
-	)
-	defer deferFn()
-
-	// Use retry utility with infinite retries until no pending blocks remain
-	_, err := retry.Retry(ctx, b.logger, func() (interface{}, error) {
-		blockNotMined, err := b.blockchainClient.GetBlocksMinedNotSet(ctx)
-		if err != nil {
-			return nil, errors.NewProcessingError("error getting blocks with mined not set", err)
-		}
-
-		if len(blockNotMined) == 0 {
-			b.logger.Infof("[waitForPendingBlocks] no pending blocks found, ready to load unmined transactions")
-			return nil, nil
-		}
-
-		for _, block := range blockNotMined {
-			b.logger.Debugf("[waitForPendingBlocks] waiting for block %s to be processed, height %d, ID %d", block.Hash(), block.Height, block.ID)
-		}
-
-		// Return an error to trigger retry when blocks are still pending
-		return nil, errors.NewProcessingError("waiting for %d blocks to be processed", len(blockNotMined))
-	},
-		retry.WithMessage("[waitForPendingBlocks] blockchain service check"),
-		retry.WithInfiniteRetry(),
-		retry.WithExponentialBackoff(),
-		retry.WithBackoffDurationType(1*time.Second),
-		retry.WithBackoffFactor(2.0),
-		retry.WithMaxBackoff(30*time.Second),
-	)
-
-	return err
 }
