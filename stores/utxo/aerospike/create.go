@@ -56,6 +56,7 @@ package aerospike
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
@@ -79,6 +80,19 @@ import (
 
 // Used for NOOP batch operations
 var placeholderKey *aerospike.Key
+
+// LockRecordIndex is a special index value for lock records
+// Uses max uint32 to avoid conflict with actual sub-records (0, 1, 2, ...)
+const LockRecordIndex = uint32(0xFFFFFFFF)
+
+// LockRecordBaseTTL is the minimum time-to-live for lock records in seconds
+const LockRecordBaseTTL = uint32(30)
+
+// LockRecordPerRecordTTL is the additional TTL per record
+const LockRecordPerRecordTTL = uint32(2)
+
+// LockRecordMaxTTL is the maximum time-to-live for lock records in seconds
+const LockRecordMaxTTL = uint32(300)
 
 // BatchStoreItem represents a transaction to be stored in a batch operation.
 type BatchStoreItem struct {
@@ -716,9 +730,10 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 //
 // The process:
 //  1. Stores transaction data in blob storage
-//  2. Creates Aerospike records with metadata
-//  3. Links records to external data
-//  4. Handles pagination if needed
+//  2. Acquires lock record
+//  3. Creates all Aerospike records in batch with locked=true
+//  4. Releases lock
+//  5. Unlocks records if user didn't request lock
 func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStoreItem, binsToStore [][]*aerospike.Bin) {
 	timeStart := time.Now()
 
@@ -728,53 +743,101 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 		fileformat.FileTypeTx,
 		bItem.tx.ExtendedBytes(),
 	); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
-		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[GetBinsToStore] error writing transaction to external store [%s]", bItem.txHash.String()))
+		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[StoreTransactionExternally] error writing transaction to external store [%s]", bItem.txHash.String()))
 
 		return
 	}
 
 	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
-	wPolicy := util.GetAerospikeWritePolicy(s.settings, 0)
-	wPolicy.RecordExistsAction = aerospike.CREATE_ONLY
+	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
+	if err != nil {
+		utils.SafeSend[error](bItem.done, err)
+		return
+	}
 
-	for binIdx := len(binsToStore) - 1; binIdx >= 0; binIdx-- {
-		bins := binsToStore[binIdx]
+	lockTTL := calculateLockTTL(len(binsToStore))
+	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
+	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
-		binIdxUint32, err := safeconversion.IntToUint32(binIdx)
-		if err != nil {
-			s.logger.Errorf("Could not convert binIdx (%d) to uint32", binIdx)
+	hostname, _ := os.Hostname()
+	lockBins := []*aerospike.Bin{
+		aerospike.NewBin("created_at", aerospike.NewIntegerValue(int(time.Now().Unix()))),
+		aerospike.NewBin("lock_type", "tx_creation"),
+		aerospike.NewBin("process_id", aerospike.NewIntegerValue(os.Getpid())),
+		aerospike.NewBin("hostname", aerospike.NewStringValue(hostname)),
+		aerospike.NewBin("expected_records", aerospike.NewIntegerValue(len(binsToStore))),
+	}
+
+	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
+	if err != nil {
+		aErr, ok := err.(*aerospike.AerospikeError)
+		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
+			utils.SafeSend[error](bItem.done, s.handleExistingTransaction(bItem.txHash))
+			return
 		}
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to acquire lock", err))
+		return
+	}
 
-		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, binIdxUint32)
+	defer func() {
+		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+			s.logger.Warnf("[StoreTransactionExternally] Failed to release lock: %v", releaseErr)
+		}
+	}()
 
+	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
+	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
+	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
+
+	for idx, bins := range binsToStore {
+		binsWithLock := s.ensureLockedBin(bins, true)
+
+		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
-			utils.SafeSend(bItem.done, err)
+			utils.SafeSend[error](bItem.done, err)
 			return
 		}
 
-		putOps := make([]*aerospike.Operation, len(bins))
-		for i, bin := range bins {
+		putOps := make([]*aerospike.Operation, len(binsWithLock))
+		for i, bin := range binsWithLock {
 			putOps[i] = aerospike.PutOp(bin)
 		}
 
-		if err = s.client.PutBins(wPolicy, key, bins...); err != nil {
-			var aErr *aerospike.AerospikeError
+		if idx == 0 && bItem.conflicting {
+			dah := bItem.blockHeight + s.settings.GetUtxoStoreBlockHeightRetention()
+			putOps = append(putOps, aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), dah)))
+		}
 
-			ok := errors.As(err, &aErr)
-			if ok {
-				if aErr.ResultCode == types.KEY_EXISTS_ERROR {
-					// PAGINATION CORRUPTION RECOVERY: This bin was already written in a previous interrupted attempt.
-					// Skip it and continue with remaining bins to complete the partial record.
-					// This allows recovery from interrupted pagination writes.
-					s.logger.Infof("[StoreTransactionExternally][%s] bin %d already exists, skipping to write missing bins", bItem.txHash, binIdx)
-					continue
-				}
+		batchRecords[idx] = aerospike.NewBatchWrite(batchWritePolicy, key, putOps...)
+	}
+
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	_ = s.client.BatchOperate(batchPolicy, batchRecords)
+
+	hasFailures := false
+	for idx, record := range batchRecords {
+		if err := record.BatchRec().Err; err != nil {
+			aErr, ok := err.(*aerospike.AerospikeError)
+			if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
+				s.logger.Debugf("[StoreTransactionExternally] Record %d already exists for tx %s (recovery)", idx, bItem.txHash)
+				continue
 			}
+			s.logger.Errorf("[StoreTransactionExternally] Failed to create record %d for tx %s: %v", idx, bItem.txHash, err)
+			hasFailures = true
+		}
+	}
 
-			utils.SafeSend[error](bItem.done, errors.NewProcessingError("[StoreTransactionExternally][%s] could not put bins (extended mode) to store", bItem.txHash, err))
-			return
+	if hasFailures {
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create records for tx %s", bItem.txHash))
+		return
+	}
+
+	if !bItem.locked {
+		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
+		if unlockErr != nil {
+			s.logger.Warnf("[StoreTransactionExternally] Failed to unlock records for %s: %v", bItem.txHash, unlockErr)
 		}
 	}
 
@@ -829,47 +892,370 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 
 	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
-	wPolicy := util.GetAerospikeWritePolicy(s.settings, 0)
-	wPolicy.RecordExistsAction = aerospike.CREATE_ONLY
+	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
+	if err != nil {
+		utils.SafeSend[error](bItem.done, err)
+		return
+	}
 
-	for i := len(binsToStore) - 1; i >= 0; i-- {
-		bins := binsToStore[i]
+	lockTTL := calculateLockTTL(len(binsToStore))
+	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
+	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
-		iUint32, err := safeconversion.IntToUint32(i)
-		if err != nil {
-			s.logger.Errorf("Could not convert i (%d) to uint32", i)
+	hostname, _ := os.Hostname()
+	lockBins := []*aerospike.Bin{
+		aerospike.NewBin("created_at", aerospike.NewIntegerValue(int(time.Now().Unix()))),
+		aerospike.NewBin("lock_type", "tx_creation"),
+		aerospike.NewBin("process_id", aerospike.NewIntegerValue(os.Getpid())),
+		aerospike.NewBin("hostname", aerospike.NewStringValue(hostname)),
+		aerospike.NewBin("expected_records", aerospike.NewIntegerValue(len(binsToStore))),
+	}
+
+	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
+	if err != nil {
+		aErr, ok := err.(*aerospike.AerospikeError)
+		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
+			utils.SafeSend[error](bItem.done, s.handleExistingTransaction(bItem.txHash))
+			return
 		}
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to acquire lock", err))
+		return
+	}
 
-		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, iUint32)
+	defer func() {
+		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+			s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock: %v", releaseErr)
+		}
+	}()
 
+	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
+	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
+	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
+
+	for idx, bins := range binsToStore {
+		binsWithLock := s.ensureLockedBin(bins, true)
+
+		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
-			utils.SafeSend(bItem.done, err)
+			utils.SafeSend[error](bItem.done, err)
 			return
 		}
 
-		putOps := make([]*aerospike.Operation, len(bins))
-		for i, bin := range bins {
+		putOps := make([]*aerospike.Operation, len(binsWithLock))
+		for i, bin := range binsWithLock {
 			putOps[i] = aerospike.PutOp(bin)
 		}
 
-		if err := s.client.PutBins(wPolicy, key, bins...); err != nil {
+		if idx == 0 && bItem.conflicting {
+			dah := bItem.blockHeight + s.settings.GetUtxoStoreBlockHeightRetention()
+			putOps = append(putOps, aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), dah)))
+		}
+
+		batchRecords[idx] = aerospike.NewBatchWrite(batchWritePolicy, key, putOps...)
+	}
+
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	_ = s.client.BatchOperate(batchPolicy, batchRecords)
+
+	hasFailures := false
+	for idx, record := range batchRecords {
+		if err := record.BatchRec().Err; err != nil {
 			aErr, ok := err.(*aerospike.AerospikeError)
-			if ok {
-				if aErr.ResultCode == types.KEY_EXISTS_ERROR {
-					// PAGINATION CORRUPTION RECOVERY: This bin was already written in a previous interrupted attempt.
-					// Skip it and continue with remaining bins to complete the partial record.
-					// This allows recovery from interrupted pagination writes.
-					s.logger.Infof("[StorePartialTransactionExternally][%s] bin %d already exists, skipping to write missing bins", bItem.txHash, i)
-					continue
-				}
+			if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
+				s.logger.Debugf("[StorePartialTransactionExternally] Record %d already exists for tx %s (recovery)", idx, bItem.txHash)
+				continue
 			}
+			s.logger.Errorf("[StorePartialTransactionExternally] Failed to create record %d for tx %s: %v", idx, bItem.txHash, err)
+			hasFailures = true
+		}
+	}
 
-			utils.SafeSend[error](bItem.done, errors.NewProcessingError("could not put partial bins (extended mode) to store", err))
+	if hasFailures {
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create records for tx %s", bItem.txHash))
+		return
+	}
 
-			return
+	if !bItem.locked {
+		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
+		if unlockErr != nil {
+			s.logger.Warnf("[StorePartialTransactionExternally] Failed to unlock records for %s: %v", bItem.txHash, unlockErr)
 		}
 	}
 
 	utils.SafeSend(bItem.done, nil)
+}
+
+// calculateLockKey generates the key for a lock record using the special LockRecordIndex
+func calculateLockKey(txHash *chainhash.Hash) []byte {
+	return uaerospike.CalculateKeySourceInternal(txHash, LockRecordIndex)
+}
+
+// calculateLockTTL dynamically calculates the lock TTL based on the number of records
+func calculateLockTTL(numRecords int) uint32 {
+	ttl := LockRecordBaseTTL + (LockRecordPerRecordTTL * uint32(numRecords))
+	if ttl > LockRecordMaxTTL {
+		return LockRecordMaxTTL
+	}
+	return ttl
+}
+
+// ensureLockedBin ensures the locked bin is set to the specified value
+func (s *Store) ensureLockedBin(bins []*aerospike.Bin, locked bool) []*aerospike.Bin {
+	for i, bin := range bins {
+		if bin.Name == fields.Locked.String() {
+			newBins := make([]*aerospike.Bin, len(bins))
+			copy(newBins, bins)
+			newBins[i] = aerospike.NewBin(fields.Locked.String(), locked)
+			return newBins
+		}
+	}
+
+	newBins := make([]*aerospike.Bin, len(bins)+1)
+	copy(newBins, bins)
+	newBins[len(bins)] = aerospike.NewBin(fields.Locked.String(), locked)
+	return newBins
+}
+
+// releaseLock deletes the lock record
+func (s *Store) releaseLock(lockKey *aerospike.Key) error {
+	policy := util.GetAerospikeWritePolicy(s.settings, 0)
+	_, err := s.client.Delete(policy, lockKey)
+	if err != nil {
+		aErr, ok := err.(*aerospike.AerospikeError)
+		if ok && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// verifySubRecordsExist checks if all sub-records exist for a transaction
+func (s *Store) verifySubRecordsExist(txHash *chainhash.Hash, totalExtraRecs int) (bool, error) {
+	if totalExtraRecs == 0 {
+		return true, nil
+	}
+
+	batchRecords := make([]aerospike.BatchRecordIfc, totalExtraRecs)
+	policy := util.GetAerospikeBatchReadPolicy(s.settings)
+
+	for i := 1; i <= totalExtraRecs; i++ {
+		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
+		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+		if err != nil {
+			return false, err
+		}
+		batchRecords[i-1] = aerospike.NewBatchRead(policy, key, []string{fields.Utxos.String()})
+	}
+
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	err := s.client.BatchOperate(batchPolicy, batchRecords)
+	if err != nil {
+		return false, err
+	}
+
+	for idx, record := range batchRecords {
+		if record.BatchRec().Err != nil {
+			if errors.Is(record.BatchRec().Err, aerospike.ErrKeyNotFound) {
+				s.logger.Debugf("[verifySubRecordsExist] Sub-record %d missing for tx %s", idx+1, txHash)
+				return false, nil
+			}
+			return false, record.BatchRec().Err
+		}
+	}
+
+	return true, nil
+}
+
+// verifyTransactionComplete checks if a transaction and all its records are complete
+func (s *Store) verifyTransactionComplete(txHash *chainhash.Hash, numRecords int) (bool, error) {
+	if numRecords == 0 {
+		return false, errors.NewProcessingError("invalid numRecords: 0")
+	}
+
+	mainKey, _ := aerospike.NewKey(s.namespace, s.setName, txHash[:])
+	policy := util.GetAerospikeReadPolicy(s.settings)
+
+	mainRecord, err := s.client.Get(policy, mainKey,
+		fields.TotalExtraRecs.String(),
+		fields.TotalUtxos.String())
+
+	if err != nil {
+		return false, err
+	}
+
+	totalExtraRecs, ok := mainRecord.Bins[fields.TotalExtraRecs.String()].(int)
+	if !ok {
+		return false, nil
+	}
+
+	if totalExtraRecs != numRecords-1 {
+		return false, nil
+	}
+
+	if totalExtraRecs > 0 {
+		return s.verifySubRecordsExist(txHash, totalExtraRecs)
+	}
+
+	return true, nil
+}
+
+// unlockAllRecords unlocks all records for a transaction with generation checks
+func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
+	readBatch := make([]aerospike.BatchRecordIfc, numRecords)
+	readPolicy := util.GetAerospikeBatchReadPolicy(s.settings)
+
+	for i := 0; i < numRecords; i++ {
+		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
+		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+		if err != nil {
+			return err
+		}
+		readBatch[i] = aerospike.NewBatchRead(readPolicy, key, []string{fields.Locked.String()})
+	}
+
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	err := s.client.BatchOperate(batchPolicy, readBatch)
+	if err != nil {
+		return errors.NewProcessingError("failed to read records for unlock", err)
+	}
+
+	writeBatch := make([]aerospike.BatchRecordIfc, 0, numRecords)
+
+	for i, readRec := range readBatch {
+		if readRec.BatchRec().Err != nil {
+			s.logger.Warnf("[unlockAllRecords] Failed to read record %d for unlock: %v", i, readRec.BatchRec().Err)
+			continue
+		}
+
+		if readRec.BatchRec().Record == nil {
+			s.logger.Warnf("[unlockAllRecords] Record %d not found for unlock", i)
+			continue
+		}
+
+		locked, ok := readRec.BatchRec().Record.Bins[fields.Locked.String()].(bool)
+		if ok && !locked {
+			continue
+		}
+
+		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
+		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+		if err != nil {
+			return err
+		}
+
+		writePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
+		writePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
+		writePolicy.GenerationPolicy = aerospike.EXPECT_GEN_EQUAL
+		writePolicy.Generation = readRec.BatchRec().Record.Generation
+
+		op := aerospike.PutOp(aerospike.NewBin(fields.Locked.String(), false))
+		writeBatch = append(writeBatch, aerospike.NewBatchWrite(writePolicy, key, op))
+	}
+
+	if len(writeBatch) == 0 {
+		return nil
+	}
+
+	err = s.client.BatchOperate(batchPolicy, writeBatch)
+	if err != nil {
+		return errors.NewProcessingError("failed to unlock records", err)
+	}
+
+	successCount := 0
+	for idx, record := range writeBatch {
+		if record.BatchRec().Err != nil {
+			aErr, ok := record.BatchRec().Err.(*aerospike.AerospikeError)
+			if ok && aErr.ResultCode == types.GENERATION_ERROR {
+				s.logger.Warnf("[unlockAllRecords] Generation mismatch unlocking record %d for tx %s - record was modified", idx, txHash)
+			} else {
+				s.logger.Warnf("[unlockAllRecords] Failed to unlock record %d for tx %s: %v", idx, txHash, record.BatchRec().Err)
+			}
+		} else {
+			successCount++
+		}
+	}
+
+	if successCount == 0 {
+		return errors.NewProcessingError("failed to unlock any records for tx %s", txHash)
+	}
+
+	return nil
+}
+
+// handleExistingTransaction checks if a transaction exists and its state
+func (s *Store) handleExistingTransaction(txHash *chainhash.Hash) error {
+	lockKey, _ := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
+	policy := util.GetAerospikeReadPolicy(s.settings)
+
+	lockRecord, lockErr := s.client.Get(policy, lockKey,
+		"created_at", "process_id", "hostname", "expected_records")
+
+	lockExists := lockErr == nil
+	lockExpired := false
+
+	if lockExists {
+		createdAt, ok := lockRecord.Bins["created_at"].(int)
+		if ok {
+			lockAge := time.Now().Unix() - int64(createdAt)
+			expectedRecords := 1
+			if er, ok := lockRecord.Bins["expected_records"].(int); ok {
+				expectedRecords = er
+			}
+			lockTTL := int64(calculateLockTTL(expectedRecords))
+			lockExpired = lockAge > lockTTL
+		}
+	}
+
+	mainKey, _ := aerospike.NewKey(s.namespace, s.setName, txHash[:])
+	record, err := s.client.Get(policy, mainKey,
+		fields.Locked.String(),
+		fields.TotalExtraRecs.String())
+
+	if err != nil {
+		if errors.Is(err, aerospike.ErrKeyNotFound) {
+			if lockExists && !lockExpired {
+				return errors.NewTxExistsError("transaction creation in progress by another process: %s", txHash)
+			}
+			return errors.NewProcessingError("transaction does not exist: %s", txHash)
+		}
+		return errors.NewProcessingError("failed to check main record", err)
+	}
+
+	locked, ok := record.Bins[fields.Locked.String()].(bool)
+	if !ok {
+		locked = false
+	}
+
+	if !locked {
+		return errors.NewTxExistsError("transaction already exists: %s", txHash)
+	}
+
+	totalExtraRecs, ok := record.Bins[fields.TotalExtraRecs.String()].(int)
+	if !ok {
+		totalExtraRecs = 0
+	}
+
+	allExist, verifyErr := s.verifySubRecordsExist(txHash, totalExtraRecs)
+	if verifyErr != nil {
+		return verifyErr
+	}
+
+	if allExist {
+		if lockExpired || !lockExists {
+			s.logger.Warnf("[handleExistingTransaction] Found orphaned locked transaction %s, attempting recovery", txHash)
+			unlockErr := s.unlockAllRecords(txHash, totalExtraRecs+1)
+			if unlockErr == nil {
+				return errors.NewTxExistsError("transaction recovered and unlocked: %s", txHash)
+			}
+			s.logger.Errorf("[handleExistingTransaction] Failed to recover orphaned transaction %s: %v", txHash, unlockErr)
+		}
+		return errors.NewTxExistsError("transaction already exists: %s", txHash)
+	}
+
+	if lockExpired {
+		return errors.NewProcessingError("incomplete transaction with expired lock: %s", txHash)
+	}
+	return errors.NewTxExistsError("transaction creation in progress or incomplete: %s", txHash)
 }
