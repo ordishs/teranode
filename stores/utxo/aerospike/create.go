@@ -868,11 +868,12 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	if !bItem.locked {
 		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
 		if unlockErr != nil {
-			// CRITICAL: Transaction records were created but some remain locked
-			// UTXOs in locked records cannot be spent - this requires manual intervention
-			s.logger.Errorf("[StoreTransactionExternally] Transaction created but unlock failed for %s: %v", bItem.txHash, unlockErr)
-			utils.SafeSend[error](bItem.done, errors.NewProcessingError("transaction created but some records remain locked: %s", bItem.txHash))
-			return
+			// CRITICAL: Transaction records were created successfully but some remain locked
+			// UTXOs in locked records cannot be spent until manually unlocked by operator
+			// However, we return success because the transaction IS in the database
+			// Returning error would mislead the user into thinking creation failed
+			s.logger.Errorf("[StoreTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but unlock failed: %v", bItem.txHash, unlockErr)
+			s.logger.Errorf("[StoreTransactionExternally] Use CLI tool to manually unlock records for transaction %s", bItem.txHash)
 		}
 	}
 
@@ -1046,11 +1047,12 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	if !bItem.locked {
 		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
 		if unlockErr != nil {
-			// CRITICAL: Transaction records were created but some remain locked
-			// UTXOs in locked records cannot be spent - this requires manual intervention
-			s.logger.Errorf("[StorePartialTransactionExternally] Transaction created but unlock failed for %s: %v", bItem.txHash, unlockErr)
-			utils.SafeSend[error](bItem.done, errors.NewProcessingError("transaction created but some records remain locked: %s", bItem.txHash))
-			return
+			// CRITICAL: Transaction records were created successfully but some remain locked
+			// UTXOs in locked records cannot be spent until manually unlocked by operator
+			// However, we return success because the transaction IS in the database
+			// Returning error would mislead the user into thinking creation failed
+			s.logger.Errorf("[StorePartialTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but unlock failed: %v", bItem.txHash, unlockErr)
+			s.logger.Errorf("[StorePartialTransactionExternally] Use CLI tool to manually unlock records for transaction %s", bItem.txHash)
 		}
 	}
 
