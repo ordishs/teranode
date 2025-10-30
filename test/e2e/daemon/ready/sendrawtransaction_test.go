@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/stretchr/testify/require"
@@ -26,7 +27,9 @@ func TestSendRawTransaction(t *testing.T) {
 		SettingsOverrideFunc: func(s *settings.Settings) {
 			s.TracingEnabled = true
 			s.TracingSampleRate = 1.0
+			s.ChainCfgParams.CoinbaseMaturity = 2
 		},
+		FSMState: blockchain.FSMStateRUNNING,
 	})
 
 	defer td.Stop(t, true)
@@ -115,10 +118,17 @@ func TestSendRawTransactionDoubleSpend(t *testing.T) {
 	SharedTestLock.Lock()
 	defer SharedTestLock.Unlock()
 
+	// Create test daemon with RPC and validator enabled
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
 		EnableRPC:       true,
 		EnableValidator: true,
 		SettingsContext: "dev.system.test",
+		SettingsOverrideFunc: func(s *settings.Settings) {
+			s.TracingEnabled = true
+			s.TracingSampleRate = 1.0
+			s.ChainCfgParams.CoinbaseMaturity = 2
+		},
+		FSMState: blockchain.FSMStateRUNNING,
 	})
 
 	defer td.Stop(t, true)
@@ -152,7 +162,7 @@ func TestSendRawTransactionDoubleSpend(t *testing.T) {
 
 	// Create second transaction that spends the same UTXO (double spend)
 	tx2 := td.CreateTransactionWithOptions(t,
-		transactions.WithInput(coinbaseTx, 0), // Same input as tx1
+		transactions.WithInput(coinbaseTx, 0),   // Same input as tx1
 		transactions.WithP2PKHOutputs(1, 40000), // Different amount
 	)
 
