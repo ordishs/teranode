@@ -868,7 +868,11 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	if !bItem.locked {
 		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
 		if unlockErr != nil {
-			s.logger.Warnf("[StoreTransactionExternally] Failed to unlock records for %s: %v", bItem.txHash, unlockErr)
+			// CRITICAL: Transaction records were created but some remain locked
+			// UTXOs in locked records cannot be spent - this requires manual intervention
+			s.logger.Errorf("[StoreTransactionExternally] Transaction created but unlock failed for %s: %v", bItem.txHash, unlockErr)
+			utils.SafeSend[error](bItem.done, errors.NewProcessingError("transaction created but some records remain locked: %s", bItem.txHash))
+			return
 		}
 	}
 
@@ -1042,7 +1046,11 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	if !bItem.locked {
 		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
 		if unlockErr != nil {
-			s.logger.Warnf("[StorePartialTransactionExternally] Failed to unlock records for %s: %v", bItem.txHash, unlockErr)
+			// CRITICAL: Transaction records were created but some remain locked
+			// UTXOs in locked records cannot be spent - this requires manual intervention
+			s.logger.Errorf("[StorePartialTransactionExternally] Transaction created but unlock failed for %s: %v", bItem.txHash, unlockErr)
+			utils.SafeSend[error](bItem.done, errors.NewProcessingError("transaction created but some records remain locked: %s", bItem.txHash))
+			return
 		}
 	}
 
@@ -1156,22 +1164,23 @@ func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 		return errors.NewProcessingError("failed to unlock records", err)
 	}
 
-	successCount := 0
+	// Check that ALL unlocks succeeded - partial unlock is unacceptable
+	// because some UTXOs would remain unspendable
+	failedCount := 0
 	for idx, record := range writeBatch {
 		if record.BatchRec().Err != nil {
+			failedCount++
 			aErr, ok := record.BatchRec().Err.(*aerospike.AerospikeError)
 			if ok && aErr.ResultCode == types.GENERATION_ERROR {
-				s.logger.Warnf("[unlockAllRecords] Generation mismatch unlocking record %d for tx %s - record was modified", idx, txHash)
+				s.logger.Errorf("[unlockAllRecords] Generation mismatch unlocking record %d for tx %s - record was modified", idx, txHash)
 			} else {
-				s.logger.Warnf("[unlockAllRecords] Failed to unlock record %d for tx %s: %v", idx, txHash, record.BatchRec().Err)
+				s.logger.Errorf("[unlockAllRecords] Failed to unlock record %d for tx %s: %v", idx, txHash, record.BatchRec().Err)
 			}
-		} else {
-			successCount++
 		}
 	}
 
-	if successCount == 0 {
-		return errors.NewProcessingError("failed to unlock any records for tx %s", txHash)
+	if failedCount > 0 {
+		return errors.NewProcessingError("failed to unlock %d of %d records for tx %s", failedCount, len(writeBatch), txHash)
 	}
 
 	return nil
