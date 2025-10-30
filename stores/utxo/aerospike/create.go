@@ -56,7 +56,6 @@ package aerospike
 
 import (
 	"context"
-	"os"
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
@@ -760,13 +759,10 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
 	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
-	hostname, _ := os.Hostname()
+	// Simple lock record with just a marker bin
+	// TTL is set in the policy above and Aerospike will auto-delete when expired
 	lockBins := []*aerospike.Bin{
-		aerospike.NewBin("created_at", aerospike.NewIntegerValue(int(time.Now().Unix()))),
 		aerospike.NewBin("lock_type", "tx_creation"),
-		aerospike.NewBin("process_id", aerospike.NewIntegerValue(os.Getpid())),
-		aerospike.NewBin("hostname", aerospike.NewStringValue(hostname)),
-		aerospike.NewBin("expected_records", aerospike.NewIntegerValue(len(binsToStore))),
 	}
 
 	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
@@ -937,13 +933,10 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
 	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
-	hostname, _ := os.Hostname()
+	// Simple lock record with just a marker bin
+	// TTL is set in the policy above and Aerospike will auto-delete when expired
 	lockBins := []*aerospike.Bin{
-		aerospike.NewBin("created_at", aerospike.NewIntegerValue(int(time.Now().Unix()))),
 		aerospike.NewBin("lock_type", "tx_creation"),
-		aerospike.NewBin("process_id", aerospike.NewIntegerValue(os.Getpid())),
-		aerospike.NewBin("hostname", aerospike.NewStringValue(hostname)),
-		aerospike.NewBin("expected_records", aerospike.NewIntegerValue(len(binsToStore))),
 	}
 
 	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
@@ -1101,76 +1094,6 @@ func (s *Store) releaseLock(lockKey *aerospike.Key) error {
 	return nil
 }
 
-// verifySubRecordsExist checks if all sub-records exist for a transaction
-func (s *Store) verifySubRecordsExist(txHash *chainhash.Hash, totalExtraRecs int) (bool, error) {
-	if totalExtraRecs == 0 {
-		return true, nil
-	}
-
-	batchRecords := make([]aerospike.BatchRecordIfc, totalExtraRecs)
-	policy := util.GetAerospikeBatchReadPolicy(s.settings)
-
-	for i := 1; i <= totalExtraRecs; i++ {
-		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
-		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
-		if err != nil {
-			return false, err
-		}
-		batchRecords[i-1] = aerospike.NewBatchRead(policy, key, []string{fields.Utxos.String()})
-	}
-
-	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
-	err := s.client.BatchOperate(batchPolicy, batchRecords)
-	if err != nil {
-		return false, err
-	}
-
-	for idx, record := range batchRecords {
-		if record.BatchRec().Err != nil {
-			if errors.Is(record.BatchRec().Err, aerospike.ErrKeyNotFound) {
-				s.logger.Debugf("[verifySubRecordsExist] Sub-record %d missing for tx %s", idx+1, txHash)
-				return false, nil
-			}
-			return false, record.BatchRec().Err
-		}
-	}
-
-	return true, nil
-}
-
-// verifyTransactionComplete checks if a transaction and all its records are complete
-func (s *Store) verifyTransactionComplete(txHash *chainhash.Hash, numRecords int) (bool, error) {
-	if numRecords == 0 {
-		return false, errors.NewProcessingError("invalid numRecords: 0")
-	}
-
-	mainKey, _ := aerospike.NewKey(s.namespace, s.setName, txHash[:])
-	policy := util.GetAerospikeReadPolicy(s.settings)
-
-	mainRecord, err := s.client.Get(policy, mainKey,
-		fields.TotalExtraRecs.String(),
-		fields.TotalUtxos.String())
-
-	if err != nil {
-		return false, err
-	}
-
-	totalExtraRecs, ok := mainRecord.Bins[fields.TotalExtraRecs.String()].(int)
-	if !ok {
-		return false, nil
-	}
-
-	if totalExtraRecs != numRecords-1 {
-		return false, nil
-	}
-
-	if totalExtraRecs > 0 {
-		return s.verifySubRecordsExist(txHash, totalExtraRecs)
-	}
-
-	return true, nil
-}
-
 // unlockAllRecords unlocks all records for a transaction with generation checks
 func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 	readBatch := make([]aerospike.BatchRecordIfc, numRecords)
@@ -1254,78 +1177,36 @@ func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 	return nil
 }
 
-// handleExistingTransaction checks if a transaction exists and its state
+// handleExistingTransaction checks if a transaction exists and returns appropriate error
+// This is called when we fail to acquire the lock record (KEY_EXISTS_ERROR)
 func (s *Store) handleExistingTransaction(txHash *chainhash.Hash) error {
-	lockKey, _ := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
 	policy := util.GetAerospikeReadPolicy(s.settings)
 
-	lockRecord, lockErr := s.client.Get(policy, lockKey,
-		"created_at", "process_id", "hostname", "expected_records")
+	// Check if lock record still exists
+	lockKey, _ := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
+	_, lockErr := s.client.Get(policy, lockKey)
 
-	lockExists := lockErr == nil
-	lockExpired := false
-
-	if lockExists {
-		createdAt, ok := lockRecord.Bins["created_at"].(int)
-		if ok {
-			lockAge := time.Now().Unix() - int64(createdAt)
-			expectedRecords := 1
-			if er, ok := lockRecord.Bins["expected_records"].(int); ok {
-				expectedRecords = er
-			}
-			lockTTL := int64(calculateLockTTL(expectedRecords))
-			lockExpired = lockAge > lockTTL
-		}
+	if lockErr == nil {
+		// Lock exists - another process is actively creating this transaction
+		return errors.NewTxExistsError("transaction creation in progress by another process: %s", txHash)
 	}
 
+	// Lock doesn't exist (expired via TTL or released)
+	// Check if the transaction records exist
 	mainKey, _ := aerospike.NewKey(s.namespace, s.setName, txHash[:])
-	record, err := s.client.Get(policy, mainKey,
-		fields.Locked.String(),
-		fields.TotalExtraRecs.String())
+	_, err := s.client.Get(policy, mainKey)
 
-	if err != nil {
-		if errors.Is(err, aerospike.ErrKeyNotFound) {
-			if lockExists && !lockExpired {
-				return errors.NewTxExistsError("transaction creation in progress by another process: %s", txHash)
-			}
-			return errors.NewProcessingError("transaction does not exist: %s", txHash)
-		}
-		return errors.NewProcessingError("failed to check main record", err)
-	}
-
-	locked, ok := record.Bins[fields.Locked.String()].(bool)
-	if !ok {
-		locked = false
-	}
-
-	if !locked {
+	if err == nil {
+		// Transaction records exist - this transaction was already created
 		return errors.NewTxExistsError("transaction already exists: %s", txHash)
 	}
 
-	totalExtraRecs, ok := record.Bins[fields.TotalExtraRecs.String()].(int)
-	if !ok {
-		totalExtraRecs = 0
+	if errors.Is(err, aerospike.ErrKeyNotFound) {
+		// Lock expired but no records exist - previous attempt failed and cleaned up
+		// This is unusual but not impossible (race condition during cleanup)
+		return errors.NewProcessingError("transaction creation failed previously, retry recommended: %s", txHash)
 	}
 
-	allExist, verifyErr := s.verifySubRecordsExist(txHash, totalExtraRecs)
-	if verifyErr != nil {
-		return verifyErr
-	}
-
-	if allExist {
-		if lockExpired || !lockExists {
-			s.logger.Warnf("[handleExistingTransaction] Found orphaned locked transaction %s, attempting recovery", txHash)
-			unlockErr := s.unlockAllRecords(txHash, totalExtraRecs+1)
-			if unlockErr == nil {
-				return errors.NewTxExistsError("transaction recovered and unlocked: %s", txHash)
-			}
-			s.logger.Errorf("[handleExistingTransaction] Failed to recover orphaned transaction %s: %v", txHash, unlockErr)
-		}
-		return errors.NewTxExistsError("transaction already exists: %s", txHash)
-	}
-
-	if lockExpired {
-		return errors.NewProcessingError("incomplete transaction with expired lock: %s", txHash)
-	}
-	return errors.NewTxExistsError("transaction creation in progress or incomplete: %s", txHash)
+	// Unexpected error reading main record
+	return errors.NewProcessingError("failed to check transaction state: %s: %v", txHash, err)
 }
