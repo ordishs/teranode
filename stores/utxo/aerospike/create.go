@@ -780,11 +780,10 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 		return
 	}
 
-	defer func() {
-		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
-			s.logger.Warnf("[StoreTransactionExternally] Failed to release lock: %v", releaseErr)
-		}
-	}()
+	// NOTE: We do NOT use defer to release the lock here because:
+	// 1. On success: we release the lock after all records are created
+	// 2. On failure: we clean up partial records AND release the lock
+	// This ensures another process can retry immediately without waiting for TTL expiration
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
@@ -830,8 +829,33 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	}
 
 	if hasFailures {
+		// Clean up: delete any records that were successfully created before the failure
+		// This ensures we leave no partial state behind
+		s.logger.Warnf("[StoreTransactionExternally] Cleaning up partial records for tx %s", bItem.txHash)
+		deletePolicy := util.GetAerospikeWritePolicy(s.settings, 0)
+		for idx := range binsToStore {
+			keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
+			key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+			if err != nil {
+				continue
+			}
+			// Ignore errors - record may not have been created
+			_, _ = s.client.Delete(deletePolicy, key)
+		}
+
+		// Release the lock so another process can retry immediately
+		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+			s.logger.Warnf("[StoreTransactionExternally] Failed to release lock after cleanup: %v", releaseErr)
+		}
+
 		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create records for tx %s", bItem.txHash))
 		return
+	}
+
+	// Success! Now release the lock record
+	if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+		s.logger.Warnf("[StoreTransactionExternally] Failed to release lock for %s: %v", bItem.txHash, releaseErr)
+		// Continue anyway - the lock will expire via TTL
 	}
 
 	if !bItem.locked {
@@ -922,11 +946,10 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 		return
 	}
 
-	defer func() {
-		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
-			s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock: %v", releaseErr)
-		}
-	}()
+	// NOTE: We do NOT use defer to release the lock here because:
+	// 1. On success: we release the lock after all records are created
+	// 2. On failure: we clean up partial records AND release the lock
+	// This ensures another process can retry immediately without waiting for TTL expiration
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
@@ -972,8 +995,33 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	}
 
 	if hasFailures {
+		// Clean up: delete any records that were successfully created before the failure
+		// This ensures we leave no partial state behind
+		s.logger.Warnf("[StorePartialTransactionExternally] Cleaning up partial records for tx %s", bItem.txHash)
+		deletePolicy := util.GetAerospikeWritePolicy(s.settings, 0)
+		for idx := range binsToStore {
+			keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
+			key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+			if err != nil {
+				continue
+			}
+			// Ignore errors - record may not have been created
+			_, _ = s.client.Delete(deletePolicy, key)
+		}
+
+		// Release the lock so another process can retry immediately
+		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+			s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock after cleanup: %v", releaseErr)
+		}
+
 		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create records for tx %s", bItem.txHash))
 		return
+	}
+
+	// Success! Now release the lock record
+	if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+		s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock for %s: %v", bItem.txHash, releaseErr)
+		// Continue anyway - the lock will expire via TTL
 	}
 
 	if !bItem.locked {
