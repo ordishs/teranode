@@ -14,12 +14,34 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/settings"
 )
+
+// maxUTXOScriptSize defines the maximum allowed script size for UTXO deserialization.
+// This prevents denial-of-service attacks where malicious actors could provide
+// extremely large script length values causing memory exhaustion.
+//
+// Note: Post-Genesis BSV has no hard consensus limit on script sizes, but nodes use policy
+// limits to determine which transactions they will relay and mine
+var maxUTXOScriptSize uint32
+
+// Although we are making this configurable, there are good reasons not to:
+// - The utxopersister is a low-level storage service that should avoid heavy dependencies
+// - UTXOs should have already been validated before reaching the persister
+func init() {
+	s := settings.NewSettings()
+	if s.Policy.MaxScriptSizePolicy > math.MaxUint32 {
+		maxUTXOScriptSize = math.MaxUint32
+	} else {
+		maxUTXOScriptSize = uint32(s.Policy.MaxScriptSizePolicy)
+	}
+}
 
 // UTXOWrapper wraps transaction outputs with additional metadata.
 // It encapsulates a transaction ID, block height, coinbase flag, and a collection of UTXOs
@@ -344,6 +366,11 @@ func (uw *UTXOWrapper) NewUTXOFromReader(r io.Reader, utxo *UTXO) error {
 	// Read the script length
 	l := uint32(uw.b16[12]) | uint32(uw.b16[13])<<8 | uint32(uw.b16[14])<<16 | uint32(uw.b16[15])<<24
 
+	// Validate script length before allocation to prevent DoS attacks
+	if l > maxUTXOScriptSize {
+		return errors.NewStorageError("script length %d exceeds maximum allowed size %d", l, maxUTXOScriptSize)
+	}
+
 	// Read the script
 	utxo.Script = make([]byte, l)
 
@@ -363,6 +390,11 @@ func (uw *UTXOWrapper) NewUTXOValueFromReader(r io.Reader) (uint64, error) {
 
 	// Read the script length
 	l := uint32(uw.b16[12]) | uint32(uw.b16[13])<<8 | uint32(uw.b16[14])<<16 | uint32(uw.b16[15])<<24
+
+	// Validate script length before allocation to prevent DoS attacks
+	if l > maxUTXOScriptSize {
+		return 0, errors.NewStorageError("script length %d exceeds maximum allowed size %d", l, maxUTXOScriptSize)
+	}
 
 	// Read the script into reusable buffer
 	var script []byte

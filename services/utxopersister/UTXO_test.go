@@ -2,7 +2,9 @@
 package utxopersister
 
 import (
+	"bytes"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -115,4 +117,183 @@ func TestTxWithOnlyOutputs(t *testing.T) {
 	}
 
 	assert.Equal(t, 476, count)
+}
+
+func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
+	t.Run("reject script length exceeding MaxUTXOScriptSize", func(t *testing.T) {
+		maliciousScriptLength := maxUTXOScriptSize + 1
+
+		maliciousBytes := make([]byte, 16)
+		maliciousBytes[0] = 0x01
+
+		maliciousBytes[4] = 0x01
+
+		maliciousBytes[12] = byte(maliciousScriptLength)
+		maliciousBytes[13] = byte(maliciousScriptLength >> 8)
+		maliciousBytes[14] = byte(maliciousScriptLength >> 16)
+		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
+
+		reader := bytes.NewReader(maliciousBytes)
+		uw := &UTXOWrapper{}
+		utxo := &UTXO{}
+
+		err := uw.NewUTXOFromReader(reader, utxo)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "script length")
+		assert.Contains(t, err.Error(), "exceeds maximum allowed size")
+	})
+
+	t.Run("reject maximum uint32 script length", func(t *testing.T) {
+		maliciousScriptLength := uint32(0xFFFFFFFF)
+
+		maliciousBytes := make([]byte, 16)
+		maliciousBytes[0] = 0x01
+
+		maliciousBytes[4] = 0x01
+
+		maliciousBytes[12] = byte(maliciousScriptLength)
+		maliciousBytes[13] = byte(maliciousScriptLength >> 8)
+		maliciousBytes[14] = byte(maliciousScriptLength >> 16)
+		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
+
+		reader := bytes.NewReader(maliciousBytes)
+		uw := &UTXOWrapper{}
+		utxo := &UTXO{}
+
+		err := uw.NewUTXOFromReader(reader, utxo)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "script length")
+		assert.Contains(t, err.Error(), "exceeds maximum allowed size")
+	})
+
+	t.Run("accept script length at MaxUTXOScriptSize", func(t *testing.T) {
+		validScriptLength := maxUTXOScriptSize
+
+		validBytes := make([]byte, 16+validScriptLength)
+		validBytes[0] = 0x01
+
+		validBytes[4] = 0x01
+
+		validBytes[12] = byte(validScriptLength)
+		validBytes[13] = byte(validScriptLength >> 8)
+		validBytes[14] = byte(validScriptLength >> 16)
+		validBytes[15] = byte(validScriptLength >> 24)
+
+		reader := bytes.NewReader(validBytes)
+		uw := &UTXOWrapper{}
+		utxo := &UTXO{}
+
+		err := uw.NewUTXOFromReader(reader, utxo)
+
+		require.NoError(t, err)
+		assert.Equal(t, int(validScriptLength), len(utxo.Script))
+	})
+}
+
+func TestNewUTXOValueFromReader_DoSProtection(t *testing.T) {
+	t.Run("reject script length exceeding MaxUTXOScriptSize", func(t *testing.T) {
+		maliciousScriptLength := maxUTXOScriptSize + 1
+
+		maliciousBytes := make([]byte, 16)
+		maliciousBytes[0] = 0x01
+
+		maliciousBytes[4] = 0x01
+
+		maliciousBytes[12] = byte(maliciousScriptLength)
+		maliciousBytes[13] = byte(maliciousScriptLength >> 8)
+		maliciousBytes[14] = byte(maliciousScriptLength >> 16)
+		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
+
+		reader := bytes.NewReader(maliciousBytes)
+		uw := &UTXOWrapper{}
+
+		value, err := uw.NewUTXOValueFromReader(reader)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "script length")
+		assert.Contains(t, err.Error(), "exceeds maximum allowed size")
+		assert.Equal(t, uint64(0), value)
+	})
+
+	t.Run("reject maximum uint32 script length", func(t *testing.T) {
+		maliciousScriptLength := uint32(0xFFFFFFFF)
+
+		maliciousBytes := make([]byte, 16)
+		maliciousBytes[0] = 0x01
+
+		maliciousBytes[4] = 0x01
+
+		maliciousBytes[12] = byte(maliciousScriptLength)
+		maliciousBytes[13] = byte(maliciousScriptLength >> 8)
+		maliciousBytes[14] = byte(maliciousScriptLength >> 16)
+		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
+
+		reader := bytes.NewReader(maliciousBytes)
+		uw := &UTXOWrapper{}
+
+		value, err := uw.NewUTXOValueFromReader(reader)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "script length")
+		assert.Contains(t, err.Error(), "exceeds maximum allowed size")
+		assert.Equal(t, uint64(0), value)
+	})
+}
+
+func TestNewUTXOFromReader_ConcurrentAttack(t *testing.T) {
+	numGoroutines := 20
+	maliciousScriptLength := uint32(0xFFFFFFFF)
+
+	t.Logf("Starting %d goroutines, each attempting %.2f GB allocation = %.2f GB total!",
+		numGoroutines, float64(maliciousScriptLength)/(1024*1024*1024),
+		float64(numGoroutines)*float64(maliciousScriptLength)/(1024*1024*1024))
+
+	maliciousBytes := make([]byte, 16)
+	maliciousBytes[0] = 0x01
+
+	maliciousBytes[4] = 0x01
+
+	maliciousBytes[12] = byte(maliciousScriptLength)
+	maliciousBytes[13] = byte(maliciousScriptLength >> 8)
+	maliciousBytes[14] = byte(maliciousScriptLength >> 16)
+	maliciousBytes[15] = byte(maliciousScriptLength >> 24)
+
+	results := make(chan error, numGoroutines)
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+
+		go func(goroutineID int) {
+			defer wg.Done()
+
+			reader := bytes.NewReader(maliciousBytes)
+			uw := &UTXOWrapper{}
+			utxo := &UTXO{}
+
+			err := uw.NewUTXOFromReader(reader, utxo)
+
+			t.Logf("Goroutine %d: %v", goroutineID, err)
+			results <- err
+		}(i)
+	}
+
+	wg.Wait()
+	close(results)
+
+	errorCount := 0
+
+	for err := range results {
+		if err != nil {
+			errorCount++
+		}
+	}
+
+	require.Equal(t, numGoroutines, errorCount, "All goroutines should fail with validation error")
+
+	t.Logf("✓ DoS protection successful: all %d concurrent allocation attempts were blocked", numGoroutines)
+	t.Logf("✓ System prevented %.2f GB of malicious memory allocation",
+		float64(numGoroutines)*float64(maliciousScriptLength)/(1024*1024*1024))
 }
