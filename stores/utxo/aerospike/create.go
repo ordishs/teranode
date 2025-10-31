@@ -749,7 +749,8 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 
 	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
-	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
+	// Pre-create all keys BEFORE acquiring lock to fail fast on key creation errors
+	lockKey, recordKeys, err := s.prepareAllKeys(bItem.txHash, len(binsToStore))
 	if err != nil {
 		utils.SafeSend[error](bItem.done, err)
 		return
@@ -788,12 +789,8 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	for idx, bins := range binsToStore {
 		binsWithLock := s.ensureLockedBin(bins, true)
 
-		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
-		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
-		if err != nil {
-			utils.SafeSend[error](bItem.done, err)
-			return
-		}
+		// Use pre-created key (no error possible)
+		key := recordKeys[idx]
 
 		putOps := make([]*aerospike.Operation, len(binsWithLock))
 		for i, bin := range binsWithLock {
@@ -830,13 +827,8 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 		s.logger.Warnf("[StoreTransactionExternally] Cleaning up partial records for tx %s", bItem.txHash)
 		deletePolicy := util.GetAerospikeWritePolicy(s.settings, 0)
 		cleanupSuccess := true
-		for idx := range binsToStore {
-			keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
-			key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
-			if err != nil {
-				cleanupSuccess = false
-				continue
-			}
+		for idx, key := range recordKeys {
+			// Use pre-created key (no error possible)
 			// Check if cleanup succeeds - we need to know if we left partial state
 			_, deleteErr := s.client.Delete(deletePolicy, key)
 			if deleteErr != nil && !errors.Is(deleteErr, aerospike.ErrKeyNotFound) {
@@ -928,7 +920,8 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 
 	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
-	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
+	// Pre-create all keys BEFORE acquiring lock to fail fast on key creation errors
+	lockKey, recordKeys, err := s.prepareAllKeys(bItem.txHash, len(binsToStore))
 	if err != nil {
 		utils.SafeSend[error](bItem.done, err)
 		return
@@ -967,12 +960,8 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	for idx, bins := range binsToStore {
 		binsWithLock := s.ensureLockedBin(bins, true)
 
-		keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
-		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
-		if err != nil {
-			utils.SafeSend[error](bItem.done, err)
-			return
-		}
+		// Use pre-created key (no error possible)
+		key := recordKeys[idx]
 
 		putOps := make([]*aerospike.Operation, len(binsWithLock))
 		for i, bin := range binsWithLock {
@@ -1009,13 +998,8 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 		s.logger.Warnf("[StorePartialTransactionExternally] Cleaning up partial records for tx %s", bItem.txHash)
 		deletePolicy := util.GetAerospikeWritePolicy(s.settings, 0)
 		cleanupSuccess := true
-		for idx := range binsToStore {
-			keySource := uaerospike.CalculateKeySourceInternal(bItem.txHash, uint32(idx))
-			key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
-			if err != nil {
-				cleanupSuccess = false
-				continue
-			}
+		for idx, key := range recordKeys {
+			// Use pre-created key (no error possible)
 			// Check if cleanup succeeds - we need to know if we left partial state
 			_, deleteErr := s.client.Delete(deletePolicy, key)
 			if deleteErr != nil && !errors.Is(deleteErr, aerospike.ErrKeyNotFound) {
@@ -1071,6 +1055,29 @@ func calculateLockTTL(numRecords int) uint32 {
 		return LockRecordMaxTTL
 	}
 	return ttl
+}
+
+// prepareAllKeys pre-creates all Aerospike keys needed for transaction storage
+// This is done BEFORE acquiring the lock to fail fast if key creation fails
+func (s *Store) prepareAllKeys(txHash *chainhash.Hash, numRecords int) (*aerospike.Key, []*aerospike.Key, error) {
+	// Create lock key
+	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
+	if err != nil {
+		return nil, nil, errors.NewProcessingError("failed to create lock key", err)
+	}
+
+	// Pre-create all record keys
+	recordKeys := make([]*aerospike.Key, numRecords)
+	for idx := range numRecords {
+		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(idx))
+		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
+		if err != nil {
+			return nil, nil, errors.NewProcessingError("failed to create record key %d", idx, err)
+		}
+		recordKeys[idx] = key
+	}
+
+	return lockKey, recordKeys, nil
 }
 
 // ensureLockedBin ensures the locked bin is set to the specified value
