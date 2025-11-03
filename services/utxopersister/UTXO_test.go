@@ -3,6 +3,7 @@ package utxopersister
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"sync"
 	"testing"
@@ -51,7 +52,7 @@ func TestBytesNormalTX(t *testing.T) {
 
 	assert.Len(t, b, 32+4+4+4+8+4+5)
 
-	uw2, err := NewUTXOWrapperFromBytes(b)
+	uw2, err := NewUTXOWrapperFromBytes(b, math.MaxUint32)
 	assert.NoError(t, err)
 
 	assert.Equal(t, uw.TxID, uw2.TxID)
@@ -83,7 +84,7 @@ func TestBytesCoinbaseTX(t *testing.T) {
 
 	assert.Len(t, b, 32+4+4+4+8+4+5)
 
-	u2, err := NewUTXOWrapperFromBytes(b)
+	u2, err := NewUTXOWrapperFromBytes(b, math.MaxUint32)
 	assert.NoError(t, err)
 
 	assert.Equal(t, uw.TxID, u2.TxID)
@@ -98,7 +99,7 @@ func TestTxWithOnlyOutputs(t *testing.T) {
 	txBytes, err := os.ReadFile("testdata/4827ad32852fd9ca3979a8e507e38c6e557e58bc453184ef19cc7a5f86e7d59b.outputs")
 	require.NoError(t, err)
 
-	uw, err := NewUTXOWrapperFromBytes(txBytes)
+	uw, err := NewUTXOWrapperFromBytes(txBytes, math.MaxUint32)
 	require.NoError(t, err)
 
 	assert.Equal(t, 476, len(uw.UTXOs))
@@ -121,7 +122,8 @@ func TestTxWithOnlyOutputs(t *testing.T) {
 
 func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
 	t.Run("reject script length exceeding MaxUTXOScriptSize", func(t *testing.T) {
-		maliciousScriptLength := maxUTXOScriptSize + 1
+		testMaxScriptSize := uint32(500000)
+		maliciousScriptLength := testMaxScriptSize + 1
 
 		maliciousBytes := make([]byte, 16)
 		maliciousBytes[0] = 0x01
@@ -134,7 +136,7 @@ func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
 		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
 
 		reader := bytes.NewReader(maliciousBytes)
-		uw := &UTXOWrapper{}
+		uw := &UTXOWrapper{maxScriptSize: testMaxScriptSize}
 		utxo := &UTXO{}
 
 		err := uw.NewUTXOFromReader(reader, utxo)
@@ -146,6 +148,7 @@ func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
 
 	t.Run("reject maximum uint32 script length", func(t *testing.T) {
 		maliciousScriptLength := uint32(0xFFFFFFFF)
+		testMaxScriptSize := uint32(500000)
 
 		maliciousBytes := make([]byte, 16)
 		maliciousBytes[0] = 0x01
@@ -158,7 +161,7 @@ func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
 		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
 
 		reader := bytes.NewReader(maliciousBytes)
-		uw := &UTXOWrapper{}
+		uw := &UTXOWrapper{maxScriptSize: testMaxScriptSize}
 		utxo := &UTXO{}
 
 		err := uw.NewUTXOFromReader(reader, utxo)
@@ -169,7 +172,7 @@ func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
 	})
 
 	t.Run("accept script length at MaxUTXOScriptSize", func(t *testing.T) {
-		validScriptLength := maxUTXOScriptSize
+		validScriptLength := uint32(500000)
 
 		validBytes := make([]byte, 16+validScriptLength)
 		validBytes[0] = 0x01
@@ -182,7 +185,7 @@ func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
 		validBytes[15] = byte(validScriptLength >> 24)
 
 		reader := bytes.NewReader(validBytes)
-		uw := &UTXOWrapper{}
+		uw := &UTXOWrapper{maxScriptSize: validScriptLength}
 		utxo := &UTXO{}
 
 		err := uw.NewUTXOFromReader(reader, utxo)
@@ -194,7 +197,8 @@ func TestNewUTXOFromReader_DoSProtection(t *testing.T) {
 
 func TestNewUTXOValueFromReader_DoSProtection(t *testing.T) {
 	t.Run("reject script length exceeding MaxUTXOScriptSize", func(t *testing.T) {
-		maliciousScriptLength := maxUTXOScriptSize + 1
+		testMaxScriptSize := uint32(500000)
+		maliciousScriptLength := testMaxScriptSize + 1
 
 		maliciousBytes := make([]byte, 16)
 		maliciousBytes[0] = 0x01
@@ -207,7 +211,7 @@ func TestNewUTXOValueFromReader_DoSProtection(t *testing.T) {
 		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
 
 		reader := bytes.NewReader(maliciousBytes)
-		uw := &UTXOWrapper{}
+		uw := &UTXOWrapper{maxScriptSize: testMaxScriptSize}
 
 		value, err := uw.NewUTXOValueFromReader(reader)
 
@@ -219,6 +223,7 @@ func TestNewUTXOValueFromReader_DoSProtection(t *testing.T) {
 
 	t.Run("reject maximum uint32 script length", func(t *testing.T) {
 		maliciousScriptLength := uint32(0xFFFFFFFF)
+		testMaxScriptSize := uint32(500000)
 
 		maliciousBytes := make([]byte, 16)
 		maliciousBytes[0] = 0x01
@@ -231,7 +236,7 @@ func TestNewUTXOValueFromReader_DoSProtection(t *testing.T) {
 		maliciousBytes[15] = byte(maliciousScriptLength >> 24)
 
 		reader := bytes.NewReader(maliciousBytes)
-		uw := &UTXOWrapper{}
+		uw := &UTXOWrapper{maxScriptSize: testMaxScriptSize}
 
 		value, err := uw.NewUTXOValueFromReader(reader)
 
@@ -245,6 +250,7 @@ func TestNewUTXOValueFromReader_DoSProtection(t *testing.T) {
 func TestNewUTXOFromReader_ConcurrentAttack(t *testing.T) {
 	numGoroutines := 20
 	maliciousScriptLength := uint32(0xFFFFFFFF)
+	testMaxScriptSize := uint32(500000)
 
 	t.Logf("Starting %d goroutines, each attempting %.2f GB allocation = %.2f GB total!",
 		numGoroutines, float64(maliciousScriptLength)/(1024*1024*1024),
@@ -270,7 +276,7 @@ func TestNewUTXOFromReader_ConcurrentAttack(t *testing.T) {
 			defer wg.Done()
 
 			reader := bytes.NewReader(maliciousBytes)
-			uw := &UTXOWrapper{}
+			uw := &UTXOWrapper{maxScriptSize: testMaxScriptSize}
 			utxo := &UTXO{}
 
 			err := uw.NewUTXOFromReader(reader, utxo)
