@@ -36,7 +36,8 @@ var maxUTXOScriptSize uint32
 // - UTXOs should have already been validated before reaching the persister
 func init() {
 	s := settings.NewSettings()
-	if s.Policy.MaxScriptSizePolicy > math.MaxUint32 {
+	// Casting to uint64 to handle overflow when compiling on 32-bit systems
+	if s.Policy.MaxScriptSizePolicy <= 0 || uint64(s.Policy.MaxScriptSizePolicy) > math.MaxUint32 {
 		maxUTXOScriptSize = math.MaxUint32
 	} else {
 		maxUTXOScriptSize = uint32(s.Policy.MaxScriptSizePolicy)
