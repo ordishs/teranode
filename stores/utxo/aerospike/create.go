@@ -777,17 +777,22 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	if err != nil {
 		aErr, ok := err.(*aerospike.AerospikeError)
 		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
-			utils.SafeSend(bItem.done, s.handleExistingTransaction(bItem.txHash))
+			// Lock already exists - either another process is creating or transaction already exists
+			utils.SafeSend[error](bItem.done, errors.NewTxExistsError("transaction creation in progress or already exists: %s", bItem.txHash))
 			return
 		}
 		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to acquire lock", err))
 		return
 	}
 
-	// NOTE: We do NOT use defer to release the lock here because:
-	// 1. On success: we release the lock after all records are created
-	// 2. On failure: we clean up partial records AND release the lock
-	// This ensures another process can retry immediately without waiting for TTL expiration
+	// Always release the lock when done (success or failure)
+	// The locked bin in each record prevents UTXO spending until unlocked
+	// Failed creations leave partial records for the next attempt to "finish off"
+	defer func() {
+		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+			s.logger.Warnf("[StoreTransactionExternally] Failed to release lock: %v", releaseErr)
+		}
+	}()
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
 
@@ -926,7 +931,8 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	if err != nil {
 		aErr, ok := err.(*aerospike.AerospikeError)
 		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
-			utils.SafeSend[error](bItem.done, s.handleExistingTransaction(bItem.txHash))
+			// Lock already exists - either another process is creating or transaction already exists
+			utils.SafeSend[error](bItem.done, errors.NewTxExistsError("transaction creation in progress or already exists: %s", bItem.txHash))
 			return
 		}
 		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to acquire lock", err))
@@ -1161,36 +1167,3 @@ func (s *Store) UnlockTransaction(ctx context.Context, txHash *chainhash.Hash, n
 	return s.unlockAllRecords(txHash, numRecords)
 }
 
-// handleExistingTransaction checks if a transaction exists and returns appropriate error
-// This is called when we fail to acquire the lock record (KEY_EXISTS_ERROR)
-func (s *Store) handleExistingTransaction(txHash *chainhash.Hash) error {
-	policy := util.GetAerospikeReadPolicy(s.settings)
-
-	// Check if lock record still exists
-	lockKey, _ := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
-	_, lockErr := s.client.Get(policy, lockKey)
-
-	if lockErr == nil {
-		// Lock exists - another process is actively creating this transaction
-		return errors.NewTxExistsError("transaction creation in progress by another process: %s", txHash)
-	}
-
-	// Lock doesn't exist (expired via TTL or released)
-	// Check if the transaction records exist
-	mainKey, _ := aerospike.NewKey(s.namespace, s.setName, txHash[:])
-	_, err := s.client.Get(policy, mainKey)
-
-	if err == nil {
-		// Transaction records exist - this transaction was already created
-		return errors.NewTxExistsError("transaction already exists: %s", txHash)
-	}
-
-	if errors.Is(err, aerospike.ErrKeyNotFound) {
-		// Lock expired but no records exist - previous attempt failed and cleaned up
-		// This is unusual but not impossible (race condition during cleanup)
-		return errors.NewProcessingError("transaction creation failed previously, retry recommended: %s", txHash)
-	}
-
-	// Unexpected error reading main record
-	return errors.NewProcessingError("failed to check transaction state: %s: %v", txHash, err)
-}
