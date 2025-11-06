@@ -18,7 +18,6 @@ import (
 	"github.com/bsv-blockchain/teranode/cmd/seeder"
 	"github.com/bsv-blockchain/teranode/cmd/setfsmstate"
 	cmdSettings "github.com/bsv-blockchain/teranode/cmd/settings"
-	"github.com/bsv-blockchain/teranode/cmd/unlocktx"
 	"github.com/bsv-blockchain/teranode/cmd/utxopersister"
 	"github.com/bsv-blockchain/teranode/cmd/utxovalidator"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -46,7 +45,6 @@ var commandHelp = map[string]string{
 	"resetblockassembly":      "Reset block assembly state",
 	"fix-chainwork":           "Fix incorrect chainwork values in blockchain database",
 	"validate-utxo-set":       "Validate UTXO set file",
-	"unlock-tx":               "Unlock all records for a transaction (removes locked flag)",
 }
 
 var dangerousCommands = map[string]bool{}
@@ -357,15 +355,6 @@ func Start(args []string, version, commit string) {
 			}
 
 			return fixChainwork(*dbURL, *dryRun, *batchSize, uint32(*startHeight), uint32(*endHeight))
-		}
-	case "unlock-tx":
-		cmd.Execute = func(args []string) error {
-			if len(args) != 1 {
-				return errors.NewProcessingError("Usage: unlock-tx <transaction-hash>")
-			}
-
-			unlocktx.UnlockTransaction(logger, tSettings, args[0])
-			return nil
 		}
 	case "validate-utxo-set":
 		verbose := cmd.FlagSet.Bool("verbose", false, "verbose output showing individual UTXOs")

@@ -1162,8 +1162,4 @@ func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 	return nil
 }
 
-// UnlockTransaction is a public wrapper for unlockAllRecords to be used by CLI tools
-func (s *Store) UnlockTransaction(ctx context.Context, txHash *chainhash.Hash, numRecords int) error {
-	return s.unlockAllRecords(txHash, numRecords)
-}
 
