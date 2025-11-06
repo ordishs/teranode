@@ -758,13 +758,10 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	}
 
 	lockTTL := calculateLockTTL(len(binsToStore))
-
 	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
 	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
-	// TTL is set in the policy above and Aerospike will auto-delete when expired
 	hostname, _ := os.Hostname()
-
 	lockBins := []*aerospike.Bin{
 		aerospike.NewBin("created_at", time.Now().Unix()),
 		aerospike.NewBin("lock_type", "tx_creation"),
@@ -921,10 +918,13 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
 	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
-	// Simple lock record with just a marker bin
-	// TTL is set in the policy above and Aerospike will auto-delete when expired
+	hostname, _ := os.Hostname()
 	lockBins := []*aerospike.Bin{
+		aerospike.NewBin("created_at", time.Now().Unix()),
 		aerospike.NewBin("lock_type", "tx_creation"),
+		aerospike.NewBin("process_id", os.Getpid()),
+		aerospike.NewBin("hostname", hostname),
+		aerospike.NewBin("expected_records", len(binsToStore)),
 	}
 
 	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
