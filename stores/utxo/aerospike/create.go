@@ -735,42 +735,10 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 //  4. Releases lock
 //  5. Unlocks records if user didn't request lock
 func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStoreItem, binsToStore [][]*aerospike.Bin) {
-	// 1. Pre-create all record keys to fail fast on key creation errors
-	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
+	// Acquire lock FIRST to prevent duplicate work
+	lockKey, err := s.acquireLock(bItem.txHash, len(binsToStore))
 	if err != nil {
 		utils.SafeSend[error](bItem.done, err)
-		return
-	}
-
-	// 2. Create and acquire lock FIRST to prevent duplicate work
-	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
-	if err != nil {
-		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create lock key", err))
-		return
-	}
-
-	lockTTL := calculateLockTTL(len(binsToStore))
-	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
-	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
-
-	hostname, _ := os.Hostname()
-	lockBins := []*aerospike.Bin{
-		aerospike.NewBin("created_at", time.Now().Unix()),
-		aerospike.NewBin("lock_type", "tx_creation"),
-		aerospike.NewBin("process_id", os.Getpid()),
-		aerospike.NewBin("hostname", hostname),
-		aerospike.NewBin("expected_records", len(binsToStore)),
-	}
-
-	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
-	if err != nil {
-		aErr, ok := err.(*aerospike.AerospikeError)
-		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
-			// Lock already exists - either another process is creating or transaction already exists
-			utils.SafeSend[error](bItem.done, errors.NewTxExistsError("transaction creation in progress or already exists: %s", bItem.txHash))
-			return
-		}
-		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to acquire lock", err))
 		return
 	}
 
@@ -782,6 +750,13 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 			s.logger.Warnf("[StoreTransactionExternally] Failed to release lock: %v", releaseErr)
 		}
 	}()
+
+	// Pre-create all record keys to fail fast on key creation errors
+	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
+	if err != nil {
+		utils.SafeSend[error](bItem.done, err)
+		return
+	}
 
 	// 3. Write to external blob storage (now protected by lock - no duplicate work)
 	timeStart := time.Now()
@@ -873,42 +848,10 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 //   - Very large output sets
 //   - Special transaction types
 func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *BatchStoreItem, binsToStore [][]*aerospike.Bin) {
-	// 1. Pre-create all record keys to fail fast on key creation errors
-	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
+	// Acquire lock FIRST to prevent duplicate work
+	lockKey, err := s.acquireLock(bItem.txHash, len(binsToStore))
 	if err != nil {
 		utils.SafeSend[error](bItem.done, err)
-		return
-	}
-
-	// 2. Create and acquire lock FIRST to prevent duplicate work
-	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
-	if err != nil {
-		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create lock key", err))
-		return
-	}
-
-	lockTTL := calculateLockTTL(len(binsToStore))
-	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
-	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
-
-	hostname, _ := os.Hostname()
-	lockBins := []*aerospike.Bin{
-		aerospike.NewBin("created_at", time.Now().Unix()),
-		aerospike.NewBin("lock_type", "tx_creation"),
-		aerospike.NewBin("process_id", os.Getpid()),
-		aerospike.NewBin("hostname", hostname),
-		aerospike.NewBin("expected_records", len(binsToStore)),
-	}
-
-	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
-	if err != nil {
-		aErr, ok := err.(*aerospike.AerospikeError)
-		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
-			// Lock already exists - either another process is creating or transaction already exists
-			utils.SafeSend[error](bItem.done, errors.NewTxExistsError("transaction creation in progress or already exists: %s", bItem.txHash))
-			return
-		}
-		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to acquire lock", err))
 		return
 	}
 
@@ -920,6 +863,13 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 			s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock: %v", releaseErr)
 		}
 	}()
+
+	// Pre-create all record keys to fail fast on key creation errors
+	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
+	if err != nil {
+		utils.SafeSend[error](bItem.done, err)
+		return
+	}
 
 	// 3. Write to external blob storage (now protected by lock - no duplicate work)
 	nonNilOutputs := utxopersister.UnpadSlice(bItem.tx.Outputs)
@@ -1036,6 +986,39 @@ func calculateLockTTL(numRecords int) uint32 {
 		return LockRecordMaxTTL
 	}
 	return ttl
+}
+
+// acquireLock creates and acquires the lock record for transaction creation
+// Returns the lock key on success, or error if lock acquisition fails
+func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.Key, error) {
+	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to create lock key", err)
+	}
+
+	lockTTL := calculateLockTTL(numRecords)
+	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
+	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
+
+	hostname, _ := os.Hostname()
+	lockBins := []*aerospike.Bin{
+		aerospike.NewBin("created_at", time.Now().Unix()),
+		aerospike.NewBin("lock_type", "tx_creation"),
+		aerospike.NewBin("process_id", os.Getpid()),
+		aerospike.NewBin("hostname", hostname),
+		aerospike.NewBin("expected_records", numRecords),
+	}
+
+	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
+	if err != nil {
+		aErr, ok := err.(*aerospike.AerospikeError)
+		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
+			return nil, errors.NewTxExistsError("transaction creation in progress or already exists: %s", txHash)
+		}
+		return nil, errors.NewProcessingError("failed to acquire lock", err)
+	}
+
+	return lockKey, nil
 }
 
 // prepareRecordKeys pre-creates all record keys (not lock key) for transaction storage
@@ -1168,5 +1151,3 @@ func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 
 	return nil
 }
-
-
