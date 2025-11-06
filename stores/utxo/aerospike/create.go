@@ -735,25 +735,17 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 //  4. Releases lock
 //  5. Unlocks records if user didn't request lock
 func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStoreItem, binsToStore [][]*aerospike.Bin) {
-	timeStart := time.Now()
-
-	if err := s.externalStore.Set(
-		ctx,
-		bItem.txHash[:],
-		fileformat.FileTypeTx,
-		bItem.tx.ExtendedBytes(),
-	); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
-		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[StoreTransactionExternally] error writing transaction to external store [%s]", bItem.txHash.String()))
-
+	// 1. Pre-create all record keys to fail fast on key creation errors
+	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
+	if err != nil {
+		utils.SafeSend[error](bItem.done, err)
 		return
 	}
 
-	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
-
-	// Pre-create all keys BEFORE acquiring lock to fail fast on key creation errors
-	lockKey, recordKeys, err := s.prepareAllKeys(bItem.txHash, len(binsToStore))
+	// 2. Create and acquire lock FIRST to prevent duplicate work
+	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
 	if err != nil {
-		utils.SafeSend[error](bItem.done, err)
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create lock key", err))
 		return
 	}
 
@@ -790,6 +782,20 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 			s.logger.Warnf("[StoreTransactionExternally] Failed to release lock: %v", releaseErr)
 		}
 	}()
+
+	// 3. Write to external blob storage (now protected by lock - no duplicate work)
+	timeStart := time.Now()
+	if err := s.externalStore.Set(
+		ctx,
+		bItem.txHash[:],
+		fileformat.FileTypeTx,
+		bItem.tx.ExtendedBytes(),
+	); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
+		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[StoreTransactionExternally] error writing transaction to external store [%s]", bItem.txHash.String()))
+		return
+	}
+
+	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
 
@@ -867,50 +873,17 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 //   - Very large output sets
 //   - Special transaction types
 func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *BatchStoreItem, binsToStore [][]*aerospike.Bin) {
-	nonNilOutputs := utxopersister.UnpadSlice(bItem.tx.Outputs)
-
-	wrapper := utxopersister.UTXOWrapper{
-		TxID:     *bItem.txHash,
-		Height:   bItem.blockHeight,
-		Coinbase: bItem.isCoinbase,
-		UTXOs:    make([]*utxopersister.UTXO, 0, len(nonNilOutputs)),
-	}
-
-	for i, output := range bItem.tx.Outputs {
-		if output == nil {
-			continue
-		}
-
-		iUint32, err := safeconversion.IntToUint32(i)
-		if err != nil {
-			s.logger.Errorf("Could not convert i (%d) to uint32", i)
-		}
-
-		wrapper.UTXOs = append(wrapper.UTXOs, &utxopersister.UTXO{
-			Index:  iUint32,
-			Value:  output.Satoshis,
-			Script: *output.LockingScript,
-		})
-	}
-
-	timeStart := time.Now()
-
-	if err := s.externalStore.Set(
-		ctx,
-		bItem.txHash[:],
-		fileformat.FileTypeOutputs,
-		wrapper.Bytes(),
-	); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
-		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[StorePartialTransactionExternally] error writing output to external store [%s]", bItem.txHash.String()))
+	// 1. Pre-create all record keys to fail fast on key creation errors
+	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
+	if err != nil {
+		utils.SafeSend[error](bItem.done, err)
 		return
 	}
 
-	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
-
-	// Pre-create all keys BEFORE acquiring lock to fail fast on key creation errors
-	lockKey, recordKeys, err := s.prepareAllKeys(bItem.txHash, len(binsToStore))
+	// 2. Create and acquire lock FIRST to prevent duplicate work
+	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(bItem.txHash))
 	if err != nil {
-		utils.SafeSend[error](bItem.done, err)
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create lock key", err))
 		return
 	}
 
@@ -948,6 +921,47 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 		}
 	}()
 
+	// 3. Write to external blob storage (now protected by lock - no duplicate work)
+	nonNilOutputs := utxopersister.UnpadSlice(bItem.tx.Outputs)
+
+	wrapper := utxopersister.UTXOWrapper{
+		TxID:     *bItem.txHash,
+		Height:   bItem.blockHeight,
+		Coinbase: bItem.isCoinbase,
+		UTXOs:    make([]*utxopersister.UTXO, 0, len(nonNilOutputs)),
+	}
+
+	for i, output := range bItem.tx.Outputs {
+		if output == nil {
+			continue
+		}
+
+		iUint32, err := safeconversion.IntToUint32(i)
+		if err != nil {
+			s.logger.Errorf("Could not convert i (%d) to uint32", i)
+		}
+
+		wrapper.UTXOs = append(wrapper.UTXOs, &utxopersister.UTXO{
+			Index:  iUint32,
+			Value:  output.Satoshis,
+			Script: *output.LockingScript,
+		})
+	}
+
+	timeStart := time.Now()
+	if err := s.externalStore.Set(
+		ctx,
+		bItem.txHash[:],
+		fileformat.FileTypeOutputs,
+		wrapper.Bytes(),
+	); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
+		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[StorePartialTransactionExternally] error writing output to external store [%s]", bItem.txHash.String()))
+		return
+	}
+
+	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
+
+	// 4. Create Aerospike records
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
 	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
@@ -1024,27 +1038,20 @@ func calculateLockTTL(numRecords int) uint32 {
 	return ttl
 }
 
-// prepareAllKeys pre-creates all Aerospike keys needed for transaction storage
+// prepareRecordKeys pre-creates all record keys (not lock key) for transaction storage
 // This is done BEFORE acquiring the lock to fail fast if key creation fails
-func (s *Store) prepareAllKeys(txHash *chainhash.Hash, numRecords int) (*aerospike.Key, []*aerospike.Key, error) {
-	// Create lock key
-	lockKey, err := aerospike.NewKey(s.namespace, s.setName, calculateLockKey(txHash))
-	if err != nil {
-		return nil, nil, errors.NewProcessingError("failed to create lock key", err)
-	}
-
-	// Pre-create all record keys
+func (s *Store) prepareRecordKeys(txHash *chainhash.Hash, numRecords int) ([]*aerospike.Key, error) {
 	recordKeys := make([]*aerospike.Key, numRecords)
 	for idx := range numRecords {
 		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(idx))
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
-			return nil, nil, errors.NewProcessingError("failed to create record key %d", idx, err)
+			return nil, errors.NewProcessingError("failed to create record key %d", idx, err)
 		}
 		recordKeys[idx] = key
 	}
 
-	return lockKey, recordKeys, nil
+	return recordKeys, nil
 }
 
 // ensureLockedBin ensures the locked bin is set to the specified value
