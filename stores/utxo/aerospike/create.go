@@ -1045,6 +1045,12 @@ func (s *Store) prepareAllKeys(txHash *chainhash.Hash, numRecords int) (*aerospi
 func (s *Store) ensureLockedBin(bins []*aerospike.Bin, locked bool) []*aerospike.Bin {
 	for i, bin := range bins {
 		if bin.Name == fields.Locked.String() {
+			// Check if the value is already correct
+			if bin.Value == aerospike.BoolValue(locked) {
+				return bins
+			}
+
+			// Value needs to change - make a copy
 			newBins := make([]*aerospike.Bin, len(bins))
 			copy(newBins, bins)
 			newBins[i] = aerospike.NewBin(fields.Locked.String(), locked)
@@ -1052,6 +1058,7 @@ func (s *Store) ensureLockedBin(bins []*aerospike.Bin, locked bool) []*aerospike
 		}
 	}
 
+	// No locked bin found - add it
 	newBins := make([]*aerospike.Bin, len(bins)+1)
 	copy(newBins, bins)
 	newBins[len(bins)] = aerospike.NewBin(fields.Locked.String(), locked)
