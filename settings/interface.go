@@ -196,6 +196,7 @@ type BlockSettings struct {
 	UtxoStore                             *url.URL
 	FileStoreReadConcurrency              int
 	FileStoreWriteConcurrency             int
+	FileStoreUseSystemLimits              bool
 }
 
 type BlockChainSettings struct {
@@ -422,6 +423,11 @@ type P2PSettings struct {
 	PeerHealthHTTPTimeout         time.Duration // HTTP timeout for DataHub checks (default: 5s)
 	PeerHealthRemoveAfterFailures int           // Consecutive failures before removing a peer (default: 3)
 
+	// DisableNAT disables NAT traversal features (UPnP/NAT-PMP port mapping, NAT service, hole punching).
+	// Set to true in test environments where NAT traversal is not needed.
+	// Default: false (NAT features enabled)
+	DisableNAT bool
+
 	// Node mode configuration (full vs pruned)
 	AllowPrunedNodeFallback bool // If true, fall back to pruned nodes when no full nodes available (default: true). Selects youngest pruned node (smallest height) to minimize UTXO pruning risk.
 }
@@ -471,6 +477,7 @@ type SubtreeValidationSettings struct {
 	BlacklistedBaseURLs            map[string]struct{}
 	BlockHeightRetentionAdjustment int32 // Adjustment to GlobalBlockHeightRetention (can be positive or negative)
 	OrphanageTimeout               time.Duration
+	OrphanageMaxSize               int // Maximum number of transactions that can be stored in the orphanage
 	// Concurrency limits
 	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
 	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)

@@ -257,8 +257,10 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 
 	path := filepath.Join("data", appSettings.ClientName)
 	if strings.HasPrefix(opts.SettingsContext, "dev.system.test") {
-		// a bit hacky. Ideally, all stores sit under data/${ClientName}
-		path = "data"
+		// Create a unique data directory per test to avoid SQLite locking issues
+		// Use test name and timestamp to ensure uniqueness across sequential test runs
+		testName := strings.ReplaceAll(t.Name(), "/", "_")
+		path = filepath.Join("data", fmt.Sprintf("test_%s_%d", testName, time.Now().UnixNano()))
 	}
 
 	if !opts.SkipRemoveDataDir {
@@ -279,6 +281,15 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	chainParams.CoinbaseMaturity = 1
 	appSettings.ChainCfgParams = &chainParams
 
+	// Override DataFolder BEFORE creating any directories
+	// This ensures all store paths (blockstore, quorum, etc.) use the test-specific path
+	if strings.HasPrefix(opts.SettingsContext, "dev.system.test") {
+		appSettings.DataFolder = path
+		// Override QuorumPath to ensure it uses the test-specific directory
+		// This prevents tests from sharing the same quorum directory
+		appSettings.SubtreeValidation.QuorumPath = filepath.Join(path, "subtree_quorum")
+	}
+
 	absPath, err := filepath.Abs(path)
 	require.NoError(t, err)
 	t.Logf("Creating data directory: %s", absPath)
@@ -287,12 +298,10 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	require.NoError(t, err)
 
 	quorumPath := appSettings.SubtreeValidation.QuorumPath
-	require.NotNil(t, quorumPath, "No subtree_quorum_path specified")
+	require.NotEmpty(t, quorumPath, "No subtree_quorum_path specified")
 
 	err = os.MkdirAll(quorumPath, 0755)
 	require.NoError(t, err)
-
-	// Override with test settings...
 	appSettings.Asset.CentrifugeDisable = true
 	appSettings.UtxoStore.DBTimeout = 500 * time.Second
 	appSettings.LocalTestStartFromState = "RUNNING"
@@ -484,6 +493,12 @@ func (td *TestDaemon) Stop(t *testing.T, skipTracerShutdown ...bool) {
 
 	// Cancel context first to trigger HTTP server shutdowns
 	td.ctxCancel()
+
+	// Shutdown the logger to prevent race conditions on testing.T access
+	// Background goroutines may still be running and trying to log errors
+	if errorTestLogger, ok := td.Logger.(*ulogger.ErrorTestLogger); ok {
+		errorTestLogger.Shutdown()
+	}
 
 	// Cleanup daemon stores to reset singletons
 	td.d.daemonStores.Cleanup()
