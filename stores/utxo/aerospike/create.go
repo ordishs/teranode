@@ -56,6 +56,7 @@ package aerospike
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/aerospike/aerospike-client-go/v8"
@@ -757,20 +758,26 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	}
 
 	lockTTL := calculateLockTTL(len(binsToStore))
+
 	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
 	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
-	// Simple lock record with just a marker bin
 	// TTL is set in the policy above and Aerospike will auto-delete when expired
+	hostname, _ := os.Hostname()
+
 	lockBins := []*aerospike.Bin{
+		aerospike.NewBin("created_at", time.Now().Unix()),
 		aerospike.NewBin("lock_type", "tx_creation"),
+		aerospike.NewBin("process_id", os.Getpid()),
+		aerospike.NewBin("hostname", hostname),
+		aerospike.NewBin("expected_records", len(binsToStore)),
 	}
 
 	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
 	if err != nil {
 		aErr, ok := err.(*aerospike.AerospikeError)
 		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
-			utils.SafeSend[error](bItem.done, s.handleExistingTransaction(bItem.txHash))
+			utils.SafeSend(bItem.done, s.handleExistingTransaction(bItem.txHash))
 			return
 		}
 		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to acquire lock", err))
@@ -783,6 +790,7 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	// This ensures another process can retry immediately without waiting for TTL expiration
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
+
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
 	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
@@ -793,6 +801,7 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 		key := recordKeys[idx]
 
 		putOps := make([]*aerospike.Operation, len(binsWithLock))
+
 		for i, bin := range binsWithLock {
 			putOps[i] = aerospike.PutOp(bin)
 		}
@@ -806,9 +815,12 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	}
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
+	// This is the moment we create the records...
 	_ = s.client.BatchOperate(batchPolicy, batchRecords)
 
 	hasFailures := false
+
 	for idx, record := range batchRecords {
 		if err := record.BatchRec().Err; err != nil {
 			aErr, ok := err.(*aerospike.AerospikeError)
@@ -816,45 +828,18 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 				s.logger.Debugf("[StoreTransactionExternally] Record %d already exists for tx %s (recovery)", idx, bItem.txHash)
 				continue
 			}
+
 			s.logger.Errorf("[StoreTransactionExternally] Failed to create record %d for tx %s: %v", idx, bItem.txHash, err)
 			hasFailures = true
 		}
 	}
 
 	if hasFailures {
-		// Clean up: delete any records that were successfully created before the failure
-		// This ensures we leave no partial state behind
-		s.logger.Warnf("[StoreTransactionExternally] Cleaning up partial records for tx %s", bItem.txHash)
-		deletePolicy := util.GetAerospikeWritePolicy(s.settings, 0)
-		cleanupSuccess := true
-		for idx, key := range recordKeys {
-			// Use pre-created key (no error possible)
-			// Check if cleanup succeeds - we need to know if we left partial state
-			_, deleteErr := s.client.Delete(deletePolicy, key)
-			if deleteErr != nil && !errors.Is(deleteErr, aerospike.ErrKeyNotFound) {
-				s.logger.Errorf("[StoreTransactionExternally] Failed to delete record %d during cleanup: %v", idx, deleteErr)
-				cleanupSuccess = false
-			}
-		}
-
-		// Only release the lock if cleanup was completely successful
-		// If cleanup failed, keep the lock held so TTL expires and prevents concurrent access
-		if cleanupSuccess {
-			if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
-				s.logger.Warnf("[StoreTransactionExternally] Failed to release lock after cleanup: %v", releaseErr)
-			}
-		} else {
-			s.logger.Warnf("[StoreTransactionExternally] Keeping lock held due to incomplete cleanup - TTL will expire")
-		}
-
-		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create records for tx %s", bItem.txHash))
+		// Do NOT clean up partial records - leave them for the next attempt to complete
+		// The locked bin in each record prevents UTXO spending until all records exist
+		// The defer will release the lock, allowing another process to finish the creation
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create all records for tx %s - partial records remain for next attempt to complete", bItem.txHash))
 		return
-	}
-
-	// Success! Now release the lock record
-	if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
-		s.logger.Warnf("[StoreTransactionExternally] Failed to release lock for %s: %v", bItem.txHash, releaseErr)
-		// Continue anyway - the lock will expire via TTL
 	}
 
 	if !bItem.locked {
@@ -948,10 +933,14 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 		return
 	}
 
-	// NOTE: We do NOT use defer to release the lock here because:
-	// 1. On success: we release the lock after all records are created
-	// 2. On failure: we clean up partial records AND release the lock
-	// This ensures another process can retry immediately without waiting for TTL expiration
+	// Always release the lock when done (success or failure)
+	// The locked bin in each record prevents UTXO spending until unlocked
+	// Failed creations leave partial records for the next attempt to "finish off"
+	defer func() {
+		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
+			s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock: %v", releaseErr)
+		}
+	}()
 
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
@@ -993,39 +982,11 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	}
 
 	if hasFailures {
-		// Clean up: delete any records that were successfully created before the failure
-		// This ensures we leave no partial state behind
-		s.logger.Warnf("[StorePartialTransactionExternally] Cleaning up partial records for tx %s", bItem.txHash)
-		deletePolicy := util.GetAerospikeWritePolicy(s.settings, 0)
-		cleanupSuccess := true
-		for idx, key := range recordKeys {
-			// Use pre-created key (no error possible)
-			// Check if cleanup succeeds - we need to know if we left partial state
-			_, deleteErr := s.client.Delete(deletePolicy, key)
-			if deleteErr != nil && !errors.Is(deleteErr, aerospike.ErrKeyNotFound) {
-				s.logger.Errorf("[StorePartialTransactionExternally] Failed to delete record %d during cleanup: %v", idx, deleteErr)
-				cleanupSuccess = false
-			}
-		}
-
-		// Only release the lock if cleanup was completely successful
-		// If cleanup failed, keep the lock held so TTL expires and prevents concurrent access
-		if cleanupSuccess {
-			if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
-				s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock after cleanup: %v", releaseErr)
-			}
-		} else {
-			s.logger.Warnf("[StorePartialTransactionExternally] Keeping lock held due to incomplete cleanup - TTL will expire")
-		}
-
-		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create records for tx %s", bItem.txHash))
+		// Do NOT clean up partial records - leave them for the next attempt to complete
+		// The locked bin in each record prevents UTXO spending until all records exist
+		// The defer will release the lock, allowing another process to finish the creation
+		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create all records for tx %s - partial records remain for next attempt to complete", bItem.txHash))
 		return
-	}
-
-	// Success! Now release the lock record
-	if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
-		s.logger.Warnf("[StorePartialTransactionExternally] Failed to release lock for %s: %v", bItem.txHash, releaseErr)
-		// Continue anyway - the lock will expire via TTL
 	}
 
 	if !bItem.locked {
