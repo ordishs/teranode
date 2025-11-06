@@ -20,6 +20,7 @@ local BIN_SPENT_UTXOS = "spentUtxos"
 local BIN_SUBTREE_IDXS = "subtreeIdxs"
 local BIN_TOTAL_EXTRA_RECS = "totalExtraRecs"
 local BIN_LOCKED = "locked"
+local BIN_CREATING = "creating"
 local BIN_UTXOS = "utxos"
 local BIN_UTXO_SPENDABLE_IN = "utxoSpendableIn"
 local BIN_LAST_SPENT_STATE = "lastSpentState"  -- Tracks last signaled state: "ALLSPENT" or "NOTALLSPENT"
@@ -33,6 +34,7 @@ local STATUS_ERROR = "ERROR"
 local ERROR_CODE_TX_NOT_FOUND = "TX_NOT_FOUND"
 local ERROR_CODE_CONFLICTING = "CONFLICTING"
 local ERROR_CODE_LOCKED = "LOCKED"
+local ERROR_CODE_CREATING = "CREATING"
 local ERROR_CODE_FROZEN = "FROZEN"
 local ERROR_CODE_ALREADY_FROZEN = "ALREADY_FROZEN"
 local ERROR_CODE_FROZEN_UNTIL = "FROZEN_UNTIL"
@@ -49,6 +51,7 @@ local ERROR_CODE_INVALID_PARAMETER = "INVALID_PARAMETER"
 -- Message constants
 local MSG_CONFLICTING = "TX is conflicting"
 local MSG_LOCKED = "TX is locked and cannot be spent"
+local MSG_CREATING = "TX is being created and cannot be spent yet"
 local MSG_FROZEN = "UTXO is frozen"
 local MSG_ALREADY_FROZEN = "UTXO is already frozen"
 local MSG_FROZEN_UNTIL = "UTXO is not spendable until block "
@@ -298,6 +301,15 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 
             return response
         end
+    end
+
+    -- Check creating flag - blocks spending during multi-record transaction creation
+    if rec[BIN_CREATING] then
+        response[FIELD_STATUS] = STATUS_ERROR
+        response[FIELD_ERROR_CODE] = ERROR_CODE_CREATING
+        response[FIELD_MESSAGE] = MSG_CREATING
+
+        return response
     end
 
     local coinbaseSpendingHeight = rec[BIN_SPENDING_HEIGHT]

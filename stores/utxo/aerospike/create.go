@@ -738,7 +738,7 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	// Acquire lock FIRST to prevent duplicate work
 	lockKey, err := s.acquireLock(bItem.txHash, len(binsToStore))
 	if err != nil {
-		utils.SafeSend[error](bItem.done, err)
+		utils.SafeSend(bItem.done, err)
 		return
 	}
 
@@ -754,12 +754,13 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	// Pre-create all record keys to fail fast on key creation errors
 	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
 	if err != nil {
-		utils.SafeSend[error](bItem.done, err)
+		utils.SafeSend(bItem.done, err)
 		return
 	}
 
-	// 3. Write to external blob storage (now protected by lock - no duplicate work)
+	// Write transaction bytes to external blob storage
 	timeStart := time.Now()
+
 	if err := s.externalStore.Set(
 		ctx,
 		bItem.txHash[:],
@@ -778,19 +779,20 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
 	for idx, bins := range binsToStore {
-		binsWithLock := s.ensureLockedBin(bins, true)
+		binsWithCreating := s.ensureCreatingBin(bins, true)
 
 		// Use pre-created key (no error possible)
 		key := recordKeys[idx]
 
-		putOps := make([]*aerospike.Operation, len(binsWithLock))
+		putOps := make([]*aerospike.Operation, len(binsWithCreating))
 
-		for i, bin := range binsWithLock {
+		for i, bin := range binsWithCreating {
 			putOps[i] = aerospike.PutOp(bin)
 		}
 
 		if idx == 0 && bItem.conflicting {
 			dah := bItem.blockHeight + s.settings.GetUtxoStoreBlockHeightRetention()
+
 			putOps = append(putOps, aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), dah)))
 		}
 
@@ -799,7 +801,6 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 
-	// This is the moment we create the records...
 	_ = s.client.BatchOperate(batchPolicy, batchRecords)
 
 	hasFailures := false
@@ -813,6 +814,7 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 			}
 
 			s.logger.Errorf("[StoreTransactionExternally] Failed to create record %d for tx %s: %v", idx, bItem.txHash, err)
+
 			hasFailures = true
 		}
 	}
@@ -826,14 +828,14 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 	}
 
 	if !bItem.locked {
-		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
-		if unlockErr != nil {
-			// CRITICAL: Transaction records were created successfully but some remain locked
-			// UTXOs in locked records cannot be spent until manually unlocked by operator
+		clearErr := s.clearCreatingFlag(bItem.txHash, len(binsToStore))
+		if clearErr != nil {
+			// CRITICAL: Transaction records were created successfully but creating flag not cleared
+			// UTXOs cannot be spent while creating=true flag is set
 			// However, we return success because the transaction IS in the database
 			// Returning error would mislead the user into thinking creation failed
-			s.logger.Errorf("[StoreTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but unlock failed: %v", bItem.txHash, unlockErr)
-			s.logger.Errorf("[StoreTransactionExternally] Use CLI tool to manually unlock records for transaction %s", bItem.txHash)
+			s.logger.Errorf("[StoreTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but creating flag not cleared: %v", bItem.txHash, clearErr)
+			s.logger.Errorf("[StoreTransactionExternally] Records remain with creating=true, preventing UTXO spending")
 		}
 	}
 
@@ -851,7 +853,7 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	// Acquire lock FIRST to prevent duplicate work
 	lockKey, err := s.acquireLock(bItem.txHash, len(binsToStore))
 	if err != nil {
-		utils.SafeSend[error](bItem.done, err)
+		utils.SafeSend(bItem.done, err)
 		return
 	}
 
@@ -867,11 +869,10 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	// Pre-create all record keys to fail fast on key creation errors
 	recordKeys, err := s.prepareRecordKeys(bItem.txHash, len(binsToStore))
 	if err != nil {
-		utils.SafeSend[error](bItem.done, err)
+		utils.SafeSend(bItem.done, err)
 		return
 	}
 
-	// 3. Write to external blob storage (now protected by lock - no duplicate work)
 	nonNilOutputs := utxopersister.UnpadSlice(bItem.tx.Outputs)
 
 	wrapper := utxopersister.UTXOWrapper{
@@ -898,7 +899,9 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 		})
 	}
 
+	// Write outputs to external blob storage
 	timeStart := time.Now()
+
 	if err := s.externalStore.Set(
 		ctx,
 		bItem.txHash[:],
@@ -911,24 +914,26 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 
 	prometheusTxMetaAerospikeMapSetExternal.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 
-	// 4. Create Aerospike records
 	batchRecords := make([]aerospike.BatchRecordIfc, len(binsToStore))
+
 	batchWritePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
 	batchWritePolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
 	for idx, bins := range binsToStore {
-		binsWithLock := s.ensureLockedBin(bins, true)
+		binsWithCreating := s.ensureCreatingBin(bins, true)
 
 		// Use pre-created key (no error possible)
 		key := recordKeys[idx]
 
-		putOps := make([]*aerospike.Operation, len(binsWithLock))
-		for i, bin := range binsWithLock {
+		putOps := make([]*aerospike.Operation, len(binsWithCreating))
+
+		for i, bin := range binsWithCreating {
 			putOps[i] = aerospike.PutOp(bin)
 		}
 
 		if idx == 0 && bItem.conflicting {
 			dah := bItem.blockHeight + s.settings.GetUtxoStoreBlockHeightRetention()
+
 			putOps = append(putOps, aerospike.PutOp(aerospike.NewBin(fields.DeleteAtHeight.String(), dah)))
 		}
 
@@ -936,9 +941,11 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	}
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
 	_ = s.client.BatchOperate(batchPolicy, batchRecords)
 
 	hasFailures := false
+
 	for idx, record := range batchRecords {
 		if err := record.BatchRec().Err; err != nil {
 			aErr, ok := err.(*aerospike.AerospikeError)
@@ -946,7 +953,9 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 				s.logger.Debugf("[StorePartialTransactionExternally] Record %d already exists for tx %s (recovery)", idx, bItem.txHash)
 				continue
 			}
+
 			s.logger.Errorf("[StorePartialTransactionExternally] Failed to create record %d for tx %s: %v", idx, bItem.txHash, err)
+
 			hasFailures = true
 		}
 	}
@@ -960,14 +969,14 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 	}
 
 	if !bItem.locked {
-		unlockErr := s.unlockAllRecords(bItem.txHash, len(binsToStore))
-		if unlockErr != nil {
-			// CRITICAL: Transaction records were created successfully but some remain locked
-			// UTXOs in locked records cannot be spent until manually unlocked by operator
+		clearErr := s.clearCreatingFlag(bItem.txHash, len(binsToStore))
+		if clearErr != nil {
+			// CRITICAL: Transaction records were created successfully but creating flag not cleared
+			// UTXOs cannot be spent while creating=true flag is set
 			// However, we return success because the transaction IS in the database
 			// Returning error would mislead the user into thinking creation failed
-			s.logger.Errorf("[StorePartialTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but unlock failed: %v", bItem.txHash, unlockErr)
-			s.logger.Errorf("[StorePartialTransactionExternally] Use CLI tool to manually unlock records for transaction %s", bItem.txHash)
+			s.logger.Errorf("[StorePartialTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but creating flag not cleared: %v", bItem.txHash, clearErr)
+			s.logger.Errorf("[StorePartialTransactionExternally] Records remain with creating=true, preventing UTXO spending")
 		}
 	}
 
@@ -997,10 +1006,12 @@ func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.
 	}
 
 	lockTTL := calculateLockTTL(numRecords)
+
 	lockPolicy := util.GetAerospikeWritePolicy(s.settings, lockTTL)
 	lockPolicy.RecordExistsAction = aerospike.CREATE_ONLY
 
 	hostname, _ := os.Hostname()
+
 	lockBins := []*aerospike.Bin{
 		aerospike.NewBin("created_at", time.Now().Unix()),
 		aerospike.NewBin("lock_type", "tx_creation"),
@@ -1015,14 +1026,32 @@ func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.
 		if ok && aErr.ResultCode == types.KEY_EXISTS_ERROR {
 			return nil, errors.NewTxExistsError("transaction creation in progress or already exists: %s", txHash)
 		}
+
 		return nil, errors.NewProcessingError("failed to acquire lock", err)
 	}
 
 	return lockKey, nil
 }
 
-// prepareRecordKeys pre-creates all record keys (not lock key) for transaction storage
-// This is done BEFORE acquiring the lock to fail fast if key creation fails
+// releaseLock deletes the lock record
+func (s *Store) releaseLock(lockKey *aerospike.Key) error {
+	policy := util.GetAerospikeWritePolicy(s.settings, 0)
+
+	_, err := s.client.Delete(policy, lockKey)
+	if err != nil {
+		aErr, ok := err.(*aerospike.AerospikeError)
+		if ok && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
+			return nil
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+// prepareRecordKeys pre-creates all record keys for transaction storage.
+// This is done BEFORE writing anything to the database to fail fast if key creation fails.
 func (s *Store) prepareRecordKeys(txHash *chainhash.Hash, numRecords int) ([]*aerospike.Key, error) {
 	recordKeys := make([]*aerospike.Key, numRecords)
 	for idx := range numRecords {
@@ -1037,39 +1066,27 @@ func (s *Store) prepareRecordKeys(txHash *chainhash.Hash, numRecords int) ([]*ae
 	return recordKeys, nil
 }
 
-// ensureLockedBin ensures the locked bin is set to the specified value
-func (s *Store) ensureLockedBin(bins []*aerospike.Bin, locked bool) []*aerospike.Bin {
+// ensureCreatingBin ensures the creating bin is set to the specified value
+// The creating bin is used for multi-record 2-phase commit to prevent UTXO spending during creation
+func (s *Store) ensureCreatingBin(bins []*aerospike.Bin, creating bool) []*aerospike.Bin {
 	for i, bin := range bins {
-		if bin.Name == fields.Locked.String() {
+		if bin.Name == fields.Creating.String() {
 			newBins := make([]*aerospike.Bin, len(bins))
 			copy(newBins, bins)
-			newBins[i] = aerospike.NewBin(fields.Locked.String(), locked)
+			newBins[i] = aerospike.NewBin(fields.Creating.String(), creating)
 			return newBins
 		}
 	}
 
 	newBins := make([]*aerospike.Bin, len(bins)+1)
 	copy(newBins, bins)
-	newBins[len(bins)] = aerospike.NewBin(fields.Locked.String(), locked)
+	newBins[len(bins)] = aerospike.NewBin(fields.Creating.String(), creating)
 	return newBins
 }
 
-// releaseLock deletes the lock record
-func (s *Store) releaseLock(lockKey *aerospike.Key) error {
-	policy := util.GetAerospikeWritePolicy(s.settings, 0)
-	_, err := s.client.Delete(policy, lockKey)
-	if err != nil {
-		aErr, ok := err.(*aerospike.AerospikeError)
-		if ok && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
-// unlockAllRecords unlocks all records for a transaction with generation checks
-func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
+// clearCreatingFlag removes the creating flag from all records for a transaction
+// This is called after all records have been successfully created to allow UTXO spending
+func (s *Store) clearCreatingFlag(txHash *chainhash.Hash, numRecords int) error {
 	readBatch := make([]aerospike.BatchRecordIfc, numRecords)
 	readPolicy := util.GetAerospikeBatchReadPolicy(s.settings)
 
@@ -1079,30 +1096,30 @@ func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 		if err != nil {
 			return err
 		}
-		readBatch[i] = aerospike.NewBatchRead(readPolicy, key, []string{fields.Locked.String()})
+		readBatch[i] = aerospike.NewBatchRead(readPolicy, key, []string{fields.Creating.String()})
 	}
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	err := s.client.BatchOperate(batchPolicy, readBatch)
 	if err != nil {
-		return errors.NewProcessingError("failed to read records for unlock", err)
+		return errors.NewProcessingError("failed to read records for clearing creating flag", err)
 	}
 
 	writeBatch := make([]aerospike.BatchRecordIfc, 0, numRecords)
 
 	for i, readRec := range readBatch {
 		if readRec.BatchRec().Err != nil {
-			s.logger.Warnf("[unlockAllRecords] Failed to read record %d for unlock: %v", i, readRec.BatchRec().Err)
+			s.logger.Warnf("[clearCreatingFlag] Failed to read record %d: %v", i, readRec.BatchRec().Err)
 			continue
 		}
 
 		if readRec.BatchRec().Record == nil {
-			s.logger.Warnf("[unlockAllRecords] Record %d not found for unlock", i)
+			s.logger.Warnf("[clearCreatingFlag] Record %d not found", i)
 			continue
 		}
 
-		locked, ok := readRec.BatchRec().Record.Bins[fields.Locked.String()].(bool)
-		if ok && !locked {
+		creating, ok := readRec.BatchRec().Record.Bins[fields.Creating.String()].(bool)
+		if ok && !creating {
 			continue
 		}
 
@@ -1117,7 +1134,7 @@ func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 		writePolicy.GenerationPolicy = aerospike.EXPECT_GEN_EQUAL
 		writePolicy.Generation = readRec.BatchRec().Record.Generation
 
-		op := aerospike.PutOp(aerospike.NewBin(fields.Locked.String(), false))
+		op := aerospike.PutOp(aerospike.NewBin(fields.Creating.String(), false))
 		writeBatch = append(writeBatch, aerospike.NewBatchWrite(writePolicy, key, op))
 	}
 
@@ -1138,9 +1155,9 @@ func (s *Store) unlockAllRecords(txHash *chainhash.Hash, numRecords int) error {
 			failedCount++
 			aErr, ok := record.BatchRec().Err.(*aerospike.AerospikeError)
 			if ok && aErr.ResultCode == types.GENERATION_ERROR {
-				s.logger.Errorf("[unlockAllRecords] Generation mismatch unlocking record %d for tx %s - record was modified", idx, txHash)
+				s.logger.Errorf("[clearCreatingFlag] Generation mismatch clearing creating flag for record %d for tx %s - record was modified", idx, txHash)
 			} else {
-				s.logger.Errorf("[unlockAllRecords] Failed to unlock record %d for tx %s: %v", idx, txHash, record.BatchRec().Err)
+				s.logger.Errorf("[clearCreatingFlag] Failed to clear creating flag for record %d for tx %s: %v", idx, txHash, record.BatchRec().Err)
 			}
 		}
 	}
