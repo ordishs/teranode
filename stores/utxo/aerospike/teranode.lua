@@ -282,7 +282,16 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 
         return response
     end
-    
+
+    -- Check creating flag - blocks spending during multi-record transaction creation
+    if rec[BIN_CREATING] then
+        response[FIELD_STATUS] = STATUS_ERROR
+        response[FIELD_ERROR_CODE] = ERROR_CODE_CREATING
+        response[FIELD_MESSAGE] = MSG_CREATING
+
+        return response
+    end
+
     if not ignoreConflicting then
         if rec[BIN_CONFLICTING] then
             response[FIELD_STATUS] = STATUS_ERROR
@@ -301,15 +310,6 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 
             return response
         end
-    end
-
-    -- Check creating flag - blocks spending during multi-record transaction creation
-    if rec[BIN_CREATING] then
-        response[FIELD_STATUS] = STATUS_ERROR
-        response[FIELD_ERROR_CODE] = ERROR_CODE_CREATING
-        response[FIELD_MESSAGE] = MSG_CREATING
-
-        return response
     end
 
     local coinbaseSpendingHeight = rec[BIN_SPENDING_HEIGHT]
@@ -626,6 +626,11 @@ function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blo
     -- set the record to not be locked again, if it was locked, since if was just mined into a block
     if rec[BIN_LOCKED] then
         rec[BIN_LOCKED] = false
+    end
+
+    -- and the same for the creating flag
+    if rec[BIN_CREATING] then
+        rec[BIN_CREATING] = false
     end
 
     local signal, childCount = setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)

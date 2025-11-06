@@ -834,8 +834,8 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 			// UTXOs cannot be spent while creating=true flag is set
 			// However, we return success because the transaction IS in the database
 			// Returning error would mislead the user into thinking creation failed
-			s.logger.Errorf("[StoreTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but creating flag not cleared: %v", bItem.txHash, clearErr)
-			s.logger.Errorf("[StoreTransactionExternally] Records remain with creating=true, preventing UTXO spending")
+			s.logger.Errorf("[StoreTransactionExternally] Transaction %s created but creating flag not cleared: %v", bItem.txHash, clearErr)
+			s.logger.Errorf("[StoreTransactionExternally] Records remain with creating=true, preventing UTXO spending. Will be cleared when setMined is called.")
 		}
 	}
 
@@ -975,8 +975,8 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 			// UTXOs cannot be spent while creating=true flag is set
 			// However, we return success because the transaction IS in the database
 			// Returning error would mislead the user into thinking creation failed
-			s.logger.Errorf("[StorePartialTransactionExternally] OPERATOR ACTION REQUIRED: Transaction %s created but creating flag not cleared: %v", bItem.txHash, clearErr)
-			s.logger.Errorf("[StorePartialTransactionExternally] Records remain with creating=true, preventing UTXO spending")
+			s.logger.Errorf("[StorePartialTransactionExternally] Transaction %s created but creating flag not cleared: %v", bItem.txHash, clearErr)
+			s.logger.Errorf("[StorePartialTransactionExternally] Records remain with creating=true, preventing UTXO spending. Will be cleared when setMined is called.")
 		}
 	}
 
@@ -1096,6 +1096,7 @@ func (s *Store) clearCreatingFlag(txHash *chainhash.Hash, numRecords int) error 
 		if err != nil {
 			return err
 		}
+
 		readBatch[i] = aerospike.NewBatchRead(readPolicy, key, []string{fields.Creating.String()})
 	}
 
