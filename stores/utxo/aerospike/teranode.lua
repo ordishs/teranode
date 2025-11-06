@@ -284,7 +284,8 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
     end
 
     -- Check creating flag - blocks spending during multi-record transaction creation
-    if rec[BIN_CREATING] then
+    -- Explicitly check for true since nil/absent means not creating
+    if rec[BIN_CREATING] == true then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_CREATING
         response[FIELD_MESSAGE] = MSG_CREATING
@@ -628,9 +629,10 @@ function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blo
         rec[BIN_LOCKED] = false
     end
 
-    -- and the same for the creating flag
+    -- Delete the creating bin entirely (nil removes it from record)
+    -- This saves storage space - absence means not creating
     if rec[BIN_CREATING] then
-        rec[BIN_CREATING] = false
+        rec[BIN_CREATING] = nil
     end
 
     local signal, childCount = setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)

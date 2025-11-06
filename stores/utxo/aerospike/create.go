@@ -729,11 +729,11 @@ func (s *Store) GetBinsToStore(tx *bt.Tx, blockHeight uint32, blockIDs, blockHei
 // This is used when transactions exceed the Aerospike record size limit.
 //
 // The process:
-//  1. Stores transaction data in blob storage
-//  2. Acquires lock record
-//  3. Creates all Aerospike records in batch with locked=true
-//  4. Releases lock
-//  5. Unlocks records if user didn't request lock
+//  1. Acquires lock record
+//  2. Stores transaction data in blob storage
+//  3. Creates all Aerospike records in batch with creating=true
+//  4. Sets creating=false for all records
+//  5. Releases lock
 func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStoreItem, binsToStore [][]*aerospike.Bin) {
 	// Acquire lock FIRST to prevent duplicate work
 	lockKey, err := s.acquireLock(bItem.txHash, len(binsToStore))
@@ -742,8 +742,8 @@ func (s *Store) StoreTransactionExternally(ctx context.Context, bItem *BatchStor
 		return
 	}
 
-	// Always release the lock when done (success or failure)
-	// The locked bin in each record prevents UTXO spending until unlocked
+	// Always release the creating flag when done (success or failure)
+	// The creating bin in each record prevents UTXO spending until the flag is removed
 	// Failed creations leave partial records for the next attempt to "finish off"
 	defer func() {
 		if releaseErr := s.releaseLock(lockKey); releaseErr != nil {
@@ -1135,7 +1135,9 @@ func (s *Store) clearCreatingFlag(txHash *chainhash.Hash, numRecords int) error 
 		writePolicy.GenerationPolicy = aerospike.EXPECT_GEN_EQUAL
 		writePolicy.Generation = readRec.BatchRec().Record.Generation
 
-		op := aerospike.PutOp(aerospike.NewBin(fields.Creating.String(), false))
+		// Delete the creating bin entirely by setting to nil
+		// This saves storage space and makes absence of bin = not creating
+		op := aerospike.PutOp(aerospike.NewBin(fields.Creating.String(), nil))
 		writeBatch = append(writeBatch, aerospike.NewBatchWrite(writePolicy, key, op))
 	}
 
