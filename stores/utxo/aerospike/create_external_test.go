@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
@@ -28,7 +29,7 @@ func TestStoreExternallySuccessScenarios(t *testing.T) {
 		cleanDB(t, client)
 
 		// Create a transaction that requires multiple records
-		tx := createTransactionWithOutputs(25000) // 2 records needed
+		tx := createTransactionWithOutputs(settings.UtxoStore.UtxoBatchSize + 1) // 2 records needed
 
 		// First attempt - should succeed completely
 		_, err := store.Create(ctx, tx, 100)
@@ -46,7 +47,7 @@ func TestStoreExternallySuccessScenarios(t *testing.T) {
 		cleanDB(t, client)
 
 		// Simulate a partial creation by manually creating some records with creating=true
-		tx := createTransactionWithOutputs(25000) // 2 records needed
+		tx := createTransactionWithOutputs(settings.UtxoStore.UtxoBatchSize + 1) // 2 records needed
 
 		// Manually create first record with creating=true to simulate partial failure
 		txMeta1, err := store.Create(ctx, tx, 100)
@@ -59,9 +60,11 @@ func TestStoreExternallySuccessScenarios(t *testing.T) {
 		// - Process B tries to create (should complete it)
 		_, err = store.Create(ctx, tx, 100)
 
-		// Should get "already exists" which is a TxExistsError, not a processing error
+		// Should get TxExistsError, not a processing error
 		require.Error(t, err, "Second attempt should detect transaction exists")
-		assert.Contains(t, err.Error(), "already exists", "Should be TxExistsError")
+		var txExistsErr *errors.Error
+		assert.True(t, errors.As(err, &txExistsErr) && txExistsErr.Is(errors.ErrTxExists),
+			"Should be TxExistsError: %v", err)
 
 		// But the first attempt should have succeeded
 		require.NotNil(t, txMeta1)
@@ -73,7 +76,7 @@ func TestStoreExternallySuccessScenarios(t *testing.T) {
 		// This test simulates the core "finish off" behavior
 		// We'll use the raw StoreTransactionExternally to have more control
 
-		tx := createTransactionWithOutputs(25000) // 2 records
+		tx := createTransactionWithOutputs(settings.UtxoStore.UtxoBatchSize + 1) // 2 records
 
 		// First attempt - create the transaction
 		// This will create both records with creating=true and then clear the flag
@@ -89,7 +92,9 @@ func TestStoreExternallySuccessScenarios(t *testing.T) {
 
 		err = bItem2.RecvDone()
 		require.Error(t, err, "Second attempt should fail with already exists")
-		assert.Contains(t, err.Error(), "already exists", "Should indicate transaction exists")
+		var txExistsErr *errors.Error
+		assert.True(t, errors.As(err, &txExistsErr) && txExistsErr.Is(errors.ErrTxExists),
+			"Should be TxExistsError indicating transaction exists: %v", err)
 	})
 
 	t.Run("Scenario D: Multiple concurrent attempts - only first complete wins", func(t *testing.T) {
@@ -99,7 +104,7 @@ func TestStoreExternallySuccessScenarios(t *testing.T) {
 		// Only the first one to COMPLETE all records should succeed
 		// Others should get "already exists" or "in progress"
 
-		tx := createTransactionWithOutputs(100) // Small for faster test
+		tx := createTransactionWithOutputs(settings.UtxoStore.UtxoBatchSize + 1) // Small for faster test
 
 		// Try to create the same transaction 3 times concurrently
 		results := make([]error, 3)
@@ -126,33 +131,13 @@ func TestStoreExternallySuccessScenarios(t *testing.T) {
 				t.Logf("Attempt %d: SUCCESS", i)
 			} else {
 				t.Logf("Attempt %d: %v", i, err)
-				// Should be either "in progress" or "already exists"
-				assert.True(t,
-					assert.ObjectsAreEqual(err.Error(), "already exists") ||
-						assert.ObjectsAreEqual(err.Error(), "in progress"),
-					"Error should indicate concurrent access: %v", err)
+				// Should be either TxExistsError (for both "in progress" and "already exists" cases)
+				var txExistsErr *errors.Error
+				assert.True(t, errors.As(err, &txExistsErr) && txExistsErr.Is(errors.ErrTxExists),
+					"Error should be TxExistsError indicating concurrent access: %v", err)
 			}
 		}
 
 		assert.Equal(t, 1, successCount, "Exactly one attempt should succeed completely")
-	})
-}
-
-// TestStoreExternallyFailureScenarios tests that storeExternallyWithLock returns
-// error only for real failures (not KEY_EXISTS_ERROR)
-func TestStoreExternallyFailureScenarios(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	t.Run("Real Aerospike failure should return error", func(t *testing.T) {
-		// This would require mocking or causing a real Aerospike failure
-		// which is complex in integration tests
-		t.Skip("Requires ability to inject Aerospike failures")
-	})
-
-	t.Run("Blob write failure should return error", func(t *testing.T) {
-		// This would require mocking the blob store to fail
-		t.Skip("Requires blob store mocking")
 	})
 }
