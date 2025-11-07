@@ -140,6 +140,15 @@ func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment in
 				aggErr = errors.Join(aggErr, recErr)
 			}
 		}
+
+		response := batchRecords[i].BatchRec().Record
+		if response != nil && response.Bins != nil {
+			successMap := response.Bins[LuaSuccess.String()].(map[interface{}]interface{})
+			status, ok := successMap["status"].(string)
+			if !ok || status != "OK" {
+				aggErr = errors.Join(aggErr, errors.NewProcessingError(successMap["message"].(string)))
+			}
+		}
 	}
 
 	return aggErr
