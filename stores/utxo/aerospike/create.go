@@ -928,7 +928,7 @@ func (s *Store) acquireLock(txHash *chainhash.Hash, numRecords int) (*aerospike.
 		aerospike.NewBin("lock_type", "tx_creation"),
 		aerospike.NewBin("process_id", os.Getpid()),
 		aerospike.NewBin("hostname", hostname),
-		aerospike.NewBin("expected_records", numRecords),
+		aerospike.NewBin("expected_recs", numRecords),
 	}
 
 	err = s.client.PutBins(lockPolicy, lockKey, lockBins...)
