@@ -1064,18 +1064,12 @@ func TestCoinbase(t *testing.T) {
 
 	var tErr *errors.Error
 
-	err = store.SetBlockHeight(1) // coinbase is immature
-	require.NoError(t, err)
-
 	spends, err := store.Spend(ctx, spendCoinbaseTx, 1)
 	require.ErrorAs(t, err, &tErr)
 	require.Equal(t, errors.ERR_UTXO_ERROR, tErr.Code())
 	require.ErrorIs(t, spends[0].Err, errors.ErrTxCoinbaseImmature)
 
-	err = store.SetBlockHeight(5000)
-	require.NoError(t, err)
-
-	_, err = store.Spend(ctx, spendCoinbaseTx, 1)
+	_, err = store.Spend(ctx, spendCoinbaseTx, 3)
 	require.NoError(t, err)
 }
 
