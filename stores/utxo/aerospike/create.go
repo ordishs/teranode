@@ -859,6 +859,7 @@ func (s *Store) storeExternallyWithLock(
 
 	// Check results - KEY_EXISTS_ERROR means recovery (completing previous attempt)
 	hasFailures := false
+	createdAny := false
 	for idx, record := range batchRecords {
 		if err := record.BatchRec().Err; err != nil {
 			aErr, ok := err.(*aerospike.AerospikeError)
@@ -868,6 +869,9 @@ func (s *Store) storeExternallyWithLock(
 			}
 			s.logger.Errorf("[%s] Failed to create record %d for tx %s: %v", funcName, idx, bItem.txHash, err)
 			hasFailures = true
+		} else {
+			// No error - this record was created successfully
+			createdAny = true
 		}
 	}
 
@@ -876,6 +880,12 @@ func (s *Store) storeExternallyWithLock(
 		// The creating bin in each record prevents UTXO spending until all records exist
 		// The defer will release the lock, allowing another process to finish the creation
 		utils.SafeSend[error](bItem.done, errors.NewProcessingError("failed to create all records for tx %s - partial records remain for next attempt to complete", bItem.txHash))
+		return
+	}
+
+	// If we didn't create any new records, all already existed - transaction is complete
+	if !createdAny {
+		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("transaction already exists: %s", bItem.txHash))
 		return
 	}
 
