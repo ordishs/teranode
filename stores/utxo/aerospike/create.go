@@ -826,7 +826,7 @@ func (s *Store) storeExternallyWithLock(
 	// Write to external blob storage (now protected by lock - no duplicate work)
 	timeStart := time.Now()
 	if err := s.externalStore.Set(ctx, bItem.txHash[:], fileType, blobData); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
-		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("[%s] error writing to external store [%s]", funcName, bItem.txHash.String()))
+		utils.SafeSend[error](bItem.done, errors.NewStorageError("[%s] error writing to external store [%s]", funcName, bItem.txHash.String()))
 		return
 	}
 
