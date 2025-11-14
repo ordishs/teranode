@@ -1011,9 +1011,18 @@ func (s *Store) ensureCreatingBin(bins []*aerospike.Bin, creating bool) []*aeros
 
 // clearCreatingFlag removes the creating flag from all records for a transaction
 // This is called after all records have been successfully created to allow UTXO spending
+// Uses expression filtering to only clear the bin on records that have it set
 func (s *Store) clearCreatingFlag(txHash *chainhash.Hash, numRecords int) error {
-	readBatch := make([]aerospike.BatchRecordIfc, numRecords)
-	readPolicy := util.GetAerospikeBatchReadPolicy(s.settings)
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+
+	// Expression filter: only update records where creating bin exists
+	filterExp := aerospike.ExpBinExists(fields.Creating.String())
+
+	// Separate master record (index 0) from children (indices 1+)
+	// Children will be cleared first, then master last
+	// This makes master's creating flag an atomic completion indicator
+	var masterWrite aerospike.BatchRecordIfc
+	childWrites := make([]aerospike.BatchRecordIfc, 0, numRecords-1)
 
 	for i := range numRecords {
 		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
@@ -1022,76 +1031,65 @@ func (s *Store) clearCreatingFlag(txHash *chainhash.Hash, numRecords int) error 
 			return err
 		}
 
-		readBatch[i] = aerospike.NewBatchRead(readPolicy, key, []string{fields.Creating.String()})
-	}
-
-	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
-	err := s.client.BatchOperate(batchPolicy, readBatch)
-	if err != nil {
-		return errors.NewProcessingError("failed to read records for clearing creating flag", err)
-	}
-
-	writeBatch := make([]aerospike.BatchRecordIfc, 0, numRecords)
-
-	for i, readRec := range readBatch {
-		if readRec.BatchRec().Err != nil {
-			s.logger.Warnf("[clearCreatingFlag] Failed to read record %d: %v", i, readRec.BatchRec().Err)
-			continue
-		}
-
-		if readRec.BatchRec().Record == nil {
-			s.logger.Warnf("[clearCreatingFlag] Record %d not found", i)
-			continue
-		}
-
-		creating, ok := readRec.BatchRec().Record.Bins[fields.Creating.String()].(bool)
-		if ok && !creating {
-			continue
-		}
-
-		keySource := uaerospike.CalculateKeySourceInternal(txHash, uint32(i))
-		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
-		if err != nil {
-			return err
-		}
-
 		writePolicy := util.GetAerospikeBatchWritePolicy(s.settings)
 		writePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
-		writePolicy.GenerationPolicy = aerospike.EXPECT_GEN_EQUAL
-		writePolicy.Generation = readRec.BatchRec().Record.Generation
+		writePolicy.FilterExpression = filterExp // Only update if creating bin exists
 
 		// Delete the creating bin entirely by setting to nil
 		// This saves storage space and makes absence of bin = not creating
 		op := aerospike.PutOp(aerospike.NewBin(fields.Creating.String(), nil))
-		writeBatch = append(writeBatch, aerospike.NewBatchWrite(writePolicy, key, op))
-	}
+		writeOp := aerospike.NewBatchWrite(writePolicy, key, op)
 
-	if len(writeBatch) == 0 {
-		return nil
-	}
-
-	err = s.client.BatchOperate(batchPolicy, writeBatch)
-	if err != nil {
-		return errors.NewProcessingError("failed to unlock records", err)
-	}
-
-	// Check that ALL unlocks succeeded - partial unlock is unacceptable
-	// because some UTXOs would remain unspendable
-	failedCount := 0
-	for idx, record := range writeBatch {
-		if record.BatchRec().Err != nil {
-			failedCount++
-			aErr, ok := record.BatchRec().Err.(*aerospike.AerospikeError)
-			if ok && aErr.ResultCode == types.GENERATION_ERROR {
-				s.logger.Errorf("[clearCreatingFlag] Generation mismatch clearing creating flag for record %d for tx %s - record was modified", idx, txHash)
-			} else {
-				s.logger.Errorf("[clearCreatingFlag] Failed to clear creating flag for record %d for tx %s: %v", idx, txHash, record.BatchRec().Err)
-			}
+		if i == 0 {
+			masterWrite = writeOp
+		} else {
+			childWrites = append(childWrites, writeOp)
 		}
 	}
 
-	if failedCount > 0 {
-		return errors.NewProcessingError("failed to unlock %d of %d records for tx %s", failedCount, len(writeBatch), txHash)
+	// Phase 1: Clear child records first (indices 1, 2, ..., N-1)
+	if len(childWrites) > 0 {
+		err := s.client.BatchOperate(batchPolicy, childWrites)
+		if err != nil {
+			return errors.NewProcessingError("failed to unlock child records", err)
+		}
+
+		// Check results - FILTERED_OUT means bin didn't exist (success case)
+		failedCount := 0
+		for idx, record := range childWrites {
+			if record.BatchRec().Err != nil {
+				aErr, ok := record.BatchRec().Err.(*aerospike.AerospikeError)
+				// FILTERED_OUT is success - bin didn't exist, nothing to clear
+				if ok && aErr.ResultCode == types.FILTERED_OUT {
+					continue
+				}
+				failedCount++
+				s.logger.Errorf("[clearCreatingFlag] Failed to clear creating flag for child record %d for tx %s: %v", idx+1, txHash, record.BatchRec().Err)
+			}
+		}
+
+		if failedCount > 0 {
+			return errors.NewProcessingError("failed to unlock %d of %d child records for tx %s", failedCount, len(childWrites), txHash)
+		}
+	}
+
+	// Phase 2: Clear master record last (index 0)
+	// Only executed if children succeeded - master's creating flag becomes atomic completion indicator
+	if masterWrite != nil {
+		err := s.client.BatchOperate(batchPolicy, []aerospike.BatchRecordIfc{masterWrite})
+		if err != nil {
+			return errors.NewProcessingError("failed to unlock master record", err)
+		}
+
+		if masterWrite.BatchRec().Err != nil {
+			aErr, ok := masterWrite.BatchRec().Err.(*aerospike.AerospikeError)
+			// FILTERED_OUT is success - bin didn't exist, nothing to clear
+			if ok && aErr.ResultCode == types.FILTERED_OUT {
+				return nil
+			}
+			s.logger.Errorf("[clearCreatingFlag] Failed to clear creating flag for master record for tx %s: %v", txHash, masterWrite.BatchRec().Err)
+			return errors.NewProcessingError("failed to unlock master record for tx %s", txHash)
+		}
 	}
 
 	return nil
