@@ -792,6 +792,36 @@ func (s *Store) StorePartialTransactionExternally(ctx context.Context, bItem *Ba
 
 // storeExternallyWithLock is the shared implementation for external transaction storage
 // Both StoreTransactionExternally and StorePartialTransactionExternally delegate to this
+//
+// TWO-PHASE COMMIT PROTOCOL FOR MULTI-RECORD TRANSACTIONS:
+//
+// Phase 1: Create all records with creating=true flag
+//   - Acquires lock to prevent duplicate work
+//   - Stores transaction data in blob storage
+//   - Creates all Aerospike records with creating=true
+//   - Notifies block assembly ONCE (only when records are newly created)
+//   - Lock is released
+//
+// Phase 2: Clear creating flags (children first, then master)
+//   - Children records cleared first (indices 1, 2, ..., N-1)
+//   - Master record cleared last (index 0)
+//   - Master's creating flag absence = atomic completion indicator
+//
+// ERROR HANDLING PHILOSOPHY:
+//
+// The function returns success (nil error) as long as Phase 1 completes, even if Phase 2
+// fails. This is intentional and correct because:
+//
+// 1. TRANSACTION IS PERSISTED: Phase 1 success means all records exist with complete data
+// 2. SPEND PROTECTION: creating=true flags prevent premature UTXO spending (per-record Lua checks)
+// 3. AUTO-RECOVERY: System self-heals through multiple paths (see line 911 for details)
+// 4. ATOMICITY: Returning error would break atomicity (Phase 1 done, but system thinks it failed)
+// 5. BLOCK ASSEMBLY: Notification is about existence, not spendability
+//
+// RECOVERY SCENARIOS:
+// - Retry attempts complete Phase 2 via "All exist" path (line 888)
+// - Auto-recovery triggers when transaction is re-encountered (processTxMetaUsingStore.go:112-122)
+// - Mining operation clears flags via setMined
 func (s *Store) storeExternallyWithLock(
 	ctx context.Context,
 	bItem *BatchStoreItem,
@@ -885,8 +915,18 @@ func (s *Store) storeExternallyWithLock(
 
 	// If we didn't create any new records, all already existed - transaction is complete
 	if !createdAny {
-		// All records already exist - don't notify block assembly
-		// But still attempt Phase 2 cleanup in case previous attempt failed
+		// RECOVERY PATH: All records already exist from previous attempt
+		//
+		// We don't notify block assembly (transaction already processed) but we still attempt
+		// Phase 2 cleanup to handle the case where a previous attempt completed Phase 1 but
+		// failed during Phase 2 (creating flag cleanup).
+		//
+		// This is a key part of the self-healing architecture:
+		// - First attempt: Creates records → Notifies block assembly → Tries to clear flags → Fails
+		// - Retry attempt: Finds all records exist → Skips block assembly → Completes flag cleanup → Success
+		//
+		// Without this cleanup attempt, creating flags would remain set indefinitely, requiring
+		// manual intervention. This ensures eventual consistency through automatic recovery.
 		clearErr := s.clearCreatingFlag(bItem.txHash, len(binsToStore))
 		if clearErr != nil {
 			s.logger.Warnf("[%s] Transaction %s exists but creating flag cleanup failed: %v", funcName, bItem.txHash, clearErr)
@@ -897,12 +937,40 @@ func (s *Store) storeExternallyWithLock(
 
 	clearErr := s.clearCreatingFlag(bItem.txHash, len(binsToStore))
 	if clearErr != nil {
-		// CRITICAL: Transaction records were created successfully but creating flag not cleared
-		// UTXOs cannot be spent while creating=true flag is set
-		// However, we return success because the transaction IS in the database
-		// Returning error would mislead the user into thinking creation failed
+		// PARTIAL SUCCESS: Transaction records created successfully, but creating flag cleanup failed
+		//
+		// WHY WE RETURN SUCCESS DESPITE INCOMPLETE PHASE 2:
+		//
+		// 1. TRANSACTION IS PERSISTED: All records exist in Aerospike with complete data.
+		//    Returning error would falsely indicate the transaction doesn't exist.
+		//
+		// 2. SPENDING IS SAFELY PROTECTED: Each UTXO spend operation checks the creating flag
+		//    per-record via Lua script (teranode.lua:288). UTXOs remain unspendable until flags
+		//    are cleared, preventing premature spending.
+		//
+		// 3. AUTO-RECOVERY IS SELF-HEALING: The system automatically recovers via multiple paths:
+		//    a) When transaction is re-encountered (propagation/subtree), subtreevalidation checks
+		//       the Creating flag (processTxMetaUsingStore.go:112-122) and triggers re-processing
+		//    b) When setMined is called, it clears creating flags as part of mining
+		//    c) Retry attempts from other sources will complete Phase 2 via "All exist" path (line 890)
+		//
+		// 4. RETURNING ERROR CREATES WORSE PROBLEMS:
+		//    - Caller would assume transaction failed and retry creation
+		//    - Retry would hit KEY_EXISTS_ERROR, creating confusion
+		//    - Block assembly wouldn't be notified of the transaction's existence
+		//    - Loss of atomicity: Phase 1 complete but system thinks it failed
+		//
+		// 5. BLOCK ASSEMBLY NOTIFICATION IS CORRECT: Block assembly needs to track transaction
+		//    existence for fee calculation and block template building. The creating flag doesn't
+		//    affect this - it only affects individual UTXO spendability.
+		//
+		// RECOVERY GUARANTEES:
+		// - Next transaction encounter triggers auto-recovery and cleanup
+		// - Manual retry completes Phase 2 via "All exist" path
+		// - Mining operation clears flags via setMined
+		// - No manual intervention required
 		s.logger.Errorf("[%s] Transaction %s created but creating flag not cleared: %v", funcName, bItem.txHash, clearErr)
-		s.logger.Errorf("[%s] Records remain with creating=true, preventing UTXO spending. Will be cleared when setMined is called.", funcName)
+		s.logger.Errorf("[%s] Records remain with creating=true, preventing UTXO spending until auto-recovery completes", funcName)
 	}
 
 	utils.SafeSend(bItem.done, nil)
