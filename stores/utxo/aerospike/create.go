@@ -885,6 +885,12 @@ func (s *Store) storeExternallyWithLock(
 
 	// If we didn't create any new records, all already existed - transaction is complete
 	if !createdAny {
+		// All records already exist - don't notify block assembly
+		// But still attempt Phase 2 cleanup in case previous attempt failed
+		clearErr := s.clearCreatingFlag(bItem.txHash, len(binsToStore))
+		if clearErr != nil {
+			s.logger.Warnf("[%s] Transaction %s exists but creating flag cleanup failed: %v", funcName, bItem.txHash, clearErr)
+		}
 		utils.SafeSend[error](bItem.done, errors.NewTxExistsError("transaction already exists: %s", bItem.txHash))
 		return
 	}
