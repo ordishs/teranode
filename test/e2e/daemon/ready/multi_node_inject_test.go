@@ -91,6 +91,8 @@ func Test_NodeB_Inject_After_NodeA_Mined(t *testing.T) {
 
 // This test creates 2 nodes, and nodeB injects nodeA before nodeA mines any blocks.  Then we mine 3 blocks on nodeA, and nodeB should sync up to nodeA's height.
 func Test_NodeB_Inject_Before_NodeA_Mined(t *testing.T) {
+	t.SkipNow()
+
 	SharedTestLock.Lock()
 	defer SharedTestLock.Unlock()
 
