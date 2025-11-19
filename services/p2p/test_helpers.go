@@ -48,8 +48,8 @@ func CreateTestSettings() *settings.Settings {
 		P2P: settings.P2PSettings{
 			BanThreshold: 100,
 			BanDuration:  24 * time.Hour,
-			DisableNAT:   true, // Disable NAT in tests to prevent data races in libp2p
 			SyncCoordinatorPeriodicEvaluationInterval: 10 * time.Second, // Reasonable default for tests
+			EnableNAT: false, // Disable NAT in tests to prevent data races in libp2p
 		},
 	}
 	return s
@@ -164,7 +164,7 @@ func SetupTestBlockchain(t *testing.T) *TestBlockchainSetup {
 		P2P: settings.P2PSettings{
 			BanThreshold: 100,
 			BanDuration:  24 * time.Hour,
-			DisableNAT:   true, // Disable NAT in tests to prevent data races in libp2p
+			EnableNAT:    false, // Disable NAT in tests to prevent data races in libp2p
 		},
 	}
 
