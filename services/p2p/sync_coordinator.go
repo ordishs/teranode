@@ -346,7 +346,15 @@ func (sc *SyncCoordinator) handleFSMTransition(currentState *blockchain_api.FSMS
 			localHeight := sc.getLocalHeightSafe()
 			peerInfo, exists := sc.registry.GetPeer(currentPeer)
 
-			if exists && peerInfo.Height > localHeight {
+			if !exists {
+				// Peer no longer exists in registry (likely disconnected)
+				sc.logger.Infof("[SyncCoordinator] Sync peer %s no longer in registry, clearing", currentPeer)
+				sc.ClearSyncPeer()
+				_ = sc.TriggerSync()
+				return true // Transition handled
+			}
+
+			if peerInfo.Height > localHeight {
 				// Only consider it a failure if we're still behind the sync peer
 				sc.logger.Infof("[SyncCoordinator] Sync with peer %s considered failed (local height: %d < peer height: %d)",
 					currentPeer, localHeight, peerInfo.Height)
