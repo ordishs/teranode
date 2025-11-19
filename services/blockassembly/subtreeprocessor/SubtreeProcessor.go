@@ -1193,7 +1193,7 @@ func (stp *SubtreeProcessor) InitCurrentBlockHeader(blockHeader *model.BlockHead
 // Returns:
 //   - error: Any error encountered during addition
 func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.TxInpoints, skipNotification bool) (err error) {
-	// parent can only be set to nil, when they are already in the map
+	// parents can only be set to nil, when they are already in the map
 	if parents == nil {
 		if _, ok := stp.currentTxMap.Get(node.Hash); !ok {
 			return errors.NewProcessingError("error adding node to subtree: txInpoints not found in currentTxMap for %s", node.Hash.String())
