@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -21,23 +22,44 @@ func NewPeerRegistry() *PeerRegistry {
 	}
 }
 
-// AddPeer adds or updates a peer
-func (pr *PeerRegistry) AddPeer(id peer.ID, clientName string) {
+// AddPeer adds or updates a peer atomically
+func (pr *PeerRegistry) AddPeer(id peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
+	now := time.Now()
+
 	if _, exists := pr.peers[id]; !exists {
-		now := time.Now()
 		pr.peers[id] = &PeerInfo{
 			ID:              id,
 			ClientName:      clientName,
+			Height:          height,
+			BlockHash:       blockHash,
+			DataHubURL:      dataHubURL,
 			ConnectedAt:     now,
 			LastMessageTime: now,  // Initialize to connection time
 			ReputationScore: 50.0, // Start with neutral reputation
 		}
-	} else if clientName != "" {
-		// Update client name if provided for existing peer
-		pr.peers[id].ClientName = clientName
+	} else {
+		info := pr.peers[id]
+
+		if clientName != "" {
+			info.ClientName = clientName
+		}
+
+		if height > 0 {
+			info.Height = height
+		}
+
+		if blockHash != nil {
+			info.BlockHash = blockHash
+		}
+
+		if dataHubURL != "" {
+			info.DataHubURL = dataHubURL
+		}
+
+		info.LastMessageTime = now
 	}
 }
 
@@ -75,27 +97,6 @@ func (pr *PeerRegistry) GetAllPeers() []*PeerInfo {
 		result = append(result, &copy)
 	}
 	return result
-}
-
-// UpdateHeight updates a peer's height
-func (pr *PeerRegistry) UpdateHeight(id peer.ID, height int32, blockHash string) {
-	pr.mu.Lock()
-	defer pr.mu.Unlock()
-
-	if info, exists := pr.peers[id]; exists {
-		info.Height = height
-		info.BlockHash = blockHash
-	}
-}
-
-// UpdateBlockHash updates only the peer's block hash
-func (pr *PeerRegistry) UpdateBlockHash(id peer.ID, blockHash string) {
-	pr.mu.Lock()
-	defer pr.mu.Unlock()
-
-	if info, exists := pr.peers[id]; exists {
-		info.BlockHash = blockHash
-	}
 }
 
 // UpdateDataHubURL updates a peer's DataHub URL

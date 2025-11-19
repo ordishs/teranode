@@ -1125,7 +1125,7 @@ func TestBlessMissingTransaction(t *testing.T) {
 
 		// Call blessMissingTransaction
 		validatorOptions := validator.ProcessOptions()
-		_, _ = server.blessMissingTransaction(context.Background(), blockHash, tx, 100, blockIds, validatorOptions)
+		_, _ = server.blessMissingTransaction(context.Background(), blockHash, blockHash, tx, 100, blockIds, validatorOptions)
 	})
 }
 

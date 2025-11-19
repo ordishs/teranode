@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
@@ -231,9 +232,9 @@ func (sc *SyncCoordinator) HandleCatchupFailure(reason string) {
 // selectNewSyncPeer selects a new sync peer based on current criteria
 func (sc *SyncCoordinator) selectNewSyncPeer() peer.ID {
 	// Get local height
-	localHeight := int32(0)
+	localHeight := uint32(0)
 	if sc.getLocalHeight != nil {
-		localHeight = int32(sc.getLocalHeight())
+		localHeight = sc.getLocalHeight()
 	}
 
 	// Get current sync peer to pass as previous peer
@@ -243,7 +244,7 @@ func (sc *SyncCoordinator) selectNewSyncPeer() peer.ID {
 
 	// Build selection criteria
 	criteria := SelectionCriteria{
-		LocalHeight:         localHeight,
+		LocalHeight:         int32(localHeight),
 		PreviousPeer:        previousPeer,
 		SyncAttemptCooldown: 1 * time.Minute, // Don't retry peers for at least 1 minute
 	}
@@ -398,15 +399,15 @@ func (sc *SyncCoordinator) handleRunningState(ctx context.Context) {
 }
 
 // getLocalHeightSafe safely gets the local blockchain height
-func (sc *SyncCoordinator) getLocalHeightSafe() int32 {
+func (sc *SyncCoordinator) getLocalHeightSafe() uint32 {
 	if sc.getLocalHeight != nil {
-		return int32(sc.getLocalHeight())
+		return sc.getLocalHeight()
 	}
 	return 0
 }
 
 // selectAndActivateNewPeer selects a new sync peer and activates it
-func (sc *SyncCoordinator) selectAndActivateNewPeer(localHeight int32, oldPeer peer.ID) {
+func (sc *SyncCoordinator) selectAndActivateNewPeer(localHeight uint32, oldPeer peer.ID) {
 	// Clear current sync peer
 	sc.ClearSyncPeer()
 
@@ -426,7 +427,7 @@ func (sc *SyncCoordinator) selectAndActivateNewPeer(localHeight int32, oldPeer p
 
 	// Select from eligible peers
 	criteria := SelectionCriteria{
-		LocalHeight: localHeight,
+		LocalHeight: int32(localHeight),
 	}
 
 	newSyncPeer := sc.selector.SelectSyncPeer(eligiblePeers, criteria)
@@ -441,7 +442,7 @@ func (sc *SyncCoordinator) selectAndActivateNewPeer(localHeight int32, oldPeer p
 }
 
 // filterEligiblePeers filters peers that are eligible for syncing
-func (sc *SyncCoordinator) filterEligiblePeers(peers []*PeerInfo, oldPeer peer.ID, localHeight int32) []*PeerInfo {
+func (sc *SyncCoordinator) filterEligiblePeers(peers []*PeerInfo, oldPeer peer.ID, localHeight uint32) []*PeerInfo {
 	eligiblePeers := make([]*PeerInfo, 0, len(peers))
 	for _, p := range peers {
 		// Skip the old peer and peers not ahead of us
@@ -559,7 +560,7 @@ func (sc *SyncCoordinator) evaluateSyncPeer() {
 	// Check if we've caught up
 	if sc.getLocalHeight != nil {
 		localHeight := int32(sc.getLocalHeight())
-		if localHeight >= peerInfo.Height && peerInfo.Height > 0 {
+		if uint32(localHeight) >= peerInfo.Height && peerInfo.Height > 0 {
 			sc.logger.Infof("[SyncCoordinator] Caught up to sync peer %s (height %d)",
 				currentPeer, localHeight)
 			// Don't clear peer yet, but look for better peer
@@ -572,11 +573,8 @@ func (sc *SyncCoordinator) evaluateSyncPeer() {
 }
 
 // UpdatePeerInfo updates peer information
-func (sc *SyncCoordinator) UpdatePeerInfo(peerID peer.ID, height int32, blockHash string, dataHubURL string) {
-	sc.registry.UpdateHeight(peerID, height, blockHash)
-	if dataHubURL != "" {
-		sc.registry.UpdateDataHubURL(peerID, dataHubURL)
-	}
+func (sc *SyncCoordinator) UpdatePeerInfo(peerID peer.ID, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
+	sc.registry.AddPeer(peerID, "", height, blockHash, dataHubURL)
 }
 
 // UpdateBanStatus updates ban status from ban manager
@@ -798,8 +796,8 @@ func (sc *SyncCoordinator) sendSyncMessage(peerID peer.ID) error {
 	var bestHash string
 	if sc.registry != nil {
 		if peerInfo, exists := sc.registry.GetPeer(peerID); exists {
-			bestHash = peerInfo.BlockHash
-			if bestHash != "" {
+			if peerInfo.BlockHash != nil {
+				bestHash = peerInfo.BlockHash.String()
 				sc.logger.Infof("[sendSyncMessage] Found block hash %s for peer %s", bestHash, peerID)
 			} else {
 				sc.logger.Warnf("[sendSyncMessage] No block hash found in registry for peer %s", peerID)
@@ -814,8 +812,7 @@ func (sc *SyncCoordinator) sendSyncMessage(peerID peer.ID) error {
 		sc.logger.Infof("[sendSyncMessage] Sending sync trigger to Kafka for peer %s with hash %s", peerID, bestHash)
 		sc.sendSyncTriggerToKafka(peerID, bestHash)
 		return nil
-	} else {
-		sc.logger.Errorf("[sendSyncMessage] Cannot send sync - no best block hash available for peer %s", peerID)
-		return errors.NewServiceError(fmt.Sprintf("no block hash available for peer %s", peerID))
 	}
+	sc.logger.Errorf("[sendSyncMessage] Cannot send sync - no best block hash available for peer %s", peerID)
+	return errors.NewServiceError(fmt.Sprintf("no block hash available for peer %s", peerID))
 }

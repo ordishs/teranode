@@ -572,8 +572,7 @@ func (u *Server) readTransactionsFromSubtreeDataStream(subtree *subtreepkg.Subtr
 
 // processTransactionsInLevels processes all transactions from all subtrees using level-based validation
 // This ensures transactions are processed in dependency order while maximizing parallelism
-func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx,
-	blockHeight uint32, blockIds map[uint32]bool) error {
+func (u *Server) processTransactionsInLevels(ctx context.Context, allTransactions []*bt.Tx, blockHash chainhash.Hash, blockHeight uint32, blockIds map[uint32]bool) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "processTransactionsInLevels",
 		tracing.WithParentStat(u.stats),
 		tracing.WithLogMessage(u.logger, "[processTransactionsInLevels] Processing %d transactions at block height %d", len(allTransactions), blockHeight),

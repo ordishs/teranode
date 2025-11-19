@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/services/p2p/p2p_api"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -29,10 +30,9 @@ func TestDistributedCatchupMetrics_RecordAttempt(t *testing.T) {
 	testPeerID, err := peer.Decode("12D3KooWBPqTBhshqRZMKZtqb5sfgckM9JYkWDR7eW5kSPEKwKCW")
 	require.NoError(t, err)
 
-	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	// Add peer to registry with all data atomically
+	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, testHash, "http://localhost:8090")
 
 	// Verify initial state
 	info, exists := p2pRegistry.GetPeer(testPeerID)
@@ -71,9 +71,7 @@ func TestDistributedCatchupMetrics_RecordSuccess(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, nil, "http://localhost:8090")
 
 	// Record first success with 100ms duration
 	req1 := &p2p_api.RecordCatchupSuccessRequest{
@@ -123,9 +121,7 @@ func TestDistributedCatchupMetrics_RecordFailure(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, nil, "http://localhost:8090")
 
 	// Record failure via gRPC handler
 	req := &p2p_api.RecordCatchupFailureRequest{
@@ -157,9 +153,7 @@ func TestDistributedCatchupMetrics_RecordMalicious(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, nil, "http://localhost:8090")
 
 	// Record malicious behavior
 	req := &p2p_api.RecordCatchupMaliciousRequest{
@@ -190,9 +184,7 @@ func TestDistributedCatchupMetrics_UpdateReputation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, nil, "http://localhost:8090")
 
 	// Update reputation score
 	req := &p2p_api.UpdateCatchupReputationRequest{
@@ -225,19 +217,13 @@ func TestDistributedCatchupMetrics_GetPeersForCatchup(t *testing.T) {
 	peer3ID, _ := peer.Decode("12D3KooWJpBNhwgvoZ15EB1JwRTRpxgM9NVaqpDtWZXfTf6CpCQd")
 
 	// Add peers with different characteristics
-	p2pRegistry.AddPeer(peer1ID, "")
-	p2pRegistry.UpdateHeight(peer1ID, 1000, "hash1")
-	p2pRegistry.UpdateDataHubURL(peer1ID, "http://peer1:8090")
+	p2pRegistry.AddPeer(peer1ID, "", 1000, nil, "http://peer1:8090")
 	p2pRegistry.UpdateReputation(peer1ID, 95.0) // Best
 
-	p2pRegistry.AddPeer(peer2ID, "")
-	p2pRegistry.UpdateHeight(peer2ID, 1001, "hash2")
-	p2pRegistry.UpdateDataHubURL(peer2ID, "http://peer2:8090")
+	p2pRegistry.AddPeer(peer2ID, "", 1001, nil, "http://peer2:8090")
 	p2pRegistry.UpdateReputation(peer2ID, 85.0) // Second best
 
-	p2pRegistry.AddPeer(peer3ID, "")
-	p2pRegistry.UpdateHeight(peer3ID, 999, "hash3")
-	p2pRegistry.UpdateDataHubURL(peer3ID, "http://peer3:8090")
+	p2pRegistry.AddPeer(peer3ID, "", 999, nil, "http://peer3:8090")
 	p2pRegistry.UpdateReputation(peer3ID, 75.0) // Third
 
 	// Query for peers suitable for catchup
@@ -277,9 +263,7 @@ func TestDistributedCatchupMetrics_ReputationCalculation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, nil, "http://localhost:8090")
 
 	// Initial reputation should be 50.0 (neutral)
 	info, exists := p2pRegistry.GetPeer(testPeerID)
@@ -375,9 +359,7 @@ func TestDistributedCatchupMetrics_ConcurrentUpdates(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, nil, "http://localhost:8090")
 
 	// Simulate concurrent updates from multiple BlockValidation instances
 	const numGoroutines = 10
@@ -473,9 +455,7 @@ func TestReportValidSubtree_IncreasesReputation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry with initial state
-	p2pRegistry.AddPeer(testPeerID, "")
-	p2pRegistry.UpdateHeight(testPeerID, 1000, "test_hash")
-	p2pRegistry.UpdateDataHubURL(testPeerID, "http://localhost:8090")
+	p2pRegistry.AddPeer(testPeerID, "", 1000, nil, "http://localhost:8090")
 
 	// Verify initial reputation (should be neutral at 50.0)
 	info, exists := p2pRegistry.GetPeer(testPeerID)
@@ -544,7 +524,7 @@ func TestReportValidSubtree_GRPCEndpoint(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add peer to registry
-	p2pRegistry.AddPeer(testPeerID, "")
+	p2pRegistry.AddPeer(testPeerID, "", 0, nil, "")
 
 	// Test valid request returns success
 	req := &p2p_api.ReportValidSubtreeRequest{

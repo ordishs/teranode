@@ -840,7 +840,8 @@ func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string,
 		s.logger.Errorf("failed to decode sender peer ID %s: %v", from, err)
 		return
 	}
-	s.addConnectedPeer(senderID, "")
+
+	s.addConnectedPeer(senderID, "", 0, nil, "")
 	s.peerRegistry.UpdateLastMessageTime(senderID)
 
 	// Also update for the originator if different (gossiped message)
@@ -848,7 +849,6 @@ func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string,
 	if originatorPeerID != "" {
 		if peerID, err := peer.Decode(originatorPeerID); err == nil && peerID != senderID {
 			// Add as gossiped peer (not connected) with their client name
-			s.addPeer(peerID, originatorClientName)
 			s.peerRegistry.UpdateLastMessageTime(peerID)
 		}
 	}
@@ -963,30 +963,15 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 			s.logger.Errorf("[handleNodeStatusTopic] failed to decode peer ID %s: %v", nodeStatusMessage.PeerID, err)
 			return
 		}
-		// Ensure this peer is in the registry with client name
-		s.addPeer(peerID, nodeStatusMessage.ClientName)
 
-		// Update sync manager with peer height from node status
-		// Update peer height in registry
-		s.updatePeerHeight(peerID, int32(nodeStatusMessage.BestHeight))
-
-		// Update DataHubURL if provided in the node status message
-		// This is important for peers we learn about through gossip (not directly connected).
-		// When we receive node_status messages forwarded by other peers, we still need to
-		// store the DataHubURL so we can potentially sync from them later if we establish
-		// a direct connection.
-		if nodeStatusMessage.BaseURL != "" {
-			s.updateDataHubURL(peerID, nodeStatusMessage.BaseURL)
-			s.logger.Debugf("[handleNodeStatusTopic] Updated DataHub URL %s for peer %s", nodeStatusMessage.BaseURL, peerID)
+		hash, err := chainhash.NewHashFromStr(nodeStatusMessage.BestBlockHash)
+		if err != nil {
+			s.logger.Warnf("[handleNodeStatusTopic] failed to create hash from best block hash %s: %v", nodeStatusMessage.BestBlockHash, err)
+			return
 		}
 
-		// Update block hash if provided
-		// Similar to DataHubURL, we store the best block hash from gossiped peers
-		// to maintain a complete picture of the network state
-		if nodeStatusMessage.BestBlockHash != "" {
-			s.updateBlockHash(peerID, nodeStatusMessage.BestBlockHash)
-			s.logger.Debugf("[handleNodeStatusTopic] Updated block hash %s for peer %s", nodeStatusMessage.BestBlockHash, peerID)
-		}
+		s.addPeer(peerID, nodeStatusMessage.ClientName, nodeStatusMessage.BestHeight, hash, nodeStatusMessage.BaseURL)
+		s.logger.Debugf("[handleNodeStatusTopic] Updated block hash %s for peer %s", nodeStatusMessage.BestBlockHash, peerID)
 
 		// Update storage mode if provided
 		// Store whether the peer is a full node or pruned node
@@ -999,7 +984,7 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 	// Also ensure the sender is in the registry
 	if !isSelf && from != "" {
 		if senderID, err := peer.Decode(from); err == nil {
-			s.addPeer(senderID, "")
+			s.addPeer(senderID, "", 0, nil, "")
 		}
 	}
 }
@@ -1139,7 +1124,7 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 
 	// Get sync peer information
 	syncPeerID := ""
-	syncPeerHeight := int32(0)
+	syncPeerHeight := uint32(0)
 	syncPeerBlockHash := ""
 	syncConnectedAt := int64(0)
 
@@ -1164,7 +1149,10 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 				if peerInfo.ID == syncPeer.String() {
 					// Get the peer's best block hash from registry
 					if pInfo, exists := s.getPeer(syncPeer); exists {
-						syncPeerBlockHash = pInfo.BlockHash
+						if pInfo.BlockHash != nil {
+							syncPeerBlockHash = pInfo.BlockHash.String()
+						}
+
 						syncPeerHeight = pInfo.Height
 					}
 					break
@@ -1937,10 +1925,15 @@ func (s *Server) GetPeerRegistry(_ context.Context, _ *emptypb.Empty) (*p2p_api.
 	// Convert to protobuf format
 	peers := make([]*p2p_api.PeerRegistryInfo, 0, len(allPeers))
 	for _, p := range allPeers {
+		blockHashStr := ""
+		if p.BlockHash != nil {
+			blockHashStr = p.BlockHash.String()
+		}
+
 		peers = append(peers, &p2p_api.PeerRegistryInfo{
 			Id:              p.ID.String(),
 			Height:          p.Height,
-			BlockHash:       p.BlockHash,
+			BlockHash:       blockHashStr,
 			DataHubUrl:      p.DataHubURL,
 			BanScore:        int32(p.BanScore),
 			IsBanned:        p.IsBanned,
@@ -2011,10 +2004,15 @@ func (s *Server) GetPeer(_ context.Context, req *p2p_api.GetPeerRequest) (*p2p_a
 	}
 
 	// Convert to protobuf format
+	blockHashStr := ""
+	if peerInfo.BlockHash != nil {
+		blockHashStr = peerInfo.BlockHash.String()
+	}
+
 	peerRegistryInfo := &p2p_api.PeerRegistryInfo{
 		Id:              peerInfo.ID.String(),
 		Height:          peerInfo.Height,
-		BlockHash:       peerInfo.BlockHash,
+		BlockHash:       blockHashStr,
 		DataHubUrl:      peerInfo.DataHubURL,
 		BanScore:        int32(peerInfo.BanScore),
 		IsBanned:        peerInfo.IsBanned,

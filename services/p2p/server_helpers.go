@@ -90,28 +90,13 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 
 	// Store the peer ID that sent this block
 	s.storePeerMapEntry(&s.blockPeerMap, blockMessage.Hash, from, now)
+
 	s.logger.Debugf("[handleBlockTopic] storing peer %s for block %s", from, blockMessage.Hash)
 
-	// Store the peer's latest block hash from block announcement
-	if blockMessage.Hash != "" {
-		// Store using the originator's peer ID
-		if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
-			s.updateBlockHash(peerID, blockMessage.Hash)
-			s.logger.Debugf("[handleBlockTopic] Stored latest block hash %s for peer %s", blockMessage.Hash, peerID)
-		}
-		// Also store using the immediate sender for redundancy
-		if peerID, err := peer.Decode(from); err == nil {
-			s.updateBlockHash(peerID, blockMessage.Hash)
-			s.logger.Debugf("[handleBlockTopic] Stored latest block hash %s for sender %s", blockMessage.Hash, from)
-		}
-	}
-
-	// Update peer height if provided
-	if blockMessage.Height > 0 {
-		// Update peer height in registry
-		if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
-			s.updatePeerHeight(peerID, int32(blockMessage.Height))
-		}
+	// Store using the originator's peer ID
+	if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
+		s.addPeer(peerID, blockMessage.ClientName, blockMessage.Height, hash, blockMessage.DataHubURL)
+		s.logger.Debugf("[handleBlockTopic] Stored latest block hash %s for peer %s", blockMessage.Hash, peerID)
 	}
 
 	// Always send block to kafka - let block validation service decide what to do based on sync state
@@ -481,44 +466,16 @@ func (s *Server) getLocalHeight() uint32 {
 	return bhMeta.Height
 }
 
-// sendSyncTriggerToKafka sends a sync trigger message to Kafka for the given peer and block hash.
-
-// Compatibility methods to ease migration from old architecture
-
-func (s *Server) updatePeerHeight(peerID peer.ID, height int32) {
-	// Update in registry and coordinator
+func (s *Server) addPeer(peerID peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	if s.peerRegistry != nil {
-		// Ensure peer exists in registry
-		s.addPeer(peerID, "")
-
-		// Get the existing block hash from registry
-		blockHash := ""
-		if peerInfo, exists := s.getPeer(peerID); exists {
-			blockHash = peerInfo.BlockHash
-		}
-		s.peerRegistry.UpdateHeight(peerID, height, blockHash)
-
-		// Also update sync coordinator if it exists
-		if s.syncCoordinator != nil {
-			dataHubURL := ""
-			if peerInfo, exists := s.getPeer(peerID); exists {
-				dataHubURL = peerInfo.DataHubURL
-			}
-			s.syncCoordinator.UpdatePeerInfo(peerID, height, blockHash, dataHubURL)
-		}
-	}
-}
-
-func (s *Server) addPeer(peerID peer.ID, clientName string) {
-	if s.peerRegistry != nil {
-		s.peerRegistry.AddPeer(peerID, clientName)
+		s.peerRegistry.AddPeer(peerID, clientName, height, blockHash, dataHubURL)
 	}
 }
 
 // addConnectedPeer adds a peer and marks it as directly connected
-func (s *Server) addConnectedPeer(peerID peer.ID, clientName string) {
+func (s *Server) addConnectedPeer(peerID peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	if s.peerRegistry != nil {
-		s.peerRegistry.AddPeer(peerID, clientName)
+		s.peerRegistry.AddPeer(peerID, clientName, height, blockHash, dataHubURL)
 		s.peerRegistry.UpdateConnectionState(peerID, true)
 	}
 }
@@ -526,18 +483,22 @@ func (s *Server) addConnectedPeer(peerID peer.ID, clientName string) {
 // InjectPeerForTesting directly injects a peer into the registry for testing purposes.
 // This method allows deterministic peer setup without requiring actual P2P network connections.
 func (s *Server) InjectPeerForTesting(peerID peer.ID, clientName, dataHubURL string, height uint32, blockHash string) {
-	s.addConnectedPeer(peerID, clientName)
-	s.updateDataHubURL(peerID, dataHubURL)
-	s.updateBlockHash(peerID, blockHash)
-	s.updatePeerHeight(peerID, int32(height))
+	// Parse block hash
+	hash, err := chainhash.NewHashFromStr(blockHash)
+	if err != nil {
+		hash = nil
+	}
 
+	// Add peer atomically with all initial data
 	if s.peerRegistry != nil {
+		s.peerRegistry.AddPeer(peerID, clientName, height, hash, dataHubURL)
+		s.peerRegistry.UpdateConnectionState(peerID, true)
 		s.peerRegistry.UpdateURLResponsiveness(peerID, true)
 		s.peerRegistry.UpdateStorage(peerID, "full")
 	}
 
 	if s.syncCoordinator != nil {
-		s.syncCoordinator.UpdatePeerInfo(peerID, int32(height), blockHash, dataHubURL)
+		s.syncCoordinator.UpdatePeerInfo(peerID, height, hash, dataHubURL)
 	}
 }
 
@@ -549,12 +510,6 @@ func (s *Server) removePeer(peerID peer.ID) {
 	}
 	if s.syncCoordinator != nil {
 		s.syncCoordinator.HandlePeerDisconnected(peerID)
-	}
-}
-
-func (s *Server) updateBlockHash(peerID peer.ID, blockHash string) {
-	if s.peerRegistry != nil && blockHash != "" {
-		s.peerRegistry.UpdateBlockHash(peerID, blockHash)
 	}
 }
 
@@ -571,13 +526,6 @@ func (s *Server) getSyncPeer() peer.ID {
 		return s.syncCoordinator.GetCurrentSyncPeer()
 	}
 	return ""
-}
-
-// updateDataHubURL updates peer DataHub URL in the registry
-func (s *Server) updateDataHubURL(peerID peer.ID, url string) {
-	if s.peerRegistry != nil && url != "" {
-		s.peerRegistry.UpdateDataHubURL(peerID, url)
-	}
 }
 
 // updateStorage updates peer storage mode in the registry
@@ -856,6 +804,7 @@ func (s *Server) parseHash(hashStr string, context string) (*chainhash.Hash, err
 		s.logger.Errorf("[%s] error getting chainhash from string %s: %v", context, hashStr, err)
 		return nil, err
 	}
+
 	return hash, nil
 }
 
@@ -874,7 +823,7 @@ func (s *Server) shouldSkipDuringSync(from string, originatorPeerID string, mess
 	// Get sync peer's height from registry
 	syncPeerHeight := int32(0)
 	if peerInfo, exists := s.getPeer(syncPeer); exists {
-		syncPeerHeight = peerInfo.Height
+		syncPeerHeight = int32(peerInfo.Height)
 	}
 
 	// Discard announcements from peers that are behind our sync peer

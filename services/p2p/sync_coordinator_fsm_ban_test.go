@@ -34,8 +34,7 @@ func TestSyncCoordinator_FSMTransitionBansPeerAndUpdatesRegistry(t *testing.T) {
 
 	// Add a peer that will fail during catchup
 	failingPeer := peer.ID("failing-peer")
-	registry.AddPeer(failingPeer, "")
-	registry.UpdateHeight(failingPeer, 200, "hash200")
+	registry.AddPeer(failingPeer, "", 200, nil, "")
 	registry.UpdateDataHubURL(failingPeer, "http://failing.test")
 	registry.UpdateReputation(failingPeer, 80.0)
 	registry.UpdateURLResponsiveness(failingPeer, true)
@@ -43,8 +42,7 @@ func TestSyncCoordinator_FSMTransitionBansPeerAndUpdatesRegistry(t *testing.T) {
 
 	// Add an alternative peer
 	goodPeer := peer.ID("good-peer")
-	registry.AddPeer(goodPeer, "")
-	registry.UpdateHeight(goodPeer, 190, "hash190")
+	registry.AddPeer(goodPeer, "", 190, nil, "")
 	registry.UpdateDataHubURL(goodPeer, "http://good.test")
 	registry.UpdateReputation(goodPeer, 80.0)
 	registry.UpdateURLResponsiveness(goodPeer, true)
@@ -94,6 +92,7 @@ func TestSyncCoordinator_BannedPeerNotReselected(t *testing.T) {
 	selector := NewPeerSelector(logger, nil)
 	banManager := NewPeerBanManager(context.Background(), nil, settings, registry)
 	blockchainSetup := SetupTestBlockchain(t)
+
 	defer blockchainSetup.Cleanup()
 
 	sc := NewSyncCoordinator(
@@ -108,9 +107,7 @@ func TestSyncCoordinator_BannedPeerNotReselected(t *testing.T) {
 
 	// Add a peer with highest height but it's banned
 	bannedPeer := peer.ID("banned-peer")
-	registry.AddPeer(bannedPeer, "")
-	registry.UpdateHeight(bannedPeer, 300, "hash300")
-	registry.UpdateDataHubURL(bannedPeer, "http://banned.test")
+	registry.AddPeer(bannedPeer, "", 300, nil, "http://banned.test")
 	registry.UpdateReputation(bannedPeer, 80.0)
 	registry.UpdateURLResponsiveness(bannedPeer, true)
 	registry.UpdateStorage(bannedPeer, "full")
@@ -124,17 +121,13 @@ func TestSyncCoordinator_BannedPeerNotReselected(t *testing.T) {
 
 	// Add other peers with lower height
 	peer1 := peer.ID("peer1")
-	registry.AddPeer(peer1, "")
-	registry.UpdateHeight(peer1, 250, "hash250")
-	registry.UpdateDataHubURL(peer1, "http://peer1.test")
+	registry.AddPeer(peer1, "", 250, nil, "http://peer1.test")
 	registry.UpdateReputation(peer1, 80.0)
 	registry.UpdateURLResponsiveness(peer1, true)
 	registry.UpdateStorage(peer1, "full")
 
 	peer2 := peer.ID("peer2")
-	registry.AddPeer(peer2, "")
-	registry.UpdateHeight(peer2, 240, "hash240")
-	registry.UpdateDataHubURL(peer2, "http://peer2.test")
+	registry.AddPeer(peer2, "", 240, nil, "http://peer2.test")
 	registry.UpdateReputation(peer2, 80.0)
 	registry.UpdateURLResponsiveness(peer2, true)
 	registry.UpdateStorage(peer2, "full")

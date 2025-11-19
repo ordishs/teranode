@@ -18,7 +18,7 @@ func TestPeerRegistry_ReputationIncrease_ValidSubtreeReceived(t *testing.T) {
 	peerID := peer.ID("test-peer-subtree")
 
 	// Add peer with neutral reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	initialInfo, _ := pr.GetPeer(peerID)
 	initialReputation := initialInfo.ReputationScore
 	assert.Equal(t, 50.0, initialReputation, "Should start with neutral reputation")
@@ -41,7 +41,7 @@ func TestPeerRegistry_ReputationIncrease_ValidBlockReceived(t *testing.T) {
 	peerID := peer.ID("test-peer-block")
 
 	// Add peer with neutral reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	initialInfo, _ := pr.GetPeer(peerID)
 	initialReputation := initialInfo.ReputationScore
 
@@ -63,7 +63,7 @@ func TestPeerRegistry_ReputationIncrease_SuccessfulCatchup(t *testing.T) {
 	peerID := peer.ID("test-peer-catchup")
 
 	// Add peer with neutral reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	pr.UpdateDataHubURL(peerID, "http://test.com")
 	initialInfo, _ := pr.GetPeer(peerID)
 	initialReputation := initialInfo.ReputationScore
@@ -91,7 +91,7 @@ func TestPeerRegistry_ReputationIncrease_MultipleSuccessfulInteractions(t *testi
 	peerID := peer.ID("test-peer-multiple")
 
 	// Add peer with low reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	pr.UpdateReputation(peerID, 30.0)
 	pr.UpdateDataHubURL(peerID, "http://test.com")
 
@@ -137,7 +137,7 @@ func TestPeerRegistry_ReputationDecrease_InvalidBlockReceived(t *testing.T) {
 	peerID := peer.ID("test-peer-invalid-block")
 
 	// Add peer with good reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	pr.UpdateReputation(peerID, 80.0)
 	initialInfo, _ := pr.GetPeer(peerID)
 	initialReputation := initialInfo.ReputationScore
@@ -160,7 +160,7 @@ func TestPeerRegistry_ReputationDecrease_InvalidForkDetected(t *testing.T) {
 	peerID := peer.ID("test-peer-invalid-fork")
 
 	// Add peer with excellent reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	pr.UpdateReputation(peerID, 90.0)
 	pr.UpdateDataHubURL(peerID, "http://test.com")
 
@@ -191,7 +191,7 @@ func TestPeerRegistry_ReputationDecrease_MultipleFailures(t *testing.T) {
 	peerID := peer.ID("test-peer-multiple-failures")
 
 	// Add peer with good reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	pr.UpdateReputation(peerID, 75.0)
 
 	// Record 1 success to establish a baseline
@@ -223,7 +223,7 @@ func TestPeerRegistry_ReputationDecrease_CatchupFailure(t *testing.T) {
 	peerID := peer.ID("test-peer-catchup-failure")
 
 	// Add peer with neutral reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	initialInfo, _ := pr.GetPeer(peerID)
 	initialReputation := initialInfo.ReputationScore
 
@@ -295,7 +295,7 @@ func TestPeerRegistry_ReputationCalculation_SuccessRate(t *testing.T) {
 			pr := NewPeerRegistry()
 			peerID := peer.ID("test-peer-" + tt.name)
 
-			pr.AddPeer(peerID, "")
+			pr.AddPeer(peerID, "", 0, nil, "")
 
 			// Record interactions
 			for i := int64(0); i < tt.successes; i++ {
@@ -320,7 +320,7 @@ func TestPeerRegistry_ReputationCalculation_RecencyBonus(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-recency-bonus")
 
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 
 	// Establish 50% success rate (5 successes, 5 failures)
 	for i := 0; i < 5; i++ {
@@ -352,7 +352,7 @@ func TestPeerRegistry_ReputationCalculation_RecencyPenalty(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-recency-penalty")
 
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 
 	// Establish 75% success rate (6 successes, 2 failures)
 	for i := 0; i < 6; i++ {
@@ -384,7 +384,7 @@ func TestPeerRegistry_ReputationCalculation_MaliciousCap(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-malicious-cap")
 
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	pr.UpdateReputation(peerID, 90.0)
 
 	// Record malicious behavior
@@ -413,7 +413,7 @@ func TestPeerRegistry_ReconsiderBadPeers_ReputationRecovery(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-recovery")
 
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 
 	// Create peer with very low reputation due to failures (90% failure rate)
 	// Record 1 success first, then 9 failures (so last interaction is a failure)
@@ -447,7 +447,7 @@ func TestPeerRegistry_ReconsiderBadPeers_ExponentialCooldown(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-exponential")
 
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 
 	// Create peer with low reputation (90% failure rate, last interaction is failure)
 	pr.RecordInteractionAttempt(peerID)
@@ -491,7 +491,7 @@ func TestPeerRegistry_ReputationRecovery_AfterInvalidBlock(t *testing.T) {
 	peerID := peer.ID("test-peer-recovery-after-invalid")
 
 	// Add peer with good reputation
-	pr.AddPeer(peerID, "")
+	pr.AddPeer(peerID, "", 0, nil, "")
 	pr.UpdateReputation(peerID, 80.0)
 	pr.UpdateDataHubURL(peerID, "http://test.com")
 

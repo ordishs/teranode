@@ -117,15 +117,21 @@ func (s *Server) GetPeersForCatchup(_ context.Context, _ *p2p_api.GetPeersForCat
 
 	// Convert to proto format
 	protoPeers := make([]*p2p_api.PeerInfoForCatchup, 0, len(peers))
+
 	for _, p := range peers {
 		// Calculate total attempts as sum of successes and failures
 		// InteractionAttempts is a separate counter that may not match
 		totalAttempts := p.InteractionSuccesses + p.InteractionFailures
 
+		blockHashStr := ""
+		if p.BlockHash != nil {
+			blockHashStr = p.BlockHash.String()
+		}
+
 		protoPeers = append(protoPeers, &p2p_api.PeerInfoForCatchup{
 			Id:                     p.ID.String(),
 			Height:                 p.Height,
-			BlockHash:              p.BlockHash,
+			BlockHash:              blockHashStr,
 			DataHubUrl:             p.DataHubURL,
 			CatchupReputationScore: p.ReputationScore,
 			CatchupAttempts:        totalAttempts,          // Use calculated total, not InteractionAttempts

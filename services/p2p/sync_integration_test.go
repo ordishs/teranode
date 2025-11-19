@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,24 +32,21 @@ func TestSyncCoordination_FullFlow(t *testing.T) {
 
 	// Add healthy peer with DataHub URL
 	healthyPeer := peer.ID("healthy")
-	registry.AddPeer(healthyPeer, "")
-	registry.UpdateHeight(healthyPeer, 1000, "hash1000")
-	registry.UpdateDataHubURL(healthyPeer, "http://healthy.test")
+	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+	registry.AddPeer(healthyPeer, "", 1000, testHash, "http://healthy.test")
 	registry.UpdateReputation(healthyPeer, 80.0)
 	registry.UpdateURLResponsiveness(healthyPeer, true)
 	registry.UpdateStorage(healthyPeer, "full")
 
 	// Add unhealthy peer
 	unhealthyPeer := peer.ID("unhealthy")
-	registry.AddPeer(unhealthyPeer, "")
-	registry.UpdateHeight(unhealthyPeer, 900, "hash900")
+	registry.AddPeer(unhealthyPeer, "", 900, nil, "")
 	registry.UpdateReputation(unhealthyPeer, 15.0)
 
 	// Add banned peer
 	bannedPeer := peer.ID("banned")
-	registry.AddPeer(bannedPeer, "")
-	registry.UpdateHeight(bannedPeer, 1100, "hash1100")
-	registry.UpdateDataHubURL(bannedPeer, "http://banned.test")
+	testHash, _ = chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+	registry.AddPeer(bannedPeer, "", 1100, testHash, "http://banned.test")
 	registry.UpdateReputation(bannedPeer, 80.0)
 	banManager.AddScore(string(bannedPeer), ReasonSpam) // Ban the peer
 	registry.UpdateBanStatus(bannedPeer, 50, true)
@@ -91,9 +89,8 @@ func TestSyncCoordination_FullFlow(t *testing.T) {
 	t.Run("HandlePeerDisconnected_SelectsNewPeer", func(t *testing.T) {
 		// Add another healthy peer
 		newHealthyPeer := peer.ID("newhealthy")
-		registry.AddPeer(newHealthyPeer, "")
-		registry.UpdateHeight(newHealthyPeer, 1050, "hash1050")
-		registry.UpdateDataHubURL(newHealthyPeer, "http://newhealthy.test")
+		testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+		registry.AddPeer(newHealthyPeer, "", 1050, testHash, "http://newhealthy.test")
 		registry.UpdateReputation(newHealthyPeer, 80.0)
 		registry.UpdateURLResponsiveness(newHealthyPeer, true)
 		registry.UpdateStorage(newHealthyPeer, "full")
@@ -117,8 +114,7 @@ func TestSyncCoordination_FullFlow(t *testing.T) {
 		// If no peer, add one and select it
 		if currentPeer == "" {
 			testPeer := peer.ID("ban-test")
-			registry.AddPeer(testPeer, "")
-			registry.UpdateHeight(testPeer, 10000, "hash10000") // Very high to ensure selection
+			registry.AddPeer(testPeer, "", 10000, nil, "") // Very high to ensure selection
 			registry.UpdateDataHubURL(testPeer, "http://ban-test.com")
 			registry.UpdateReputation(testPeer, 80.0)
 			registry.UpdateURLResponsiveness(testPeer, true)
@@ -233,8 +229,7 @@ func TestSyncCoordination_WithHTTPServer(t *testing.T) {
 
 	// Add peer with test server URL
 	testPeer := peer.ID("httptest")
-	registry.AddPeer(testPeer, "")
-	registry.UpdateHeight(testPeer, 1000, "hash1000")
+	registry.AddPeer(testPeer, "", 1000, nil, "")
 	registry.UpdateDataHubURL(testPeer, server.URL)
 	registry.UpdateReputation(testPeer, 80.0)
 
@@ -292,8 +287,7 @@ func TestSyncCoordination_ConcurrentOperations(t *testing.T) {
 	// Add multiple peers
 	for i := 0; i < 20; i++ {
 		peerID := peer.ID(string(rune('A' + i)))
-		registry.AddPeer(peerID, "")
-		registry.UpdateHeight(peerID, int32(1000+i*10), "hash")
+		registry.AddPeer(peerID, "", uint32(1000+i*10), nil, "")
 		registry.UpdateReputation(peerID, func() float64 {
 			if i%3 != 0 {
 				return 80.0
@@ -340,7 +334,7 @@ func TestSyncCoordination_ConcurrentOperations(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
 				peerID := peer.ID(string(rune('A' + (id*2+j)%20)))
-				coordinator.UpdatePeerInfo(peerID, int32(1100+j), "newhash", "")
+				coordinator.UpdatePeerInfo(peerID, uint32(1100+j), nil, "")
 				time.Sleep(20 * time.Millisecond)
 			}
 		}(i)
@@ -392,17 +386,15 @@ func TestSyncCoordination_CatchupFailures(t *testing.T) {
 
 	// Add test peers
 	goodPeer := peer.ID("good")
-	registry.AddPeer(goodPeer, "")
-	registry.UpdateHeight(goodPeer, 1000, "hash1000")
-	registry.UpdateDataHubURL(goodPeer, "http://good.test")
+	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+	registry.AddPeer(goodPeer, "", 1000, testHash, "http://good.test")
 	registry.UpdateReputation(goodPeer, 80.0)
 	registry.UpdateURLResponsiveness(goodPeer, true)
 	registry.UpdateStorage(goodPeer, "full")
 
 	badPeer := peer.ID("bad")
-	registry.AddPeer(badPeer, "")
-	registry.UpdateHeight(badPeer, 1100, "hash1100")
-	registry.UpdateDataHubURL(badPeer, "http://bad.test")
+	testHash, _ = chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+	registry.AddPeer(badPeer, "", 1100, testHash, "http://bad.test")
 	registry.UpdateReputation(badPeer, 80.0)
 	registry.UpdateURLResponsiveness(badPeer, true)
 	registry.UpdateStorage(badPeer, "full")
@@ -459,9 +451,8 @@ func TestSyncCoordination_PeerEvaluation(t *testing.T) {
 			name: "healthy_peer_with_url",
 			setupPeer: func() peer.ID {
 				id := peer.ID("good")
-				registry.AddPeer(id, "")
-				registry.UpdateHeight(id, 1000, "hash")
-				registry.UpdateDataHubURL(id, "http://good.test")
+				testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+				registry.AddPeer(id, "", 1000, testHash, "http://good.test")
 				registry.UpdateReputation(id, 80.0)
 				registry.UpdateURLResponsiveness(id, true)
 				return id
@@ -473,9 +464,8 @@ func TestSyncCoordination_PeerEvaluation(t *testing.T) {
 			name: "banned_peer",
 			setupPeer: func() peer.ID {
 				id := peer.ID("banned")
-				registry.AddPeer(id, "")
-				registry.UpdateHeight(id, 1000, "hash")
-				registry.UpdateDataHubURL(id, "http://banned.test")
+				testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+				registry.AddPeer(id, "", 1000, testHash, "http://banned.test")
 				registry.UpdateReputation(id, 80.0)
 				registry.UpdateBanStatus(id, 100, true)
 				return id
@@ -487,9 +477,8 @@ func TestSyncCoordination_PeerEvaluation(t *testing.T) {
 			name: "unhealthy_peer",
 			setupPeer: func() peer.ID {
 				id := peer.ID("unhealthy")
-				registry.AddPeer(id, "")
-				registry.UpdateHeight(id, 1000, "hash")
-				registry.UpdateDataHubURL(id, "http://unhealthy.test")
+				testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+				registry.AddPeer(id, "", 1000, testHash, "http://unhealthy.test")
 				registry.UpdateReputation(id, 15.0)
 				return id
 			},
@@ -500,8 +489,7 @@ func TestSyncCoordination_PeerEvaluation(t *testing.T) {
 			name: "no_datahub_url",
 			setupPeer: func() peer.ID {
 				id := peer.ID("nourl")
-				registry.AddPeer(id, "")
-				registry.UpdateHeight(id, 1000, "hash")
+				registry.AddPeer(id, "", 1000, nil, "")
 				registry.UpdateReputation(id, 80.0)
 				return id
 			},
