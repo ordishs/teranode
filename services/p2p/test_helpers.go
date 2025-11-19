@@ -46,9 +46,10 @@ func (m *MockHTTPClient) Do(req *http.Request) (*http.Response, error) {
 func CreateTestSettings() *settings.Settings {
 	s := &settings.Settings{
 		P2P: settings.P2PSettings{
-			BanThreshold: 100,
-			BanDuration:  24 * time.Hour,
-			EnableNAT:    false, // Disable NAT in tests to prevent data races in libp2p
+			BanThreshold:                              100,
+			BanDuration:                               24 * time.Hour,
+			EnableNAT:                                 false,          // Disable NAT in tests to prevent data races in libp2p
+			SyncCoordinatorPeriodicEvaluationInterval: 10 * time.Second, // Prevent ticker panic in tests
 		},
 	}
 	return s
