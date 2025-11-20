@@ -66,7 +66,7 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 	}
 
 	// Update last message time for the sender and originator with client name
-	s.updatePeerLastMessageTime(from, blockMessage.PeerID, blockMessage.ClientName)
+	s.updatePeerLastMessageTime(from, blockMessage.PeerID)
 
 	// Track bytes received from this message
 	s.updateBytesReceived(from, blockMessage.PeerID, uint64(len(m)))
@@ -172,7 +172,7 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, from string) {
 	}
 
 	// Update last message time for the sender and originator with client name
-	s.updatePeerLastMessageTime(from, subtreeMessage.PeerID, subtreeMessage.ClientName)
+	s.updatePeerLastMessageTime(from, subtreeMessage.PeerID)
 
 	// Track bytes received from this message
 	s.updateBytesReceived(from, subtreeMessage.PeerID, uint64(len(m)))
@@ -295,7 +295,7 @@ func (s *Server) handleRejectedTxTopic(_ context.Context, m []byte, from string)
 	}
 
 	// Update last message time with client name
-	s.updatePeerLastMessageTime(from, rejectedTxMessage.PeerID, rejectedTxMessage.ClientName)
+	s.updatePeerLastMessageTime(from, rejectedTxMessage.PeerID)
 
 	// Track bytes received from this message
 	s.updateBytesReceived(from, rejectedTxMessage.PeerID, uint64(len(m)))
@@ -320,7 +320,7 @@ func (s *Server) getPeerIDFromDataHubURL(dataHubURL string) string {
 		return ""
 	}
 
-	peers := s.peerRegistry.GetAllPeers()
+	peers := s.peerRegistry.GetAll()
 	for _, peerInfo := range peers {
 		if peerInfo.DataHubURL == dataHubURL {
 			return peerInfo.ID.String()
@@ -468,14 +468,14 @@ func (s *Server) getLocalHeight() uint32 {
 
 func (s *Server) addPeer(peerID peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	if s.peerRegistry != nil {
-		s.peerRegistry.AddPeer(peerID, clientName, height, blockHash, dataHubURL)
+		s.peerRegistry.Put(peerID, clientName, height, blockHash, dataHubURL)
 	}
 }
 
 // addConnectedPeer adds a peer and marks it as directly connected
 func (s *Server) addConnectedPeer(peerID peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	if s.peerRegistry != nil {
-		s.peerRegistry.AddPeer(peerID, clientName, height, blockHash, dataHubURL)
+		s.peerRegistry.Put(peerID, clientName, height, blockHash, dataHubURL)
 		s.peerRegistry.UpdateConnectionState(peerID, true)
 	}
 }
@@ -491,7 +491,7 @@ func (s *Server) InjectPeerForTesting(peerID peer.ID, clientName, dataHubURL str
 
 	// Add peer atomically with all initial data
 	if s.peerRegistry != nil {
-		s.peerRegistry.AddPeer(peerID, clientName, height, hash, dataHubURL)
+		s.peerRegistry.Put(peerID, clientName, height, hash, dataHubURL)
 		s.peerRegistry.UpdateConnectionState(peerID, true)
 		s.peerRegistry.UpdateURLResponsiveness(peerID, true)
 		s.peerRegistry.UpdateStorage(peerID, "full")
@@ -506,7 +506,7 @@ func (s *Server) removePeer(peerID peer.ID) {
 	if s.peerRegistry != nil {
 		// Mark as disconnected before removing
 		s.peerRegistry.UpdateConnectionState(peerID, false)
-		s.peerRegistry.RemovePeer(peerID)
+		s.peerRegistry.Remove(peerID)
 	}
 	if s.syncCoordinator != nil {
 		s.syncCoordinator.HandlePeerDisconnected(peerID)
@@ -516,7 +516,7 @@ func (s *Server) removePeer(peerID peer.ID) {
 // getPeer gets peer information from the registry
 func (s *Server) getPeer(peerID peer.ID) (*PeerInfo, bool) {
 	if s.peerRegistry != nil {
-		return s.peerRegistry.GetPeer(peerID)
+		return s.peerRegistry.Get(peerID)
 	}
 	return nil, false
 }
@@ -757,7 +757,7 @@ func (s *Server) shouldSkipUnhealthyPeer(from string, messageType string) bool {
 		return false
 	}
 
-	peerInfo, exists := s.peerRegistry.GetPeer(peerID)
+	peerInfo, exists := s.peerRegistry.Get(peerID)
 	if !exists {
 		// Peer not in registry - allow message (peer might be new)
 		return false

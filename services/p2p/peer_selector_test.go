@@ -52,16 +52,16 @@ func TestSelector_SkipsPeerMarkedUnhealthyByHealthChecker(t *testing.T) {
 	unhealthyID := peer.ID("U")
 
 	// Set heights so both are ahead
-	registry.AddPeer(healthyID, "", 120, nil, okSrv.URL)
+	registry.Put(healthyID, "", 120, nil, okSrv.URL)
 	registry.UpdateURLResponsiveness(healthyID, true) // Healthy URL
 	registry.UpdateStorage(healthyID, "full")
 
-	registry.AddPeer(unhealthyID, "", 125, nil, failSrv.URL)
+	registry.Put(unhealthyID, "", 125, nil, failSrv.URL)
 	registry.UpdateURLResponsiveness(unhealthyID, false) // Unhealthy URL
 	registry.UpdateStorage(unhealthyID, "full")
 
 	// Fetch peers and select
-	peers := registry.GetAllPeers()
+	peers := registry.GetAll()
 
 	selected := ps.SelectSyncPeer(peers, SelectionCriteria{LocalHeight: 100})
 

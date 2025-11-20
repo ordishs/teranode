@@ -255,7 +255,7 @@ func (s *Server) IsPeerMalicious(_ context.Context, req *p2p_api.IsPeerMalicious
 				Reason:      "invalid peer ID",
 			}, nil
 		}
-		peerInfo, exists := s.peerRegistry.GetPeer(peerId)
+		peerInfo, exists := s.peerRegistry.Get(peerId)
 		if exists {
 			// A peer is considered malicious if:
 			// 1. They have a very low reputation score (below 20)
@@ -295,7 +295,7 @@ func (s *Server) IsPeerUnhealthy(_ context.Context, req *p2p_api.IsPeerUnhealthy
 				ReputationScore: 0,
 			}, nil
 		}
-		peerInfo, exists := s.peerRegistry.GetPeer(peerId)
+		peerInfo, exists := s.peerRegistry.Get(peerId)
 		if !exists {
 			// Unknown peer - consider unhealthy
 			return &p2p_api.IsPeerUnhealthyResponse{

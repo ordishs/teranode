@@ -330,12 +330,12 @@ func TestHandleBlockTopic(t *testing.T) {
 
 		// Create peer registry to track updates
 		peerRegistry := NewPeerRegistry()
-		peerRegistry.AddPeer(senderPeerID, "", 0, nil, "")
-		peerRegistry.AddPeer(originatorPeerID, "", 0, nil, "")
+		peerRegistry.Put(senderPeerID, "", 0, nil, "")
+		peerRegistry.Put(originatorPeerID, "", 0, nil, "")
 
 		// Get initial times
-		senderInfo1, _ := peerRegistry.GetPeer(senderPeerID)
-		originatorInfo1, _ := peerRegistry.GetPeer(originatorPeerID)
+		senderInfo1, _ := peerRegistry.Get(senderPeerID)
+		originatorInfo1, _ := peerRegistry.Get(originatorPeerID)
 
 		// Wait to ensure time difference
 		time.Sleep(50 * time.Millisecond)
@@ -354,8 +354,8 @@ func TestHandleBlockTopic(t *testing.T) {
 		server.handleBlockTopic(ctx, []byte(blockMsg), senderPeerID.String())
 
 		// Verify last message times were updated
-		senderInfo2, _ := peerRegistry.GetPeer(senderPeerID)
-		originatorInfo2, _ := peerRegistry.GetPeer(originatorPeerID)
+		senderInfo2, _ := peerRegistry.Get(senderPeerID)
+		originatorInfo2, _ := peerRegistry.Get(originatorPeerID)
 
 		assert.True(t, senderInfo2.LastMessageTime.After(senderInfo1.LastMessageTime), "Sender's LastMessageTime should be updated")
 		assert.True(t, originatorInfo2.LastMessageTime.After(originatorInfo1.LastMessageTime), "Originator's LastMessageTime should be updated")
@@ -1001,7 +1001,7 @@ func TestHandleBanEvent(t *testing.T) {
 		// Store some test data for peer1
 		// Add peer to registry with test hash
 		testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-		server.peerRegistry.AddPeer(peerID1, "", 0, testHash, "")
+		server.peerRegistry.Put(peerID1, "", 0, testHash, "")
 
 		// Create a ban event for PeerID
 		event := BanEvent{
@@ -1017,7 +1017,7 @@ func TestHandleBanEvent(t *testing.T) {
 		mockP2PNode.AssertCalled(t, "GetPeers")
 
 		// Verify peer data was cleaned up (peer removed from registry)
-		_, exists := server.peerRegistry.GetPeer(peerID1)
+		_, exists := server.peerRegistry.Get(peerID1)
 		assert.False(t, exists, "Peer should be removed from registry after ban")
 	})
 }
@@ -3053,13 +3053,13 @@ func TestServer_UpdatePeerHeight(t *testing.T) {
 	server.addPeer(peerID, "", 100, nil, "")
 
 	// Verify peer was added with correct height
-	peerInfo, exists := registry.GetPeer(peerID)
+	peerInfo, exists := registry.Get(peerID)
 	assert.True(t, exists)
 	assert.Equal(t, uint32(100), peerInfo.Height)
 
 	// Update height for existing peer
 	server.addPeer(peerID, "", 200, nil, "")
-	peerInfo, exists = registry.GetPeer(peerID)
+	peerInfo, exists = registry.Get(peerID)
 	assert.True(t, exists)
 	assert.Equal(t, uint32(200), peerInfo.Height)
 }
@@ -3080,12 +3080,12 @@ func TestServer_AddPeer(t *testing.T) {
 	server.addPeer(peerID, "", 0, nil, "")
 
 	// Verify peer was added
-	_, exists := registry.GetPeer(peerID)
+	_, exists := registry.Get(peerID)
 	assert.True(t, exists)
 
 	// Add same peer again (should be idempotent)
 	server.addPeer(peerID, "", 0, nil, "")
-	_, exists = registry.GetPeer(peerID)
+	_, exists = registry.Get(peerID)
 	assert.True(t, exists)
 }
 
@@ -3100,15 +3100,15 @@ func TestServer_RemovePeer(t *testing.T) {
 	peerID := peer.ID("test-peer")
 
 	// Add peer first
-	registry.AddPeer(peerID, "", 0, nil, "")
-	_, exists := registry.GetPeer(peerID)
+	registry.Put(peerID, "", 0, nil, "")
+	_, exists := registry.Get(peerID)
 	assert.True(t, exists)
 
 	// Remove peer
 	server.removePeer(peerID)
 
 	// Verify peer was removed
-	_, exists = registry.GetPeer(peerID)
+	_, exists = registry.Get(peerID)
 	assert.False(t, exists)
 }
 
@@ -3123,21 +3123,21 @@ func TestServer_UpdateBlockHash(t *testing.T) {
 	peerID := peer.ID("test-peer")
 
 	// Add peer first
-	registry.AddPeer(peerID, "", 0, nil, "")
+	registry.Put(peerID, "", 0, nil, "")
 
 	// Update block hash
 	blockHashStr := "00000000000000000123456789abcdef00000000000000000123456789abcdef"
 	blockHash, _ := chainhash.NewHashFromStr(blockHashStr)
-	server.peerRegistry.AddPeer(peerID, "", 0, blockHash, "")
+	server.peerRegistry.Put(peerID, "", 0, blockHash, "")
 
 	// Verify hash was updated
-	peerInfo, exists := registry.GetPeer(peerID)
+	peerInfo, exists := registry.Get(peerID)
 	assert.True(t, exists)
 	assert.Equal(t, blockHashStr, peerInfo.BlockHash.String())
 
 	// Test with nil hash (should not update)
-	server.peerRegistry.AddPeer(peerID, "", 0, nil, "")
-	peerInfo, exists = registry.GetPeer(peerID)
+	server.peerRegistry.Put(peerID, "", 0, nil, "")
+	peerInfo, exists = registry.Get(peerID)
 	assert.True(t, exists)
 	assert.Equal(t, blockHashStr, peerInfo.BlockHash.String()) // Should still be the old hash
 }
@@ -3159,7 +3159,7 @@ func TestServer_GetPeer(t *testing.T) {
 
 	// Add peer with height and hash atomically
 	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(peerID, "", 100, testHash, "")
+	registry.Put(peerID, "", 100, testHash, "")
 
 	// Get existing peer
 	peerInfo, exists = server.getPeer(peerID)
@@ -3177,16 +3177,16 @@ func TestServer_UpdateDataHubURL(t *testing.T) {
 	url := "http://example.com:8080"
 
 	// Add peer first
-	registry.AddPeer(peerID, "", 0, nil, url)
+	registry.Put(peerID, "", 0, nil, url)
 
 	// Verify URL was updated
-	peerInfo, exists := registry.GetPeer(peerID)
+	peerInfo, exists := registry.Get(peerID)
 	assert.True(t, exists)
 	assert.Equal(t, url, peerInfo.DataHubURL)
 
 	// Test with empty URL (should not update)
-	registry.AddPeer(peerID, "", 0, nil, "")
-	peerInfo, exists = registry.GetPeer(peerID)
+	registry.Put(peerID, "", 0, nil, "")
+	peerInfo, exists = registry.Get(peerID)
 	assert.True(t, exists)
 	assert.Equal(t, url, peerInfo.DataHubURL) // Should still be the old URL
 }

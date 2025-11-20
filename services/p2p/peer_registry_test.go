@@ -17,10 +17,10 @@ func TestPeerRegistry_AddPeer(t *testing.T) {
 
 	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
 
-	pr.AddPeer(peerID, "", 12345, testHash, "")
+	pr.Put(peerID, "", 12345, testHash, "")
 
 	// Verify peer was added
-	info, exists := pr.GetPeer(peerID)
+	info, exists := pr.Get(peerID)
 	require.True(t, exists, "Peer should exist after adding")
 	assert.Equal(t, peerID, info.ID)
 	assert.Equal(t, uint32(12345), info.Height)
@@ -35,9 +35,9 @@ func TestPeerRegistry_AddPeer(t *testing.T) {
 	// Adding same peer again should not reset data
 	originalTime := info.ConnectedAt
 	time.Sleep(10 * time.Millisecond)
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, originalTime, info.ConnectedAt, "ConnectedAt should not change on re-add")
 }
 
@@ -46,15 +46,15 @@ func TestPeerRegistry_RemovePeer(t *testing.T) {
 	peerID := peer.ID("test-peer-1")
 
 	// Add then remove
-	pr.AddPeer(peerID, "", 0, nil, "")
-	pr.RemovePeer(peerID)
+	pr.Put(peerID, "", 0, nil, "")
+	pr.Remove(peerID)
 
 	// Verify peer was removed
-	_, exists := pr.GetPeer(peerID)
+	_, exists := pr.Get(peerID)
 	assert.False(t, exists, "Peer should not exist after removal")
 
 	// Remove non-existent peer should not panic
-	pr.RemovePeer(peer.ID("non-existent"))
+	pr.Remove(peer.ID("non-existent"))
 }
 
 func TestPeerRegistry_UpdateLastMessageTime(t *testing.T) {
@@ -62,10 +62,10 @@ func TestPeerRegistry_UpdateLastMessageTime(t *testing.T) {
 	peerID := peer.ID("test-peer-1")
 
 	// Add peer
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
 	// Get initial last message time (should be set to connection time)
-	info1, exists := pr.GetPeer(peerID)
+	info1, exists := pr.Get(peerID)
 	require.True(t, exists, "Peer should exist")
 	assert.NotZero(t, info1.LastMessageTime, "LastMessageTime should be initialized")
 	assert.Equal(t, info1.ConnectedAt, info1.LastMessageTime, "LastMessageTime should initially equal ConnectedAt")
@@ -75,7 +75,7 @@ func TestPeerRegistry_UpdateLastMessageTime(t *testing.T) {
 	pr.UpdateLastMessageTime(peerID)
 
 	// Verify last message time was updated
-	info2, exists := pr.GetPeer(peerID)
+	info2, exists := pr.Get(peerID)
 	require.True(t, exists, "Peer should still exist")
 	assert.True(t, info2.LastMessageTime.After(info1.LastMessageTime), "LastMessageTime should be updated")
 	assert.Equal(t, info1.ConnectedAt, info2.ConnectedAt, "ConnectedAt should not change")
@@ -88,17 +88,17 @@ func TestPeerRegistry_GetAllPeers(t *testing.T) {
 	pr := NewPeerRegistry()
 
 	// Start with empty registry
-	peers := pr.GetAllPeers()
+	peers := pr.GetAll()
 	assert.Empty(t, peers, "Registry should start empty")
 
 	// Add multiple peers
 	ids := GenerateTestPeerIDs(3)
 	for _, id := range ids {
-		pr.AddPeer(id, "", 0, nil, "")
+		pr.Put(id, "", 0, nil, "")
 	}
 
 	// Get all peers
-	peers = pr.GetAllPeers()
+	peers = pr.GetAll()
 	assert.Len(t, peers, 3, "Should have 3 peers")
 
 	// Verify returned copies (not references)
@@ -106,7 +106,7 @@ func TestPeerRegistry_GetAllPeers(t *testing.T) {
 		originalHeight := peers[0].Height
 		peers[0].Height = 999
 
-		info, _ := pr.GetPeer(peers[0].ID)
+		info, _ := pr.Get(peers[0].ID)
 		assert.Equal(t, originalHeight, info.Height, "Modifying returned peer should not affect registry")
 	}
 }
@@ -115,10 +115,9 @@ func TestPeerRegistry_UpdateDataHubURL(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
-	pr.UpdateDataHubURL(peerID, "http://datahub.test")
+	pr.Put(peerID, "", 0, nil, "http://datahub.test")
 
-	info, exists := pr.GetPeer(peerID)
+	info, exists := pr.Get(peerID)
 	require.True(t, exists)
 	assert.Equal(t, "http://datahub.test", info.DataHubURL)
 }
@@ -127,20 +126,20 @@ func TestPeerRegistry_UpdateHealth(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
 	// Initially healthy
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.True(t, info.ReputationScore >= 20.0)
 
 	// Mark as unhealthy (low reputation)
 	pr.UpdateReputation(peerID, 15.0)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.False(t, info.ReputationScore >= 20.0)
 
 	// Mark as healthy again
 	pr.UpdateReputation(peerID, 80.0)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.True(t, info.ReputationScore >= 20.0)
 }
 
@@ -148,16 +147,16 @@ func TestPeerRegistry_UpdateBanStatus(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 	pr.UpdateBanStatus(peerID, 50, false)
 
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.Equal(t, 50, info.BanScore)
 	assert.False(t, info.IsBanned)
 
 	// Ban the peer
 	pr.UpdateBanStatus(peerID, 100, true)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, 100, info.BanScore)
 	assert.True(t, info.IsBanned)
 }
@@ -166,10 +165,10 @@ func TestPeerRegistry_UpdateNetworkStats(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 	pr.UpdateNetworkStats(peerID, 1024)
 
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.Equal(t, uint64(1024), info.BytesReceived)
 	assert.NotZero(t, info.LastBlockTime)
 }
@@ -178,16 +177,15 @@ func TestPeerRegistry_UpdateURLResponsiveness(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
-	pr.UpdateDataHubURL(peerID, "http://test.com")
+	pr.Put(peerID, "", 0, nil, "http://test.com")
 
 	// Initially not responsive
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.False(t, info.URLResponsive)
 
 	// Mark as responsive
 	pr.UpdateURLResponsiveness(peerID, true)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.True(t, info.URLResponsive)
 	assert.NotZero(t, info.LastURLCheck)
 }
@@ -200,13 +198,13 @@ func TestPeerRegistry_PeerCount(t *testing.T) {
 	// Add peers
 	ids := GenerateTestPeerIDs(5)
 	for i, id := range ids {
-		pr.AddPeer(id, "", 0, nil, "")
+		pr.Put(id, "", 0, nil, "")
 		assert.Equal(t, i+1, pr.PeerCount())
 	}
 
 	// Remove peers
 	for i, id := range ids {
-		pr.RemovePeer(id)
+		pr.Remove(id)
 		assert.Equal(t, len(ids)-i-1, pr.PeerCount())
 	}
 }
@@ -219,7 +217,7 @@ func TestPeerRegistry_ConcurrentAccess(t *testing.T) {
 	go func() {
 		for i := 0; i < 100; i++ {
 			id := peer.ID(string(rune('A' + i%10)))
-			pr.AddPeer(id, "", uint32(i), nil, "")
+			pr.Put(id, "", uint32(i), nil, "")
 		}
 		done <- true
 	}()
@@ -234,7 +232,7 @@ func TestPeerRegistry_ConcurrentAccess(t *testing.T) {
 
 	go func() {
 		for i := 0; i < 100; i++ {
-			pr.GetAllPeers()
+			pr.GetAll()
 			pr.PeerCount()
 		}
 		done <- true
@@ -244,7 +242,7 @@ func TestPeerRegistry_ConcurrentAccess(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			id := peer.ID(string(rune('A' + i%10)))
 			if i%5 == 0 {
-				pr.RemovePeer(id)
+				pr.Remove(id)
 			}
 		}
 		done <- true
@@ -256,7 +254,7 @@ func TestPeerRegistry_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Should not panic and registry should be in consistent state
-	peers := pr.GetAllPeers()
+	peers := pr.GetAll()
 	assert.NotNil(t, peers)
 }
 
@@ -264,11 +262,11 @@ func TestPeerRegistry_GetPeerReturnsCopy(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 100, nil, "")
+	pr.Put(peerID, "", 100, nil, "")
 
 	// Get peer info
-	info1, _ := pr.GetPeer(peerID)
-	info2, _ := pr.GetPeer(peerID)
+	info1, _ := pr.Get(peerID)
+	info2, _ := pr.Get(peerID)
 
 	// Modify one copy
 	info1.Height = 200
@@ -277,7 +275,7 @@ func TestPeerRegistry_GetPeerReturnsCopy(t *testing.T) {
 	assert.Equal(t, uint32(100), info2.Height)
 
 	// Original in registry should be unchanged
-	info3, _ := pr.GetPeer(peerID)
+	info3, _ := pr.Get(peerID)
 	assert.Equal(t, uint32(100), info3.Height)
 }
 
@@ -287,16 +285,16 @@ func TestPeerRegistry_RecordCatchupAttempt(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
 	// Initial state
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.Equal(t, int64(0), info.InteractionAttempts)
 	assert.True(t, info.LastInteractionAttempt.IsZero())
 
 	// Record first attempt
 	pr.RecordInteractionAttempt(peerID)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(1), info.InteractionAttempts)
 	assert.False(t, info.LastInteractionAttempt.IsZero())
 
@@ -305,7 +303,7 @@ func TestPeerRegistry_RecordCatchupAttempt(t *testing.T) {
 	// Record second attempt
 	time.Sleep(10 * time.Millisecond)
 	pr.RecordInteractionAttempt(peerID)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(2), info.InteractionAttempts)
 	assert.True(t, info.LastInteractionAttempt.After(firstAttemptTime))
 
@@ -317,17 +315,17 @@ func TestPeerRegistry_RecordCatchupSuccess(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
 	// Initial state
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.Equal(t, int64(0), info.InteractionSuccesses)
 	assert.True(t, info.LastInteractionSuccess.IsZero())
 	assert.Equal(t, time.Duration(0), info.AvgResponseTime)
 
 	// Record first success with 100ms duration
 	pr.RecordInteractionSuccess(peerID, 100*time.Millisecond)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(1), info.InteractionSuccesses)
 	assert.False(t, info.LastInteractionSuccess.IsZero())
 	assert.Equal(t, 100*time.Millisecond, info.AvgResponseTime)
@@ -336,7 +334,7 @@ func TestPeerRegistry_RecordCatchupSuccess(t *testing.T) {
 	// Should calculate weighted average: 80% of 100ms + 20% of 200ms = 120ms
 	time.Sleep(10 * time.Millisecond)
 	pr.RecordInteractionSuccess(peerID, 200*time.Millisecond)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(2), info.InteractionSuccesses)
 	expectedAvg := time.Duration(int64(float64(100*time.Millisecond)*0.8 + float64(200*time.Millisecond)*0.2))
 	assert.Equal(t, expectedAvg, info.AvgResponseTime)
@@ -349,16 +347,16 @@ func TestPeerRegistry_RecordCatchupFailure(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
 	// Initial state
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.Equal(t, int64(0), info.InteractionFailures)
 	assert.True(t, info.LastInteractionFailure.IsZero())
 
 	// Record first failure
 	pr.RecordInteractionFailure(peerID)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(1), info.InteractionFailures)
 	assert.False(t, info.LastInteractionFailure.IsZero())
 
@@ -367,7 +365,7 @@ func TestPeerRegistry_RecordCatchupFailure(t *testing.T) {
 	// Record second failure
 	time.Sleep(10 * time.Millisecond)
 	pr.RecordInteractionFailure(peerID)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(2), info.InteractionFailures)
 	assert.True(t, info.LastInteractionFailure.After(firstFailureTime))
 
@@ -379,19 +377,19 @@ func TestPeerRegistry_RecordCatchupMalicious(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
 	// Initial state
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.Equal(t, int64(0), info.MaliciousCount)
 
 	// Record malicious behavior
 	pr.RecordMaliciousInteraction(peerID)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(1), info.MaliciousCount)
 
 	pr.RecordMaliciousInteraction(peerID)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, int64(2), info.MaliciousCount)
 
 	// Malicious on non-existent peer should not panic
@@ -402,25 +400,25 @@ func TestPeerRegistry_UpdateCatchupReputation(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID := peer.ID("test-peer-1")
 
-	pr.AddPeer(peerID, "", 0, nil, "")
+	pr.Put(peerID, "", 0, nil, "")
 
 	// Initial state - should have default reputation of 50
-	info, _ := pr.GetPeer(peerID)
+	info, _ := pr.Get(peerID)
 	assert.Equal(t, float64(50), info.ReputationScore)
 
 	// Update to valid score
 	pr.UpdateReputation(peerID, 75.5)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, 75.5, info.ReputationScore)
 
 	// Test clamping - score above 100
 	pr.UpdateReputation(peerID, 150.0)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, 100.0, info.ReputationScore)
 
 	// Test clamping - score below 0
 	pr.UpdateReputation(peerID, -50.0)
-	info, _ = pr.GetPeer(peerID)
+	info, _ = pr.Get(peerID)
 	assert.Equal(t, 0.0, info.ReputationScore)
 
 	// Update on non-existent peer should not panic
@@ -434,27 +432,23 @@ func TestPeerRegistry_GetPeersForCatchup(t *testing.T) {
 	ids := GenerateTestPeerIDs(5)
 
 	// Peer 0: Healthy with DataHub URL, good reputation
-	pr.AddPeer(ids[0], "", 0, nil, "")
-	pr.UpdateDataHubURL(ids[0], "http://peer0.test")
+	pr.Put(ids[0], "", 0, nil, "http://peer0.test")
 	pr.UpdateReputation(ids[0], 90.0)
 
 	// Peer 1: Healthy with DataHub URL, medium reputation
-	pr.AddPeer(ids[1], "", 0, nil, "")
-	pr.UpdateDataHubURL(ids[1], "http://peer1.test")
+	pr.Put(ids[1], "", 0, nil, "http://peer1.test")
 	pr.UpdateReputation(ids[1], 50.0)
 
 	// Peer 2: Low reputation with DataHub URL (should be excluded)
-	pr.AddPeer(ids[2], "", 0, nil, "")
-	pr.UpdateDataHubURL(ids[2], "http://peer2.test")
+	pr.Put(ids[2], "", 0, nil, "http://peer2.test")
 	pr.UpdateReputation(ids[2], 15.0)
 
 	// Peer 3: Healthy but no DataHub URL (should be excluded)
-	pr.AddPeer(ids[3], "", 0, nil, "")
+	pr.Put(ids[3], "", 0, nil, "http://peer3.test")
 	pr.UpdateReputation(ids[3], 85.0)
 
 	// Peer 4: Healthy with DataHub URL but banned (should be excluded)
-	pr.AddPeer(ids[4], "", 0, nil, "")
-	pr.UpdateDataHubURL(ids[4], "http://peer4.test")
+	pr.Put(ids[4], "", 0, nil, "http://peer4.test")
 	pr.UpdateBanStatus(ids[4], 100, true)
 	pr.UpdateReputation(ids[4], 95.0)
 
@@ -483,23 +477,20 @@ func TestPeerRegistry_GetPeersForCatchup_SameReputation(t *testing.T) {
 	baseTime := time.Now()
 
 	// Peer 0: Last success 1 hour ago
-	pr.AddPeer(ids[0], "", 0, nil, "")
-	pr.UpdateDataHubURL(ids[0], "http://peer0.test")
+	pr.Put(ids[0], "", 0, nil, "http://peer0.test")
 	pr.UpdateReputation(ids[0], 75.0)
 	pr.RecordInteractionSuccess(ids[0], 100*time.Millisecond)
 	// Manually set last success to older time
 	pr.peers[ids[0]].LastInteractionSuccess = baseTime.Add(-1 * time.Hour)
 
 	// Peer 1: Last success 10 minutes ago (most recent)
-	pr.AddPeer(ids[1], "", 0, nil, "")
-	pr.UpdateDataHubURL(ids[1], "http://peer1.test")
+	pr.Put(ids[1], "", 0, nil, "http://peer1.test")
 	pr.UpdateReputation(ids[1], 75.0)
 	pr.RecordInteractionSuccess(ids[1], 100*time.Millisecond)
 	pr.peers[ids[1]].LastInteractionSuccess = baseTime.Add(-10 * time.Minute)
 
 	// Peer 2: Last success 30 minutes ago
-	pr.AddPeer(ids[2], "", 0, nil, "")
-	pr.UpdateDataHubURL(ids[2], "http://peer2.test")
+	pr.Put(ids[2], "", 0, nil, "http://peer2.test")
 	pr.UpdateReputation(ids[2], 75.0)
 	pr.RecordInteractionSuccess(ids[2], 100*time.Millisecond)
 	pr.peers[ids[2]].LastInteractionSuccess = baseTime.Add(-30 * time.Minute)
@@ -516,8 +507,7 @@ func TestPeerRegistry_GetPeersForCatchup_SameReputation(t *testing.T) {
 func TestPeerRegistry_CatchupMetrics_ConcurrentAccess(t *testing.T) {
 	pr := NewPeerRegistry()
 	peerID, _ := peer.Decode(testPeer1)
-	pr.AddPeer(peerID, "", 0, nil, "")
-	pr.UpdateDataHubURL(peerID, "http://test.com")
+	pr.Put(peerID, "", 0, nil, "http://test.com")
 	pr.UpdateReputation(peerID, 80.0)
 
 	done := make(chan bool)
@@ -568,7 +558,7 @@ func TestPeerRegistry_CatchupMetrics_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Verify final state is consistent
-	info, exists := pr.GetPeer(peerID)
+	info, exists := pr.Get(peerID)
 	require.True(t, exists)
 	assert.Equal(t, int64(100), info.InteractionAttempts)
 	assert.Equal(t, int64(50), info.InteractionSuccesses)

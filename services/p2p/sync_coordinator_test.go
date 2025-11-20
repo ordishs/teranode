@@ -209,7 +209,7 @@ func TestSyncCoordinator_TriggerSync(t *testing.T) {
 	// Add a peer that is ahead with block hash for sync message
 	peerID := peer.ID("test-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(peerID, "", 110, peerHash, "http://test.com")
+	registry.Put(peerID, "", 110, peerHash, "http://test.com")
 	registry.UpdateURLResponsiveness(peerID, true)
 
 	// Trigger sync
@@ -274,7 +274,7 @@ func TestSyncCoordinator_HandlePeerDisconnected(t *testing.T) {
 
 	// Add a peer and set as sync peer
 	peerID := peer.ID("test-peer")
-	registry.AddPeer(peerID, "", 0, nil, "")
+	registry.Put(peerID, "", 0, nil, "")
 
 	sc.mu.Lock()
 	sc.currentSyncPeer = peerID
@@ -287,7 +287,7 @@ func TestSyncCoordinator_HandlePeerDisconnected(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify peer was removed from registry
-	_, exists := registry.GetPeer(peerID)
+	_, exists := registry.Get(peerID)
 	assert.False(t, exists)
 
 	// Sync peer should be cleared
@@ -317,8 +317,8 @@ func TestSyncCoordinator_HandlePeerDisconnected_NotSyncPeer(t *testing.T) {
 	// Add two peers
 	syncPeer := peer.ID("sync-peer")
 	otherPeer := peer.ID("other-peer")
-	registry.AddPeer(syncPeer, "", 0, nil, "")
-	registry.AddPeer(otherPeer, "", 0, nil, "")
+	registry.Put(syncPeer, "", 0, nil, "")
+	registry.Put(otherPeer, "", 0, nil, "")
 
 	// Set sync peer
 	sc.mu.Lock()
@@ -329,7 +329,7 @@ func TestSyncCoordinator_HandlePeerDisconnected_NotSyncPeer(t *testing.T) {
 	sc.HandlePeerDisconnected(otherPeer)
 
 	// Verify peer was removed
-	_, exists := registry.GetPeer(otherPeer)
+	_, exists := registry.Get(otherPeer)
 	assert.False(t, exists)
 
 	// Sync peer should remain
@@ -365,7 +365,7 @@ func TestSyncCoordinator_HandleCatchupFailure(t *testing.T) {
 	// Add new peer for recovery
 	newPeer := peer.ID("new-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(newPeer, "", 110, peerHash, "http://test.com")
+	registry.Put(newPeer, "", 110, peerHash, "http://test.com")
 	registry.UpdateURLResponsiveness(newPeer, true)
 
 	sc.SetGetLocalHeightCallback(func() uint32 {
@@ -408,11 +408,11 @@ func TestSyncCoordinator_selectNewSyncPeer(t *testing.T) {
 	peer2 := peer.ID("peer2")
 
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(peer1, "", 105, peerHash, "http://peer1.com")
+	registry.Put(peer1, "", 105, peerHash, "http://peer1.com")
 	registry.UpdateURLResponsiveness(peer1, false) // Not responsive
 
 	peerHash, _ = chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(peer2, "", 110, peerHash, "http://peer2.com")
+	registry.Put(peer2, "", 110, peerHash, "http://peer2.com")
 	registry.UpdateURLResponsiveness(peer2, true) // Responsive
 
 	// Select new sync peer
@@ -451,13 +451,13 @@ func TestSyncCoordinator_selectNewSyncPeer_ForcedPeer(t *testing.T) {
 	forcedPeer := peer.ID("forced-peer")
 	settings.P2P.ForceSyncPeer = string(forcedPeer) // Set the forced peer in settings
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(forcedPeer, "", 110, peerHash, "http://forced.com")
+	registry.Put(forcedPeer, "", 110, peerHash, "http://forced.com")
 	registry.UpdateURLResponsiveness(forcedPeer, true)
 
 	// Add another better peer
 	betterPeer := peer.ID("better-peer")
 	peerHash, _ = chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(betterPeer, "", 120, peerHash, "http://better.com")
+	registry.Put(betterPeer, "", 120, peerHash, "http://better.com")
 	registry.UpdateURLResponsiveness(betterPeer, true)
 
 	// Should select forced peer
@@ -486,14 +486,14 @@ func TestSyncCoordinator_UpdatePeerInfo(t *testing.T) {
 
 	// Add peer first
 	peerID := peer.ID("test-peer")
-	registry.AddPeer(peerID, "", 0, nil, "")
+	registry.Put(peerID, "", 0, nil, "")
 
 	// Update peer info
 	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
 	sc.UpdatePeerInfo(peerID, 150, testHash, "http://datahub.com")
 
 	// Verify peer was updated
-	info, exists := registry.GetPeer(peerID)
+	info, exists := registry.Get(peerID)
 	require.True(t, exists)
 	assert.Equal(t, uint32(150), info.Height)
 	assert.Equal(t, testHash.String(), info.BlockHash.String())
@@ -521,7 +521,7 @@ func TestSyncCoordinator_UpdateBanStatus(t *testing.T) {
 
 	// Add peer and ban it
 	peerID := peer.ID("test-peer")
-	registry.AddPeer(peerID, "", 0, nil, "")
+	registry.Put(peerID, "", 0, nil, "")
 
 	// Add ban score - use raw string conversion to match UpdateBanStatus
 	banManager.AddScore(string(peerID), ReasonSpam)
@@ -531,7 +531,7 @@ func TestSyncCoordinator_UpdateBanStatus(t *testing.T) {
 	sc.UpdateBanStatus(peerID)
 
 	// Verify ban status was updated
-	info, exists := registry.GetPeer(peerID)
+	info, exists := registry.Get(peerID)
 	require.True(t, exists)
 	assert.True(t, info.IsBanned)
 	assert.Equal(t, 100, info.BanScore)
@@ -621,23 +621,20 @@ func TestSyncCoordinator_checkAndUpdateURLResponsiveness(t *testing.T) {
 
 	// Add peers to registry
 	for _, p := range peers {
-		registry.AddPeer(p.ID, "", 0, nil, "")
-		if p.DataHubURL != "" {
-			registry.UpdateDataHubURL(p.ID, p.DataHubURL)
-		}
+		registry.Put(p.ID, "", 0, nil, p.DataHubURL)
 	}
 
 	// Check and update responsiveness
 	sc.checkAndUpdateURLResponsiveness(peers)
 
 	// Verify updates
-	info1, _ := registry.GetPeer(peer.ID("peer1"))
+	info1, _ := registry.Get(peer.ID("peer1"))
 	assert.True(t, info1.URLResponsive)
 
-	info2, _ := registry.GetPeer(peer.ID("peer2"))
+	info2, _ := registry.Get(peer.ID("peer2"))
 	assert.False(t, info2.URLResponsive)
 
-	info3, _ := registry.GetPeer(peer.ID("peer3"))
+	info3, _ := registry.Get(peer.ID("peer3"))
 	assert.False(t, info3.URLResponsive)
 }
 
@@ -668,7 +665,7 @@ func TestSyncCoordinator_checkFSMState(t *testing.T) {
 	// Add peer
 	peerID := peer.ID("test-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(peerID, "", 110, peerHash, "http://test.com")
+	registry.Put(peerID, "", 110, peerHash, "http://test.com")
 	registry.UpdateURLResponsiveness(peerID, true)
 
 	// Check FSM state (LocalClient returns RUNNING by default)
@@ -713,12 +710,12 @@ func TestSyncCoordinator_evaluateSyncPeer(t *testing.T) {
 
 	// Add current sync peer
 	syncPeer := peer.ID("sync-peer")
-	registry.AddPeer(syncPeer, "", 105, nil, "")
+	registry.Put(syncPeer, "", 105, nil, "")
 
 	// Add better peer
 	betterPeer := peer.ID("better-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(betterPeer, "", 120, peerHash, "http://better.com")
+	registry.Put(betterPeer, "", 120, peerHash, "http://better.com")
 	registry.UpdateURLResponsiveness(betterPeer, true)
 
 	// Set current sync peer
@@ -766,7 +763,7 @@ func TestSyncCoordinator_evaluateSyncPeer_StuckAtHeight(t *testing.T) {
 	// Add sync peer
 	syncPeer := peer.ID("sync-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(syncPeer, "", 110, peerHash, "http://test.com")
+	registry.Put(syncPeer, "", 110, peerHash, "http://test.com")
 	registry.UpdateURLResponsiveness(syncPeer, true)
 
 	// Set sync peer and simulate being stuck for too long
@@ -787,7 +784,7 @@ func TestSyncCoordinator_evaluateSyncPeer_StuckAtHeight(t *testing.T) {
 	// Add alternative peer
 	altPeer := peer.ID("alt-peer")
 	peerHash, _ = chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(altPeer, "", 115, peerHash, "http://alt.com")
+	registry.Put(altPeer, "", 115, peerHash, "http://alt.com")
 	registry.UpdateURLResponsiveness(altPeer, true)
 
 	// Evaluate - should clear peer due to long sync without progress and select new one
@@ -958,17 +955,14 @@ func TestSyncCoordinator_CheckAndUpdateURLResponsiveness(t *testing.T) {
 	peerID2 := peer.ID("peer2")
 
 	// Add peers to registry first
-	registry.AddPeer(peerID1, "", 0, nil, "")
-	registry.UpdateDataHubURL(peerID1, server.URL)
-
-	registry.AddPeer(peerID2, "", 0, nil, "")
-	registry.UpdateDataHubURL(peerID2, "http://invalid.localhost.test:99999")
+	registry.Put(peerID1, "", 0, nil, server.URL)
+	registry.Put(peerID2, "", 0, nil, "http://invalid.localhost.test:99999")
 
 	// Get peers and set old check times
-	peer1Info, _ := registry.GetPeer(peerID1)
+	peer1Info, _ := registry.Get(peerID1)
 	peer1Info.LastURLCheck = time.Now().Add(-1 * time.Minute)
 
-	peer2Info, _ := registry.GetPeer(peerID2)
+	peer2Info, _ := registry.Get(peerID2)
 	peer2Info.LastURLCheck = time.Now().Add(-1 * time.Minute)
 
 	peers := []*PeerInfo{peer1Info, peer2Info}
@@ -977,24 +971,23 @@ func TestSyncCoordinator_CheckAndUpdateURLResponsiveness(t *testing.T) {
 	sc.checkAndUpdateURLResponsiveness(peers)
 
 	// Verify results in registry
-	peer1InfoUpdated, _ := registry.GetPeer(peerID1)
+	peer1InfoUpdated, _ := registry.Get(peerID1)
 	assert.True(t, peer1InfoUpdated.URLResponsive, "Peer1 URL should be responsive")
 
-	peer2InfoUpdated, _ := registry.GetPeer(peerID2)
+	peer2InfoUpdated, _ := registry.Get(peerID2)
 	assert.False(t, peer2InfoUpdated.URLResponsive, "Peer2 URL should not be responsive")
 
 	// Test with peer that was checked recently (should skip)
 	peerID3 := peer.ID("peer3")
-	registry.AddPeer(peerID3, "", 0, nil, "")
-	registry.UpdateDataHubURL(peerID3, server.URL)
+	registry.Put(peerID3, "", 0, nil, server.URL)
 
-	peer3Info, _ := registry.GetPeer(peerID3)
+	peer3Info, _ := registry.Get(peerID3)
 	peer3Info.LastURLCheck = time.Now() // Just checked
 
 	peers3 := []*PeerInfo{peer3Info}
 	sc.checkAndUpdateURLResponsiveness(peers3)
 	// Should not update since it was checked recently
-	peer3InfoUpdated, _ := registry.GetPeer(peerID3)
+	peer3InfoUpdated, _ := registry.Get(peerID3)
 	assert.False(t, peer3InfoUpdated.URLResponsive, "Peer3 URL should not be updated (checked recently)")
 }
 
@@ -1027,17 +1020,17 @@ func TestSyncCoordinator_IsCaughtUp(t *testing.T) {
 
 	// Add peer at same height - should be caught up
 	peer1 := peer.ID("peer1")
-	registry.AddPeer(peer1, "", 100, nil, "")
+	registry.Put(peer1, "", 100, nil, "http://peer1.test")
 	assert.True(t, sc.isCaughtUp(), "Should be caught up when at same height")
 
 	// Add peer behind us - should still be caught up
 	peer2 := peer.ID("peer2")
-	registry.AddPeer(peer2, "", 90, nil, "")
+	registry.Put(peer2, "", 90, nil, "http://peer2.test")
 	assert.True(t, sc.isCaughtUp(), "Should be caught up when peers are behind")
 
 	// Add peer ahead of us - should NOT be caught up
 	peer3 := peer.ID("peer3")
-	registry.AddPeer(peer3, "", 110, nil, "")
+	registry.Put(peer3, "", 110, nil, "http://peer3.test")
 	assert.False(t, sc.isCaughtUp(), "Should NOT be caught up when a peer is ahead")
 }
 
@@ -1065,8 +1058,7 @@ func TestSyncCoordinator_SendSyncTriggerToKafka(t *testing.T) {
 
 	// Add peer with DataHub URL
 	peerID := peer.ID("test-peer")
-	registry.AddPeer(peerID, "", 0, nil, "")
-	registry.UpdateDataHubURL(peerID, "http://datahub.example.com")
+	registry.Put(peerID, "", 0, nil, "http://datahub.example.com")
 
 	// Start monitoring the publish channel
 	publishCount := int32(0)
@@ -1122,7 +1114,7 @@ func TestSyncCoordinator_SendSyncMessage(t *testing.T) {
 
 	// Add peer without block hash
 	peerNoHash := peer.ID("peer-no-hash")
-	registry.AddPeer(peerNoHash, "", 0, nil, "")
+	registry.Put(peerNoHash, "", 0, nil, "")
 	err = sc.sendSyncMessage(peerNoHash)
 	assert.Error(t, err, "Should error when peer has no block hash")
 	assert.Contains(t, err.Error(), "no block hash available")
@@ -1130,7 +1122,7 @@ func TestSyncCoordinator_SendSyncMessage(t *testing.T) {
 	// Add peer with block hash atomically
 	peerWithHash := peer.ID("peer-with-hash")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(peerWithHash, "", 100, peerHash, "http://datahub.example.com")
+	registry.Put(peerWithHash, "", 100, peerHash, "http://datahub.example.com")
 
 	// Start monitoring the publish channel
 	done := make(chan bool)
@@ -1274,13 +1266,13 @@ func TestSyncCoordinator_MonitorFSM_AdaptiveIntervals(t *testing.T) {
 
 	// Add a peer ahead of us - should switch to fast monitoring
 	peerID := peer.ID("test-peer")
-	registry.AddPeer(peerID, "", 110, nil, "")
+	registry.Put(peerID, "", 110, nil, "")
 
 	// Let it detect we're not caught up and switch to fast interval
 	time.Sleep(3 * time.Second) // Wait for timer to fire with fast interval
 
 	// Now remove the peer so we're caught up again
-	registry.RemovePeer(peerID)
+	registry.Remove(peerID)
 
 	// Let it detect we're caught up and switch back to slow interval
 	time.Sleep(3 * time.Second)
@@ -1329,12 +1321,12 @@ func TestSyncCoordinator_HandleFSMTransition_Simplified(t *testing.T) {
 
 	// Test RUNNING state with current sync peer - should handle catchup failure
 	syncPeer := peer.ID("sync-peer")
-	registry.AddPeer(syncPeer, "", 110, nil, "")
+	registry.Put(syncPeer, "", 110, nil, "")
 
 	// Add another peer for selection after the failure
 	altPeer := peer.ID("alt-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(altPeer, "", 120, peerHash, "http://alt.com")
+	registry.Put(altPeer, "", 120, peerHash, "http://alt.com")
 	registry.UpdateURLResponsiveness(altPeer, true)
 
 	sc.mu.Lock()
@@ -1346,7 +1338,7 @@ func TestSyncCoordinator_HandleFSMTransition_Simplified(t *testing.T) {
 	assert.True(t, transitioned, "Should return true for RUNNING state with sync peer")
 
 	// Verify ban score was increased
-	info, exists := registry.GetPeer(syncPeer)
+	info, exists := registry.Get(syncPeer)
 	assert.True(t, exists)
 	assert.True(t, info.BanScore > 0, "Peer should have increased ban score")
 
@@ -1511,7 +1503,7 @@ func TestSyncCoordinator_SelectAndActivateNewPeer(t *testing.T) {
 	// Add eligible peer atomically with all data including block hash
 	newPeer := peer.ID("new-peer")
 	newPeerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(newPeer, "", 110, newPeerHash, "http://datahub.example.com")
+	registry.Put(newPeer, "", 110, newPeerHash, "http://datahub.example.com")
 	registry.UpdateURLResponsiveness(newPeer, true)
 
 	// Start monitoring the publish channel
@@ -1563,7 +1555,7 @@ func TestSyncCoordinator_UpdateBanStatus_SyncPeerBanned(t *testing.T) {
 
 	// Add and set sync peer
 	syncPeer := peer.ID("sync-peer")
-	registry.AddPeer(syncPeer, "", 110, nil, "")
+	registry.Put(syncPeer, "", 110, nil, "")
 
 	sc.mu.Lock()
 	sc.currentSyncPeer = syncPeer
@@ -1572,7 +1564,7 @@ func TestSyncCoordinator_UpdateBanStatus_SyncPeerBanned(t *testing.T) {
 	// Add alternative peer
 	altPeer := peer.ID("alt-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(altPeer, "", 115, peerHash, "http://alt.example.com")
+	registry.Put(altPeer, "", 115, peerHash, "http://alt.example.com")
 	registry.UpdateURLResponsiveness(altPeer, true)
 
 	// Start monitoring the publish channel
@@ -1629,7 +1621,7 @@ func TestSyncCoordinator_TriggerSync_SendMessageError(t *testing.T) {
 	// Add peer with block hash for successful sync
 	peerID := peer.ID("test-peer")
 	peerHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-	registry.AddPeer(peerID, "", 110, peerHash, "http://test.com")
+	registry.Put(peerID, "", 110, peerHash, "http://test.com")
 	registry.UpdateURLResponsiveness(peerID, true)
 
 	// Trigger sync - should succeed

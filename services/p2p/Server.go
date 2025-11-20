@@ -823,8 +823,7 @@ func generateRandomKey() (string, error) {
 // Parameters:
 //   - from: the immediate sender's peer ID string
 //   - originatorPeerID: the original message creator's peer ID string (may be same as from)
-//   - originatorClientName: the client name of the original message creator (optional)
-func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string, originatorClientName string) {
+func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string) {
 	if s.peerRegistry == nil {
 		return
 	}
@@ -864,7 +863,7 @@ func (s *Server) updateBytesReceived(from string, originatorPeerID string, messa
 		s.logger.Errorf("failed to decode sender peer ID %s: %v", from, err)
 		return
 	}
-	if info, exists := s.peerRegistry.GetPeer(senderID); exists {
+	if info, exists := s.peerRegistry.Get(senderID); exists {
 		newTotal := info.BytesReceived + messageSize
 		s.peerRegistry.UpdateNetworkStats(senderID, newTotal)
 	}
@@ -872,7 +871,7 @@ func (s *Server) updateBytesReceived(from string, originatorPeerID string, messa
 	// Also update for the originator if different (gossiped message)
 	if originatorPeerID != "" {
 		if peerID, err := peer.Decode(originatorPeerID); err == nil && peerID != senderID {
-			if info, exists := s.peerRegistry.GetPeer(peerID); exists {
+			if info, exists := s.peerRegistry.Get(peerID); exists {
 				newTotal := info.BytesReceived + messageSize
 				s.peerRegistry.UpdateNetworkStats(peerID, newTotal)
 			}
@@ -906,7 +905,7 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, from string)
 		s.logger.Debugf("[handleNodeStatusTopic] Processing node_status from remote peer %s (peer_id: %s)", from, nodeStatusMessage.PeerID)
 
 		// Update last message time for the sender and originator with client name
-		s.updatePeerLastMessageTime(from, nodeStatusMessage.PeerID, nodeStatusMessage.ClientName)
+		s.updatePeerLastMessageTime(from, nodeStatusMessage.PeerID)
 
 		// Track bytes received from this message
 		s.updateBytesReceived(from, nodeStatusMessage.PeerID, uint64(len(m)))
@@ -1211,7 +1210,7 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 	// Get connected peers count from the registry
 	connectedPeersCount := 0
 	if s.peerRegistry != nil {
-		allPeers := s.peerRegistry.GetAllPeers()
+		allPeers := s.peerRegistry.GetAll()
 		connectedPeersCount = len(allPeers)
 	}
 
@@ -1358,7 +1357,7 @@ func (s *Server) handleSubtreeNotification(ctx context.Context, hash *chainhash.
 	return nil
 }
 
-func (s *Server) handlePeerFailureNotification(ctx context.Context, notification *blockchain.Notification) error {
+func (s *Server) handlePeerFailureNotification(_ context.Context, notification *blockchain.Notification) error {
 	// Extract failure details from metadata
 	if notification.Metadata == nil || notification.Metadata.Metadata == nil {
 		s.logger.Warnf("[handlePeerFailureNotification] Received PeerFailure notification with no metadata")
@@ -1730,7 +1729,7 @@ func (s *Server) RecordBytesDownloaded(ctx context.Context, req *p2p_api.RecordB
 	}
 
 	// Get current peer info from registry
-	peerInfo, exists := s.peerRegistry.GetPeer(peerID)
+	peerInfo, exists := s.peerRegistry.Get(peerID)
 	if !exists {
 		s.logger.Warnf("[RecordBytesDownloaded] peer %s not found in registry", req.PeerId)
 		// Still return success - peer might not be in registry yet
@@ -1903,7 +1902,7 @@ func (s *Server) GetPeerRegistry(_ context.Context, _ *emptypb.Empty) (*p2p_api.
 	}
 
 	// Get all peers from the registry
-	allPeers := s.peerRegistry.GetAllPeers()
+	allPeers := s.peerRegistry.GetAll()
 
 	// Helper function to convert time to Unix timestamp, returning 0 for zero times
 	timeToUnix := func(t time.Time) int64 {
@@ -1979,7 +1978,7 @@ func (s *Server) GetPeer(_ context.Context, req *p2p_api.GetPeerRequest) (*p2p_a
 	}
 
 	// Get peer from registry
-	peerInfo, found := s.peerRegistry.GetPeer(peerID)
+	peerInfo, found := s.peerRegistry.Get(peerID)
 	if !found {
 		s.logger.Debugf("[GetPeer] peer %s not found in registry", req.PeerId)
 		return &p2p_api.GetPeerResponse{
