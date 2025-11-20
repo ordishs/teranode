@@ -749,8 +749,9 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 
 	// Fill blockFoundCh to trigger the catchup path - send enough blocks so that
 	// when workers consume them, len(blockFoundCh) > 3 remains for threshold check
-	// Workers consume before checking, so need 8 blocks to ensure len > 3 when checked
-	for i := 0; i < 8; i++ {
+	// With 10 concurrent workers on CI, need many more blocks to ensure len > 3
+	// when checked. Send 20 blocks to overwhelm the workers.
+	for i := 0; i < 20; i++ {
 		blockFoundCh <- processBlockFound{
 			hash:    dummyBlock.Hash(),
 			baseURL: fmt.Sprintf("http://peer%d", i),
