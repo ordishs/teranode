@@ -844,7 +844,8 @@ func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string)
 	// The originator is not directly connected to us
 	if originatorPeerID != "" {
 		if peerID, err := peer.Decode(originatorPeerID); err == nil && peerID != senderID {
-			// Add as gossiped peer (not connected) with their client name
+			// Add as gossiped peer (not connected) before updating last message time
+			s.addPeer(peerID, "", 0, nil, "")
 			s.peerRegistry.UpdateLastMessageTime(peerID)
 		}
 	}
