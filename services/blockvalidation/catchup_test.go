@@ -720,8 +720,8 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	defer cancel()
 	defer close(subscriptionCh)
 
-	blockFoundCh := make(chan processBlockFound, 1)
-	catchupCh := make(chan processBlockCatchup, 1)
+	blockFoundCh := make(chan processBlockFound, 10)
+	catchupCh := make(chan processBlockCatchup, 10)
 
 	baseServer := &Server{
 		logger:              ulogger.TestLogger{},
@@ -745,8 +745,10 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	err = baseServer.Init(ctx)
 	require.NoError(t, err)
 
-	// Fill blockFoundCh to trigger the catchup path - use dummyBlock hash (matches httpmock setup)
-	for i := 0; i < 1; i++ {
+	// Fill blockFoundCh to trigger the catchup path - send enough blocks so that
+	// when workers consume them, len(blockFoundCh) > 3 remains for threshold check
+	// Workers consume before checking, so need 8 blocks to ensure len > 3 when checked
+	for i := 0; i < 8; i++ {
 		blockFoundCh <- processBlockFound{
 			hash:    dummyBlock.Hash(),
 			baseURL: fmt.Sprintf("http://peer%d", i),
@@ -757,7 +759,8 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	select {
 	case got := <-catchupCh:
 		assert.NotNil(t, got.block)
-		assert.Equal(t, "http://peer0", got.baseURL)
+		// With multiple blocks sent, any peer URL is valid
+		assert.Contains(t, got.baseURL, "http://peer")
 	case <-time.After(5 * time.Second):
 		t.Fatal("processBlockFoundChannel did not put anything on catchupCh")
 	}
