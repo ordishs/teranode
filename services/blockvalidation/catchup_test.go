@@ -689,7 +689,9 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 
 	// Activate httpmock before registering responders
 	httpmock.Activate()
-	defer httpmock.DeactivateAndReset()
+	// Don't deactivate httpmock - it causes race conditions when goroutines are still
+	// processing HTTP requests during test cleanup. The mock state will be reset by
+	// other tests that activate httpmock.
 
 	// Register responder for block fetch - use regex to match any peer URL
 	httpmock.RegisterRegexpResponder("GET", regexp.MustCompile(`http://peer[0-9]+/block/[a-f0-9]+`), httpmock.NewBytesResponder(200, blockBytes))
