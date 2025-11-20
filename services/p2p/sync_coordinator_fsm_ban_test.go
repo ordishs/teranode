@@ -36,14 +36,12 @@ func TestSyncCoordinator_FSMTransitionBansPeerAndUpdatesRegistry(t *testing.T) {
 	failingPeer := peer.ID("failing-peer")
 	registry.Put(failingPeer, "", 200, nil, "http://failing.test")
 	registry.UpdateReputation(failingPeer, 80.0)
-	registry.UpdateURLResponsiveness(failingPeer, true)
 	registry.UpdateStorage(failingPeer, "full")
 
 	// Add an alternative peer
 	goodPeer := peer.ID("good-peer")
 	registry.Put(goodPeer, "", 190, nil, "http://good.test")
 	registry.UpdateReputation(goodPeer, 80.0)
-	registry.UpdateURLResponsiveness(goodPeer, true)
 	registry.UpdateStorage(goodPeer, "full")
 
 	// Set the failing peer as current sync peer
@@ -107,7 +105,6 @@ func TestSyncCoordinator_BannedPeerNotReselected(t *testing.T) {
 	bannedPeer := peer.ID("banned-peer")
 	registry.Put(bannedPeer, "", 300, nil, "http://banned.test")
 	registry.UpdateReputation(bannedPeer, 80.0)
-	registry.UpdateURLResponsiveness(bannedPeer, true)
 	registry.UpdateStorage(bannedPeer, "full")
 
 	// Ban the peer
@@ -121,13 +118,11 @@ func TestSyncCoordinator_BannedPeerNotReselected(t *testing.T) {
 	peer1 := peer.ID("peer1")
 	registry.Put(peer1, "", 250, nil, "http://peer1.test")
 	registry.UpdateReputation(peer1, 80.0)
-	registry.UpdateURLResponsiveness(peer1, true)
 	registry.UpdateStorage(peer1, "full")
 
 	peer2 := peer.ID("peer2")
 	registry.Put(peer2, "", 240, nil, "http://peer2.test")
 	registry.UpdateReputation(peer2, 80.0)
-	registry.UpdateURLResponsiveness(peer2, true)
 	registry.UpdateStorage(peer2, "full")
 
 	// Set local height

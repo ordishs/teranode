@@ -480,28 +480,6 @@ func (s *Server) addConnectedPeer(peerID peer.ID, clientName string, height uint
 	}
 }
 
-// InjectPeerForTesting directly injects a peer into the registry for testing purposes.
-// This method allows deterministic peer setup without requiring actual P2P network connections.
-func (s *Server) InjectPeerForTesting(peerID peer.ID, clientName, dataHubURL string, height uint32, blockHash string) {
-	// Parse block hash
-	hash, err := chainhash.NewHashFromStr(blockHash)
-	if err != nil {
-		hash = nil
-	}
-
-	// Add peer atomically with all initial data
-	if s.peerRegistry != nil {
-		s.peerRegistry.Put(peerID, clientName, height, hash, dataHubURL)
-		s.peerRegistry.UpdateConnectionState(peerID, true)
-		s.peerRegistry.UpdateURLResponsiveness(peerID, true)
-		s.peerRegistry.UpdateStorage(peerID, "full")
-	}
-
-	if s.syncCoordinator != nil {
-		s.syncCoordinator.UpdatePeerInfo(peerID, height, hash, dataHubURL)
-	}
-}
-
 func (s *Server) removePeer(peerID peer.ID) {
 	if s.peerRegistry != nil {
 		// Mark as disconnected before removing

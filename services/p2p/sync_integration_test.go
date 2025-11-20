@@ -35,7 +35,6 @@ func TestSyncCoordination_FullFlow(t *testing.T) {
 	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
 	registry.Put(healthyPeer, "", 1000, testHash, "http://healthy.test")
 	registry.UpdateReputation(healthyPeer, 80.0)
-	registry.UpdateURLResponsiveness(healthyPeer, true)
 	registry.UpdateStorage(healthyPeer, "full")
 
 	// Add unhealthy peer
@@ -92,7 +91,6 @@ func TestSyncCoordination_FullFlow(t *testing.T) {
 		testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
 		registry.Put(newHealthyPeer, "", 1050, testHash, "http://newhealthy.test")
 		registry.UpdateReputation(newHealthyPeer, 80.0)
-		registry.UpdateURLResponsiveness(newHealthyPeer, true)
 		registry.UpdateStorage(newHealthyPeer, "full")
 
 		// Disconnect current sync peer
@@ -116,7 +114,6 @@ func TestSyncCoordination_FullFlow(t *testing.T) {
 			testPeer := peer.ID("ban-test")
 			registry.Put(testPeer, "", 10000, nil, "http://ban-test.com") // Very high to ensure selection
 			registry.UpdateReputation(testPeer, 80.0)
-			registry.UpdateURLResponsiveness(testPeer, true)
 			registry.UpdateStorage(testPeer, "full")
 
 			_ = coordinator.TriggerSync()
@@ -246,18 +243,6 @@ func TestSyncCoordination_WithHTTPServer(t *testing.T) {
 	coordinator.Start(blockchainSetup.Ctx)
 	defer coordinator.Stop()
 
-	// Test URL responsiveness check
-	t.Run("CheckURLResponsiveness", func(t *testing.T) {
-		responsive := coordinator.checkURLResponsiveness(server.URL)
-		assert.True(t, responsive)
-	})
-
-	// Test with unresponsive URL
-	t.Run("CheckURLUnresponsive", func(t *testing.T) {
-		badURL := "http://nonexistent.invalid:12345"
-		responsive := coordinator.checkURLResponsiveness(badURL)
-		assert.False(t, responsive)
-	})
 }
 
 // Test sync coordination with multiple concurrent operations
@@ -387,14 +372,12 @@ func TestSyncCoordination_CatchupFailures(t *testing.T) {
 	testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
 	registry.Put(goodPeer, "", 1000, testHash, "http://good.test")
 	registry.UpdateReputation(goodPeer, 80.0)
-	registry.UpdateURLResponsiveness(goodPeer, true)
 	registry.UpdateStorage(goodPeer, "full")
 
 	badPeer := peer.ID("bad")
 	testHash, _ = chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
 	registry.Put(badPeer, "", 1100, testHash, "http://bad.test")
 	registry.UpdateReputation(badPeer, 80.0)
-	registry.UpdateURLResponsiveness(badPeer, true)
 	registry.UpdateStorage(badPeer, "full")
 
 	coordinator.Start(blockchainSetup.Ctx)
@@ -452,11 +435,10 @@ func TestSyncCoordination_PeerEvaluation(t *testing.T) {
 				testHash, _ := chainhash.NewHashFromStr("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
 				registry.Put(id, "", 1000, testHash, "http://good.test")
 				registry.UpdateReputation(id, 80.0)
-				registry.UpdateURLResponsiveness(id, true)
 				return id
 			},
 			shouldSync:  true,
-			description: "Healthy peer with responsive URL should be selected",
+			description: "Healthy peer with DataHub URL should be selected",
 		},
 		{
 			name: "banned_peer",
