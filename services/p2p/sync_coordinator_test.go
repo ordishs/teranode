@@ -459,40 +459,6 @@ func TestSyncCoordinator_selectNewSyncPeer_ForcedPeer(t *testing.T) {
 	assert.Equal(t, forcedPeer, selected)
 }
 
-func TestSyncCoordinator_UpdatePeerInfo(t *testing.T) {
-	logger := ulogger.New("test")
-	settings := CreateTestSettings()
-	registry := NewPeerRegistry()
-	selector := NewPeerSelector(logger, nil)
-	banManager := NewPeerBanManager(context.Background(), nil, settings, registry)
-	blockchainSetup := SetupTestBlockchain(t)
-	defer blockchainSetup.Cleanup()
-
-	sc := NewSyncCoordinator(
-		logger,
-		settings,
-		registry,
-		selector,
-		banManager,
-		blockchainSetup.Client,
-		nil, // blocksKafkaProducerClient
-	)
-
-	// Add peer first
-	peerID := peer.ID("test-peer")
-	registry.Put(peerID, "", 0, nil, "")
-
-	// Update peer info
-	sc.UpdatePeerInfo(peerID, 150, "block-hash", "http://datahub.com")
-
-	// Verify peer was updated
-	info, exists := registry.Get(peerID)
-	require.True(t, exists)
-	assert.Equal(t, int32(150), info.Height)
-	assert.Equal(t, "block-hash", info.BlockHash)
-	assert.Equal(t, "http://datahub.com", info.DataHubURL)
-}
-
 func TestSyncCoordinator_UpdateBanStatus(t *testing.T) {
 	logger := ulogger.New("test")
 	settings := CreateTestSettings()
@@ -1173,7 +1139,7 @@ func TestSyncCoordinator_FilterEligiblePeers(t *testing.T) {
 	)
 
 	oldPeer := peer.ID("old-peer")
-	localHeight := int32(100)
+	localHeight := uint32(100)
 
 	peers := []*PeerInfo{
 		{ID: oldPeer, Height: 110, Storage: "full"},          // Old peer, should be skipped
@@ -1210,7 +1176,7 @@ func TestSyncCoordinator_FilterEligiblePeers_OldPeerLogging(t *testing.T) {
 	)
 
 	oldPeer := peer.ID("old-peer-to-skip")
-	localHeight := int32(100)
+	localHeight := uint32(100)
 
 	// Test case 1: Old peer is ahead of local height (should log that it's being skipped)
 	peers1 := []*PeerInfo{
@@ -1278,7 +1244,7 @@ func TestSyncCoordinator_SelectAndActivateNewPeer(t *testing.T) {
 		mockProducer,
 	)
 
-	localHeight := int32(100)
+	localHeight := uint32(100)
 	oldPeer := peer.ID("old-peer")
 
 	// Test with no eligible peers
