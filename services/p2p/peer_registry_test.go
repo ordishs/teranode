@@ -427,7 +427,7 @@ func TestPeerRegistry_GetPeersForCatchup(t *testing.T) {
 	pr.UpdateReputation(ids[2], 15.0)
 
 	// Peer 3: Healthy but no DataHub URL (should be excluded)
-	pr.Put(ids[3], "", 0, nil, "http://peer3.test")
+	pr.Put(ids[3], "", 0, nil, "")
 	pr.UpdateReputation(ids[3], 85.0)
 
 	// Peer 4: Healthy with DataHub URL but banned (should be excluded)

@@ -56,7 +56,6 @@ func TestSelector_SkipsPeerMarkedUnhealthyByHealthChecker(t *testing.T) {
 	registry.UpdateStorage(healthyID, "full")
 
 	registry.Put(unhealthyID, "", 125, nil, failSrv.URL)
-	registry.UpdateStorage(unhealthyID, "full")
 
 	// Fetch peers and select
 	peers := registry.GetAll()

@@ -65,6 +65,19 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 		return
 	}
 
+	now := time.Now().UTC()
+
+	// Store the peer ID that sent this block
+	s.storePeerMapEntry(&s.blockPeerMap, blockMessage.Hash, from, now)
+
+	s.logger.Debugf("[handleBlockTopic] storing peer %s for block %s", from, blockMessage.Hash)
+
+	// Store using the originator's peer ID
+	if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
+		s.addPeer(peerID, blockMessage.ClientName, blockMessage.Height, hash, blockMessage.DataHubURL)
+		s.logger.Debugf("[handleBlockTopic] Stored latest block hash %s for peer %s", blockMessage.Hash, peerID)
+	}
+
 	// Update last message time for the sender and originator with client name
 	s.updatePeerLastMessageTime(from, blockMessage.PeerID)
 
@@ -81,22 +94,9 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, from string) {
 		return
 	}
 
-	now := time.Now().UTC()
-
 	hash, err = s.parseHash(blockMessage.Hash, "handleBlockTopic")
 	if err != nil {
 		return
-	}
-
-	// Store the peer ID that sent this block
-	s.storePeerMapEntry(&s.blockPeerMap, blockMessage.Hash, from, now)
-
-	s.logger.Debugf("[handleBlockTopic] storing peer %s for block %s", from, blockMessage.Hash)
-
-	// Store using the originator's peer ID
-	if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
-		s.addPeer(peerID, blockMessage.ClientName, blockMessage.Height, hash, blockMessage.DataHubURL)
-		s.logger.Debugf("[handleBlockTopic] Stored latest block hash %s for peer %s", blockMessage.Hash, peerID)
 	}
 
 	// Always send block to kafka - let block validation service decide what to do based on sync state
