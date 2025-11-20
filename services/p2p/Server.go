@@ -844,6 +844,10 @@ func (s *Server) updatePeerLastMessageTime(from string, originatorPeerID string)
 	// The originator is not directly connected to us
 	if originatorPeerID != "" {
 		if peerID, err := peer.Decode(originatorPeerID); err == nil && peerID != senderID {
+			// Don't add ourselves as a peer (prevent self-gossip in single-node environments)
+			if originatorPeerID == s.P2PClient.GetID() {
+				return
+			}
 			// Add as gossiped peer (not connected) before updating last message time
 			s.addPeer(peerID, "", 0, nil, "")
 			s.peerRegistry.UpdateLastMessageTime(peerID)
