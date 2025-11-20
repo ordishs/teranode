@@ -750,14 +750,16 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	// Fill blockFoundCh to trigger the catchup path - send enough blocks so that
 	// when workers consume them, len(blockFoundCh) > 3 remains for threshold check
 	// With 10 concurrent workers on CI, need many more blocks to ensure len > 3
-	// when checked. Send 20 blocks to overwhelm the workers.
-	for i := 0; i < 20; i++ {
-		blockFoundCh <- processBlockFound{
-			hash:    dummyBlock.Hash(),
-			baseURL: fmt.Sprintf("http://peer%d", i),
-			errCh:   make(chan error, 1),
+	// when checked. Send 5 blocks to overwhelm the workers.
+	go func() {
+		for i := 0; i < 5; i++ {
+			blockFoundCh <- processBlockFound{
+				hash:    dummyBlock.Hash(),
+				baseURL: fmt.Sprintf("http://peer%d", i),
+				errCh:   make(chan error, 1),
+			}
 		}
-	}
+	}()
 
 	select {
 	case got := <-catchupCh:
