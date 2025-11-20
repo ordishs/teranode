@@ -532,7 +532,6 @@ func (s *Server) InjectPeerForTesting(peerID peer.ID, clientName, dataHubURL str
 	s.updatePeerHeight(peerID, int32(height))
 
 	if s.peerRegistry != nil {
-		s.peerRegistry.UpdateURLResponsiveness(peerID, true)
 		s.peerRegistry.UpdateStorage(peerID, "full")
 	}
 
