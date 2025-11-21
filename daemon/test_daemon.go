@@ -110,7 +110,7 @@ func (je *JSONError) Error() string {
 
 // NewTestDaemon creates a new TestDaemon instance with the provided options.
 func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	var (
 		composeDependencies tc.ComposeStack
@@ -1904,7 +1904,7 @@ func (td *TestDaemon) InjectPeer(t *testing.T, peer *TestDaemon) {
 	header, meta, err := peer.BlockchainClient.GetBestBlockHeader(td.Ctx)
 	require.NoError(t, err, "Failed to get best block header")
 
-	p2pServer.InjectPeerForTesting(peerID, peer.Settings.Context, peer.AssetURL, meta.Height, header.Hash().String())
+	p2pServer.InjectPeerForTesting(peerID, peer.Settings.Context, peer.AssetURL, meta.Height, header.Hash())
 
 	t.Logf("Injected peer %s into %s's registry (PeerID: %s)", peer.Settings.Context, td.Settings.Context, peerID)
 }

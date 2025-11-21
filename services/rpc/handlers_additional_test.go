@@ -3034,8 +3034,8 @@ func TestHandleIsBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeer,
+			logger:          logger,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3067,9 +3067,9 @@ func TestHandleIsBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3101,9 +3101,9 @@ func TestHandleIsBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3135,9 +3135,9 @@ func TestHandleIsBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3258,8 +3258,8 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeer,
+			logger:          logger,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3291,9 +3291,9 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3329,9 +3329,9 @@ func TestHandleListBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3414,9 +3414,9 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3444,9 +3444,9 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3491,8 +3491,8 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeer,
+			logger:          logger,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3536,9 +3536,9 @@ func TestHandleClearBannedComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3626,9 +3626,9 @@ func TestHandleSetBanComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3729,9 +3729,9 @@ func TestHandleSetBanComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3847,9 +3847,9 @@ func TestHandleSetBanComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3886,9 +3886,9 @@ func TestHandleSetBanComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			p2pClient:  mockP2P,
-			peerClient: mockPeer,
+			logger:          logger,
+			p2pClient:       mockP2P,
+			legacyP2PClient: mockPeer,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 			},
@@ -3982,7 +3982,7 @@ func TestHandleGetInfoComprehensive(t *testing.T) {
 			blockchainClient:    mockBlockchainClient,
 			blockAssemblyClient: mockBlockAssemblyClient,
 			p2pClient:           mockP2PClient,
-			peerClient:          mockLegacyPeerClient,
+			legacyP2PClient:     mockLegacyPeerClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 				RPC: settings.RPCSettings{
@@ -4208,7 +4208,7 @@ func TestHandleGetInfoComprehensive(t *testing.T) {
 			logger:              logger,
 			blockchainClient:    mockBlockchainClient,
 			blockAssemblyClient: mockBlockAssemblyClient,
-			peerClient:          mockLegacyPeerClient,
+			legacyP2PClient:     mockLegacyPeerClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 				RPC: settings.RPCSettings{
@@ -4842,8 +4842,8 @@ func TestHandleGetpeerinfoComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeerClient,
+			logger:          logger,
+			legacyP2PClient: mockPeerClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 				RPC: settings.RPCSettings{
@@ -4989,9 +4989,9 @@ func TestHandleGetpeerinfoComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeerClient,
-			p2pClient:  mockP2PClient,
+			logger:          logger,
+			legacyP2PClient: mockPeerClient,
+			p2pClient:       mockP2PClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 				RPC: settings.RPCSettings{
@@ -5051,8 +5051,8 @@ func TestHandleGetpeerinfoComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeerClient,
+			logger:          logger,
+			legacyP2PClient: mockPeerClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 				RPC: settings.RPCSettings{
@@ -5086,9 +5086,9 @@ func TestHandleGetpeerinfoComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeerClient,
-			p2pClient:  mockP2PClient,
+			logger:          logger,
+			legacyP2PClient: mockPeerClient,
+			p2pClient:       mockP2PClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 				RPC: settings.RPCSettings{
@@ -5128,8 +5128,8 @@ func TestHandleGetpeerinfoComprehensive(t *testing.T) {
 		}
 
 		s := &RPCServer{
-			logger:     logger,
-			peerClient: mockPeerClient,
+			logger:          logger,
+			legacyP2PClient: mockPeerClient,
 			settings: &settings.Settings{
 				ChainCfgParams: &chaincfg.MainNetParams,
 				RPC: settings.RPCSettings{
