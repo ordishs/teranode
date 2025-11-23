@@ -370,7 +370,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
 				return nil
 			case <-timer.C:
-				prometheusUtxoMapErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
+				if prometheusUtxoMapErrors != nil {
+					prometheusUtxoMapErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
+				}
 				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
 				return nil
 			}
@@ -1113,6 +1115,7 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 		batch[batchIdx].errCh <- nil
 	}
 }
+
 func (s *Store) acquireSpendPermit(ctx context.Context) error {
 	if s == nil || s.spendQueueSem == nil {
 		return nil
@@ -1134,7 +1137,9 @@ func (s *Store) acquireSpendPermit(ctx context.Context) error {
 	case <-ctx.Done():
 		return errors.NewContextCanceledError("[SPEND] context canceled while waiting for spend queue slot: %v", ctx.Err())
 	case <-timer.C:
-		prometheusUtxoMapErrors.WithLabelValues("Spend", "QueueTimeout").Inc()
+		if prometheusUtxoMapErrors != nil {
+			prometheusUtxoMapErrors.WithLabelValues("Spend", "QueueTimeout").Inc()
+		}
 		return errors.NewServiceUnavailableError("[SPEND] timed out after %s waiting for spend queue slot", timeout)
 	}
 }
@@ -1144,6 +1149,13 @@ func (s *Store) releaseSpendPermit() {
 	}
 	select {
 	case <-s.spendQueueSem:
+		// Successfully released permit
 	default:
+		// This should never happen - it means we're trying to release more permits than we acquired
+		// Log error to detect potential logic bugs in permit acquisition/release
+		s.logger.Errorf("[SPEND] Failed to release spend permit: semaphore buffer is full (potential permit leak)")
+		if prometheusUtxoMapErrors != nil {
+			prometheusUtxoMapErrors.WithLabelValues("Spend", "PermitLeakage").Inc()
+		}
 	}
 }
