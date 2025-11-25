@@ -332,7 +332,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		spend := spend
 
 		g.Go(func() error {
-			// Check circuit breaker before attempting spend
+			// Fast-fail check: if circuit breaker is already open, don't waste time acquiring permit
 			if s.spendCircuitBreaker != nil && !s.spendCircuitBreaker.Allow() {
 				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND] circuit breaker open, rejecting request")
 				return nil
@@ -343,6 +343,14 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				return nil
 			}
 			defer s.releaseSpendPermit()
+
+			// Critical: Re-check circuit breaker after acquiring permit to prevent race condition.
+			// During the (potentially long) wait for permit, the circuit breaker state may have changed.
+			// This second check ensures we see the most recent state before submitting work.
+			if s.spendCircuitBreaker != nil && !s.spendCircuitBreaker.Allow() {
+				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND] circuit breaker opened during permit acquisition, rejecting request")
+				return nil
+			}
 
 			errCh := make(chan error, 1)
 			s.spendBatcher.Put(&batchSpend{
