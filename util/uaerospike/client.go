@@ -226,14 +226,19 @@ func (c *Client) Delete(policy *aerospike.WritePolicy, key *aerospike.Key) (bool
 
 // Get is a wrapper around aerospike.Client.Get that uses semaphore to limit concurrent connections.
 func (c *Client) Get(policy *aerospike.BasePolicy, key *aerospike.Key, binNames ...string) (*aerospike.Record, aerospike.Error) {
-	start := gocore.CurrentTime()
-
-	if err := c.acquirePermit(policy.TotalTimeout); err != nil {
-		return nil, err
+	timeout := time.Duration(0)
+	if policy != nil && policy.TotalTimeout > 0 {
+		timeout = policy.TotalTimeout
 	}
 
+	if err := c.acquirePermit(timeout); err != nil {
+		return nil, err
+	}
+	defer c.releasePermit()
+
+	start := gocore.CurrentTime()
+
 	defer func() {
-		c.releasePermit()
 
 		// Build the query string with sorted keys
 		var sb strings.Builder
