@@ -943,7 +943,7 @@ func TestCompareMerkleProofsToSubtrees(t *testing.T) {
 	settings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
 
 	ctx := context.Background()
-	subtreeProcessor, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan, WithBatcherSize(1))
+	subtreeProcessor, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, nil, nil, nil, newSubtreeChan)
 	subtreeProcessor.Start(ctx)
 
 	for i, hash := range hashes {
