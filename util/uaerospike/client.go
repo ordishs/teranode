@@ -130,14 +130,14 @@ func NewClientWithPolicyAndHost(policy *aerospike.ClientPolicy, hosts ...*aerosp
 
 // Put is a wrapper around aerospike.Client.Put that uses semaphore to limit concurrent connections.
 func (c *Client) Put(policy *aerospike.WritePolicy, key *aerospike.Key, binMap aerospike.BinMap) aerospike.Error {
-	start := gocore.CurrentTime()
-
-	if err := c.acquirePermit(policy.TotalTimeout); err != nil {
+	if err := c.acquirePermit(policy); err != nil {
 		return err
 	}
+	defer c.releasePermit()
+
+	start := gocore.CurrentTime()
 
 	defer func() {
-		c.releasePermit()
 
 		// Extract keys from binMap
 		keys := make([]string, len(binMap))
@@ -173,14 +173,14 @@ func (c *Client) Put(policy *aerospike.WritePolicy, key *aerospike.Key, binMap a
 
 // PutBins is a wrapper around aerospike.Client.PutBins that uses semaphore to limit concurrent connections.
 func (c *Client) PutBins(policy *aerospike.WritePolicy, key *aerospike.Key, bins ...*aerospike.Bin) aerospike.Error {
-	start := gocore.CurrentTime()
-
-	if err := c.acquirePermit(policy.TotalTimeout); err != nil {
+	if err := c.acquirePermit(policy); err != nil {
 		return err
 	}
+	defer c.releasePermit()
+
+	start := gocore.CurrentTime()
 
 	defer func() {
-		c.releasePermit()
 
 		// Extract keys from binMap
 		keys := make([]string, len(bins))
@@ -209,15 +209,14 @@ func (c *Client) PutBins(policy *aerospike.WritePolicy, key *aerospike.Key, bins
 
 // Delete is a wrapper around aerospike.Client.Delete that uses semaphore to limit concurrent connections.
 func (c *Client) Delete(policy *aerospike.WritePolicy, key *aerospike.Key) (bool, aerospike.Error) {
-	start := gocore.CurrentTime()
-
-	if err := c.acquirePermit(policy.TotalTimeout); err != nil {
+	if err := c.acquirePermit(policy); err != nil {
 		return false, err
 	}
+	defer c.releasePermit()
+
+	start := gocore.CurrentTime()
 
 	defer func() {
-		c.releasePermit()
-
 		c.stats.stat.NewStat("Delete").AddTime(start)
 	}()
 
@@ -226,12 +225,7 @@ func (c *Client) Delete(policy *aerospike.WritePolicy, key *aerospike.Key) (bool
 
 // Get is a wrapper around aerospike.Client.Get that uses semaphore to limit concurrent connections.
 func (c *Client) Get(policy *aerospike.BasePolicy, key *aerospike.Key, binNames ...string) (*aerospike.Record, aerospike.Error) {
-	timeout := time.Duration(0)
-	if policy != nil && policy.TotalTimeout > 0 {
-		timeout = policy.TotalTimeout
-	}
-
-	if err := c.acquirePermit(timeout); err != nil {
+	if err := c.acquirePermit(policy); err != nil {
 		return nil, err
 	}
 	defer c.releasePermit()
@@ -261,14 +255,13 @@ func (c *Client) Get(policy *aerospike.BasePolicy, key *aerospike.Key, binNames 
 
 // Operate is a wrapper around aerospike.Client.Operate that uses semaphore to limit concurrent connections.
 func (c *Client) Operate(policy *aerospike.WritePolicy, key *aerospike.Key, operations ...*aerospike.Operation) (*aerospike.Record, aerospike.Error) {
-	start := gocore.CurrentTime()
-
-	if err := c.acquirePermit(policy.TotalTimeout); err != nil {
+	if err := c.acquirePermit(policy); err != nil {
 		return nil, err
 	}
+	defer c.releasePermit()
 
+	start := gocore.CurrentTime()
 	defer func() {
-		c.releasePermit()
 		c.stats.operateStat.AddTimeForRange(start, len(operations))
 	}()
 
@@ -277,14 +270,13 @@ func (c *Client) Operate(policy *aerospike.WritePolicy, key *aerospike.Key, oper
 
 // BatchOperate is a wrapper around aerospike.Client.BatchOperate that uses semaphore to limit concurrent connections.
 func (c *Client) BatchOperate(policy *aerospike.BatchPolicy, records []aerospike.BatchRecordIfc) aerospike.Error {
-	start := gocore.CurrentTime()
-
-	if err := c.acquirePermit(policy.TotalTimeout); err != nil {
+	if err := c.acquirePermit(policy); err != nil {
 		return err
 	}
+	defer c.releasePermit()
 
+	start := gocore.CurrentTime()
 	defer func() {
-		c.releasePermit()
 		c.stats.batchOperateStat.AddTimeForRange(start, len(records))
 	}()
 
@@ -298,9 +290,33 @@ func (c *Client) GetConnectionQueueSize() int {
 }
 
 // acquirePermit attempts to acquire a permit from the connection semaphore with an optional timeout.
-// If timeout is <= 0, it will block until a permit is available.
+// The policy parameter can be nil, in which case no timeout is used (blocks until available).
+// If the policy has a TotalTimeout > 0, that timeout is used for permit acquisition.
 // Returns an error if the timeout expires before a permit becomes available.
-func (c *Client) acquirePermit(timeout time.Duration) aerospike.Error {
+//
+// Accepts any Aerospike policy type (BasePolicy, WritePolicy, BatchPolicy) as they all
+// embed BasePolicy which contains TotalTimeout.
+func (c *Client) acquirePermit(policy any) aerospike.Error {
+	timeout := time.Duration(0)
+
+	// Extract timeout from policy if available
+	if policy != nil {
+		switch p := policy.(type) {
+		case *aerospike.BasePolicy:
+			if p != nil && p.TotalTimeout > 0 {
+				timeout = p.TotalTimeout
+			}
+		case *aerospike.WritePolicy:
+			if p != nil && p.TotalTimeout > 0 {
+				timeout = p.TotalTimeout
+			}
+		case *aerospike.BatchPolicy:
+			if p != nil && p.TotalTimeout > 0 {
+				timeout = p.TotalTimeout
+			}
+		}
+	}
+
 	if timeout <= 0 {
 		// No timeout - block until available
 		c.connSemaphore <- struct{}{}
