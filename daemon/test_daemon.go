@@ -1301,25 +1301,10 @@ func (td *TestDaemon) WaitForBlockStateChange(t *testing.T, expectedBlock *model
 }
 
 func (td *TestDaemon) WaitForBlockhash(t *testing.T, blockHash *chainhash.Hash, timeout time.Duration) {
-	ctx, cancel := context.WithTimeout(td.Ctx, timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			t.Errorf("Timeout waiting for block with hash %s", blockHash.String())
-			t.FailNow()
-			return
-		case <-ticker.C:
-			_, err := td.BlockchainClient.GetBlock(ctx, blockHash)
-			if err == nil {
-				return
-			}
-		}
-	}
+	require.Eventually(t, func() bool {
+		_, err := td.BlockchainClient.GetBlock(td.Ctx, blockHash)
+		return err == nil
+	}, timeout, 100*time.Millisecond, "Timeout waiting for block with hash %s", blockHash.String())
 }
 
 func (td *TestDaemon) WaitForBlock(t *testing.T, expectedBlock *model.Block, timeout time.Duration, skipVerifyChain ...bool) {
