@@ -16,6 +16,13 @@ const (
 	// DefaultConnectionQueueSize is the default size for the connection queue
 	// if not specified in the client policy
 	DefaultConnectionQueueSize = 128
+
+	// semaphoreTimeoutFraction is the fraction of TotalTimeout to use for semaphore acquisition
+	// This ensures the total operation time (semaphore wait + actual operation) stays within bounds
+	semaphoreTimeoutFraction = 0.1 // 10% of total timeout
+
+	// minSemaphoreTimeout is the minimum timeout for semaphore acquisition
+	minSemaphoreTimeout = 100 * time.Millisecond
 )
 
 // getConnectionQueueSize returns the connection queue size from the given policy
@@ -291,39 +298,47 @@ func (c *Client) GetConnectionQueueSize() int {
 
 // acquirePermit attempts to acquire a permit from the connection semaphore with an optional timeout.
 // The policy parameter can be nil, in which case no timeout is used (blocks until available).
-// If the policy has a TotalTimeout > 0, that timeout is used for permit acquisition.
+// If the policy has a TotalTimeout > 0, a fraction of that timeout (semaphoreTimeoutFraction)
+// is used for permit acquisition to ensure the total operation time stays within bounds.
 // Returns an error if the timeout expires before a permit becomes available.
 //
 // Accepts any Aerospike policy type (BasePolicy, WritePolicy, BatchPolicy) as they all
 // embed BasePolicy which contains TotalTimeout.
 func (c *Client) acquirePermit(policy any) aerospike.Error {
-	timeout := time.Duration(0)
+	totalTimeout := time.Duration(0)
 
 	// Extract timeout from policy if available
 	if policy != nil {
 		switch p := policy.(type) {
 		case *aerospike.BasePolicy:
 			if p != nil && p.TotalTimeout > 0 {
-				timeout = p.TotalTimeout
+				totalTimeout = p.TotalTimeout
 			}
 		case *aerospike.WritePolicy:
 			if p != nil && p.TotalTimeout > 0 {
-				timeout = p.TotalTimeout
+				totalTimeout = p.TotalTimeout
 			}
 		case *aerospike.BatchPolicy:
 			if p != nil && p.TotalTimeout > 0 {
-				timeout = p.TotalTimeout
+				totalTimeout = p.TotalTimeout
 			}
 		}
 	}
 
-	if timeout <= 0 {
+	if totalTimeout <= 0 {
 		// No timeout - block until available
 		c.connSemaphore <- struct{}{}
 		return nil
 	}
 
-	timer := time.NewTimer(timeout)
+	// Calculate semaphore timeout as a fraction of total timeout
+	// This ensures total operation time (semaphore wait + actual operation) stays within bounds
+	semaphoreTimeout := time.Duration(float64(totalTimeout) * semaphoreTimeoutFraction)
+	if semaphoreTimeout < minSemaphoreTimeout {
+		semaphoreTimeout = minSemaphoreTimeout
+	}
+
+	timer := time.NewTimer(semaphoreTimeout)
 	defer timer.Stop()
 
 	select {
