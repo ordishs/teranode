@@ -4912,7 +4912,7 @@ func TestHandleGetpeerinfoComprehensive(t *testing.T) {
 	t.Run("p2p client with stats", func(t *testing.T) {
 		// Create mock p2p client
 		mockP2PClient := &mockP2PClient{
-			getPeersFunc: func(ctx context.Context) ([]*p2p.PeerInfo, error) {
+			getPeerRegistryFunc: func(ctx context.Context) ([]*p2p.PeerInfo, error) {
 				peerID, err := peer.Decode("12D3KooWL1NF6fdTJ9cucEuwvuX8V8KtpJZZnUE4umdLBuK15eUZ")
 				require.NoError(t, err, "Failed to decode peer ID")
 				return []*p2p.PeerInfo{
@@ -4995,7 +4995,7 @@ func TestHandleGetpeerinfoComprehensive(t *testing.T) {
 		}
 
 		mockP2PClient := &mockP2PClient{
-			getPeersFunc: func(ctx context.Context) ([]*p2p.PeerInfo, error) {
+			getPeerRegistryFunc: func(ctx context.Context) ([]*p2p.PeerInfo, error) {
 				peerID, err := peer.Decode("12D3KooWJZZnUE4umdLBuK15eUZL1NF6fdTJ9cucEuwvuX8V8Ktp")
 				require.NoError(t, err, "Failed to decode peer ID")
 				return []*p2p.PeerInfo{
