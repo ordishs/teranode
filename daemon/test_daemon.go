@@ -1304,17 +1304,19 @@ func (td *TestDaemon) WaitForBlockhash(t *testing.T, blockHash *chainhash.Hash, 
 	ctx, cancel := context.WithTimeout(td.Ctx, timeout)
 	defer cancel()
 
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			t.Errorf("Timeout waiting for block with hash %s", blockHash.String())
-			return
-		default:
+			t.FailNow()
+		case <-ticker.C:
 			_, err := td.BlockchainClient.GetBlock(ctx, blockHash)
 			if err == nil {
 				return
 			}
-			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }

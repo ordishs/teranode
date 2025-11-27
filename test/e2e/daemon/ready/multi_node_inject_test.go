@@ -57,7 +57,7 @@ func printPeerRegistry(t *testing.T, td *daemon.TestDaemon) {
 	fmt.Printf("\nPeer %s (%s) registry:\n", td.Settings.ClientName, td.Settings.P2P.PeerID)
 
 	for _, peerInfo := range registry {
-		fmt.Printf("\tName: %s (%s): Height=%d, BlockHash=%s, DataHubURL=%s", peerInfo.ClientName, peerInfo.ID, peerInfo.Height, peerInfo.BlockHash, peerInfo.DataHubURL)
+		fmt.Printf("\tName: %s (%s): Height=%d, BlockHash=%s, DataHubURL=%s\n", peerInfo.ClientName, peerInfo.ID, peerInfo.Height, peerInfo.BlockHash, peerInfo.DataHubURL)
 	}
 
 	fmt.Println()

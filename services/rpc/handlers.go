@@ -1118,19 +1118,21 @@ func handleGetpeerinfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-c
 
 	wg := sync.WaitGroup{}
 
+	hasLegacyClient := s.legacyP2PClient != nil
+	hasP2PClient := s.p2pClient != nil
+
 	// get legacy peer info
-	if s.legacyP2PClient != nil {
+	if hasLegacyClient {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			resp, err := s.legacyP2PClient.GetPeers(peerCtx)
 			legacyResultCh <- legacyPeerResult{resp: resp, err: err}
 		}()
-
 	}
 
 	// get new peer info from p2p service
-	if s.p2pClient != nil {
+	if hasP2PClient {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1143,74 +1145,77 @@ func handleGetpeerinfo(ctx context.Context, s *RPCServer, cmd interface{}, _ <-c
 
 	infos := make([]*bsvjson.GetPeerInfoResult, 0, 32)
 
-	legacyResult := <-legacyResultCh
-
-	if legacyResult.err != nil {
-		// not critical - legacy service may not be running, so log as info
-		s.logger.Infof("error getting legacy peer info: %v", legacyResult.err)
-	} else {
-		for _, p := range legacyResult.resp.Peers {
-			info := &bsvjson.GetPeerInfoResult{
-				ID:        p.Id,
-				Addr:      p.Addr,
-				AddrLocal: p.AddrLocal,
-				// Services:       fmt.Sprintf("%08d", uint64(statsSnap.Services)),
-				ServicesStr: p.Services,
-				// RelayTxes:      !p.IsTxRelayDisabled(),
-				LastSend:       p.LastSend,
-				LastRecv:       p.LastRecv,
-				BytesSent:      p.BytesSent,
-				BytesRecv:      p.BytesReceived,
-				ConnTime:       p.ConnTime,
-				PingTime:       float64(p.PingTime),
-				TimeOffset:     p.TimeOffset,
-				Version:        p.Version,
-				SubVer:         p.SubVer,
-				Inbound:        p.Inbound,
-				StartingHeight: p.StartingHeight,
-				CurrentHeight:  p.CurrentHeight,
-				BanScore:       p.Banscore,
-				Whitelisted:    p.Whitelisted,
-				FeeFilter:      p.FeeFilter,
-				// SyncNode:       p.ID == syncPeerID,
+	if hasLegacyClient {
+		legacyResult := <-legacyResultCh
+		if legacyResult.err != nil {
+			// not critical - legacy service may not be running, so log as info
+			s.logger.Infof("error getting legacy peer info: %v", legacyResult.err)
+		} else {
+			for _, p := range legacyResult.resp.Peers {
+				info := &bsvjson.GetPeerInfoResult{
+					ID:        p.Id,
+					Addr:      p.Addr,
+					AddrLocal: p.AddrLocal,
+					// Services:       fmt.Sprintf("%08d", uint64(statsSnap.Services)),
+					ServicesStr: p.Services,
+					// RelayTxes:      !p.IsTxRelayDisabled(),
+					LastSend:       p.LastSend,
+					LastRecv:       p.LastRecv,
+					BytesSent:      p.BytesSent,
+					BytesRecv:      p.BytesReceived,
+					ConnTime:       p.ConnTime,
+					PingTime:       float64(p.PingTime),
+					TimeOffset:     p.TimeOffset,
+					Version:        p.Version,
+					SubVer:         p.SubVer,
+					Inbound:        p.Inbound,
+					StartingHeight: p.StartingHeight,
+					CurrentHeight:  p.CurrentHeight,
+					BanScore:       p.Banscore,
+					Whitelisted:    p.Whitelisted,
+					FeeFilter:      p.FeeFilter,
+					// SyncNode:       p.ID == syncPeerID,
+				}
+				// if p.ToPeer().LastPingNonce() != 0 {
+				// 	wait := float64(time.Since(p.LastPingTime).Nanoseconds())
+				// 	// We actually want microseconds.
+				// 	info.PingWait = wait / 1000
+				// }
+				infos = append(infos, info)
 			}
-			// if p.ToPeer().LastPingNonce() != 0 {
-			// 	wait := float64(time.Since(p.LastPingTime).Nanoseconds())
-			// 	// We actually want microseconds.
-			// 	info.PingWait = wait / 1000
-			// }
-			infos = append(infos, info)
 		}
 	}
 
-	newResult := <-newPeerResultCh
-	if newResult.err != nil {
-		// not critical - p2p service may not be running, so log as info
-		s.logger.Infof("error getting new peer info: %v", newResult.err)
-	} else {
-		for _, np := range newResult.resp {
-			s.logger.Debugf("new peer: %v", np)
-		}
-
-		for _, p := range newResult.resp {
-			info := &bsvjson.GetPeerInfoResult{
-				PeerID:         p.ID.String(),
-				Addr:           p.DataHubURL, // Use DataHub URL as address
-				SubVer:         p.ClientName,
-				CurrentHeight:  int32(p.Height),
-				StartingHeight: int32(p.Height), // Use current height as starting height
-				BanScore:       int32(p.BanScore),
-				BytesRecv:      p.BytesReceived,
-				BytesSent:      0, // P2P doesn't track bytes sent currently
-				ConnTime:       p.ConnectedAt.Unix(),
-				TimeOffset:     0, // P2P doesn't track time offset
-				PingTime:       p.AvgResponseTime.Seconds(),
-				Version:        0,                        // P2P doesn't track protocol version
-				LastSend:       p.LastMessageTime.Unix(), // Last time we sent/received any message
-				LastRecv:       p.LastBlockTime.Unix(),   // Last time we received a block
-				Inbound:        p.IsConnected,            // Whether peer is currently connected
+	if hasP2PClient {
+		newResult := <-newPeerResultCh
+		if newResult.err != nil {
+			// not critical - p2p service may not be running, so log as info
+			s.logger.Infof("error getting new peer info: %v", newResult.err)
+		} else {
+			for _, np := range newResult.resp {
+				s.logger.Debugf("new peer: %v", np)
 			}
-			infos = append(infos, info)
+
+			for _, p := range newResult.resp {
+				info := &bsvjson.GetPeerInfoResult{
+					PeerID:         p.ID.String(),
+					Addr:           p.DataHubURL, // Use DataHub URL as address
+					SubVer:         p.ClientName,
+					CurrentHeight:  int32(p.Height),
+					StartingHeight: int32(p.Height), // Use current height as starting height
+					BanScore:       int32(p.BanScore),
+					BytesRecv:      p.BytesReceived,
+					BytesSent:      0, // P2P doesn't track bytes sent currently
+					ConnTime:       p.ConnectedAt.Unix(),
+					TimeOffset:     0, // P2P doesn't track time offset
+					PingTime:       p.AvgResponseTime.Seconds(),
+					Version:        0,                        // P2P doesn't track protocol version
+					LastSend:       p.LastMessageTime.Unix(), // Last time we sent/received any message
+					LastRecv:       p.LastBlockTime.Unix(),   // Last time we received a block
+					Inbound:        p.IsConnected,            // Whether peer is currently connected
+				}
+				infos = append(infos, info)
+			}
 		}
 	}
 
