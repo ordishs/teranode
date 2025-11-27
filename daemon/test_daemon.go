@@ -1312,6 +1312,7 @@ func (td *TestDaemon) WaitForBlockhash(t *testing.T, blockHash *chainhash.Hash, 
 		case <-ctx.Done():
 			t.Errorf("Timeout waiting for block with hash %s", blockHash.String())
 			t.FailNow()
+			return
 		case <-ticker.C:
 			_, err := td.BlockchainClient.GetBlock(ctx, blockHash)
 			if err == nil {
