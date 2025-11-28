@@ -2613,7 +2613,7 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 // resetSubtreeState resets the current subtree state and returns the old state
 func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (err error) {
 	// Save current state
-	stp.currentTxMap.Clear()
+	stp.currentTxMap = NewSplitTxInpointsMap(256)
 
 	subtreeSize := stp.currentItemsPerFile
 	if !createProperlySizedSubtrees {

@@ -179,7 +179,7 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 	var wg sync.WaitGroup
 	var stopped atomic.Bool
 	itemsPerGoroutine := numTxs / producers
-	const batchSize = 16 * 1024
+	const batchSize = 2 * 1024
 
 	fmt.Printf("Starting benchmark with %d producers (batch size: %d)...\n", producers, batchSize)
 
