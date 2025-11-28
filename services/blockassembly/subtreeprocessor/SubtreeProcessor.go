@@ -250,7 +250,6 @@ type SubtreeProcessor struct {
 
 	// startOnce ensures the processing goroutine is only started once
 	startOnce sync.Once
-
 }
 
 type State uint32
@@ -2206,14 +2205,7 @@ func (stp *SubtreeProcessor) setTxCountFromSubtrees() {
 		return
 	}
 
-	queueLenUint64, err := safeconversion.Int64ToUint64(stp.queue.length())
-	if err != nil {
-		stp.logger.Errorf("error converting queue length: %s", err)
-		return
-	}
-
 	stp.txCount.Add(currSubtreeLenUint64)
-	stp.txCount.Add(queueLenUint64)
 }
 
 // moveBackBlock processes a block during downward chain movement.

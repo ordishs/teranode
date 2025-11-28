@@ -66,13 +66,13 @@ func (q *LockFreeQueue) enqueueBatch(nodes []subtree.Node, txInpoints []subtree.
 	prev := q.tail.Swap(batch)
 	if prev == nil {
 		q.head.next.Store(batch)
-		q.queueLength.Add(1)
+		q.queueLength.Add(int64(len(nodes))) // gosec:nolint
 
 		return
 	}
 
 	prev.next.Store(batch)
-	q.queueLength.Add(1)
+	q.queueLength.Add(int64(len(nodes))) // gosec:nolint
 }
 
 // dequeueBatch removes and returns the next batch from the queue.
@@ -97,7 +97,7 @@ func (q *LockFreeQueue) dequeueBatch(validFromMillis int64) (*TxBatch, bool) {
 	}
 
 	q.head = next
-	q.queueLength.Add(-1)
+	q.queueLength.Add(-int64(len(next.nodes))) // gosec:nolint
 
 	return next, true
 }
