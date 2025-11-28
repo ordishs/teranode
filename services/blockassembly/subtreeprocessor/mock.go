@@ -11,7 +11,6 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/model"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/mock"
@@ -34,14 +33,14 @@ type MockSubtreeProcessor struct {
 	mock.Mock
 }
 
-func (m *MockSubtreeProcessor) GetCurrentTxMap() *txmap.SyncedMap[chainhash.Hash, subtree.TxInpoints] {
+func (m *MockSubtreeProcessor) GetCurrentTxMap() *SplitTxInpointsMap {
 	args := m.Called()
-	return args.Get(0).(*txmap.SyncedMap[chainhash.Hash, subtree.TxInpoints])
+	return args.Get(0).(*SplitTxInpointsMap)
 }
 
-func (m *MockSubtreeProcessor) GetRemoveMap() *txmap.SwissMap {
+func (m *MockSubtreeProcessor) GetRemoveMap() *SplitSwissMap {
 	args := m.Called()
-	return args.Get(0).(*txmap.SwissMap)
+	return args.Get(0).(*SplitSwissMap)
 }
 
 func (m *MockSubtreeProcessor) GetCurrentRunningState() State {

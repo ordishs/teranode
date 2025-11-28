@@ -736,9 +736,6 @@ func (ba *BlockAssembly) Stop(ctx context.Context) error {
 	return nil
 }
 
-// txsProcessed tracks the total number of transactions processed atomically
-var txsProcessed = atomic.Uint64{}
-
 // AddTx adds a transaction to the block assembly.
 //
 // Parameters:
@@ -752,13 +749,12 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "AddTx",
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyAddTx),
+		tracing.WithCounter(prometheusBlockAssemblyAddTxCounter),
 		tracing.WithTag("txid", utils.ReverseAndHexEncodeSlice(req.Txid)),
 		tracing.WithLogMessage(ba.logger, "[AddTx][%s] add tx called", utils.ReverseAndHexEncodeSlice(req.Txid)),
 	)
 
 	defer func() {
-		txsProcessed.Inc()
-
 		deferFn()
 	}()
 
@@ -872,6 +868,8 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 		}
 		txInpointsList[i] = inpoints
 	}
+
+	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
 
 	// Add entire batch in one call
 	if !ba.settings.BlockAssembly.Disabled {
@@ -999,8 +997,12 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 		}
 	}
 
+	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
+
 	// Add entire batch in one call
-	ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
+	if !ba.settings.BlockAssembly.Disabled {
+		ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
+	}
 
 	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 }

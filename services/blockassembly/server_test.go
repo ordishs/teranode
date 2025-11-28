@@ -10,7 +10,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -213,13 +212,13 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 	})
 }
 
-func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]) {
+func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, *subtreeprocessor.SplitTxInpointsMap) {
 	s, subtreeStore := setupServer(t)
 
 	subtree, err := subtreepkg.NewTreeByLeafCount(16)
 	require.NoError(t, err)
 
-	txMap := txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+	txMap := subtreeprocessor.NewSplitTxInpointsMap(256)
 
 	previousHash := chainhash.HashH([]byte("previousHash"))
 

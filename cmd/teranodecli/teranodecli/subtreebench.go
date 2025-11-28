@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -61,12 +62,12 @@ func runSubtreeBenchmark(subtreeSize, producers, iterations, duration int, cpuPr
 	// Start CPU profiling
 	cpuFile, err := os.Create(cpuProfile)
 	if err != nil {
-		return fmt.Errorf("failed to create CPU profile: %w", err)
+		return errors.NewProcessingError("failed to create CPU profile: %w", err)
 	}
 	defer cpuFile.Close()
 
 	if err := pprof.StartCPUProfile(cpuFile); err != nil {
-		return fmt.Errorf("failed to start CPU profile: %w", err)
+		return errors.NewProcessingError("failed to start CPU profile: %w", err)
 	}
 	defer pprof.StopCPUProfile()
 
@@ -80,13 +81,13 @@ func runSubtreeBenchmark(subtreeSize, producers, iterations, duration int, cpuPr
 	// Write memory profile
 	memFile, err := os.Create(memProfile)
 	if err != nil {
-		return fmt.Errorf("failed to create memory profile: %w", err)
+		return errors.NewProcessingError("failed to create memory profile: %w", err)
 	}
 	defer memFile.Close()
 
 	runtime.GC() // Force GC before memory profile
 	if err := pprof.WriteHeapProfile(memFile); err != nil {
-		return fmt.Errorf("failed to write memory profile: %w", err)
+		return errors.NewStorageError("failed to write memory profile: %w", err)
 	}
 
 	// Print results
@@ -178,7 +179,7 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 	var wg sync.WaitGroup
 	var stopped atomic.Bool
 	itemsPerGoroutine := numTxs / producers
-	const batchSize = 1024
+	const batchSize = 16 * 1024
 
 	fmt.Printf("Starting benchmark with %d producers (batch size: %d)...\n", producers, batchSize)
 

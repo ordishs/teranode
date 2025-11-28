@@ -66,10 +66,10 @@ type Job struct {
 // and the subtree processor, including an error channel for asynchronous result reporting.
 
 type NewSubtreeRequest struct {
-	Subtree          *subtreepkg.Subtree                                     // The subtree to process
-	ParentTxMap      *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] // Map of parent transactions
-	SkipNotification bool                                                    // Whether to skip notification to the network
-	ErrChan          chan error                                              // Channel for error reporting
+	Subtree          *subtreepkg.Subtree // The subtree to process
+	ParentTxMap      *SplitTxInpointsMap // Map of parent transactions
+	SkipNotification bool                // Whether to skip notification to the network
+	ErrChan          chan error          // Channel for error reporting
 }
 
 // moveBlockRequest represents a request to move a block in the chain.
@@ -125,7 +125,7 @@ type RemainderTransactionParams struct {
 	CurrentSubtree    *subtreepkg.Subtree
 	TransactionMap    txmap.TxMap
 	LosingTxHashesMap txmap.TxMap
-	CurrentTxMap      *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
+	CurrentTxMap      *SplitTxInpointsMap
 	SkipDequeue       bool
 	SkipNotification  bool
 }
@@ -216,10 +216,10 @@ type SubtreeProcessor struct {
 	queue *LockFreeQueue
 
 	// currentTxMap tracks transactions currently held in the subtree processor
-	currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
+	currentTxMap *SplitTxInpointsMap
 
 	// removeMap tracks transactions marked for removal
-	removeMap *txmap.SwissMap
+	removeMap *SplitSwissMap
 
 	// blockchainClient provides access to blockchain data
 	blockchainClient blockchain.ClientI
@@ -379,8 +379,8 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		chainedSubtreeCount:      atomic.Int32{},
 		currentSubtree:           firstSubtree,
 		queue:                    queue,
-		currentTxMap:             txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints](),
-		removeMap:                txmap.NewSwissMap(0),
+		currentTxMap:             NewSplitTxInpointsMap(256),
+		removeMap:                NewSplitSwissMap(256, 1024),
 		blockchainClient:         blockchainClient,
 		subtreeStore:             subtreeStore,
 		utxoStore:                utxoStore,
@@ -676,46 +676,80 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						addedCount++
 					}
 
-					// Dequeue a batch directly - queue items are already batches
-					batch, found := stp.queue.dequeueBatch(validFromMillis)
-					if !found {
-						// Queue is empty right now → be nice to the core
+					// Phase 1: Dequeue multiple batches
+					const maxBatchesPerIteration = 64
+					batches := make([]*TxBatch, 0, maxBatchesPerIteration)
+
+					for batchNum := 0; batchNum < maxBatchesPerIteration; batchNum++ {
+						batch, found := stp.queue.dequeueBatch(validFromMillis)
+						if !found {
+							break
+						}
+						batches = append(batches, batch)
+					}
+
+					if len(batches) == 0 {
 						runtime.Gosched()
+						stp.setCurrentRunningState(StateRunning)
 						continue
 					}
 
-					// Process all transactions in this batch
-					for i, node := range batch.nodes {
-						txInpoints := batch.txInpoints[i]
+					// Phase 2: Filter batches in parallel goroutines
+					// Each goroutine marks rejected nodes by zeroing their Hash.
+					// The maps (removeMap, currentTxMap) are thread-safe.
+					var zeroHash chainhash.Hash
+					var filterWg sync.WaitGroup
 
-						// Fast reject path first (most common in practice)
-						if mapLength > 0 && removeMap.Exists(node.Hash) {
-							// Fire-and-forget delete — we don't care about the error in the hot path
-							_ = removeMap.Delete(node.Hash)
-							continue
-						}
+					for _, batch := range batches {
+						filterWg.Add(1)
+						go func(b *TxBatch) {
+							defer filterWg.Done()
 
-						// We always have txInpoints from the queue, so we use SetIfNotExists.
-						// This covers the common case where we are adding a new transaction.
-						if _, wasSet := currentTxMap.SetIfNotExists(node.Hash, txInpoints); !wasSet {
-							stp.logger.Debugf("duplicate tx %s", node.Hash.String())
-							continue
-						}
+							for i := range b.nodes {
+								node := &b.nodes[i]
+								txInpoints := b.txInpoints[i]
 
-						// Add to current subtree
-						if err = stp.currentSubtree.AddSubtreeNodeWithoutLock(node); err != nil {
-							stp.logger.Errorf("addNode failed: error adding node to subtree: %s", err)
-							// If adding failed, should we remove from map?
-							// addNode didn't remove it, so we keep consistent behavior.
-						} else {
-							addedCount++
-							nrProcessed++
-						}
+								// Fast reject path first (most common in practice)
+								if mapLength > 0 && removeMap.Exists(node.Hash) {
+									_ = removeMap.Delete(node.Hash)
+									node.Hash = zeroHash // Mark as rejected
+									continue
+								}
 
-						// Check if subtree is complete
-						if len(stp.currentSubtree.Nodes) >= currentItemsPerFile {
-							if err = stp.processCompleteSubtree(false); err != nil {
-								stp.logger.Errorf("processCompleteSubtree failed: %s", err)
+								// Check for duplicates and insert into txMap
+								if _, wasSet := currentTxMap.SetIfNotExists(node.Hash, txInpoints); !wasSet {
+									node.Hash = zeroHash // Mark as duplicate
+									continue
+								}
+								// Node is valid, keep its Hash intact
+							}
+						}(batch)
+					}
+
+					filterWg.Wait()
+
+					// Phase 3: Bulk insert valid nodes into subtrees (single-threaded)
+					// Only nodes with non-zero Hash passed the filters
+					for _, batch := range batches {
+						for _, node := range batch.nodes {
+							// Skip rejected/duplicate nodes (marked with zero hash)
+							if node.Hash == zeroHash {
+								continue
+							}
+
+							// Add to current subtree
+							if err = stp.currentSubtree.AddSubtreeNodeWithoutLock(node); err != nil {
+								stp.logger.Errorf("addNode failed: error adding node to subtree: %s", err)
+							} else {
+								addedCount++
+								nrProcessed++
+							}
+
+							// Check if subtree is complete
+							if len(stp.currentSubtree.Nodes) >= currentItemsPerFile {
+								if err = stp.processCompleteSubtree(false); err != nil {
+									stp.logger.Errorf("processCompleteSubtree failed: %s", err)
+								}
 							}
 						}
 					}
@@ -724,7 +758,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						stp.txCount.Add(addedCount)
 					}
 
-					// Yield if we processed transactions (queue likely has more work)
+					// Yield after processing batches to allow other goroutines to run
 					if nrProcessed > 0 {
 						runtime.Gosched() // let sibling hyper-thread breathe while we go around again
 					}
@@ -1071,7 +1105,7 @@ func (stp *SubtreeProcessor) GetCurrentSubtree() *subtreepkg.Subtree {
 //
 // Returns:
 //   - *util.SyncedMap[chainhash.Hash, []chainhash.Hash]: Map of transactions
-func (stp *SubtreeProcessor) GetCurrentTxMap() *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints] {
+func (stp *SubtreeProcessor) GetCurrentTxMap() *SplitTxInpointsMap {
 	return stp.currentTxMap
 }
 
@@ -1080,7 +1114,7 @@ func (stp *SubtreeProcessor) GetCurrentTxMap() *txmap.SyncedMap[chainhash.Hash, 
 //
 // Returns:
 //   - *txmap.SwissMap: Map of transactions to be removed
-func (stp *SubtreeProcessor) GetRemoveMap() *txmap.SwissMap {
+func (stp *SubtreeProcessor) GetRemoveMap() *SplitSwissMap {
 	return stp.removeMap
 }
 
@@ -1435,10 +1469,13 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 		ErrChan:          errCh,
 	}
 
-	err = <-errCh
-	if err != nil {
-		return errors.NewProcessingError("[%s] error sending subtree to newSubtreeChan", oldSubtreeHash.String(), err)
-	}
+	// wait for the writing of the subtree to complete in a separate goroutine
+	go func() {
+		err = <-errCh
+		if err != nil {
+			stp.logger.Errorf("[%s] error sending subtree to newSubtreeChan: %v", oldSubtreeHash.String(), err)
+		}
+	}()
 
 	// Reset the announcement timer since we just announced a complete subtree
 	if !skipNotification {
@@ -2576,7 +2613,7 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 // resetSubtreeState resets the current subtree state and returns the old state
 func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (err error) {
 	// Save current state
-	stp.currentTxMap = txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+	stp.currentTxMap.Clear()
 
 	subtreeSize := stp.currentItemsPerFile
 	if !createProperlySizedSubtrees {
@@ -2648,7 +2685,7 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 }
 
 // processOwnBlockNodes processes nodes when this was most likely our own block
-func (stp *SubtreeProcessor) processOwnBlockNodes(_ context.Context, block *model.Block, chainedSubtrees []*subtreepkg.Subtree, currentSubtree *subtreepkg.Subtree, currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], skipNotification bool) error {
+func (stp *SubtreeProcessor) processOwnBlockNodes(_ context.Context, block *model.Block, chainedSubtrees []*subtreepkg.Subtree, currentSubtree *subtreepkg.Subtree, currentTxMap *SplitTxInpointsMap, skipNotification bool) error {
 	removeMapLength := stp.removeMap.Length()
 	coinbaseID := block.CoinbaseTx.TxIDChainHash()
 
@@ -2668,7 +2705,7 @@ func (stp *SubtreeProcessor) processOwnBlockNodes(_ context.Context, block *mode
 }
 
 // processOwnBlockSubtreeNodes processes nodes from a subtree for our own block
-func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nodes []subtreepkg.Node, currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], removeMapLength int, coinbaseID *chainhash.Hash, skipNotification bool) error {
+func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nodes []subtreepkg.Node, currentTxMap *SplitTxInpointsMap, removeMapLength int, coinbaseID *chainhash.Hash, skipNotification bool) error {
 	for _, node := range nodes {
 		if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
 			continue
@@ -3018,7 +3055,7 @@ func (stp *SubtreeProcessor) processCoinbaseUtxos(ctx context.Context, block *mo
 // Returns:
 //   - error: Any error encountered during processing
 func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chainedSubtrees []*subtreepkg.Subtree,
-	transactionMap, losingTxHashesMap txmap.TxMap, currentTxMap *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], skipNotification bool) error {
+	transactionMap, losingTxHashesMap txmap.TxMap, currentTxMap *SplitTxInpointsMap, skipNotification bool) error {
 	var hashCount atomic.Int64
 
 	// clean out the transactions from the old current subtree that were in the block

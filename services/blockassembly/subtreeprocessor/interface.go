@@ -17,7 +17,6 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/model"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 )
@@ -177,16 +176,16 @@ type Interface interface {
 	// This provides access to the processor's transaction tracking state.
 	//
 	// Returns:
-	//   - *util.SyncedMap[chainhash.Hash, meta.TxInpoints]: Current transaction map
-	GetCurrentTxMap() *txmap.SyncedMap[chainhash.Hash, subtree.TxInpoints]
+	//   - *SplitTxInpointsMap: Current transaction map
+	GetCurrentTxMap() *SplitTxInpointsMap
 
 	// GetRemoveMap returns the map of transactions scheduled for removal.
 	// This map contains transactions that have been marked for removal
 	// but not yet processed.
 	//
 	// Returns:
-	//   - *txmap.SwissMap: Map of transactions to be removed
-	GetRemoveMap() *txmap.SwissMap
+	//   - *SplitSwissMap: Map of transactions to be removed
+	GetRemoveMap() *SplitSwissMap
 
 	// GetChainedSubtrees returns subtrees that are chained together.
 	// These represent transaction dependencies and processing order.
