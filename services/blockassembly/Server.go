@@ -755,6 +755,8 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 		deferFn()
 	}()
 
+	ba.logger.Debugf("[AddTx] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
+
 	if len(req.Txid) != 32 {
 		return nil, errors.WrapGRPC(
 			errors.NewProcessingError("invalid txid length: %d for %s", len(req.Txid), utils.ReverseAndHexEncodeSlice(req.Txid)))
@@ -867,6 +869,7 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 				SizeInBytes: req.Size,
 			}, txInpoints)
 
+			ba.logger.Debugf("[AddTxBatch] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
 			prometheusBlockAssemblyAddTx.Observe(float64(time.Since(startTxTime).Microseconds()) / 1_000_000)
 		}
 	}

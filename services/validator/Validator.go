@@ -280,6 +280,7 @@ func (v *Validator) Validate(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 //   - *meta.Data: Transaction metadata if validation succeeds, includes fee calculations
 //   - error: Detailed validation error if validation fails, nil on success
 func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight uint32, validationOptions *Options) (txMetaData *meta.Data, err error) {
+	v.logger.Debugf("[ValidateWithOptions] Validate tx %s", tx.TxID())
 	if txMetaData, err = v.validateInternal(ctx, tx, blockHeight, validationOptions); err != nil {
 		if v.rejectedTxKafkaProducerClient != nil { // tests may not set this
 			// TODO which errors should we be sending here?
@@ -862,9 +863,9 @@ func (v *Validator) sendToBlockAssembler(ctx context.Context, bData *blockassemb
 
 	_ = reservedUtxos
 
-	if v.settings.Validator.VerboseDebug {
-		v.logger.Debugf("[Validator] sending tx %s to block assembler", bData.TxIDChainHash.String())
-	}
+	//if v.settings.Validator.VerboseDebug {
+	v.logger.Debugf("[Validator] sending tx %s to block assembler", bData.TxIDChainHash.String())
+	//}
 
 	if _, err := v.blockAssembler.Store(ctx, &bData.TxIDChainHash, bData.Fee, bData.Size, bData.TxInpoints); err != nil {
 		e := errors.NewServiceError("error calling blockAssembler Store()", err)
