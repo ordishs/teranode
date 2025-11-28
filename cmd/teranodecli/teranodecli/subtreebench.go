@@ -137,7 +137,7 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 		fmt.Fprintf(os.Stderr, "Failed to create subtree processor: %v\n", err)
 		os.Exit(1)
 	}
-	defer stp.Close()
+	defer stp.Stop(ctx)
 
 	// Determine number of iterations
 	numTxs := iterations
