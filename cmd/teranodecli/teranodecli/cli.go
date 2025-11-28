@@ -45,6 +45,7 @@ var commandHelp = map[string]string{
 	"resetblockassembly":      "Reset block assembly state",
 	"fix-chainwork":           "Fix incorrect chainwork values in blockchain database",
 	"validate-utxo-set":       "Validate UTXO set file",
+	"subtreebench":            "Benchmark SubtreeProcessor throughput with CPU and memory profiling",
 }
 
 var dangerousCommands = map[string]bool{}
@@ -402,6 +403,17 @@ func Start(args []string, version, commit string) {
 			}
 
 			return nil
+		}
+	case "subtreebench":
+		subtreeSize := cmd.FlagSet.Int("subtree-size", 1_048_576, "Size of subtree")
+		producers := cmd.FlagSet.Int("producers", 16, "Number of producer goroutines")
+		iterations := cmd.FlagSet.Int("iterations", 10_000_000, "Number of transactions to process")
+		cpuProfile := cmd.FlagSet.String("cpu-profile", "cpu.prof", "Output file for CPU profile")
+		memProfile := cmd.FlagSet.String("mem-profile", "mem.prof", "Output file for memory profile")
+		duration := cmd.FlagSet.Int("duration", 30, "Duration to run benchmark in seconds (0 for iteration-based)")
+
+		cmd.Execute = func(args []string) error {
+			return runSubtreeBenchmark(*subtreeSize, *producers, *iterations, *duration, *cpuProfile, *memProfile)
 		}
 	default:
 		fmt.Printf("Unknown command: %s\n\n", command)
