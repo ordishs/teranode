@@ -178,8 +178,9 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 	var wg sync.WaitGroup
 	var stopped atomic.Bool
 	itemsPerGoroutine := numTxs / producers
+	const batchSize = 1024
 
-	fmt.Printf("Starting benchmark with %d producers...\n", producers)
+	fmt.Printf("Starting benchmark with %d producers (batch size: %d)...\n", producers, batchSize)
 
 	for g := 0; g < producers; g++ {
 		wg.Add(1)
@@ -192,6 +193,10 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 				end = numTxs // Last goroutine handles remainder
 			}
 
+			// Pre-allocate batch slices
+			nodes := make([]subtreepkg.Node, 0, batchSize)
+			inpoints := make([]subtreepkg.TxInpoints, 0, batchSize)
+
 			for i := start; i < end; i++ {
 				// Check if we should stop (duration-based)
 				if stopped.Load() {
@@ -202,20 +207,38 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 				select {
 				case <-timeoutChan:
 					stopped.Store(true)
+					// Flush remaining batch before returning
+					if len(nodes) > 0 {
+						stp.AddBatch(nodes, inpoints)
+						opsCompleted.Add(int64(len(nodes)))
+					}
 					return
 				default:
 				}
 
-				stp.Add(
-					subtreepkg.Node{
-						Hash: txHashes[i],
-						Fee:  uint64(i % 10000),
-					},
-					subtreepkg.TxInpoints{
-						ParentTxHashes: []chainhash.Hash{parentHashes[i]},
-					},
-				)
-				opsCompleted.Add(1)
+				// Add to batch
+				nodes = append(nodes, subtreepkg.Node{
+					Hash: txHashes[i],
+					Fee:  uint64(i % 10000),
+				})
+				inpoints = append(inpoints, subtreepkg.TxInpoints{
+					ParentTxHashes: []chainhash.Hash{parentHashes[i]},
+				})
+
+				// Submit batch when full
+				if len(nodes) >= batchSize {
+					stp.AddBatch(nodes, inpoints)
+					opsCompleted.Add(int64(len(nodes)))
+					// Reset slices (reuse backing array)
+					nodes = nodes[:0]
+					inpoints = inpoints[:0]
+				}
+			}
+
+			// Flush remaining batch
+			if len(nodes) > 0 {
+				stp.AddBatch(nodes, inpoints)
+				opsCompleted.Add(int64(len(nodes)))
 			}
 		}(g)
 	}

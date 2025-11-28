@@ -862,12 +862,13 @@ func (b *BlockAssembler) CurrentBlock() (*model.BlockHeader, uint32) {
 	return info.Header, info.Height
 }
 
-// AddTx adds a transaction to the block assembler.
+// AddTxBatch adds a batch of transactions to the block assembler.
 //
 // Parameters:
-//   - node: Transaction node to add
-func (b *BlockAssembler) AddTx(node subtree.Node, txInpoints subtree.TxInpoints) {
-	b.subtreeProcessor.Add(node, txInpoints)
+//   - nodes: Transaction nodes to add
+//   - txInpoints: Parent transaction references for each node
+func (b *BlockAssembler) AddTxBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints) {
+	b.subtreeProcessor.AddBatch(nodes, txInpoints)
 }
 
 // RemoveTx removes a transaction from the block assembler.

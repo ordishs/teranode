@@ -167,9 +167,6 @@ type SubtreeProcessor struct {
 	subtreeNodeCounts     *ring.Ring
 	subtreeNodeCountsSize int // Size of the ring buffer
 
-	// txChan receives transaction batches for processing
-	txChan chan *[]TxIDAndFee
-
 	// getSubtreesChan handles requests to retrieve current subtrees
 	getSubtreesChan chan chan []*subtreepkg.Subtree
 
@@ -215,9 +212,6 @@ type SubtreeProcessor struct {
 	// txCount tracks the total number of transactions processed
 	txCount atomic.Uint64
 
-	// batcher manages transaction batching operations
-	batcher *TxIDAndFeeBatch
-
 	// queue manages the transaction processing queue
 	queue *LockFreeQueue
 
@@ -257,15 +251,6 @@ type SubtreeProcessor struct {
 	// startOnce ensures the processing goroutine is only started once
 	startOnce sync.Once
 
-	// dequeueBatchBuffer is a pre-allocated reusable slice for batch dequeuing
-	// This eliminates the allocation overhead of creating a new slice on each dequeue cycle
-	// Size is set smaller than batchSize to handle typical queue depths efficiently
-	dequeueBatchBuffer []*TxIDAndFee
-
-	// validItemsBuffer is a pre-allocated reusable slice for parallel duplicate detection
-	// Used to mark which items in a batch are valid and should be processed
-	// Reused across all batch processing cycles to eliminate allocations
-	validItemsBuffer []bool
 }
 
 type State uint32
@@ -381,7 +366,6 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		maxBlockSamples:          10,
 		subtreeNodeCounts:        ring.New(subtreeSampleSize),
 		subtreeNodeCountsSize:    subtreeSampleSize,
-		txChan:                   make(chan *[]TxIDAndFee, tSettings.SubtreeValidation.TxChanBufferSize),
 		getSubtreesChan:          make(chan chan []*subtreepkg.Subtree),
 		getSubtreeHashesChan:     make(chan chan []chainhash.Hash),
 		getTransactionHashesChan: make(chan chan []chainhash.Hash),
@@ -405,8 +389,6 @@ func NewSubtreeProcessor(ctx context.Context, logger ulogger.Logger, tSettings *
 		stats:                    gocore.NewStat("subtreeProcessor").NewStat("Add", false),
 		currentRunningState:      atomic.Value{},
 		announcementTicker:       time.NewTicker(tSettings.BlockAssembly.SubtreeAnnouncementInterval),
-		dequeueBatchBuffer:       make([]*TxIDAndFee, 0, 128*1024), // Pre-allocate 128K entries for batch dequeueing
-		validItemsBuffer:         make([]bool, 128*1024),           // Pre-allocate for parallel duplicate detection
 	}
 	stp.setCurrentRunningState(StateStarting)
 
@@ -668,7 +650,6 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					stp.setCurrentRunningState(StateDequeue)
 
 					nrProcessed := 0
-					batchSize := cap(stp.dequeueBatchBuffer)
 
 					// Cache these — they are read on every single iteration
 					removeMap := stp.removeMap
@@ -696,21 +677,17 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						addedCount++
 					}
 
-					// Batch dequeue for improved throughput using pre-allocated buffer
-					batch := stp.dequeueBatchBuffer
-					batch = stp.queue.DequeueBatch(batch, batchSize, validFromMillis)
-					batchLen := len(batch)
-
-					if batchLen == 0 {
+					// Dequeue a batch directly - queue items are already batches
+					batch, found := stp.queue.dequeueBatch(validFromMillis)
+					if !found {
 						// Queue is empty right now → be nice to the core
 						runtime.Gosched()
 						continue
 					}
 
-					// Process the batch
-					for _, item := range batch {
-						node := item.node
-						txInpoints := item.txInpoints
+					// Process all transactions in this batch
+					for i, node := range batch.nodes {
+						txInpoints := batch.txInpoints[i]
 
 						// Fast reject path first (most common in practice)
 						if mapLength > 0 && removeMap.Exists(node.Hash) {
@@ -748,9 +725,8 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						stp.txCount.Add(addedCount)
 					}
 
-					// Only yield if we actually hit the batch limit (means queue still has work)
-					// If we exited because !found, we already Gosched'ed above
-					if nrProcessed == batchSize {
+					// Yield if we processed transactions (queue likely has more work)
+					if nrProcessed > 0 {
 						runtime.Gosched() // let sibling hyper-thread breathe while we go around again
 					}
 
@@ -1003,14 +979,14 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		}
 	}
 
-	// dequeue all transactions
+	// dequeue all batches
 	stp.logger.Warnf("[SubtreeProcessor][Reset] Dequeueing all transactions")
 
 	validUntilMillis := time.Now().UnixMilli()
 
 	for {
-		_, _, time64, found := stp.queue.dequeue(0)
-		if !found || time64 > validUntilMillis {
+		batch, found := stp.queue.dequeueBatch(0)
+		if !found || batch.time > validUntilMillis {
 			// we are done
 			break
 		}
@@ -1473,12 +1449,13 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	return nil
 }
 
-// Add adds a transaction node to the processor.
+// AddBatch adds a batch of transaction nodes to the processor queue.
 //
 // Parameters:
-//   - node: Transaction node to add
-func (stp *SubtreeProcessor) Add(node subtreepkg.Node, txInpoints subtreepkg.TxInpoints) {
-	stp.queue.enqueue(node, txInpoints)
+//   - nodes: Transaction nodes to add
+//   - txInpoints: Parent transaction references for each node
+func (stp *SubtreeProcessor) AddBatch(nodes []subtreepkg.Node, txInpoints []subtreepkg.TxInpoints) {
+	stp.queue.enqueueBatch(nodes, txInpoints)
 }
 
 // AddDirectly adds a transaction node directly to the subtree processor without going through the queue.
@@ -2940,21 +2917,26 @@ func (stp *SubtreeProcessor) WaitForPendingBlocks(ctx context.Context) error {
 func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap, losingTxHashesMap txmap.TxMap, skipNotification bool) (err error) {
 	queueLength := stp.queue.length()
 	if queueLength > 0 {
-		nrProcessed := int64(0)
+		nrBatchesProcessed := int64(0)
 		validFromMillis := time.Now().Add(-1 * stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
 
 		for {
-			node, txInpoints, _, found := stp.queue.dequeue(validFromMillis)
+			batch, found := stp.queue.dequeueBatch(validFromMillis)
 			if !found {
 				break
 			}
 
-			if (transactionMap == nil || !transactionMap.Exists(node.Hash)) && (losingTxHashesMap == nil || !losingTxHashesMap.Exists(node.Hash)) {
-				_ = stp.addNode(node, &txInpoints, skipNotification)
+			// Process all transactions in this batch
+			for i, node := range batch.nodes {
+				txInpoints := batch.txInpoints[i]
+
+				if (transactionMap == nil || !transactionMap.Exists(node.Hash)) && (losingTxHashesMap == nil || !losingTxHashesMap.Exists(node.Hash)) {
+					_ = stp.addNode(node, &txInpoints, skipNotification)
+				}
 			}
 
-			nrProcessed++
-			if nrProcessed > queueLength {
+			nrBatchesProcessed++
+			if nrBatchesProcessed > queueLength {
 				break
 			}
 		}

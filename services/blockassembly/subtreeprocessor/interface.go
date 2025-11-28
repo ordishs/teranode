@@ -37,14 +37,14 @@ import (
 // into efficient subtree structures and maintaining consistency during blockchain
 // state changes.
 type Interface interface {
-	// Add adds a transaction node to the subtree processor for processing.
-	// The transaction will be organized into appropriate subtrees based on
-	// its dependencies and relationships with other transactions.
+	// AddBatch adds a batch of transaction nodes to the subtree processor for processing.
+	// The transactions will be organized into appropriate subtrees based on
+	// their dependencies and relationships with other transactions.
 	//
 	// Parameters:
-	//   - node: The transaction node to add to processing
-	//   - txInpoints: Transaction input points for dependency tracking
-	Add(node subtree.Node, txInpoints subtree.TxInpoints)
+	//   - nodes: The transaction nodes to add to processing
+	//   - txInpoints: Transaction input points for each node for dependency tracking
+	AddBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints)
 
 	// Start starts the main processing goroutine for the SubtreeProcessor.
 	// This should be called after loading unmined transactions at startup to avoid race conditions.

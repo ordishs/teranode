@@ -128,9 +128,9 @@ func (m *MockSubtreeProcessor) SubtreeCount() int {
 	return args.Int(0)
 }
 
-// Add implements Interface.Add
-func (m *MockSubtreeProcessor) Add(node subtree.Node, txInpoints subtree.TxInpoints) {
-	m.Called(node, txInpoints)
+// AddBatch implements Interface.AddBatch
+func (m *MockSubtreeProcessor) AddBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints) {
+	m.Called(nodes, txInpoints)
 }
 
 func (m *MockSubtreeProcessor) AddDirectly(node subtree.Node, txInpoints subtree.TxInpoints, skipNotification bool) error {
