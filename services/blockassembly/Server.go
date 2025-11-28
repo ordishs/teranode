@@ -881,6 +881,137 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 	return resp, nil
 }
 
+// AddTxBatchColumnar processes a batch of transactions using columnar data format.
+// This method provides improved performance over AddTxBatch by reducing deserialization
+// overhead and GC pressure through better memory locality and fewer allocations.
+//
+// OPTIMIZATION: TxInpoints are now pre-deserialized by the Client (which runs on multiple machines)
+// and sent in columnar format. The Server reconstructs TxInpoints directly from columnar data
+// WITHOUT calling NewTxInpointsFromBytes, eliminating deserialization work on the single-machine Server.
+//
+// The columnar format stores all transaction data in packed arrays:
+// - All TXIDs in a single byte slice (32 bytes each)
+// - All fees in a single array
+// - All sizes in a single array
+// - All parent tx hashes concatenated
+// - Offset tables for parent hashes and vout indices
+//
+// Expected performance improvements:
+// - Eliminates per-transaction TxInpoints deserialization on Server
+// - Shifts deserialization work to distributed Clients
+// - Reduces Server CPU usage significantly
+// - Lower GC pressure from fewer intermediate allocations
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - req: Columnar batch request with packed transaction data
+//
+// Returns:
+//   - *blockassembly_api.AddTxBatchResponse: Response indicating success
+//   - error: Any error encountered during batch processing
+func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassembly_api.AddTxBatchColumnarRequest) (*blockassembly_api.AddTxBatchResponse, error) {
+	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "AddTxBatchColumnar",
+		tracing.WithParentStat(ba.stats),
+		tracing.WithDebugLogMessage(ba.logger, "[AddTxBatchColumnar] called with columnar batch"),
+	)
+	defer func() {
+		prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
+		prometheusBlockAssemblerQueuedTransactions.Set(float64(ba.blockAssembler.QueueLength()))
+		prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
+		deferFn()
+	}()
+
+	// Validate request structure
+	if len(req.TxidsPacked)%32 != 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("txids_packed length must be divisible by 32"))
+	}
+
+	txCount := len(req.TxidsPacked) / 32
+	if txCount == 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("no transactions in batch"))
+	}
+
+	if len(req.Fees) != txCount || len(req.Sizes) != txCount {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("mismatched array lengths: txids=%d, fees=%d, sizes=%d", txCount, len(req.Fees), len(req.Sizes)))
+	}
+
+	// Validate columnar TxInpoints structure
+	if len(req.ParentTxOffsets) != txCount+1 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"parent_tx_offsets must have exactly txCount+1 elements (got %d, expected %d)",
+			len(req.ParentTxOffsets), txCount+1))
+	}
+
+	if len(req.ParentTxHashesPacked)%32 != 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("parent_tx_hashes_packed length must be divisible by 32"))
+	}
+
+	totalParentHashes := len(req.ParentTxHashesPacked) / 32
+	if len(req.VoutIdxOffsets) != totalParentHashes+1 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("vout_idx_offsets must have exactly (total_parent_hashes+1) elements (got %d, expected %d)", len(req.VoutIdxOffsets), totalParentHashes+1))
+	}
+
+	if ba.settings.BlockAssembly.Disabled {
+		return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
+	}
+
+	// Process each transaction using column-oriented access
+	for i := 0; i < txCount; i++ {
+		startTxTime := time.Now()
+
+		// Extract TXID (32 bytes) - no allocation, just slice reference
+		txidStart := i * 32
+		txid := req.TxidsPacked[txidStart : txidStart+32]
+
+		// Reconstruct TxInpoints from columnar data WITHOUT deserialization
+		// This is the key optimization - we build TxInpoints directly from pre-parsed data
+		parentHashStart := req.ParentTxOffsets[i]
+		parentHashEnd := req.ParentTxOffsets[i+1]
+		numParentHashes := parentHashEnd - parentHashStart
+
+		// Pre-allocate slices with exact capacity to avoid reallocation
+		parentTxHashes := make([]chainhash.Hash, numParentHashes)
+		idxs := make([][]uint32, numParentHashes)
+
+		totalVouts := 0
+		for j := uint32(0); j < numParentHashes; j++ {
+			parentHashIdx := parentHashStart + j
+
+			// Extract parent hash (32 bytes) - no allocation, direct copy
+			hashOffset := parentHashIdx * 32
+			copy(parentTxHashes[j][:], req.ParentTxHashesPacked[hashOffset:hashOffset+32])
+
+			// Extract vout indices for this parent hash
+			voutIdxStart := req.VoutIdxOffsets[parentHashIdx]
+			voutIdxEnd := req.VoutIdxOffsets[parentHashIdx+1]
+			numVouts := voutIdxEnd - voutIdxStart
+
+			// Reference the vout indices slice directly - no allocation
+			idxs[j] = req.ParentVoutIndices[voutIdxStart:voutIdxEnd]
+			totalVouts += int(numVouts)
+		}
+
+		// Construct TxInpoints directly - minimal allocations
+		txInpoints := subtreepkg.TxInpoints{
+			ParentTxHashes: parentTxHashes,
+			Idxs:           idxs,
+		}
+
+		// Add to block assembler
+		if !ba.settings.BlockAssembly.Disabled {
+			ba.blockAssembler.AddTx(subtreepkg.Node{
+				Hash:        chainhash.Hash(txid),
+				Fee:         req.Fees[i],
+				SizeInBytes: req.Sizes[i],
+			}, txInpoints)
+
+			prometheusBlockAssemblyAddTx.Observe(float64(time.Since(startTxTime).Microseconds()) / 1_000_000)
+		}
+	}
+
+	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
+}
+
 // TxCount returns the total number of transactions processed.
 //
 // Returns:
