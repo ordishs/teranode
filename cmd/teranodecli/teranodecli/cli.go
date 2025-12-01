@@ -410,7 +410,7 @@ func Start(args []string, version, commit string) {
 		iterations := cmd.FlagSet.Int("iterations", 10_000_000, "Number of transactions to process")
 		cpuProfile := cmd.FlagSet.String("cpu-profile", "cpu.prof", "Output file for CPU profile")
 		memProfile := cmd.FlagSet.String("mem-profile", "mem.prof", "Output file for memory profile")
-		duration := cmd.FlagSet.Int("duration", 30, "Duration to run benchmark in seconds (0 for iteration-based)")
+		duration := cmd.FlagSet.Int("duration", 0, "Duration to run benchmark in seconds (0 for iteration-based, processes all items)")
 
 		cmd.Execute = func(args []string) error {
 			return runSubtreeBenchmark(*subtreeSize, *producers, *iterations, *duration, *cpuProfile, *memProfile)

@@ -212,7 +212,7 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 	})
 }
 
-func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, *subtreeprocessor.SplitTxInpointsMap) {
+func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, subtreeprocessor.TxInpointsMap) {
 	s, subtreeStore := setupServer(t)
 
 	subtree, err := subtreepkg.NewTreeByLeafCount(16)

@@ -514,7 +514,7 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 
 	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "storeSubtree",
 		tracing.WithParentStat(ba.stats),
-		tracing.WithCounter(prometheusBlockAssemblerSubtreeCreated),
+		tracing.WithHistogram(prometheusBlockAssemblerSubtreeStoredHist),
 		tracing.WithLogMessage(ba.logger, "[BlockAssembly:Init][%s] new subtree notification from assembly: len %d", subtree.RootHash().String(), subtree.Length()),
 	)
 	defer deferFn()

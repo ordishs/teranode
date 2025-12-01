@@ -73,6 +73,7 @@ var (
 	prometheusBlockAssemblerAddDirectlyTime             prometheus.Histogram
 	prometheusBlockAssemblerAddDirectlyTotal            prometheus.Counter
 	prometheusBlockAssemblerAddDirectlyBatchTime        prometheus.Histogram
+	prometheusBlockAssemblerSubtreeStoredHist           prometheus.Histogram
 )
 
 var (
@@ -175,12 +176,13 @@ func _initPrometheusMetrics() {
 		},
 	)
 
-	prometheusBlockAssemblerSubtreeCreated = promauto.NewCounter(
-		prometheus.CounterOpts{
+	prometheusBlockAssemblerSubtreeStoredHist = promauto.NewHistogram(
+		prometheus.HistogramOpts{
 			Namespace: "teranode",
 			Subsystem: "blockassembly",
-			Name:      "subtree_created",
-			Help:      "Number of subtrees created in the block assembler",
+			Name:      "subtree_stored",
+			Help:      "Histogram of subtree stored duration in block assembler",
+			Buckets:   util.MetricsBucketsMilliSeconds,
 		},
 	)
 

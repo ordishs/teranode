@@ -33,9 +33,9 @@ type MockSubtreeProcessor struct {
 	mock.Mock
 }
 
-func (m *MockSubtreeProcessor) GetCurrentTxMap() *SplitTxInpointsMap {
+func (m *MockSubtreeProcessor) GetCurrentTxMap() TxInpointsMap {
 	args := m.Called()
-	return args.Get(0).(*SplitTxInpointsMap)
+	return args.Get(0).(TxInpointsMap)
 }
 
 func (m *MockSubtreeProcessor) GetRemoveMap() *SplitSwissMap {
