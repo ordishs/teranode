@@ -211,6 +211,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SubtreeProcessorConcurrentReads:      getInt("blockassembly_subtreeProcessorConcurrentReads", 375, alternativeContext...),
 			NewSubtreeChanBuffer:                 getInt("blockassembly_newSubtreeChanBuffer", 1_000, alternativeContext...),
 			SubtreeRetryChanBuffer:               getInt("blockassembly_subtreeRetryChanBuffer", 1_000, alternativeContext...),
+			SubtreeStorageWorkers:                getInt("blockassembly_subtreeStorageWorkers", 4, alternativeContext...),
 			SubmitMiningSolutionWaitForResponse:  getBool("blockassembly_SubmitMiningSolution_waitForResponse", true, alternativeContext...),
 			InitialMerkleItemsPerSubtree:         getInt("initial_merkle_items_per_subtree", 1_048_576, alternativeContext...),
 			MinimumMerkleItemsPerSubtree:         getInt("minimum_merkle_items_per_subtree", 1024, alternativeContext...),

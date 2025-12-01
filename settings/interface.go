@@ -232,6 +232,7 @@ type BlockAssemblySettings struct {
 	SubtreeProcessorConcurrentReads      int
 	NewSubtreeChanBuffer                 int
 	SubtreeRetryChanBuffer               int
+	SubtreeStorageWorkers                int
 	SubmitMiningSolutionWaitForResponse  bool
 	InitialMerkleItemsPerSubtree         int
 	MinimumMerkleItemsPerSubtree         int

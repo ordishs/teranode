@@ -1,6 +1,9 @@
 package subtreeprocessor
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -82,60 +85,79 @@ func (s SplitSwissMap) Iter(f func(hash chainhash.Hash, value uint64) bool) {
 }
 
 type SplitTxInpointsMap struct {
-	m           map[uint16]*txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]
+	m           map[uint16]*sync.Map
+	l           map[uint16]*atomic.Uint64
 	nrOfBuckets uint16
 }
 
 func NewSplitTxInpointsMap(nrOfBuckets uint16) *SplitTxInpointsMap {
-	m := make(map[uint16]*txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints], nrOfBuckets)
+	m := make(map[uint16]*sync.Map, nrOfBuckets)
+	l := make(map[uint16]*atomic.Uint64, nrOfBuckets)
+
 	for i := uint16(0); i < nrOfBuckets; i++ {
-		m[i] = txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+		m[i] = &sync.Map{}
+		l[i] = &atomic.Uint64{}
 	}
 
 	return &SplitTxInpointsMap{
 		m:           m,
+		l:           l,
 		nrOfBuckets: nrOfBuckets,
 	}
 }
 
 func (s *SplitTxInpointsMap) Delete(hash chainhash.Hash) bool {
-	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Delete(hash)
+	s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Delete(hash)
+	s.l[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Add(^uint64(0))
+	return true
 }
 
 func (s *SplitTxInpointsMap) Exists(hash chainhash.Hash) bool {
-	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Exists(hash)
+	_, ok := s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Load(hash)
+
+	return ok
 }
 
 func (s *SplitTxInpointsMap) Get(hash chainhash.Hash) (subtreepkg.TxInpoints, bool) {
-	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Get(hash)
+	v, ok := s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Load(hash)
+
+	if !ok {
+		return subtreepkg.TxInpoints{}, false
+	}
+
+	return v.(subtreepkg.TxInpoints), true
 }
 
 func (s *SplitTxInpointsMap) Length() int {
 	length := 0
 
-	for _, syncedMap := range s.m {
-		length += syncedMap.Length()
+	for i := uint16(0); i < s.nrOfBuckets; i++ {
+		length += int(s.l[i].Load())
 	}
 
 	return length
 }
 
 func (s *SplitTxInpointsMap) Set(hash chainhash.Hash, inpoints subtreepkg.TxInpoints) {
-	s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Set(hash, inpoints)
+	s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Store(hash, inpoints)
+	s.l[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Add(1)
 }
 
 func (s *SplitTxInpointsMap) SetIfNotExists(hash chainhash.Hash, inpoints subtreepkg.TxInpoints) (subtreepkg.TxInpoints, bool) {
-	if existingValue, ok := s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Get(hash); ok {
-		return existingValue, false
+	if v, ok := s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Load(hash); ok {
+		return v.(subtreepkg.TxInpoints), false
 	}
 
-	s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Set(hash, inpoints)
+	s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Store(hash, inpoints)
+	s.l[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Add(1)
 
 	return inpoints, true
 }
 
 func (s *SplitTxInpointsMap) Clear() {
-	for _, syncedMap := range s.m {
-		syncedMap.Clear()
+	for i := uint16(0); i < s.nrOfBuckets; i++ {
+		s.m[i] = &sync.Map{}
+		s.l[i] = &atomic.Uint64{}
 	}
+
 }

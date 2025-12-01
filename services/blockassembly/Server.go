@@ -307,44 +307,172 @@ func (ba *BlockAssembly) runSubtreeRetryProcessor(ctx context.Context, subtreeRe
 	}
 }
 
+// subtreeStorageWork represents a unit of work for subtree storage workers.
+type subtreeStorageWork struct {
+	seq      uint64                             // sequence number for ordering notifications
+	request  subtreeprocessor.NewSubtreeRequest // the subtree request to process
+	doneChan chan *subtreeStorageResult         // channel to signal completion
+}
+
+// subtreeStorageResult represents the result of a subtree storage operation.
+type subtreeStorageResult struct {
+	seq              uint64                             // sequence number for ordering
+	request          subtreeprocessor.NewSubtreeRequest // original request
+	err              error                              // error from storage operation
+	skipNotification bool                               // whether notification should be skipped
+	storedOK         bool                               // true if subtree was stored successfully
+}
+
 // runNewSubtreeListener handles incoming requests for new subtrees.
-// It stores subtrees and invalidates mining candidate cache when new subtrees are available.
+// It uses a worker pool for parallel storage and ensures notifications are sent in order.
 func (ba *BlockAssembly) runNewSubtreeListener(ctx context.Context, newSubtreeChan <-chan subtreeprocessor.NewSubtreeRequest, subtreeRetryChan chan *subtreeRetrySend) {
+	numWorkers := ba.settings.BlockAssembly.SubtreeStorageWorkers
+	if numWorkers <= 0 {
+		numWorkers = 4
+	}
+
+	workChan := make(chan *subtreeStorageWork, numWorkers*2)
+	resultChan := make(chan *subtreeStorageResult, numWorkers*2)
+
+	// Start storage workers
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ba.subtreeStorageWorker(ctx, workChan, subtreeRetryChan, resultChan)
+		}()
+	}
+
+	// Start notification sender (processes results in order)
+	notifyDone := make(chan struct{})
+	go func() {
+		defer close(notifyDone)
+		ba.subtreeNotificationSender(ctx, resultChan)
+	}()
+
+	var seq uint64
 	for {
 		select {
 		case <-ctx.Done():
 			ba.logger.Infof("Stopping subtree listener")
+			close(workChan)
+			wg.Wait()
+			close(resultChan)
+			<-notifyDone
 			return
 
 		case newSubtreeRequest := <-newSubtreeChan:
-			err := ba.storeSubtree(ctx, newSubtreeRequest, subtreeRetryChan)
-			if err != nil {
-				ba.logger.Errorf(err.Error())
+			work := &subtreeStorageWork{
+				seq:     seq,
+				request: newSubtreeRequest,
 			}
+			seq++
 
-			// Smart cache invalidation: only invalidate if significant change
-			// Get current state from subtree processor
-			currentTxCount := uint32(ba.blockAssembler.TxCount())
-			currentSubtreeCount := ba.blockAssembler.SubtreeCount()
-
-			// Calculate actual total size by summing all subtree sizes
-			var currentSize uint64
-			subtrees := ba.blockAssembler.GetChainedSubtrees()
-			for _, st := range subtrees {
-				currentSize += st.SizeInBytes
+			select {
+			case workChan <- work:
+			case <-ctx.Done():
+				return
 			}
+		}
+	}
+}
 
-			if ba.blockAssembler.shouldInvalidateCache(currentTxCount, currentSize, currentSubtreeCount) {
-				ba.logger.Debugf("[Server] Invalidating cache: significant change detected (txs=%d, size=%d, subtrees=%d)",
-					currentTxCount, currentSize, currentSubtreeCount)
-				ba.blockAssembler.invalidateMiningCandidateCache()
+// subtreeStorageWorker processes subtree storage work items in parallel.
+func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-chan *subtreeStorageWork, subtreeRetryChan chan *subtreeRetrySend, resultChan chan<- *subtreeStorageResult) {
+	for work := range workChan {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		result := &subtreeStorageResult{
+			seq:              work.seq,
+			request:          work.request,
+			skipNotification: work.request.SkipNotification,
+		}
+
+		// Store subtree and meta
+		subtreeDone, allDone, err := ba.storeSubtreeData(ctx, work.request, subtreeRetryChan)
+		result.err = err
+
+		if err != nil {
+			if errors.Is(err, errors.ErrBlobAlreadyExists) {
+				// Already exists is success for notification purposes
+				result.storedOK = true
+				result.err = nil
 			} else {
-				ba.logger.Debugf("[Server] Keeping cache valid: minor change (txs=%d, size=%d, subtrees=%d)",
-					currentTxCount, currentSize, currentSubtreeCount)
+				ba.logger.Errorf(err.Error())
+				result.storedOK = false
 			}
+		} else {
+			// Wait for subtree storage to complete (notification can be sent)
+			result.storedOK = <-subtreeDone
+		}
 
-			if newSubtreeRequest.ErrChan != nil {
-				newSubtreeRequest.ErrChan <- err
+		// Send result for ordered notification processing
+		select {
+		case resultChan <- result:
+		case <-ctx.Done():
+			return
+		}
+
+		// Smart cache invalidation: only invalidate if significant change
+		currentTxCount := uint32(ba.blockAssembler.TxCount())
+		currentSubtreeCount := ba.blockAssembler.SubtreeCount()
+
+		var currentSize uint64
+		subtrees := ba.blockAssembler.GetChainedSubtrees()
+		for _, st := range subtrees {
+			currentSize += st.SizeInBytes
+		}
+
+		if ba.blockAssembler.shouldInvalidateCache(currentTxCount, currentSize, currentSubtreeCount) {
+			ba.logger.Debugf("[Server] Invalidating cache: significant change detected (txs=%d, size=%d, subtrees=%d)", currentTxCount, currentSize, currentSubtreeCount)
+			ba.blockAssembler.invalidateMiningCandidateCache()
+		} else {
+			ba.logger.Debugf("[Server] Keeping cache valid: minor change (txs=%d, size=%d, subtrees=%d)", currentTxCount, currentSize, currentSubtreeCount)
+		}
+
+		// Wait for all work to complete before sending response to caller
+		if allDone != nil {
+			<-allDone
+		}
+
+		// Send error back to caller if channel exists
+		if work.request.ErrChan != nil {
+			work.request.ErrChan <- result.err
+		}
+	}
+}
+
+// subtreeNotificationSender sends subtree notifications in order after storage completes.
+func (ba *BlockAssembly) subtreeNotificationSender(ctx context.Context, resultChan <-chan *subtreeStorageResult) {
+	pending := make(map[uint64]*subtreeStorageResult)
+	var nextSeq uint64
+
+	for result := range resultChan {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		pending[result.seq] = result
+
+		// Process all consecutive results we have
+		for {
+			r, ok := pending[nextSeq]
+			if !ok {
+				break
+			}
+			delete(pending, nextSeq)
+			nextSeq++
+
+			// Send notification if needed
+			if !r.skipNotification && r.storedOK {
+				ba.sendSubtreeNotification(ctx, *r.request.Subtree.RootHash())
 			}
 		}
 	}
@@ -468,13 +596,19 @@ func (ba *BlockAssembly) handleRetryLogic(ctx context.Context, subtreeRetry *sub
 }
 
 // sendSubtreeNotification sends a notification about a successfully stored subtree.
+// It only sends the notification if the FSM is in the running state.
 func (ba *BlockAssembly) sendSubtreeNotification(ctx context.Context, subtreeHash chainhash.Hash) {
-	// TODO #145
-	// the repository in the blob server sometimes cannot find subtrees that were just stored
-	// this is the dumbest way we can think of to fix it, at least temporarily
-	time.Sleep(20 * time.Millisecond)
+	isRunning, err := ba.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
+	if err != nil {
+		ba.logger.Errorf("[BlockAssembly:sendSubtreeNotification][%s] failed to get current state: %s", subtreeHash.String(), err)
+		return
+	}
 
-	if err := ba.blockchainClient.SendNotification(ctx, &blockchain.Notification{
+	if !isRunning {
+		return
+	}
+
+	if err = ba.blockchainClient.SendNotification(ctx, &blockchain.Notification{
 		Type:     model.NotificationType_Subtree,
 		Hash:     (&subtreeHash)[:],
 		Base_URL: "",
@@ -482,103 +616,89 @@ func (ba *BlockAssembly) sendSubtreeNotification(ctx context.Context, subtreeHas
 			Metadata: nil,
 		},
 	}); err != nil {
-		ba.logger.Errorf("[BlockAssembly:Init][%s] failed to send subtree notification: %s", subtreeHash.String(), err)
+		ba.logger.Errorf("[BlockAssembly:sendSubtreeNotification][%s] failed to send subtree notification: %s", subtreeHash.String(), err)
 	}
 }
 
-// storeSubtree stores a completed subtree to the subtree store with retry capability.
-// This method handles the persistence of newly created subtrees to the blob store,
-// ensuring they are available for block assembly and mining operations. It includes
-// existence checking to avoid duplicate storage and implements retry logic for
-// handling transient storage failures.
-//
-// The function performs the following operations:
-// - Checks if the subtree already exists in the store to avoid duplicates
-// - Serializes the subtree data and metadata for storage
-// - Attempts to store the subtree with error handling
-// - Queues failed storage attempts for retry with exponential backoff
-//
-// This is a critical operation for maintaining the integrity of the block assembly
-// process, as subtrees must be persistently stored before they can be included
-// in mining candidates.
+// storeSubtreeData stores the subtree data and metadata to the blob store.
+// It returns two channels:
+//   - subtreeDone: signals when subtree storage is complete (bool = success)
+//   - allDone: signals when all work including meta storage is complete
 //
 // Parameters:
-//   - ctx: Context for the storage operation, allowing for cancellation and timeouts
+//   - ctx: Context for the storage operation
 //   - subtreeRequest: Request containing the subtree to store and associated metadata
 //   - subtreeRetryChan: Channel for queuing failed storage attempts for retry
 //
 // Returns:
-//   - error: Any error encountered during storage, excluding retryable failures which are queued
-func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtreeprocessor.NewSubtreeRequest, subtreeRetryChan chan *subtreeRetrySend) (err error) {
+//   - subtreeDone: Channel that sends true when subtree stored OK, false on failure
+//   - allDone: Channel that closes when all work is complete
+//   - err: Any error encountered during setup
+func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest subtreeprocessor.NewSubtreeRequest, subtreeRetryChan chan *subtreeRetrySend) (subtreeDone <-chan bool, allDone <-chan struct{}, err error) {
 	subtree := subtreeRequest.Subtree
 
-	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "storeSubtree",
+	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "storeSubtreeData",
 		tracing.WithParentStat(ba.stats),
-		tracing.WithCounter(prometheusBlockAssemblerSubtreeCreated),
-		tracing.WithLogMessage(ba.logger, "[BlockAssembly:Init][%s] new subtree notification from assembly: len %d", subtree.RootHash().String(), subtree.Length()),
+		tracing.WithHistogram(prometheusBlockAssemblerSubtreeStoredHist),
+		tracing.WithLogMessage(ba.logger, "[BlockAssembly:storeSubtreeData][%s] storing subtree: len %d", subtree.RootHash().String(), subtree.Length()),
 	)
 	defer deferFn()
 
-	// start1, stat1, _ := util.NewStatFromContext(ctx, "newSubtreeChan", channelStats)
-	// check whether this subtree already exists in the store, which would mean it has already been announced
+	// Check whether this subtree already exists in the store
 	if ok, _ := ba.subtreeStore.Exists(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree); ok {
-		// subtree already exists, nothing to do
-		ba.logger.Debugf("[BlockAssembly:Init][%s] subtree already exists", subtree.RootHash().String())
-		return
+		ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] subtree already exists", subtree.RootHash().String())
+		return nil, nil, errors.ErrBlobAlreadyExists
 	}
 
-	var subtreeBytes []byte
-
-	if subtreeBytes, err = subtree.Serialize(); err != nil {
-		return errors.NewProcessingError("[BlockAssembly:storeSubtree][%s] failed to serialize subtree", subtree.RootHash().String(), err)
+	// Serialize subtree
+	subtreeBytes, err := subtree.Serialize()
+	if err != nil {
+		return nil, nil, errors.NewProcessingError("[BlockAssembly:storeSubtreeData][%s] failed to serialize subtree", subtree.RootHash().String(), err)
 	}
 
 	dah := ba.blockAssembler.utxoStore.GetBlockHeight() + ba.settings.GlobalBlockHeightRetention
 
+	subtreeDoneCh := make(chan bool, 1)
+	metaDoneCh := make(chan struct{})
+	allDoneCh := make(chan struct{})
+
+	// Build, serialize, and store subtree meta in background
 	if subtreeRequest.ParentTxMap != nil {
-		// create and store the subtree meta
-		subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
-		subtreeMetaMissingTxs := false
+		go func() {
+			defer close(metaDoneCh)
+			subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
 
-		for idx, node := range subtreeRequest.Subtree.Nodes {
-			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
-				if !found {
-					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+			for idx, node := range subtreeRequest.Subtree.Nodes {
+				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+					txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
+					if !found {
+						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to find parent tx hashes for node %s: parent transaction not found in ParentTxMap", subtreeRequest.Subtree.RootHash().String(), node.Hash.String())
+						return
+					}
 
-					subtreeMetaMissingTxs = true
-
-					break
-				}
-
-				if err = subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
-					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
-
-					subtreeMetaMissingTxs = true
-
-					break
+					if err := subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
+						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
+						return
+					}
 				}
 			}
-		}
 
-		if !subtreeMetaMissingTxs {
 			subtreeMetaBytes, err := subtreeMeta.Serialize()
 			if err != nil {
-				return errors.NewStorageError("[BlockAssembly:storeSubtree][%s] failed to serialize subtree data", subtree.RootHash().String(), err)
+				ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to serialize subtree meta: %s", subtree.RootHash().String(), err)
+				return
 			}
 
-			if err = ba.subtreeStore.Set(ctx,
+			if err := ba.subtreeStore.Set(ctx,
 				subtree.RootHash()[:],
 				fileformat.FileTypeSubtreeMeta,
 				subtreeMetaBytes,
 				options.WithDeleteAt(dah),
 			); err != nil {
 				if errors.Is(err, errors.ErrBlobAlreadyExists) {
-					ba.logger.Debugf("[BlockAssembly:storeSubtree][%s] subtree meta already exists", subtree.RootHash().String())
+					ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] subtree meta already exists", subtree.RootHash().String())
 				} else {
-					ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to store subtree meta: %s", subtree.RootHash().String(), err)
-
-					// add to retry saving the subtree
+					ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to store subtree meta: %s", subtree.RootHash().String(), err)
 					subtreeRetryChan <- &subtreeRetrySend{
 						subtreeHash:      *subtree.RootHash(),
 						subtreeBytes:     subtreeBytes,
@@ -587,61 +707,44 @@ func (ba *BlockAssembly) storeSubtree(ctx context.Context, subtreeRequest subtre
 					}
 				}
 			}
-		}
+		}()
+	} else {
+		close(metaDoneCh)
 	}
 
-	if err = ba.subtreeStore.Set(ctx,
-		subtree.RootHash()[:],
-		fileformat.FileTypeSubtree,
-		subtreeBytes,
-		options.WithDeleteAt(dah), // this sets the DAH for the subtree, it must be updated when a block is mined
-	); err != nil {
-		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			ba.logger.Debugf("[BlockAssembly:storeSubtree][%s] subtree already exists", subtree.RootHash().String())
-		} else {
-			ba.logger.Errorf("[BlockAssembly:storeSubtree][%s] failed to store subtree: %s", subtree.RootHash().String(), err)
-
-			// add to retry saving the subtree
-			// no need to retry the subtree meta, we have already stored that
-			subtreeRetryChan <- &subtreeRetrySend{
-				subtreeHash:  *subtree.RootHash(),
-				subtreeBytes: subtreeBytes,
-				retries:      0,
+	// Store subtree in background
+	go func() {
+		storedOK := true
+		if err := ba.subtreeStore.Set(ctx,
+			subtree.RootHash()[:],
+			fileformat.FileTypeSubtree,
+			subtreeBytes,
+			options.WithDeleteAt(dah),
+		); err != nil {
+			if errors.Is(err, errors.ErrBlobAlreadyExists) {
+				ba.logger.Debugf("[BlockAssembly:storeSubtreeData][%s] subtree already exists", subtree.RootHash().String())
+			} else {
+				ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to store subtree: %s", subtree.RootHash().String(), err)
+				subtreeRetryChan <- &subtreeRetrySend{
+					subtreeHash:  *subtree.RootHash(),
+					subtreeBytes: subtreeBytes,
+					retries:      0,
+				}
+				storedOK = false
 			}
 		}
+		subtreeDoneCh <- storedOK
+		close(subtreeDoneCh)
+	}()
 
-		return nil
-	}
+	// Coordinator: wait for both and signal all done
+	go func() {
+		defer close(allDoneCh)
+		<-subtreeDoneCh
+		<-metaDoneCh
+	}()
 
-	if subtreeRequest.SkipNotification {
-		return nil
-	}
-
-	isRunning, err := ba.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
-	if err != nil {
-		return errors.NewProcessingError("[BlockAssembly:storeSubtree][%s] failed to get current state", subtree.RootHash().String(), err)
-	}
-
-	// only send notification if the FSM is in the running state
-	if isRunning {
-		// TODO #145
-		// the repository in the blob server sometimes cannot find subtrees that were just stored
-		// this is the dumbest way we can think of to fix it, at least temporarily
-		time.Sleep(20 * time.Millisecond)
-
-		if err = ba.blockchainClient.SendNotification(ctx, &blockchain.Notification{
-			Type:     model.NotificationType_Subtree,
-			Hash:     subtree.RootHash()[:],
-			Base_URL: "",
-			Metadata: &blockchain.NotificationMetadata{
-				Metadata: nil,
-			},
-		}); err != nil {
-			return errors.NewServiceError("[BlockAssembly:storeSubtree][%s] failed to send subtree notification", subtree.RootHash().String(), err)
-		}
-	}
-
-	return nil
+	return subtreeDoneCh, allDoneCh, nil
 }
 
 // Start begins the BlockAssembly service operation.

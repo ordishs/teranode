@@ -152,7 +152,7 @@ func Test_MoveBlock(t *testing.T) {
 	})
 }
 
-func storeMoveBlockSubtrees(t *testing.T, subtreeStore *memory.Memory, subtrees []*subtreepkg.Subtree, txMap *subtreeprocessor.SplitTxInpointsMap) []*chainhash.Hash {
+func storeMoveBlockSubtrees(t *testing.T, subtreeStore *memory.Memory, subtrees []*subtreepkg.Subtree, txMap subtreeprocessor.TxInpointsMap) []*chainhash.Hash {
 	subtreeHashes := make([]*chainhash.Hash, 0, len(subtrees))
 
 	for _, subtree := range subtrees {

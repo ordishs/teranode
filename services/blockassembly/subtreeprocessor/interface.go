@@ -17,6 +17,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/model"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 )
@@ -176,8 +177,8 @@ type Interface interface {
 	// This provides access to the processor's transaction tracking state.
 	//
 	// Returns:
-	//   - *SplitTxInpointsMap: Current transaction map
-	GetCurrentTxMap() *SplitTxInpointsMap
+	//   - TxInpointsMap: Current transaction map
+	GetCurrentTxMap() TxInpointsMap
 
 	// GetRemoveMap returns the map of transactions scheduled for removal.
 	// This map contains transactions that have been marked for removal
@@ -259,4 +260,33 @@ type Interface interface {
 	// Parameters:
 	//   - ctx: Context for the stop operation
 	Stop(ctx context.Context)
+}
+
+// TxInpointsMap defines the interface for transaction inpoints storage with hash keys.
+// Implementations provide concurrent-safe operations for storing and retrieving transaction inpoints.
+type TxInpointsMap interface {
+	// Delete removes a transaction hash and its inpoints from the map.
+	// Returns true if the hash was found and deleted, false otherwise.
+	Delete(hash chainhash.Hash) bool
+
+	// Exists checks if a transaction hash exists in the map.
+	// Returns true if the hash exists, false otherwise.
+	Exists(hash chainhash.Hash) bool
+
+	// Get retrieves the inpoints for a given transaction hash.
+	// Returns the inpoints and true if found, empty inpoints and false otherwise.
+	Get(hash chainhash.Hash) (subtreepkg.TxInpoints, bool)
+
+	// Length returns the total number of entries in the map.
+	Length() int
+
+	// Set stores or updates the inpoints for a given transaction hash.
+	Set(hash chainhash.Hash, inpoints subtreepkg.TxInpoints)
+
+	// SetIfNotExists stores the inpoints only if the hash doesn't already exist.
+	// Returns the inpoints (existing or newly inserted) and true if inserted, false if already existed.
+	SetIfNotExists(hash chainhash.Hash, inpoints subtreepkg.TxInpoints) (subtreepkg.TxInpoints, bool)
+
+	// Clear removes all entries from the map.
+	Clear()
 }
