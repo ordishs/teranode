@@ -122,7 +122,7 @@ func (s *SplitTxInpointsMap) Get(hash chainhash.Hash) (subtreepkg.TxInpoints, bo
 	v, ok := s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Load(hash)
 
 	if !ok {
-		return v.(subtreepkg.TxInpoints), false
+		return subtreepkg.TxInpoints{}, false
 	}
 
 	return v.(subtreepkg.TxInpoints), true
