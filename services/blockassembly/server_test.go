@@ -10,7 +10,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -182,11 +181,11 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 		require.NoError(t, err)
 
 		for i := uint64(0); i < 10; i++ {
-			server.blockAssembler.AddTx(subtreepkg.Node{
+			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 				Hash:        chainhash.HashH([]byte(fmt.Sprintf("%d", i))),
 				Fee:         i,
 				SizeInBytes: i,
-			}, subtreepkg.TxInpoints{})
+			}}, []subtreepkg.TxInpoints{{}})
 		}
 
 		require.Eventually(t, func() bool {
@@ -213,13 +212,13 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 	})
 }
 
-func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, *txmap.SyncedMap[chainhash.Hash, subtreepkg.TxInpoints]) {
+func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, *subtreeprocessor.SplitTxInpointsMap) {
 	s, subtreeStore := setupServer(t)
 
 	subtree, err := subtreepkg.NewTreeByLeafCount(16)
 	require.NoError(t, err)
 
-	txMap := txmap.NewSyncedMap[chainhash.Hash, subtreepkg.TxInpoints]()
+	txMap := subtreeprocessor.NewSplitTxInpointsMap(256)
 
 	previousHash := chainhash.HashH([]byte("previousHash"))
 
@@ -412,11 +411,11 @@ func TestTxCount(t *testing.T) {
 		// to avoid TxInpoints serialization issues
 		for i := 0; i < 3; i++ {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("tx-%d", i)))
-			server.blockAssembler.AddTx(subtreepkg.Node{
+			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 				Hash:        txHash,
 				Fee:         uint64(100),
 				SizeInBytes: uint64(250),
-			}, subtreepkg.TxInpoints{})
+			}}, []subtreepkg.TxInpoints{{}})
 		}
 
 		// Wait for processing - expect initial count + 3 added transactions
@@ -435,11 +434,11 @@ func TestSubmitMiningSolution_InvalidBlock_HandlesReset(t *testing.T) {
 		// Add some transactions to create a mining candidate
 		for i := 0; i < 5; i++ {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("tx%d", i)))
-			server.blockAssembler.AddTx(subtreepkg.Node{
+			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 				Hash:        txHash,
 				Fee:         uint64(100),
 				SizeInBytes: uint64(250),
-			}, subtreepkg.TxInpoints{})
+			}}, []subtreepkg.TxInpoints{{}})
 		}
 
 		// Wait for transactions to be processed
@@ -1182,11 +1181,11 @@ func TestRemoveTxIntensive(t *testing.T) {
 
 		// First add a transaction
 		txHash := chainhash.HashH([]byte("test-tx-to-remove"))
-		server.blockAssembler.AddTx(subtreepkg.Node{
+		server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 			Hash:        txHash,
 			Fee:         100,
 			SizeInBytes: 250,
-		}, subtreepkg.TxInpoints{})
+		}}, []subtreepkg.TxInpoints{{}})
 
 		// Wait for it to be added
 		time.Sleep(10 * time.Millisecond)
@@ -1330,11 +1329,11 @@ func TestGetMiningCandidateIntensive(t *testing.T) {
 		// Add some transactions to create subtrees
 		for i := 0; i < 5; i++ {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("mining-tx-%d", i)))
-			server.blockAssembler.AddTx(subtreepkg.Node{
+			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 				Hash:        txHash,
 				Fee:         uint64(100),
 				SizeInBytes: uint64(250),
-			}, subtreepkg.TxInpoints{})
+			}}, []subtreepkg.TxInpoints{{}})
 		}
 
 		time.Sleep(50 * time.Millisecond) // Allow processing
@@ -1838,11 +1837,11 @@ func TestRemoveTxEdgeCases(t *testing.T) {
 
 		// Add a transaction first
 		txHash := chainhash.HashH([]byte("test-tx-remove"))
-		server.blockAssembler.AddTx(subtreepkg.Node{
+		server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 			Hash:        txHash,
 			Fee:         100,
 			SizeInBytes: 250,
-		}, subtreepkg.TxInpoints{})
+		}}, []subtreepkg.TxInpoints{{}})
 
 		// Now remove it to cover the success path
 		req := &blockassembly_api.RemoveTxRequest{

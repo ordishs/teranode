@@ -271,6 +271,20 @@ func (ba *BlockAssembly) Init(ctx context.Context) (err error) {
 	go ba.runNewSubtreeListener(ctx, newSubtreeChan, subtreeRetryChan)
 	go ba.runBlockSubmissionListener(ctx)
 
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ba.logger.Infof("Stopping block assembler metrics updater")
+				return
+			case <-time.After(5 * time.Second):
+				prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
+				prometheusBlockAssemblerQueuedTransactions.Set(float64(ba.blockAssembler.QueueLength()))
+				prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
+			}
+		}
+	}()
+
 	return nil
 }
 
@@ -722,9 +736,6 @@ func (ba *BlockAssembly) Stop(ctx context.Context) error {
 	return nil
 }
 
-// txsProcessed tracks the total number of transactions processed atomically
-var txsProcessed = atomic.Uint64{}
-
 // AddTx adds a transaction to the block assembly.
 //
 // Parameters:
@@ -738,29 +749,21 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "AddTx",
 		tracing.WithParentStat(ba.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyAddTx),
+		tracing.WithCounter(prometheusBlockAssemblyAddTxCounter),
 		tracing.WithTag("txid", utils.ReverseAndHexEncodeSlice(req.Txid)),
 		tracing.WithLogMessage(ba.logger, "[AddTx][%s] add tx called", utils.ReverseAndHexEncodeSlice(req.Txid)),
 	)
 
 	defer func() {
-		if txsProcessed.Load()%1000 == 0 {
-			// we should NOT be setting this on every call, it's a waste of resources
-			prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
-			prometheusBlockAssemblerQueuedTransactions.Set(float64(ba.blockAssembler.QueueLength()))
-			prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
-		}
-
-		txsProcessed.Inc()
-
 		deferFn()
 	}()
-
-	ba.logger.Debugf("[AddTx] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
 
 	if len(req.Txid) != 32 {
 		return nil, errors.WrapGRPC(
 			errors.NewProcessingError("invalid txid length: %d for %s", len(req.Txid), utils.ReverseAndHexEncodeSlice(req.Txid)))
 	}
+
+	ba.logger.Debugf("[AddTx] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
 
 	txInpoints, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
 	if err != nil {
@@ -768,11 +771,10 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 	}
 
 	if !ba.settings.BlockAssembly.Disabled {
-		ba.blockAssembler.AddTx(subtreepkg.Node{
-			Hash:        chainhash.Hash(req.Txid),
-			Fee:         req.Fee,
-			SizeInBytes: req.Size,
-		}, txInpoints)
+		ba.blockAssembler.AddTxBatch(
+			[]subtreepkg.Node{{Hash: chainhash.Hash(req.Txid), Fee: req.Fee, SizeInBytes: req.Size}},
+			[]subtreepkg.TxInpoints{txInpoints},
+		)
 	}
 
 	return &blockassembly_api.AddTxResponse{
@@ -841,9 +843,6 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 		tracing.WithDebugLogMessage(ba.logger, "[AddTxBatch] called with %d transactions", len(batch.GetTxRequests())),
 	)
 	defer func() {
-		prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
-		prometheusBlockAssemblerQueuedTransactions.Set(float64(ba.blockAssembler.QueueLength()))
-		prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
 		deferFn()
 	}()
 
@@ -852,33 +851,32 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("no tx requests in batch"))
 	}
 
-	// this is never used, so we can remove it
-	for _, req := range requests {
-		startTxTime := time.Now()
+	// Build batch arrays
+	nodes := make([]subtreepkg.Node, len(requests))
+	txInpointsList := make([]subtreepkg.TxInpoints, len(requests))
 
-		txInpoints, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
+	for i, req := range requests {
+		inpoints, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
 		if err != nil {
 			return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
 		}
 
-		// create the subtree node
-		if !ba.settings.BlockAssembly.Disabled {
-			ba.blockAssembler.AddTx(subtreepkg.Node{
-				Hash:        chainhash.Hash(req.Txid),
-				Fee:         req.Fee,
-				SizeInBytes: req.Size,
-			}, txInpoints)
-
-			ba.logger.Debugf("[AddTxBatch] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
-			prometheusBlockAssemblyAddTx.Observe(float64(time.Since(startTxTime).Microseconds()) / 1_000_000)
+		nodes[i] = subtreepkg.Node{
+			Hash:        chainhash.Hash(req.Txid),
+			Fee:         req.Fee,
+			SizeInBytes: req.Size,
 		}
+		txInpointsList[i] = inpoints
 	}
 
-	resp := &blockassembly_api.AddTxBatchResponse{
-		Ok: true,
+	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
+
+	// Add entire batch in one call
+	if !ba.settings.BlockAssembly.Disabled {
+		ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
 	}
 
-	return resp, nil
+	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 }
 
 // AddTxBatchColumnar processes a batch of transactions using columnar data format.
@@ -915,9 +913,6 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 		tracing.WithDebugLogMessage(ba.logger, "[AddTxBatchColumnar] called with columnar batch"),
 	)
 	defer func() {
-		prometheusBlockAssemblerTransactions.Set(float64(ba.blockAssembler.TxCount()))
-		prometheusBlockAssemblerQueuedTransactions.Set(float64(ba.blockAssembler.QueueLength()))
-		prometheusBlockAssemblerSubtrees.Set(float64(ba.blockAssembler.SubtreeCount()))
 		deferFn()
 	}()
 
@@ -955,10 +950,12 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 		return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 	}
 
+	// Build batch arrays
+	nodes := make([]subtreepkg.Node, txCount)
+	txInpointsList := make([]subtreepkg.TxInpoints, txCount)
+
 	// Process each transaction using column-oriented access
 	for i := 0; i < txCount; i++ {
-		startTxTime := time.Now()
-
 		// Extract TXID (32 bytes) - no allocation, just slice reference
 		txidStart := i * 32
 		txid := req.TxidsPacked[txidStart : txidStart+32]
@@ -973,7 +970,6 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 		parentTxHashes := make([]chainhash.Hash, numParentHashes)
 		idxs := make([][]uint32, numParentHashes)
 
-		totalVouts := 0
 		for j := uint32(0); j < numParentHashes; j++ {
 			parentHashIdx := parentHashStart + j
 
@@ -984,29 +980,28 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 			// Extract vout indices for this parent hash
 			voutIdxStart := req.VoutIdxOffsets[parentHashIdx]
 			voutIdxEnd := req.VoutIdxOffsets[parentHashIdx+1]
-			numVouts := voutIdxEnd - voutIdxStart
 
 			// Reference the vout indices slice directly - no allocation
 			idxs[j] = req.ParentVoutIndices[voutIdxStart:voutIdxEnd]
-			totalVouts += int(numVouts)
 		}
 
-		// Construct TxInpoints directly - minimal allocations
-		txInpoints := subtreepkg.TxInpoints{
+		// Build node and txInpoints for this transaction
+		nodes[i] = subtreepkg.Node{
+			Hash:        chainhash.Hash(txid),
+			Fee:         req.Fees[i],
+			SizeInBytes: req.Sizes[i],
+		}
+		txInpointsList[i] = subtreepkg.TxInpoints{
 			ParentTxHashes: parentTxHashes,
 			Idxs:           idxs,
 		}
+	}
 
-		// Add to block assembler
-		if !ba.settings.BlockAssembly.Disabled {
-			ba.blockAssembler.AddTx(subtreepkg.Node{
-				Hash:        chainhash.Hash(txid),
-				Fee:         req.Fees[i],
-				SizeInBytes: req.Sizes[i],
-			}, txInpoints)
+	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
 
-			prometheusBlockAssemblyAddTx.Observe(float64(time.Since(startTxTime).Microseconds()) / 1_000_000)
-		}
+	// Add entire batch in one call
+	if !ba.settings.BlockAssembly.Disabled {
+		ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
 	}
 
 	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil

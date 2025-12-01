@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -61,12 +62,12 @@ func runSubtreeBenchmark(subtreeSize, producers, iterations, duration int, cpuPr
 	// Start CPU profiling
 	cpuFile, err := os.Create(cpuProfile)
 	if err != nil {
-		return fmt.Errorf("failed to create CPU profile: %w", err)
+		return errors.NewProcessingError("failed to create CPU profile: %w", err)
 	}
 	defer cpuFile.Close()
 
 	if err := pprof.StartCPUProfile(cpuFile); err != nil {
-		return fmt.Errorf("failed to start CPU profile: %w", err)
+		return errors.NewProcessingError("failed to start CPU profile: %w", err)
 	}
 	defer pprof.StopCPUProfile()
 
@@ -80,13 +81,13 @@ func runSubtreeBenchmark(subtreeSize, producers, iterations, duration int, cpuPr
 	// Write memory profile
 	memFile, err := os.Create(memProfile)
 	if err != nil {
-		return fmt.Errorf("failed to create memory profile: %w", err)
+		return errors.NewProcessingError("failed to create memory profile: %w", err)
 	}
 	defer memFile.Close()
 
 	runtime.GC() // Force GC before memory profile
 	if err := pprof.WriteHeapProfile(memFile); err != nil {
-		return fmt.Errorf("failed to write memory profile: %w", err)
+		return errors.NewStorageError("failed to write memory profile: %w", err)
 	}
 
 	// Print results
@@ -178,8 +179,9 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 	var wg sync.WaitGroup
 	var stopped atomic.Bool
 	itemsPerGoroutine := numTxs / producers
+	const batchSize = 2 * 1024
 
-	fmt.Printf("Starting benchmark with %d producers...\n", producers)
+	fmt.Printf("Starting benchmark with %d producers (batch size: %d)...\n", producers, batchSize)
 
 	for g := 0; g < producers; g++ {
 		wg.Add(1)
@@ -192,6 +194,10 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 				end = numTxs // Last goroutine handles remainder
 			}
 
+			// Pre-allocate batch slices
+			nodes := make([]subtreepkg.Node, 0, batchSize)
+			inpoints := make([]subtreepkg.TxInpoints, 0, batchSize)
+
 			for i := start; i < end; i++ {
 				// Check if we should stop (duration-based)
 				if stopped.Load() {
@@ -202,20 +208,38 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int) benchmar
 				select {
 				case <-timeoutChan:
 					stopped.Store(true)
+					// Flush remaining batch before returning
+					if len(nodes) > 0 {
+						stp.AddBatch(nodes, inpoints)
+						opsCompleted.Add(int64(len(nodes)))
+					}
 					return
 				default:
 				}
 
-				stp.Add(
-					subtreepkg.Node{
-						Hash: txHashes[i],
-						Fee:  uint64(i % 10000),
-					},
-					subtreepkg.TxInpoints{
-						ParentTxHashes: []chainhash.Hash{parentHashes[i]},
-					},
-				)
-				opsCompleted.Add(1)
+				// Add to batch
+				nodes = append(nodes, subtreepkg.Node{
+					Hash: txHashes[i],
+					Fee:  uint64(i % 10000),
+				})
+				inpoints = append(inpoints, subtreepkg.TxInpoints{
+					ParentTxHashes: []chainhash.Hash{parentHashes[i]},
+				})
+
+				// Submit batch when full
+				if len(nodes) >= batchSize {
+					stp.AddBatch(nodes, inpoints)
+					opsCompleted.Add(int64(len(nodes)))
+					// Reset slices (reuse backing array)
+					nodes = nodes[:0]
+					inpoints = inpoints[:0]
+				}
+			}
+
+			// Flush remaining batch
+			if len(nodes) > 0 {
+				stp.AddBatch(nodes, inpoints)
+				opsCompleted.Add(int64(len(nodes)))
 			}
 		}(g)
 	}

@@ -17,7 +17,6 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
-	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/model"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 )
@@ -37,14 +36,14 @@ import (
 // into efficient subtree structures and maintaining consistency during blockchain
 // state changes.
 type Interface interface {
-	// Add adds a transaction node to the subtree processor for processing.
-	// The transaction will be organized into appropriate subtrees based on
-	// its dependencies and relationships with other transactions.
+	// AddBatch adds a batch of transaction nodes to the subtree processor for processing.
+	// The transactions will be organized into appropriate subtrees based on
+	// their dependencies and relationships with other transactions.
 	//
 	// Parameters:
-	//   - node: The transaction node to add to processing
-	//   - txInpoints: Transaction input points for dependency tracking
-	Add(node subtree.Node, txInpoints subtree.TxInpoints)
+	//   - nodes: The transaction nodes to add to processing
+	//   - txInpoints: Transaction input points for each node for dependency tracking
+	AddBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints)
 
 	// Start starts the main processing goroutine for the SubtreeProcessor.
 	// This should be called after loading unmined transactions at startup to avoid race conditions.
@@ -177,16 +176,16 @@ type Interface interface {
 	// This provides access to the processor's transaction tracking state.
 	//
 	// Returns:
-	//   - *util.SyncedMap[chainhash.Hash, meta.TxInpoints]: Current transaction map
-	GetCurrentTxMap() *txmap.SyncedMap[chainhash.Hash, subtree.TxInpoints]
+	//   - *SplitTxInpointsMap: Current transaction map
+	GetCurrentTxMap() *SplitTxInpointsMap
 
 	// GetRemoveMap returns the map of transactions scheduled for removal.
 	// This map contains transactions that have been marked for removal
 	// but not yet processed.
 	//
 	// Returns:
-	//   - *txmap.SwissMap: Map of transactions to be removed
-	GetRemoveMap() *txmap.SwissMap
+	//   - *SplitSwissMap: Map of transactions to be removed
+	GetRemoveMap() *SplitSwissMap
 
 	// GetChainedSubtrees returns subtrees that are chained together.
 	// These represent transaction dependencies and processing order.
