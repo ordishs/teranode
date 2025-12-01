@@ -1885,10 +1885,25 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		if indexWaiter, ok := b.utxoStore.(interface {
 			WaitForIndexReady(ctx context.Context, indexName string) error
 		}); ok {
-			if err := indexWaiter.WaitForIndexReady(ctx, "unminedSinceIndex"); err != nil {
+			indexName := "unminedSinceIndex"
+			prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(0)
+
+			start := time.Now()
+			err := indexWaiter.WaitForIndexReady(ctx, indexName)
+
+			duration := time.Since(start).Seconds()
+			if err != nil {
 				b.logger.Warnf("[BlockAssembler] failed to wait for unmined_since index: %v", err)
+				prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(2)
+				prometheusBlockAssemblerUtxoIndexWaitDuration.WithLabelValues(indexName, "error").Observe(duration)
 				// Continue anyway as this may be a non-Aerospike store
+			} else {
+				prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(1)
+				prometheusBlockAssemblerUtxoIndexWaitDuration.WithLabelValues(indexName, "success").Observe(duration)
 			}
+		} else {
+			b.logger.Warnf("[BlockAssembler] utxo store does not support WaitForIndexReady")
+			prometheusBlockAssemblerUtxoIndexWaitDuration.WithLabelValues("unminedSinceIndex", "skipped").Observe(0)
 		}
 	} else {
 		// get the full header count so we can do a full scan of all unmined transactions
@@ -1918,10 +1933,18 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	}
 
 	b.logger.Infof("[loadUnminedTransactions] requesting unmined tx iterator from UTXO store (fullScan=%t)", fullScan)
+	fullScanLabel := "false"
+	if fullScan {
+		fullScanLabel = "true"
+	}
+	start := time.Now()
 	it, err := b.utxoStore.GetUnminedTxIterator(fullScan)
+	duration := time.Since(start).Seconds()
 	if err != nil {
+		prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues(fullScanLabel, "error").Observe(duration)
 		return errors.NewProcessingError("error getting unmined tx iterator", err)
 	}
+	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues(fullScanLabel, "success").Observe(duration)
 	b.logger.Infof("[loadUnminedTransactions] successfully created unmined tx iterator, starting to process transactions")
 
 	unminedTransactions := make([]*utxo.UnminedTransaction, 0, 1024*1024) // preallocate a large slice to avoid reallocations
@@ -1931,6 +1954,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	// this is for transactions that are included in a block that is in the best chain
 	// but the transaction itself is still marked as unmined, this can happen if block assembly got dirty
 	markAsMinedOnLongestChain := make([]chainhash.Hash, 0, 1024)
+
+	iteratorStart := time.Now()
+	totalProcessed := 0
+	skippedCount := 0
+	alreadyMinedCount := 0
+	lockedCount := 0
 
 	for {
 		unminedTransaction, err := it.Next(ctx)
@@ -1942,7 +1971,10 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			break
 		}
 
+		totalProcessed++
+
 		if unminedTransaction.Skip {
+			skippedCount++
 			continue
 		}
 
@@ -1958,6 +1990,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 
 			if skipAlreadyMined {
 				// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+				alreadyMinedCount++
 
 				if unminedTransaction.UnminedSince > 0 {
 					markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, *unminedTransaction.Hash)
@@ -1972,36 +2005,72 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		if unminedTransaction.Locked {
 			// if the transaction is locked, we need to add it to the locked transactions list, so we can unlock them
 			lockedTransactions = append(lockedTransactions, *unminedTransaction.Hash)
+			lockedCount++
 		}
 	}
+
+	iteratorDuration := time.Since(iteratorStart).Seconds()
+	prometheusBlockAssemblerIteratorProcessingTime.WithLabelValues(fullScanLabel).Observe(iteratorDuration)
+	prometheusBlockAssemblerIteratorTransactionsTotal.WithLabelValues(fullScanLabel).Add(float64(totalProcessed))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "skipped").Add(float64(skippedCount))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "already_mined").Add(float64(alreadyMinedCount))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "locked").Add(float64(lockedCount))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "added").Add(float64(len(unminedTransactions)))
 
 	// Always fix data inconsistencies: transactions with block_ids on main chain but unmined_since set
 	// This ensures data integrity on every load, catching issues from previous bugs, crashes, or edge cases
 	// The performance impact is minimal since the list is usually empty when data is correct
 	if len(markAsMinedOnLongestChain) > 0 {
+		markStart := time.Now()
 		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
 			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
 		}
+		prometheusBlockAssemblerMarkTransactionsTime.Observe(time.Since(markStart).Seconds())
+		prometheusBlockAssemblerMarkTransactionsCount.Add(float64(len(markAsMinedOnLongestChain)))
 
 		b.logger.Infof("[BlockAssembler] fixed %d transactions with inconsistent unmined_since (had block_ids on main but unmined_since set)", len(markAsMinedOnLongestChain))
 	}
 
 	// order the transactions by createdAt
+	sortStart := time.Now()
 	sort.Slice(unminedTransactions, func(i, j int) bool {
 		// sort by createdAt, oldest first
 		return unminedTransactions[i].CreatedAt < unminedTransactions[j].CreatedAt
 	})
+	txCount := len(unminedTransactions)
+	var countBucket string
+	switch {
+	case txCount < 1000:
+		countBucket = "<1k"
+	case txCount < 10000:
+		countBucket = "1k-10k"
+	case txCount < 100000:
+		countBucket = "10k-100k"
+	case txCount < 1000000:
+		countBucket = "100k-1M"
+	default:
+		countBucket = ">1M"
+	}
+	prometheusBlockAssemblerSortTransactionsTime.WithLabelValues(countBucket).Observe(time.Since(sortStart).Seconds())
 
 	// Apply parent chain validation if enabled
 	if b.settings.BlockAssembly.OnRestartValidateParentChain {
+		validateStart := time.Now()
+		beforeCount := len(unminedTransactions)
 		var err error
 		unminedTransactions, err = b.validateParentChain(ctx, unminedTransactions, bestBlockHeaderIDsMap)
 		if err != nil {
 			// Context was cancelled during parent validation
 			return err
 		}
+		prometheusBlockAssemblerValidateParentChainTime.Observe(time.Since(validateStart).Seconds())
+		filteredCount := beforeCount - len(unminedTransactions)
+		if filteredCount > 0 {
+			prometheusBlockAssemblerValidateParentChainFiltered.Add(float64(filteredCount))
+		}
 	}
 
+	batchStart := time.Now()
 	for _, unminedTransaction := range unminedTransactions {
 		subtreeNode := subtree.Node{
 			Hash:        *unminedTransaction.Hash,
@@ -2009,10 +2078,14 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			SizeInBytes: unminedTransaction.Size,
 		}
 
+		addStart := time.Now()
 		if err = b.subtreeProcessor.AddDirectly(subtreeNode, unminedTransaction.TxInpoints, true); err != nil {
 			return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
 		}
+		prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
+		prometheusBlockAssemblerAddDirectlyTotal.Inc()
 	}
+	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
 
 	// unlock any locked transactions
 	if len(lockedTransactions) > 0 {
