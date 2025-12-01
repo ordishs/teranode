@@ -1476,9 +1476,11 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	}
 
 	// wait for the writing of the subtree to complete in a separate goroutine
-	if err = <-errCh; err != nil {
-		stp.logger.Errorf("[%s] error sending subtree to newSubtreeChan: %v", oldSubtreeHash.String(), err)
-	}
+	go func() {
+		if err := <-errCh; err != nil {
+			stp.logger.Errorf("[%s] error sending subtree to newSubtreeChan: %v", oldSubtreeHash.String(), err)
+		}
+	}()
 
 	// Reset the announcement timer since we just announced a complete subtree
 	if !skipNotification {

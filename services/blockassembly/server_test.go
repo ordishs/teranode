@@ -25,17 +25,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func Test_storeSubtree(t *testing.T) {
-	t.Run("Test storeSubtree", func(t *testing.T) {
+func Test_storeSubtreeData(t *testing.T) {
+	t.Run("Test storeSubtreeData", func(t *testing.T) {
 		server, subtreeStore, subtree, txMap := setup(t)
 
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
-		require.NoError(t, server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
+		subtreeDone, allDone, err := server.storeSubtreeData(t.Context(), subtreeprocessor.NewSubtreeRequest{
 			Subtree:     subtree,
 			ParentTxMap: txMap,
 			ErrChan:     nil,
-		}, subtreeRetryChan))
+		}, subtreeRetryChan)
+		require.NoError(t, err)
+
+		// Wait for subtree storage
+		storedOK := <-subtreeDone
+		require.True(t, storedOK)
+
+		// Wait for all work to complete
+		<-allDone
 
 		subtreeBytes, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
 		require.NoError(t, err)
@@ -68,21 +76,29 @@ func Test_storeSubtree(t *testing.T) {
 		}
 	})
 
-	t.Run("Test storeSubtree - meta missing", func(t *testing.T) {
+	t.Run("Test storeSubtreeData - meta missing", func(t *testing.T) {
 		server, subtreeStore, subtree, txMap := setup(t)
 
 		txMap.Clear()
 
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1_000)
 
-		require.NoError(t, server.storeSubtree(t.Context(), subtreeprocessor.NewSubtreeRequest{
+		subtreeDone, allDone, err := server.storeSubtreeData(t.Context(), subtreeprocessor.NewSubtreeRequest{
 			Subtree:     subtree,
 			ParentTxMap: txMap,
 			ErrChan:     nil,
-		}, subtreeRetryChan))
+		}, subtreeRetryChan)
+		require.NoError(t, err)
+
+		// Wait for subtree storage
+		storedOK := <-subtreeDone
+		require.True(t, storedOK)
+
+		// Wait for all work to complete
+		<-allDone
 
 		// check that the meta data was not stored
-		_, err := subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
+		_, err = subtreeStore.Get(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta)
 		require.Error(t, err)
 	})
 }
@@ -922,13 +938,13 @@ func TestInitIntensive(t *testing.T) {
 	})
 }
 
-// TestStoreSubtreeIntensive tests the storeSubtree method comprehensively
-func TestStoreSubtreeIntensive(t *testing.T) {
-	t.Run("storeSubtree with SkipNotification", func(t *testing.T) {
+// TestStoreSubtreeDataIntensive tests the storeSubtreeData method comprehensively
+func TestStoreSubtreeDataIntensive(t *testing.T) {
+	t.Run("storeSubtreeData basic storage", func(t *testing.T) {
 		server, subtreeStore, subtree, txMap := setup(t)
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
-		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
+		subtreeDone, allDone, err := server.storeSubtreeData(context.Background(), subtreeprocessor.NewSubtreeRequest{
 			Subtree:          subtree,
 			ParentTxMap:      txMap,
 			SkipNotification: true,
@@ -936,6 +952,9 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		}, subtreeRetryChan)
 
 		assert.NoError(t, err)
+		storedOK := <-subtreeDone
+		assert.True(t, storedOK)
+		<-allDone // Wait for all work
 
 		// Verify subtree was stored
 		subtreeBytes, err := subtreeStore.Get(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtree)
@@ -943,49 +962,7 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 		assert.NotNil(t, subtreeBytes)
 	})
 
-	t.Run("storeSubtree with FSM not running", func(t *testing.T) {
-		server, _, subtree, txMap := setup(t)
-
-		// Mock blockchain client to return FSM not running
-		mockClient := &blockchain.Mock{}
-		mockClient.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(false, nil)
-		server.blockchainClient = mockClient
-
-		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
-
-		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
-		}, subtreeRetryChan)
-
-		assert.NoError(t, err)
-		mockClient.AssertExpectations(t)
-	})
-
-	t.Run("storeSubtree with notification error", func(t *testing.T) {
-		server, _, subtree, txMap := setup(t)
-
-		// Mock blockchain client to return error on notification
-		mockClient := &blockchain.Mock{}
-		mockClient.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(true, nil)
-		mockClient.On("SendNotification", mock.Anything, mock.Anything).Return(errors.NewProcessingError("notification failed"))
-		server.blockchainClient = mockClient
-
-		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
-
-		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
-			Subtree:     subtree,
-			ParentTxMap: txMap,
-			ErrChan:     nil,
-		}, subtreeRetryChan)
-
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "failed to send subtree notification")
-		mockClient.AssertExpectations(t)
-	})
-
-	t.Run("storeSubtree with store already exists error", func(t *testing.T) {
+	t.Run("storeSubtreeData with store already exists", func(t *testing.T) {
 		server, subtreeStore, subtree, txMap := setup(t)
 
 		// Pre-store the subtree to trigger "already exists" path
@@ -996,23 +973,23 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
-		err = server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
+		_, _, err = server.storeSubtreeData(context.Background(), subtreeprocessor.NewSubtreeRequest{
 			Subtree:     subtree,
 			ParentTxMap: txMap,
 			ErrChan:     nil,
 		}, subtreeRetryChan)
 
-		// Should not error - should detect existing subtree and return early
-		assert.NoError(t, err)
+		// Should return ErrBlobAlreadyExists
+		assert.True(t, errors.Is(err, errors.ErrBlobAlreadyExists))
 	})
 
-	t.Run("storeSubtree handles errors gracefully", func(t *testing.T) {
+	t.Run("storeSubtreeData handles errors gracefully", func(t *testing.T) {
 		server, _, subtree, txMap := setup(t)
 
 		subtreeRetryChan := make(chan *subtreeRetrySend, 1000)
 
 		// Test with valid scenario - this just ensures the path is covered
-		err := server.storeSubtree(context.Background(), subtreeprocessor.NewSubtreeRequest{
+		subtreeDone, allDone, err := server.storeSubtreeData(context.Background(), subtreeprocessor.NewSubtreeRequest{
 			Subtree:     subtree,
 			ParentTxMap: txMap,
 			ErrChan:     nil,
@@ -1020,6 +997,56 @@ func TestStoreSubtreeIntensive(t *testing.T) {
 
 		// Should succeed in most cases
 		assert.NoError(t, err)
+		storedOK := <-subtreeDone
+		assert.True(t, storedOK)
+		<-allDone // Wait for all work
+	})
+}
+
+// TestSendSubtreeNotification tests the sendSubtreeNotification method
+func TestSendSubtreeNotification(t *testing.T) {
+	t.Run("sendSubtreeNotification with FSM not running", func(t *testing.T) {
+		server, _, subtree, _ := setup(t)
+
+		// Mock blockchain client to return FSM not running
+		mockClient := &blockchain.Mock{}
+		mockClient.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(false, nil)
+		server.blockchainClient = mockClient
+
+		// Should not send notification when FSM is not running
+		server.sendSubtreeNotification(context.Background(), *subtree.RootHash())
+
+		mockClient.AssertExpectations(t)
+		mockClient.AssertNotCalled(t, "SendNotification", mock.Anything, mock.Anything)
+	})
+
+	t.Run("sendSubtreeNotification with FSM running", func(t *testing.T) {
+		server, _, subtree, _ := setup(t)
+
+		// Mock blockchain client to return FSM running
+		mockClient := &blockchain.Mock{}
+		mockClient.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(true, nil)
+		mockClient.On("SendNotification", mock.Anything, mock.Anything).Return(nil)
+		server.blockchainClient = mockClient
+
+		server.sendSubtreeNotification(context.Background(), *subtree.RootHash())
+
+		mockClient.AssertExpectations(t)
+	})
+
+	t.Run("sendSubtreeNotification with notification error", func(t *testing.T) {
+		server, _, subtree, _ := setup(t)
+
+		// Mock blockchain client to return error on notification
+		mockClient := &blockchain.Mock{}
+		mockClient.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(true, nil)
+		mockClient.On("SendNotification", mock.Anything, mock.Anything).Return(errors.NewProcessingError("notification failed"))
+		server.blockchainClient = mockClient
+
+		// Should log error but not panic
+		server.sendSubtreeNotification(context.Background(), *subtree.RootHash())
+
+		mockClient.AssertExpectations(t)
 	})
 }
 
@@ -2030,6 +2057,7 @@ func TestStoreRetryErrorPaths(t *testing.T) {
 		// Mock blockchain client to return error on notification
 		mockClient := &blockchain.Mock{}
 		mockClient.On("SendNotification", mock.Anything, mock.Anything).Return(errors.NewProcessingError("notification failed"))
+		mockClient.On("IsFSMCurrentState", mock.Anything, mock.Anything).Return(true, nil)
 		server.blockchainClient = mockClient
 
 		subtreeHash := chainhash.HashH([]byte("test-notify"))
