@@ -916,7 +916,6 @@ func (b *BlockAssembler) Reset(fullReset bool) {
 //   - []*util.Subtree: Associated subtrees
 //   - error: Any error encountered during retrieval
 func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningCandidate, []*subtree.Subtree, error) {
-	// make sure we call this on the select, so we don't get a candidate when we found a new block
 	ctx, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "GetMiningCandidate",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockAssemblyGetMiningCandidateDuration),
@@ -937,151 +936,56 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 		return b.generateEmptyBlockCandidate(bestBlockHeader, bestBlockMeta.Height)
 	}
 
-	// Declare currentHeight outside loop so it's available for cache update later
-	var currentHeight uint32
+	b.cachedCandidate.mu.RLock()
+	_, currentHeight := b.CurrentBlock()
 
-	// Use iterative approach instead of recursion to prevent stack overflow under load
-	for {
-		// Try to get from cache first
-		b.cachedCandidate.mu.RLock()
-
-		_, currentHeight = b.CurrentBlock()
-
-		// Return cached if still valid (same height and within timeout)
-		if !b.settings.ChainCfgParams.ReduceMinDifficulty && b.cachedCandidate.candidate != nil &&
-			b.cachedCandidate.lastHeight == currentHeight &&
-			time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateCacheTimeout {
-			candidate := b.cachedCandidate.candidate
-			subtrees := b.cachedCandidate.subtrees
-			b.cachedCandidate.mu.RUnlock()
-
-			// Record cache hit metrics
-			prometheusBlockAssemblerCacheHits.Inc()
-
-			b.logger.Debugf("[BlockAssembler] Returning cached mining candidate %s", candidate.Id)
-
-			return candidate, subtrees, nil
-		}
-
-		// Check if already generating
-		if b.cachedCandidate.generating {
-			// Return stale cache if available rather than blocking
-			// Miners can work with slightly stale data during high load
-			if b.cachedCandidate.candidate != nil &&
-				time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateSmartCacheMaxAge {
-				candidate := b.cachedCandidate.candidate
-				subtrees := b.cachedCandidate.subtrees
-				b.cachedCandidate.mu.RUnlock()
-
-				b.logger.Debugf("[BlockAssembler] Returning stale cache during generation (age: %v)",
-					time.Since(b.cachedCandidate.lastUpdate))
-				prometheusBlockAssemblerCacheHits.Inc()
-
-				return candidate, subtrees, nil
-			}
-
-			// If stale cache too old or doesn't exist, wait for generation
-			ch := b.cachedCandidate.generationChan
-			b.cachedCandidate.mu.RUnlock()
-
-			// Wait for ongoing generation with timeout
-			select {
-			case <-ch:
-				// Generation complete, retry to get fresh cache (loop continues)
-				continue
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(b.settings.BlockAssembly.GetMiningCandidateResponseTimeout):
-				// Timeout waiting for generation, retry (loop continues)
-				continue
-			}
-		}
-
-		// Mark as generating - upgrade to write lock
+	if !b.settings.ChainCfgParams.ReduceMinDifficulty && b.cachedCandidate.candidate != nil &&
+		b.cachedCandidate.lastHeight == currentHeight &&
+		time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateCacheTimeout {
+		candidate := b.cachedCandidate.candidate
+		subtrees := b.cachedCandidate.subtrees
 		b.cachedCandidate.mu.RUnlock()
-		b.cachedCandidate.mu.Lock()
 
-		// Double check generating flag in case another goroutine set it while we upgraded locks
-		if b.cachedCandidate.generating {
-			// Return stale cache if available (same logic as above)
-			if b.cachedCandidate.candidate != nil &&
-				time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateSmartCacheMaxAge {
-				candidate := b.cachedCandidate.candidate
-				subtrees := b.cachedCandidate.subtrees
-				b.cachedCandidate.mu.Unlock()
+		prometheusBlockAssemblerCacheHits.Inc()
+		b.logger.Debugf("[BlockAssembler] Returning cached mining candidate %s", candidate.Id)
 
-				b.logger.Debugf("[BlockAssembler] Returning stale cache after lock upgrade (age: %v)",
-					time.Since(b.cachedCandidate.lastUpdate))
-				prometheusBlockAssemblerCacheHits.Inc()
+		return candidate, subtrees, nil
+	}
+	b.cachedCandidate.mu.RUnlock()
 
-				return candidate, subtrees, nil
-			}
+	b.cachedCandidate.mu.Lock()
+	defer b.cachedCandidate.mu.Unlock()
 
-			ch := b.cachedCandidate.generationChan
-			b.cachedCandidate.mu.Unlock()
+	if !b.settings.ChainCfgParams.ReduceMinDifficulty && b.cachedCandidate.candidate != nil &&
+		b.cachedCandidate.lastHeight == currentHeight &&
+		time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateCacheTimeout {
+		prometheusBlockAssemblerCacheHits.Inc()
+		b.logger.Debugf("[BlockAssembler] Returning cached mining candidate after lock upgrade %s", b.cachedCandidate.candidate.Id)
 
-			// Wait for ongoing generation
-			select {
-			case <-ch:
-				// Generation complete, retry (loop continues)
-				continue
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(b.settings.BlockAssembly.GetMiningCandidateResponseTimeout):
-				// Timeout waiting for generation, retry (loop continues)
-				continue
-			}
-		}
-
-		// We have the write lock and no one else is generating - break out to generate
-		break
+		return b.cachedCandidate.candidate, b.cachedCandidate.subtrees, nil
 	}
 
-	b.cachedCandidate.generating = true
-	b.cachedCandidate.generationChan = make(chan struct{})
-	b.cachedCandidate.mu.Unlock()
-
-	// Ensure cache state is always cleaned up, even on early returns
-	defer func() {
-		b.cachedCandidate.mu.Lock()
-		b.cachedCandidate.generating = false
-		if b.cachedCandidate.generationChan != nil {
-			close(b.cachedCandidate.generationChan)
-			b.cachedCandidate.generationChan = nil
-		}
-		b.cachedCandidate.mu.Unlock()
-	}()
-
-	// Generate new candidate
 	responseCh := make(chan *miningCandidateResponse)
 
 	select {
 	case <-ctx.Done():
 		close(responseCh)
-		// context cancelled, do not send
 		return nil, nil, ctx.Err()
 	case <-time.After(b.settings.BlockAssembly.GetMiningCandidateSendTimeout):
 		return nil, nil, errors.NewServiceError("timeout sending mining candidate request")
 	case b.miningCandidateCh <- responseCh:
-		// sent successfully
 	}
 
-	// wait for response with timeout
 	var candidate *model.MiningCandidate
-
 	var subtrees []*subtree.Subtree
-
 	var err error
 
 	select {
 	case <-ctx.Done():
-		// context cancelled, do not send
 		close(responseCh)
 		err = ctx.Err()
 	case <-time.After(b.settings.BlockAssembly.GetMiningCandidateResponseTimeout):
-		// make sure to close the channel, otherwise the for select will hang, because no one is reading from it
 		close(responseCh)
-
 		err = errors.NewServiceError("timeout getting mining candidate")
 	case response := <-responseCh:
 		candidate = response.miningCandidate
@@ -1089,9 +993,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 		err = response.err
 	}
 
-	// Update cache on success
 	if err == nil {
-		// Calculate metrics for smart invalidation
 		var totalTxCount uint32
 		var totalSize uint64
 		for _, st := range subtrees {
@@ -1099,7 +1001,6 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 			totalSize += st.SizeInBytes
 		}
 
-		b.cachedCandidate.mu.Lock()
 		b.cachedCandidate.candidate = candidate
 		b.cachedCandidate.subtrees = subtrees
 		b.cachedCandidate.lastHeight = currentHeight
@@ -1107,9 +1008,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 		b.cachedCandidate.lastTxCount = totalTxCount
 		b.cachedCandidate.lastSizeInBytes = totalSize
 		b.cachedCandidate.lastSubtreeCount = len(subtrees)
-		b.cachedCandidate.mu.Unlock()
 
-		// Record cache miss metrics
 		prometheusBlockAssemblerCacheMisses.Inc()
 	}
 
