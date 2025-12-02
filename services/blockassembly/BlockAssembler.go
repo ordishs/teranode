@@ -923,6 +923,19 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	)
 	defer deferFn()
 
+	currentState := b.GetCurrentRunningState()
+
+	if currentState == StateBlockchainSubscription || currentState == StateMovingUp {
+		b.logger.Infof("[GetMiningCandidate] Block processing in progress (state: %s), returning empty block template for new height", StateStrings[currentState])
+
+		bestBlockHeader, bestBlockMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+		if err != nil {
+			return nil, nil, errors.NewProcessingError("failed to get best block header during block processing", err)
+		}
+
+		return b.generateEmptyBlockCandidate(bestBlockHeader, bestBlockMeta.Height)
+	}
+
 	// Declare currentHeight outside loop so it's available for cache update later
 	var currentHeight uint32
 
@@ -1100,6 +1113,47 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	}
 
 	return candidate, subtrees, err
+}
+
+func (b *BlockAssembler) generateEmptyBlockCandidate(prevBlockHeader *model.BlockHeader, prevHeight uint32) (*model.MiningCandidate, []*subtree.Subtree, error) {
+	currentHeight := prevHeight + 1
+	timeNow := time.Now().Unix()
+
+	b.logger.Infof("[generateEmptyBlockCandidate] Generating empty block template for height %d (prev: %s)", currentHeight, prevBlockHeader.Hash())
+
+	timeNowUint32, err := safeconversion.Int64ToUint32(timeNow)
+	if err != nil {
+		return nil, nil, errors.NewProcessingError("error converting time", err)
+	}
+
+	nBits, err := b.getNextNbits(timeNow)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	blockSubsidy := util.GetBlockSubsidyForHeight(currentHeight, b.settings.ChainCfgParams)
+
+	id := &chainhash.Hash{}
+	copy(id[:], prevBlockHeader.Hash()[:])
+	id[0] ^= 0xFF
+
+	miningCandidate := &model.MiningCandidate{
+		Id:                  id[:],
+		PreviousHash:        prevBlockHeader.Hash()[:],
+		CoinbaseValue:       blockSubsidy,
+		Version:             prevBlockHeader.Version,
+		NBits:               nBits[:],
+		Time:                timeNowUint32,
+		Height:              currentHeight,
+		NumTxs:              0,
+		SizeWithoutCoinbase: 80,
+		MerkleProof:         [][]byte{},
+		SubtreeHashes:       [][]byte{},
+	}
+
+	b.logger.Infof("[generateEmptyBlockCandidate] Empty block template: height=%d, subsidy=%d, prev=%s", currentHeight, blockSubsidy, prevBlockHeader.Hash())
+
+	return miningCandidate, []*subtree.Subtree{}, nil
 }
 
 // getMiningCandidate creates a new mining candidate from the current block state.
