@@ -58,6 +58,8 @@ var (
 	prometheusBlockAssemblyBestBlockHeight              prometheus.Gauge
 	prometheusBlockAssemblyCurrentBlockHeight           prometheus.Gauge
 	prometheusBlockAssemblerCurrentState                prometheus.Gauge
+	prometheusBlockAssemblerStateTransitions            *prometheus.CounterVec
+	prometheusBlockAssemblerStateDuration               *prometheus.HistogramVec
 	prometheusBlockAssemblerGenerateBlocks              prometheus.Histogram
 	prometheusBlockAssemblerUtxoIndexReady              *prometheus.GaugeVec
 	prometheusBlockAssemblerUtxoIndexWaitDuration       *prometheus.HistogramVec
@@ -305,6 +307,27 @@ func _initPrometheusMetrics() {
 			Name:      "current_state",
 			Help:      "Current state of the block assembly process",
 		},
+	)
+
+	prometheusBlockAssemblerStateTransitions = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "state_transitions_total",
+			Help:      "Total number of state transitions",
+		},
+		[]string{"from", "to"},
+	)
+
+	prometheusBlockAssemblerStateDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "state_duration_seconds",
+			Help:      "Time spent in each state",
+			Buckets:   []float64{0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
+		},
+		[]string{"state"},
 	)
 
 	prometheusBlockAssemblerGenerateBlocks = promauto.NewHistogram(

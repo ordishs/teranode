@@ -147,6 +147,9 @@ type BlockAssembler struct {
 	// currentRunningState tracks the current operational state
 	currentRunningState atomic.Value
 
+	// stateStartTime tracks when the current state began
+	stateStartTime atomic.Value
+
 	// unminedCleanupTicker manages periodic cleanup of old unmined transactions
 	unminedCleanupTicker *time.Ticker
 	// cachedCandidate stores the cached mining candidate
@@ -705,7 +708,27 @@ func (b *BlockAssembler) setBestBlockHeader(bestBlockchainBlockHeader *model.Blo
 // Parameters:
 //   - state: New state to set
 func (b *BlockAssembler) setCurrentRunningState(state State) {
+	now := time.Now()
+
+	oldStateValue := b.currentRunningState.Load()
+	if oldStateValue != nil {
+		oldState := oldStateValue.(State)
+
+		if oldState != state {
+			startTimeValue := b.stateStartTime.Load()
+			if startTimeValue != nil {
+				startTime := startTimeValue.(time.Time)
+				duration := now.Sub(startTime).Seconds()
+
+				prometheusBlockAssemblerStateDuration.WithLabelValues(StateStrings[oldState]).Observe(duration)
+			}
+
+			prometheusBlockAssemblerStateTransitions.WithLabelValues(StateStrings[oldState], StateStrings[state]).Inc()
+		}
+	}
+
 	b.currentRunningState.Store(state)
+	b.stateStartTime.Store(now)
 	prometheusBlockAssemblerCurrentState.Set(float64(state))
 }
 
@@ -942,6 +965,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	if !b.settings.ChainCfgParams.ReduceMinDifficulty && b.cachedCandidate.candidate != nil &&
 		b.cachedCandidate.lastHeight == currentHeight &&
 		time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateCacheTimeout {
+
 		candidate := b.cachedCandidate.candidate
 		subtrees := b.cachedCandidate.subtrees
 		b.cachedCandidate.mu.RUnlock()
@@ -951,11 +975,15 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 
 		return candidate, subtrees, nil
 	}
+
+	// Release the read lock...
 	b.cachedCandidate.mu.RUnlock()
 
+	// Acquire the write lock...
 	b.cachedCandidate.mu.Lock()
 	defer b.cachedCandidate.mu.Unlock()
 
+	// Now we have exclusivity, check if the cached candidate is still valid...
 	if !b.settings.ChainCfgParams.ReduceMinDifficulty && b.cachedCandidate.candidate != nil &&
 		b.cachedCandidate.lastHeight == currentHeight &&
 		time.Since(b.cachedCandidate.lastUpdate) < b.settings.BlockAssembly.MiningCandidateCacheTimeout {
