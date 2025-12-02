@@ -242,7 +242,7 @@ func enqueueBatches(t *testing.T, q *LockFreeQueue, threads, iter int) {
 						Fee:         uint64(u),
 						SizeInBytes: 0,
 					}},
-					[]subtree.TxInpoints{{}},
+					[]*subtree.TxInpoints{{}},
 				)
 			}
 		}(n)
@@ -276,7 +276,7 @@ func BenchmarkQueue(b *testing.B) {
 				Fee:         uint64(i),
 				SizeInBytes: 0,
 			}},
-			[]subtree.TxInpoints{{}},
+			[]*subtree.TxInpoints{{}},
 		)
 	}
 }

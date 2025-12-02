@@ -141,7 +141,7 @@ func TestReorgDuplicateTransactionBug(t *testing.T) {
 		for _, subtree := range chainedSubtrees {
 			for _, node := range subtree.Nodes {
 				if !node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
-					currentTxMap.Set(node.Hash, subtreepkg.TxInpoints{
+					currentTxMap.Set(node.Hash, &subtreepkg.TxInpoints{
 						ParentTxHashes: []chainhash.Hash{parentHash}, // Use common parent instead of self-reference
 					})
 				}

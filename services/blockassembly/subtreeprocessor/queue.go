@@ -55,7 +55,7 @@ func (q *LockFreeQueue) length() int64 {
 // Parameters:
 //   - nodes: The transaction nodes to add
 //   - txInpoints: Parent transaction references for each node
-func (q *LockFreeQueue) enqueueBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints) {
+func (q *LockFreeQueue) enqueueBatch(nodes []subtree.Node, txInpoints []*subtree.TxInpoints) {
 	batch := &TxBatch{
 		nodes:      nodes,
 		txInpoints: txInpoints,

@@ -13,7 +13,7 @@ import (
 // This significantly reduces atomic operations and improves throughput at high volumes.
 type TxBatch struct {
 	nodes      []subtree.Node          // All transaction nodes in this batch
-	txInpoints []subtree.TxInpoints    // Corresponding inpoints for each node
+	txInpoints []*subtree.TxInpoints   // Corresponding inpoints for each node
 	time       int64                   // Single timestamp for the entire batch
 	next       atomic.Pointer[TxBatch] // Pointer to next batch in queue
 }

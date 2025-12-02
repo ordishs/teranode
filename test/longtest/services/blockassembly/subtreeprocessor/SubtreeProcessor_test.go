@@ -80,7 +80,7 @@ func Test_AddTx(t *testing.T) {
 		waitForSubtreeProcessorQueueToEmpty(t, stp)
 		assert.Equal(t, uint64(1), stp.TxCount(), "Expected tx count to be 1 at startup")
 
-		stp.AddBatch([]subtreepkg.Node{node1, node2}, []subtreepkg.TxInpoints{parents, parents})
+		stp.AddBatch([]subtreepkg.Node{node1, node2}, []*subtreepkg.TxInpoints{&parents, &parents})
 
 		waitForSubtreeProcessorQueueToEmpty(t, stp)
 		assert.Equal(t, uint64(3), stp.TxCount(), "Expected tx count to be 2 after adding a transaction")
@@ -169,7 +169,7 @@ func storeMoveBlockSubtrees(t *testing.T, subtreeStore *memory.Memory, subtrees 
 				txInpoints, ok := txMap.Get(node.Hash)
 				require.True(t, ok)
 
-				require.NoError(t, subtreeMeta.SetTxInpoints(idx, txInpoints))
+				require.NoError(t, subtreeMeta.SetTxInpoints(idx, *txInpoints))
 			}
 		}
 
@@ -272,7 +272,7 @@ func initMoveBlock(t *testing.T) (*subtreeprocessor.SubtreeProcessor, *memory.Me
 			SizeInBytes: 1,
 		}
 
-		stp.AddBatch([]subtreepkg.Node{node}, []subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{hash1, hash2}, Idxs: [][]uint32{{0, 1}, {2, 3}}}})
+		stp.AddBatch([]subtreepkg.Node{node}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{hash1, hash2}, Idxs: [][]uint32{{0, 1}, {2, 3}}}})
 	}
 
 	waitForSubtreeProcessorQueueToEmpty(t, stp)

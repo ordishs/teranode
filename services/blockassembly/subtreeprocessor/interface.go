@@ -44,7 +44,7 @@ type Interface interface {
 	// Parameters:
 	//   - nodes: The transaction nodes to add to processing
 	//   - txInpoints: Transaction input points for each node for dependency tracking
-	AddBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints)
+	AddBatch(nodes []subtreepkg.Node, txInpoints []*subtreepkg.TxInpoints)
 
 	// Start starts the main processing goroutine for the SubtreeProcessor.
 	// This should be called after loading unmined transactions at startup to avoid race conditions.
@@ -275,17 +275,17 @@ type TxInpointsMap interface {
 
 	// Get retrieves the inpoints for a given transaction hash.
 	// Returns the inpoints and true if found, empty inpoints and false otherwise.
-	Get(hash chainhash.Hash) (subtreepkg.TxInpoints, bool)
+	Get(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool)
 
 	// Length returns the total number of entries in the map.
 	Length() int
 
 	// Set stores or updates the inpoints for a given transaction hash.
-	Set(hash chainhash.Hash, inpoints subtreepkg.TxInpoints)
+	Set(hash chainhash.Hash, inpoints *subtreepkg.TxInpoints)
 
 	// SetIfNotExists stores the inpoints only if the hash doesn't already exist.
 	// Returns the inpoints (existing or newly inserted) and true if inserted, false if already existed.
-	SetIfNotExists(hash chainhash.Hash, inpoints subtreepkg.TxInpoints) (subtreepkg.TxInpoints, bool)
+	SetIfNotExists(hash chainhash.Hash, inpoints *subtreepkg.TxInpoints) (*subtreepkg.TxInpoints, bool)
 
 	// Clear removes all entries from the map.
 	Clear()

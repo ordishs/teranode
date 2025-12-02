@@ -676,7 +676,7 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 						return
 					}
 
-					if err := subtreeMeta.SetTxInpoints(idx, txInpoints); err != nil {
+					if err := subtreeMeta.SetTxInpoints(idx, *txInpoints); err != nil {
 						ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] failed to set parent tx hashes: %s", node.Hash.String(), err)
 						return
 					}
@@ -876,7 +876,7 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 	if !ba.settings.BlockAssembly.Disabled {
 		ba.blockAssembler.AddTxBatch(
 			[]subtreepkg.Node{{Hash: chainhash.Hash(req.Txid), Fee: req.Fee, SizeInBytes: req.Size}},
-			[]subtreepkg.TxInpoints{txInpoints},
+			[]*subtreepkg.TxInpoints{&txInpoints},
 		)
 	}
 
@@ -956,7 +956,7 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 
 	// Build batch arrays
 	nodes := make([]subtreepkg.Node, len(requests))
-	txInpointsList := make([]subtreepkg.TxInpoints, len(requests))
+	txInpointsList := make([]*subtreepkg.TxInpoints, len(requests))
 
 	for i, req := range requests {
 		inpoints, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
@@ -969,7 +969,7 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 			Fee:         req.Fee,
 			SizeInBytes: req.Size,
 		}
-		txInpointsList[i] = inpoints
+		txInpointsList[i] = &inpoints
 	}
 
 	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
@@ -1055,7 +1055,7 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 
 	// Build batch arrays
 	nodes := make([]subtreepkg.Node, txCount)
-	txInpointsList := make([]subtreepkg.TxInpoints, txCount)
+	txInpointsList := make([]*subtreepkg.TxInpoints, txCount)
 
 	// Process each transaction using column-oriented access
 	for i := 0; i < txCount; i++ {
@@ -1094,7 +1094,7 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 			Fee:         req.Fees[i],
 			SizeInBytes: req.Sizes[i],
 		}
-		txInpointsList[i] = subtreepkg.TxInpoints{
+		txInpointsList[i] = &subtreepkg.TxInpoints{
 			ParentTxHashes: parentTxHashes,
 			Idxs:           idxs,
 		}

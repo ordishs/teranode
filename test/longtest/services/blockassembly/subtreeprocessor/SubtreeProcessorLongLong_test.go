@@ -118,7 +118,7 @@ func TestMoveForwardBlockLarge(t *testing.T) {
 		if i == 0 {
 			stp.GetCurrentSubtree().ReplaceRootNode(hash, 0, 0)
 		} else {
-			stp.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 1}}, []subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
+			stp.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{}}})
 		}
 	}
 

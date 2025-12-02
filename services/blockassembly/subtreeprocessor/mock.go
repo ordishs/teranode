@@ -128,7 +128,7 @@ func (m *MockSubtreeProcessor) SubtreeCount() int {
 }
 
 // AddBatch implements Interface.AddBatch
-func (m *MockSubtreeProcessor) AddBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints) {
+func (m *MockSubtreeProcessor) AddBatch(nodes []subtree.Node, txInpoints []*subtree.TxInpoints) {
 	m.Called(nodes, txInpoints)
 }
 

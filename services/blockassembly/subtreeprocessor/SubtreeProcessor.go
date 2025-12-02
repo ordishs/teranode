@@ -708,15 +708,19 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 							defer filterWg.Done()
 
 							for i := range b.nodes {
+								// Cache local variables to reduce bounds checking and improve CPU cache locality
+								hash := b.nodes[i].Hash
+								inpoints := b.txInpoints[i]
+
 								// Fast reject path first (most common in practice)
-								if mapLength > 0 && removeMap.Exists(b.nodes[i].Hash) {
-									_ = removeMap.Delete(b.nodes[i].Hash)
+								if mapLength > 0 && removeMap.Exists(hash) {
+									_ = removeMap.Delete(hash)
 									b.nodes[i].Hash = zeroHash // Mark as rejected
 									continue
 								}
 
 								// Check for duplicates and insert into txMap
-								if _, wasSet := currentTxMap.SetIfNotExists(b.nodes[i].Hash, b.txInpoints[i]); !wasSet {
+								if _, wasSet := currentTxMap.SetIfNotExists(hash, inpoints); !wasSet {
 									b.nodes[i].Hash = zeroHash // Mark as duplicate
 									continue
 								}
@@ -1391,7 +1395,7 @@ func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.T
 		}
 	} else {
 		// SetIfNotExists returns (value, wasSet) where wasSet is true if the key was newly inserted
-		if _, wasSet := stp.currentTxMap.SetIfNotExists(node.Hash, *parents); !wasSet {
+		if _, wasSet := stp.currentTxMap.SetIfNotExists(node.Hash, parents); !wasSet {
 			// Key already existed, this is a duplicate
 			stp.logger.Debugf("[addNode] duplicate transaction ignored %s", node.Hash.String())
 
@@ -1495,7 +1499,7 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 // Parameters:
 //   - nodes: Transaction nodes to add
 //   - txInpoints: Parent transaction references for each node
-func (stp *SubtreeProcessor) AddBatch(nodes []subtreepkg.Node, txInpoints []subtreepkg.TxInpoints) {
+func (stp *SubtreeProcessor) AddBatch(nodes []subtreepkg.Node, txInpoints []*subtreepkg.TxInpoints) {
 	stp.queue.enqueueBatch(nodes, txInpoints)
 }
 
@@ -1709,7 +1713,7 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 	}
 
 	var (
-		parents subtreepkg.TxInpoints
+		parents *subtreepkg.TxInpoints
 		found   bool
 	)
 
@@ -1732,7 +1736,7 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 			stp.currentTxMap.Delete(node.Hash)
 
 			// Immediately re-add the node
-			if err = stp.addNode(node, &parents, true); err != nil {
+			if err = stp.addNode(node, parents, true); err != nil {
 				return errors.NewProcessingError("error adding node to subtree", err)
 			}
 		}
@@ -2731,7 +2735,7 @@ func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nod
 				return errors.NewProcessingError("[moveForwardBlock][%s] error getting node txInpoints from currentTxMap for %s", block.String(), node.Hash.String())
 			}
 
-			if err := stp.addNode(node, &nodeParents, skipNotification); err != nil {
+			if err := stp.addNode(node, nodeParents, skipNotification); err != nil {
 				return errors.NewProcessingError("[moveForwardBlock][%s] error adding node %s to subtree", block.String(), node.Hash.String(), err)
 			}
 		}
@@ -2965,7 +2969,7 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap, losingTx
 				txInpoints := batch.txInpoints[i]
 
 				if (transactionMap == nil || !transactionMap.Exists(node.Hash)) && (losingTxHashesMap == nil || !losingTxHashesMap.Exists(node.Hash)) {
-					_ = stp.addNode(node, &txInpoints, skipNotification)
+					_ = stp.addNode(node, txInpoints, skipNotification)
 				}
 			}
 
@@ -3121,7 +3125,7 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 				return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", node.Hash.String())
 			}
 
-			_ = stp.addNode(node, &parents, skipNotification)
+			_ = stp.addNode(node, parents, skipNotification)
 		}
 	}
 

@@ -867,7 +867,7 @@ func (b *BlockAssembler) CurrentBlock() (*model.BlockHeader, uint32) {
 // Parameters:
 //   - nodes: Transaction nodes to add
 //   - txInpoints: Parent transaction references for each node
-func (b *BlockAssembler) AddTxBatch(nodes []subtree.Node, txInpoints []subtree.TxInpoints) {
+func (b *BlockAssembler) AddTxBatch(nodes []subtree.Node, txInpoints []*subtree.TxInpoints) {
 	b.subtreeProcessor.AddBatch(nodes, txInpoints)
 }
 

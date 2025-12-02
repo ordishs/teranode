@@ -258,7 +258,7 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int, cpuProfi
 
 			// Pre-allocate batch slices
 			nodes := make([]subtreepkg.Node, 0, batchSize)
-			inpoints := make([]subtreepkg.TxInpoints, 0, batchSize)
+			inpoints := make([]*subtreepkg.TxInpoints, 0, batchSize)
 
 			for i := start; i < end; i++ {
 				// Add to batch
@@ -266,7 +266,7 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int, cpuProfi
 					Hash: txHashes[i],
 					Fee:  uint64(i % 10000),
 				})
-				inpoints = append(inpoints, subtreepkg.TxInpoints{
+				inpoints = append(inpoints, &subtreepkg.TxInpoints{
 					ParentTxHashes: []chainhash.Hash{parentHashes[i]},
 				})
 
@@ -274,7 +274,7 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int, cpuProfi
 				if len(nodes) >= batchSize {
 					// Copy slices before submitting since AddBatch stores references
 					nodesCopy := make([]subtreepkg.Node, len(nodes))
-					inpointsCopy := make([]subtreepkg.TxInpoints, len(inpoints))
+					inpointsCopy := make([]*subtreepkg.TxInpoints, len(inpoints))
 					copy(nodesCopy, nodes)
 					copy(inpointsCopy, inpoints)
 					stp.AddBatch(nodesCopy, inpointsCopy)
@@ -289,7 +289,7 @@ func runBenchmarkCore(subtreeSize, producers, iterations, duration int, cpuProfi
 			if len(nodes) > 0 {
 				// Copy slices before submitting since AddBatch stores references
 				nodesCopy := make([]subtreepkg.Node, len(nodes))
-				inpointsCopy := make([]subtreepkg.TxInpoints, len(inpoints))
+				inpointsCopy := make([]*subtreepkg.TxInpoints, len(inpoints))
 				copy(nodesCopy, nodes)
 				copy(inpointsCopy, inpoints)
 				stp.AddBatch(nodesCopy, inpointsCopy)
