@@ -126,6 +126,10 @@ func TestCheckBlockAssembly(t *testing.T) {
 		mockSubtreeProcessor := &subtreeprocessor.MockSubtreeProcessor{}
 		mockSubtreeProcessor.On("CheckSubtreeProcessor").Return(errors.NewProcessingError("test error"))
 		mockSubtreeProcessor.On("Stop", mock.Anything).Return() // Expect Stop() to be called during cleanup
+		// Mock methods called by metrics goroutine every 5 seconds
+		mockSubtreeProcessor.On("TxCount").Return(uint64(0)).Maybe()
+		mockSubtreeProcessor.On("QueueLength").Return(int64(0)).Maybe()
+		mockSubtreeProcessor.On("SubtreeCount").Return(0).Maybe()
 
 		server.blockAssembler.subtreeProcessor = mockSubtreeProcessor
 
@@ -196,18 +200,34 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 		err := server.blockAssembler.Start(t.Context())
 		require.NoError(t, err)
 
+		// Use a common parent hash for all transactions (simulating they all spend from same output)
+		genesisHash := chainhash.HashH([]byte("genesis"))
 		for i := uint64(0); i < 10; i++ {
 			server.blockAssembler.AddTxBatch([]subtreepkg.Node{{
 				Hash:        chainhash.HashH([]byte(fmt.Sprintf("%d", i))),
 				Fee:         i,
 				SizeInBytes: i,
-			}}, []*subtreepkg.TxInpoints{{}})
+			}}, []*subtreepkg.TxInpoints{{
+				ParentTxHashes: []chainhash.Hash{genesisHash},
+				Idxs:           [][]uint32{{uint32(i)}}, // Different output index for each tx
+			}})
 		}
 
 		require.Eventually(t, func() bool {
-			return server.blockAssembler.TxCount() == 11
-		}, 5*time.Second, 10*time.Millisecond)
+			count := server.blockAssembler.TxCount()
+			t.Logf("Current TxCount: %d", count)
+			return count == 11
+		}, 5*time.Second, 100*time.Millisecond)
 
+		// Wait for BlockAssembler state to be StateRunning before requesting mining candidate
+		// This is critical after the recent change that returns empty blocks during state transitions
+		require.Eventually(t, func() bool {
+			state := server.blockAssembler.GetCurrentRunningState()
+			t.Logf("Current BlockAssembler state: %s", StateStrings[state])
+			return state == StateRunning
+		}, 5*time.Second, 100*time.Millisecond)
+
+		t.Logf("BlockAssembler is in StateRunning, now calling GetBlockAssemblyBlockCandidate")
 		resp, err := server.GetBlockAssemblyBlockCandidate(t.Context(), &blockassembly_api.EmptyMessage{})
 		require.NoError(t, err)
 
@@ -269,6 +289,8 @@ func setupServer(t *testing.T) (*BlockAssembly, *memory.Memory) {
 	// Ensure proper cleanup when test ends
 	t.Cleanup(func() {
 		_ = s.Stop(context.Background())
+		// Brief sleep to allow async goroutines to complete logging before test cleanup
+		time.Sleep(10 * time.Millisecond)
 	})
 
 	return s, subtreeStore
