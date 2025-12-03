@@ -896,7 +896,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 	// clear remove map to prevent memory leak - entries for transactions that were
 	// never dequeued would otherwise accumulate indefinitely across resets
-	stp.removeMap = txmap.NewSwissMap(0)
+	stp.removeMap = NewSplitSwissMap(1, 0)
 
 	// reset tx count
 	stp.setTxCountFromSubtrees()

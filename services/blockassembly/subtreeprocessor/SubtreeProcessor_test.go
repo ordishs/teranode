@@ -2166,7 +2166,7 @@ func Test_removeMap(t *testing.T) {
 		// Also add some transactions to currentTxMap to verify it IS cleared
 		for i := 0; i < 10; i++ {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("current-tx-%d", i)))
-			stp.currentTxMap.Set(txHash, subtreepkg.TxInpoints{})
+			stp.currentTxMap.Set(txHash, &subtreepkg.TxInpoints{})
 		}
 		currentTxMapLengthBeforeReset := stp.currentTxMap.Length()
 		assert.Equal(t, 10, currentTxMapLengthBeforeReset, "currentTxMap should have 10 entries before reset")
