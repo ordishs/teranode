@@ -135,12 +135,8 @@ func initWorker(tSettings *settings.Settings) {
 					}
 				}()
 
-				// Mark block as in-flight
-				inFlightBlocksMu.Lock()
-				inFlightBlocks[msg.blockID] = true
-				inFlightBlocksMu.Unlock()
-
 				// Ensure block is removed from in-flight tracking when done
+				// Note: block was already marked as in-flight in UpdateTxMinedStatus before queueing
 				defer func() {
 					inFlightBlocksMu.Lock()
 					delete(inFlightBlocks, msg.blockID)
@@ -179,14 +175,16 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 	// start the worker, if not already started
 	txMinedOnce.Do(func() { initWorker(tSettings) })
 
-	// Check if this block is already being processed
+	// Check if this block is already being processed and mark it as in-flight atomically
 	inFlightBlocksMu.Lock()
 	if inFlightBlocks[blockID] {
 		inFlightBlocksMu.Unlock()
-		logger.Debugf("[UpdateTxMinedStatus][%s] blockID %d is already being processed, ignoring duplicate call", block.Hash().String(), blockID)
+		logger.Infof("[UpdateTxMinedStatus][%s] blockID %d is already being processed, ignoring duplicate call", block.Hash().String(), blockID)
 		prometheusUpdateTxMinedDuplicates.Inc()
 		return nil
 	}
+	// Mark block as in-flight immediately to prevent duplicate processing
+	inFlightBlocks[blockID] = true
 	inFlightBlocksMu.Unlock()
 
 	startTime := time.Now()
