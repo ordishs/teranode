@@ -143,8 +143,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			WarmUp:                          getBool("aerospike_warmUp", true, alternativeContext...),
 			StoreBatcherDuration:            getDuration("aerospike_storeBatcherDuration", 10*time.Millisecond, alternativeContext...),
 			StatsRefreshDuration:            getDuration("aerospike_statsRefresh", 5*time.Second, alternativeContext...),
-			EnableSetMinedFilterExpressions: getBool("aerospike_enable_setmined_filter_expressions", true, alternativeContext...),
-			UseSeparateUDFModules:           getBool("aerospike_use_separate_udf_modules", false, alternativeContext...),
+			EnableSetMinedFilterExpressions: getBool("aerospike_enable_setmined_filter_expressions", false, alternativeContext...),
+			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
+			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
 		},
 		Alert: AlertSettings{
 			GenesisKeys:   getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),

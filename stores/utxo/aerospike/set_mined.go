@@ -191,7 +191,7 @@ func (s *Store) prepareBatchRecordsForSetMined(batchRecords []aerospike.BatchRec
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 
 	usePackage := LuaPackage
-	if s.settings.Aerospike.UseSeparateUDFModules {
+	if s.settings.Aerospike.UseSeparateUDFMinedModule {
 		usePackage = LuaPackageMined
 	}
 

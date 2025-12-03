@@ -448,6 +448,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 type keyIgnoreLocked struct {
 	key               *aerospike.Key
+	hash              *chainhash.Hash
 	blockHeight       uint32
 	ignoreConflicting bool
 	ignoreLocked      bool
@@ -522,6 +523,7 @@ func (s *Store) prepareSpendBatches(batch []*batchSpend, batchID uint64) (map[ke
 		mapValue := s.createSpendMapValue(idx, bItem)
 		useKey := keyIgnoreLocked{
 			key:               key,
+			hash:              bItem.spend.TxID,
 			blockHeight:       bItem.blockHeight,
 			ignoreConflicting: bItem.ignoreConflicting,
 			ignoreLocked:      bItem.ignoreLocked,
@@ -577,7 +579,13 @@ func (s *Store) createBatchRecords(batchesByKey map[keyIgnoreLocked][]aerospike.
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 
 	for batchKey, batchItems := range batchesByKey {
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, batchKey.key, LuaPackage, "spendMulti",
+		useLuaPackage := LuaPackage
+		if s.settings.Aerospike.SeparateSpendUDFModuleCount > 0 {
+			// determine which lua package to use for spends, based on the first byte of the tx id, there will be N packages (0 to N-1)
+			useLuaPackage = s.spendLuaPackages[batchKey.hash[0]%uint8(s.settings.Aerospike.SeparateSpendUDFModuleCount)]
+		}
+
+		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, batchKey.key, useLuaPackage, "spendMulti",
 			aerospike.NewValue(batchItems),
 			aerospike.NewValue(batchKey.ignoreConflicting),
 			aerospike.NewValue(batchKey.ignoreLocked),
