@@ -3,6 +3,8 @@ package aerospike
 import (
 	"context"
 	"math"
+	"runtime"
+	"sync"
 
 	as "github.com/aerospike/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -16,18 +18,23 @@ import (
 
 // unminedTxIterator implements utxo.UnminedTxIterator for Aerospike
 // It scans all records in the set and yields those that are not mined (i.e., unmined/mempool)
+// Uses multiple workers to read from Aerospike in parallel for improved throughput
 type unminedTxIterator struct {
-	store     *Store
-	fullScan  bool
-	err       error
-	done      bool
-	recordset *as.Recordset
-	result    <-chan *as.Result
+	store         *Store
+	fullScan      bool
+	err           error
+	done          bool
+	recordset     *as.Recordset
+	resultChan    chan *utxo.UnminedTransaction
+	errorChan     chan error
+	cancelWorkers context.CancelFunc
+	wg            sync.WaitGroup
 }
 
 // newUnminedTxIterator creates a new iterator for scanning unmined transactions in Aerospike.
 // The iterator uses a scan operation to traverse all records in the set and filters
 // for transactions that don't have block IDs (indicating they are unmined/mempool transactions).
+// Multiple workers are spawned to process records in parallel for improved throughput.
 //
 // Parameters:
 //   - store: The Aerospike store instance to iterate over
@@ -37,11 +44,6 @@ type unminedTxIterator struct {
 //   - *unminedTxIterator: A new iterator instance ready for use
 //   - error: Any error encountered during iterator initialization
 func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, error) {
-	it := &unminedTxIterator{
-		store:    store,
-		fullScan: fullScan,
-	}
-
 	stmt := as.NewStatement(store.namespace, store.setName)
 
 	if !fullScan {
@@ -76,87 +78,118 @@ func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, erro
 	}
 	store.logger.Infof("[newUnminedTxIterator] Aerospike query completed successfully")
 
-	it.recordset = recordset
-	it.result = recordset.Results()
+	// Create context for workers
+	workerCtx, cancel := context.WithCancel(context.Background())
+
+	// Calculate optimal number of workers (use half the CPUs)
+	numWorkers := runtime.NumCPU() / 2
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	it := &unminedTxIterator{
+		store:         store,
+		fullScan:      fullScan,
+		recordset:     recordset,
+		resultChan:    make(chan *utxo.UnminedTransaction, numWorkers*4),
+		errorChan:     make(chan error, 1),
+		cancelWorkers: cancel,
+	}
+
+	// Start worker goroutines
+	result := recordset.Results()
+	for i := 0; i < numWorkers; i++ {
+		it.wg.Add(1)
+		go it.worker(workerCtx, result)
+	}
+
+	// Start a goroutine to close resultChan after all workers finish
+	go func() {
+		it.wg.Wait()
+		close(it.resultChan)
+		close(it.errorChan)
+	}()
 
 	return it, nil
 }
 
-// Next advances the iterator and returns the next unmined transaction.
-// It filters records to only return transactions that don't have block IDs,
-// indicating they are unmined (in mempool). The method handles external storage
-// retrieval for large transactions when necessary.
-//
-// Parameters:
-//   - ctx: Context for cancellation
-//
-// Returns:
-//   - *utxo.UnminedTransaction: The next unmined transaction, or nil if iteration is complete
-//   - error: Any error encountered during iteration
-func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction, error) {
-	if it.done || it.err != nil || it.recordset == nil {
-		return nil, it.err
-	}
+// worker processes records from Aerospike in parallel
+func (it *unminedTxIterator) worker(ctx context.Context, result <-chan *as.Result) {
+	defer it.wg.Done()
 
-	// Loop to handle skipping conflicting transactions without recursion
-	var rec *as.Result
-	var ok bool
 	for {
-		rec, ok = <-it.result
-		if !ok || rec == nil {
-			it.closeWithLogging()
-			return nil, nil
-		}
+		select {
+		case <-ctx.Done():
+			return
+		case rec, ok := <-result:
+			if !ok || rec == nil {
+				return
+			}
 
-		if rec.Err != nil {
-			it.closeWithLogging()
-			it.err = rec.Err
-			return nil, it.err
-		}
+			if rec.Err != nil {
+				select {
+				case it.errorChan <- rec.Err:
+				default:
+				}
+				return
+			}
 
-		// Check if the transaction is conflicting and skip it if so
-		// Note: This implements a dual filtering approach where conflicting transactions
-		// can be filtered at both the SQL query level (for SQL-backed stores) and here
-		// at the iterator level (for Aerospike stores). This ensures consistent behavior
-		// across different storage backends while allowing each to optimize filtering
-		// based on their capabilities.
-		conflictingVal := rec.Record.Bins[fields.Conflicting.String()]
-		if conflictingVal != nil {
-			conflicting, ok := conflictingVal.(bool)
-			if ok && conflicting {
-				// Skip conflicting transaction and continue to next iteration
+			// Check if the transaction is conflicting and skip it if so
+			conflictingVal := rec.Record.Bins[fields.Conflicting.String()]
+			if conflictingVal != nil {
+				conflicting, ok := conflictingVal.(bool)
+				if ok && conflicting {
+					continue
+				}
+			}
+
+			coinbaseBool, ok := rec.Record.Bins[fields.IsCoinbase.String()].(bool)
+			if ok && coinbaseBool {
+				// Skip coinbase transactions
+				select {
+				case <-ctx.Done():
+					return
+				case it.resultChan <- &utxo.UnminedTransaction{Skip: true}:
+				}
 				continue
 			}
+
+			// Process the record and send to result channel
+			unminedTx, err := it.processRecord(ctx, rec.Record.Bins)
+			if err != nil {
+				select {
+				case it.errorChan <- err:
+				default:
+				}
+				return
+			}
+
+			if unminedTx != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case it.resultChan <- unminedTx:
+				}
+			}
 		}
-
-		// If we reach here, we have a non-conflicting transaction
-		break
 	}
+}
 
-	coinbaseBool, ok := rec.Record.Bins[fields.IsCoinbase.String()].(bool)
-	if ok && coinbaseBool {
-		// Skip coinbase transactions as they are not unmined
-		return &utxo.UnminedTransaction{
-			Skip: true,
-		}, nil
-	}
-
+// processRecord processes a single Aerospike record and returns the unmined transaction
+func (it *unminedTxIterator) processRecord(ctx context.Context, bins map[string]interface{}) (*utxo.UnminedTransaction, error) {
 	// Extract transaction data from the record
-	txData, err := it.extractTransactionData(rec.Record.Bins)
+	txData, err := it.extractTransactionData(bins)
 	if err != nil {
-		it.closeWithLogging()
-		it.err = err
 		return nil, errors.NewProcessingError("invalid transaction data", err)
 	}
 
-	blockIDs, err := processBlockIDs(rec.Record.Bins)
+	blockIDs, err := processBlockIDs(bins)
 	if err != nil {
-		it.closeWithLogging()
 		return nil, errors.NewProcessingError("invalid block IDs for %s", txData.hash.String(), err)
 	}
 
 	// Process external transaction if needed
-	txInpoints, err := it.processTransactionInpoints(ctx, txData, rec.Record.Bins)
+	txInpoints, err := it.processTransactionInpoints(ctx, txData, bins)
 	if err != nil {
 		if it.fullScan {
 			// In full scan mode, if we encounter an error processing inpoints and the transaction
@@ -171,21 +204,17 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 			}, nil
 		}
 
-		it.closeWithLogging()
-		it.err = err
 		return nil, errors.NewProcessingError("failed to process transaction inpoints for %s", txData.hash.String(), err)
 	}
 
 	// Extract created_at timestamp
-	createdAt, err := it.extractCreatedAt(rec.Record.Bins)
+	createdAt, err := it.extractCreatedAt(bins)
 	if err != nil {
-		it.closeWithLogging()
 		return nil, errors.NewProcessingError("invalid created_at for %s", txData.hash.String(), err)
 	}
 
-	locked, err := it.extractLocked(rec.Record.Bins)
+	locked, err := it.extractLocked(bins)
 	if err != nil {
-		it.closeWithLogging()
 		return nil, errors.NewProcessingError("invalid locked status for %s", txData.hash.String(), err)
 	}
 
@@ -201,6 +230,51 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 		Locked:       locked,
 		BlockIDs:     blockIDs,
 	}, nil
+}
+
+// Next advances the iterator and returns the next unmined transaction.
+// This method now simply reads from the result channel populated by worker goroutines.
+//
+// Parameters:
+//   - ctx: Context for cancellation (unused in this implementation, kept for interface compatibility)
+//
+// Returns:
+//   - *utxo.UnminedTransaction: The next unmined transaction, or nil if iteration is complete
+//   - error: Any error encountered during iteration
+func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction, error) {
+	if it.done || it.err != nil {
+		return nil, it.err
+	}
+
+	// If resultChan is nil, no workers were started (e.g., nil recordset)
+	if it.resultChan == nil {
+		it.closeWithLogging()
+		return nil, nil
+	}
+
+	// Check for errors from workers
+	select {
+	case <-ctx.Done():
+		it.err = ctx.Err()
+		it.closeWithLogging()
+		return nil, it.err
+	case err := <-it.errorChan:
+		if err != nil {
+			it.err = err
+			it.closeWithLogging()
+			return nil, err
+		}
+	default:
+	}
+
+	// Read from result channel
+	tx, ok := <-it.resultChan
+	if !ok {
+		it.closeWithLogging()
+		return nil, nil
+	}
+
+	return tx, nil
 }
 
 // transactionData holds the basic transaction data extracted from a record
@@ -340,15 +414,30 @@ func (it *unminedTxIterator) Err() error {
 }
 
 // Close releases resources held by the iterator and marks it as done.
+// It cancels all worker goroutines and closes the recordset.
 // It's safe to call Close multiple times. After calling Close, subsequent
 // calls to Next will return nil.
 //
 // Returns:
 //   - error: Always returns nil (kept for interface compatibility)
 func (it *unminedTxIterator) Close() error {
+	if it.done {
+		return nil
+	}
+
 	it.done = true
 
-	return it.recordset.Close()
+	// Cancel workers
+	if it.cancelWorkers != nil {
+		it.cancelWorkers()
+	}
+
+	// Close recordset
+	if it.recordset != nil {
+		return it.recordset.Close()
+	}
+
+	return nil
 }
 
 // toUint64 converts various numeric interface{} types to uint64.

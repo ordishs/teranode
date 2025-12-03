@@ -2093,6 +2093,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		}(i)
 	}
 
+	b.logger.Infof("[loadUnminedTransactions] feeding unmined transactions to %d workers", numWorkers)
+
 	// Feed transactions from the iterator to workers
 	for {
 		unminedTransaction, err := it.Next(ctx)
@@ -2113,6 +2115,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	// Close channel and wait for all workers to finish
 	close(workChan)
 	wg.Wait()
+
+	b.logger.Infof("[loadUnminedTransactions] completed processing unmined transactions from iterator, merging results")
 
 	// Merge per-worker results into final slices
 	for _, result := range workerResults {
