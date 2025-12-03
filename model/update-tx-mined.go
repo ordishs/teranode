@@ -46,10 +46,15 @@ var (
 	// a new slice with the appropriate capacity from settings.
 	hashesPool = sync.Pool{}
 
+	// inFlightBlocks tracks blocks currently being processed to prevent duplicate processing
+	inFlightBlocks   = make(map[uint32]bool)
+	inFlightBlocksMu sync.Mutex
+
 	// prometheus metrics
-	prometheusUpdateTxMinedCh       prometheus.Counter
-	prometheusUpdateTxMinedQueue    prometheus.Gauge
-	prometheusUpdateTxMinedDuration prometheus.Histogram
+	prometheusUpdateTxMinedCh         prometheus.Counter
+	prometheusUpdateTxMinedQueue      prometheus.Gauge
+	prometheusUpdateTxMinedDuration   prometheus.Histogram
+	prometheusUpdateTxMinedDuplicates prometheus.Counter
 )
 
 func setWorkerSettings(tSettings *settings.Settings) {
@@ -112,6 +117,12 @@ func initWorker(tSettings *settings.Settings) {
 		Help:      "Duration of updating tx mined status",
 		Buckets:   util.MetricsBucketsSeconds,
 	})
+	prometheusUpdateTxMinedDuplicates = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "model",
+		Name:      "update_tx_mined_duplicates",
+		Help:      "Number of duplicate tx mined update attempts blocked",
+	})
 
 	go func() {
 		for msg := range txMinedChan {
@@ -122,6 +133,18 @@ func initWorker(tSettings *settings.Settings) {
 						msg.logger.Errorf("[UpdateTxMinedStatus] worker panic recovered: %v", r)
 						msg.done <- errors.NewProcessingError("[UpdateTxMinedStatus] worker panic: %v", r)
 					}
+				}()
+
+				// Mark block as in-flight
+				inFlightBlocksMu.Lock()
+				inFlightBlocks[msg.blockID] = true
+				inFlightBlocksMu.Unlock()
+
+				// Ensure block is removed from in-flight tracking when done
+				defer func() {
+					inFlightBlocksMu.Lock()
+					delete(inFlightBlocks, msg.blockID)
+					inFlightBlocksMu.Unlock()
 				}()
 
 				chainBlockIDsMap := make(map[uint32]bool, len(msg.chainBlockIDs))
@@ -155,6 +178,16 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 	block *Block, blockID uint32, chainBlockIDs []uint32, onLongestChain bool, unsetMined ...bool) error {
 	// start the worker, if not already started
 	txMinedOnce.Do(func() { initWorker(tSettings) })
+
+	// Check if this block is already being processed
+	inFlightBlocksMu.Lock()
+	if inFlightBlocks[blockID] {
+		inFlightBlocksMu.Unlock()
+		logger.Debugf("[UpdateTxMinedStatus][%s] blockID %d is already being processed, ignoring duplicate call", block.Hash().String(), blockID)
+		prometheusUpdateTxMinedDuplicates.Inc()
+		return nil
+	}
+	inFlightBlocksMu.Unlock()
 
 	startTime := time.Now()
 	defer func() {
