@@ -204,10 +204,12 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 	}
 
 	return &utxo.UnminedTransaction{
-		Hash:         txID,
-		Fee:          fee,
-		Size:         sizeInBytes,
-		TxInpoints:   txInpoints,
+		Node: &subtree.Node{
+			Hash:        *txID,
+			Fee:         fee,
+			SizeInBytes: sizeInBytes,
+		},
+		TxInpoints:   &txInpoints,
 		CreatedAt:    int(insertedAt.UnixMilli()),
 		Locked:       locked,
 		BlockIDs:     blockIds,

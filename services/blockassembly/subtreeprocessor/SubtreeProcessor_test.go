@@ -2867,13 +2867,13 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 
 		// Add a transaction to the current subtree
 		txHash := chainhash.HashH([]byte("test_tx_current"))
-		node := subtreepkg.Node{
+		node := &subtreepkg.Node{
 			Hash:        txHash,
 			Fee:         1000,
 			SizeInBytes: 250,
 		}
 
-		err := stp.AddDirectly(node, subtreepkg.TxInpoints{}, false)
+		err := stp.AddDirectly(node, &subtreepkg.TxInpoints{}, false)
 		require.NoError(t, err)
 
 		// Verify transaction was added
@@ -2910,12 +2910,12 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 		}
 
 		for i, hash := range txHashes {
-			node := subtreepkg.Node{
+			node := &subtreepkg.Node{
 				Hash:        hash,
 				Fee:         1000 + uint64(i*100),
 				SizeInBytes: 250,
 			}
-			err := stp.AddDirectly(node, subtreepkg.TxInpoints{}, false)
+			err := stp.AddDirectly(node, &subtreepkg.TxInpoints{}, false)
 			require.NoError(t, err)
 		}
 
@@ -2944,12 +2944,12 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 			hash := chainhash.HashH([]byte("chained_tx_" + string(rune('0'+i))))
 			allHashes = append(allHashes, hash)
 
-			node := subtreepkg.Node{
+			node := &subtreepkg.Node{
 				Hash:        hash,
 				Fee:         1000 + uint64(i*100),
 				SizeInBytes: 250,
 			}
-			err := stp.AddDirectly(node, subtreepkg.TxInpoints{}, false)
+			err := stp.AddDirectly(node, &subtreepkg.TxInpoints{}, false)
 			require.NoError(t, err)
 		}
 
@@ -2991,12 +2991,12 @@ func TestRemoveTxsFromSubtreesIntegration(t *testing.T) {
 			hash := chainhash.HashH([]byte("integration_tx_" + string(rune('A'+i))))
 			testHashes[i] = hash
 
-			node := subtreepkg.Node{
+			node := &subtreepkg.Node{
 				Hash:        hash,
 				Fee:         1000 + uint64(i*500),
 				SizeInBytes: 200 + uint64(i*50),
 			}
-			err := stp.AddDirectly(node, subtreepkg.TxInpoints{}, false)
+			err := stp.AddDirectly(node, &subtreepkg.TxInpoints{}, false)
 			require.NoError(t, err)
 		}
 

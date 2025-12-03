@@ -369,7 +369,7 @@ func getUnminedTransactions(t *testing.T, ctx context.Context, store utxo.Store)
 			break
 		}
 
-		hashes = append(hashes, *unminedTx.Hash)
+		hashes = append(hashes, unminedTx.Hash)
 	}
 
 	// Sort hashes for consistent comparison

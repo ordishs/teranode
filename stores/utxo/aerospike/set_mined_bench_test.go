@@ -80,7 +80,7 @@ func initAerospikeBench(b *testing.B, settings *settings.Settings, logger ulogge
 
 	deferFn := func() {
 		client.Close()
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 	}
 
 	return db, ctx, deferFn

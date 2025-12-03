@@ -129,7 +129,7 @@ func testUnminedTxIterator(t *testing.T, utxoStoreURL string) {
 
 			assert.Equal(t, tx1.TxIDChainHash(), unminedTransaction.Hash)
 			assert.Equal(t, tx1Meta.Fee, unminedTransaction.Fee)
-			assert.Equal(t, tx1Meta.SizeInBytes, unminedTransaction.Size)
+			assert.Equal(t, tx1Meta.SizeInBytes, unminedTransaction.SizeInBytes)
 			assert.Len(t, unminedTransaction.TxInpoints.ParentTxHashes, 1)
 			assert.Greater(t, unminedTransaction.CreatedAt, 0)
 			assert.NotNil(t, unminedTransaction.BlockIDs)

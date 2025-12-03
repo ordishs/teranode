@@ -67,7 +67,7 @@ type Interface interface {
 	//   - error: Any error encountered during the addition
 	//
 	// Note: This method bypasses the normal queue processing and should be used
-	AddDirectly(node subtree.Node, txInpoints subtree.TxInpoints, skipNotification bool) error
+	AddDirectly(node *subtreepkg.Node, txInpoints *subtreepkg.TxInpoints, skipNotification bool) error
 
 	// GetCurrentRunningState returns the current operational state of the processor.
 	// This provides visibility into whether the processor is running, stopped,

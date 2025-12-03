@@ -100,6 +100,8 @@ func (m *MockUnminedTxIterator) Close() error {
 
 // TestLoadUnminedTransactionsExcludesConflicting tests that loadUnminedTransactions excludes conflicting transactions
 func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
+	initPrometheusMetrics()
+
 	t.Run("conflicting transactions are excluded during loading", func(t *testing.T) {
 		ctx := context.Background()
 		mockStore := new(utxo.MockUtxostore)
@@ -108,13 +110,15 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		settings.UtxoStore.UnminedTxRetention = 5
 
 		// Create mock transactions - only normal transaction should be returned by iterator
-		normalTxHash := chainhash.DoubleHashB([]byte("normal-tx"))
+		normalTxHash := chainhash.DoubleHashH([]byte("normal-tx"))
 
 		normalTx := &utxo.UnminedTransaction{
-			Hash:       (*chainhash.Hash)(normalTxHash),
-			Fee:        1000,
-			Size:       250,
-			TxInpoints: subtree.TxInpoints{},
+			Node: &subtree.Node{
+				Hash:        normalTxHash,
+				Fee:         1000,
+				SizeInBytes: 250,
+			},
+			TxInpoints: &subtree.TxInpoints{},
 			CreatedAt:  1000,
 		}
 
@@ -138,7 +142,7 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		mockSubtreeProcessor := &subtreeprocessor.MockSubtreeProcessor{}
 
 		// Should only be called once for the normal transaction
-		mockSubtreeProcessor.On("AddDirectly", mock.MatchedBy(func(node subtree.Node) bool {
+		mockSubtreeProcessor.On("AddDirectly", mock.MatchedBy(func(node *subtree.Node) bool {
 			return node.Hash.String() == normalTx.Hash.String()
 		}), mock.Anything, true).Return(nil).Once()
 		// GetCurrentBlockHeader may be called multiple times during loading

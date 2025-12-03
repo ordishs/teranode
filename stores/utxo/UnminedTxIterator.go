@@ -7,17 +7,14 @@ package utxo
 import (
 	"context"
 
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 )
 
 // UnminedTransaction represents an unmined transaction in the UTXO store.
 // It contains metadata about transactions that have been validated but not yet included in a block.
 type UnminedTransaction struct {
-	Hash         *chainhash.Hash
-	Fee          uint64
-	Size         uint64
-	TxInpoints   subtree.TxInpoints
+	*subtree.Node
+	TxInpoints   *subtree.TxInpoints
 	CreatedAt    int
 	Locked       bool
 	Skip         bool

@@ -162,9 +162,11 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 			// In full scan mode, if we encounter an error processing inpoints and the transaction
 			// has block IDs, it has already been mined. We can skip it.
 			return &utxo.UnminedTransaction{
-				Hash: txData.hash,
-				Fee:  txData.fee,
-				Size: txData.size,
+				Node: &subtree.Node{
+					Hash:        *txData.hash,
+					Fee:         txData.fee,
+					SizeInBytes: txData.size,
+				},
 				Skip: true,
 			}, nil
 		}
@@ -188,11 +190,13 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 	}
 
 	return &utxo.UnminedTransaction{
-		Hash:         txData.hash,
-		Fee:          txData.fee,
-		Size:         txData.size,
+		Node: &subtree.Node{
+			Hash:        *txData.hash,
+			Fee:         txData.fee,
+			SizeInBytes: txData.size,
+		},
 		UnminedSince: txData.unminedSince,
-		TxInpoints:   txInpoints,
+		TxInpoints:   &txInpoints,
 		CreatedAt:    createdAt,
 		Locked:       locked,
 		BlockIDs:     blockIDs,

@@ -1524,12 +1524,12 @@ func (stp *SubtreeProcessor) AddBatch(nodes []subtreepkg.Node, txInpoints []*sub
 //
 // Returns:
 //   - error: Any error encountered during addition
-func (stp *SubtreeProcessor) AddDirectly(node subtreepkg.Node, txInpoints subtreepkg.TxInpoints, skipNotification bool) error {
+func (stp *SubtreeProcessor) AddDirectly(node *subtreepkg.Node, txInpoints *subtreepkg.TxInpoints, skipNotification bool) error {
 	if _, ok := stp.currentTxMap.Get(node.Hash); ok {
 		return errors.NewInvalidArgumentError("transaction already exists in currentTxMap")
 	}
 
-	err := stp.addNode(node, &txInpoints, skipNotification)
+	err := stp.addNode(*node, txInpoints, skipNotification)
 	if err != nil {
 		return errors.NewProcessingError("error adding node directly to subtree", err)
 	}

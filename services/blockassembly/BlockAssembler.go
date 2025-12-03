@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1658,15 +1659,14 @@ func (b *BlockAssembler) validateParentChain(
 			referencedParents[parentHash] = true
 		}
 	}
-	b.logger.Debugf("[BlockAssembler][validateParentChain] Found %d unique parent references out of %d transactions",
-		len(referencedParents), len(unminedTxs))
+	b.logger.Debugf("[BlockAssembler][validateParentChain] Found %d unique parent references out of %d transactions", len(referencedParents), len(unminedTxs))
 
 	// Pass 2: Build index ONLY for transactions that are referenced as parents
 	// This dramatically reduces memory usage from O(all_txs) to O(referenced_parents)
 	parentIndexMap := make(map[chainhash.Hash]int, len(referencedParents))
-	for idx, tx := range unminedTxs {
-		if tx.Hash != nil && referencedParents[*tx.Hash] {
-			parentIndexMap[*tx.Hash] = idx
+	for idx, unminedTx := range unminedTxs {
+		if referencedParents[unminedTx.Node.Hash] {
+			parentIndexMap[unminedTx.Node.Hash] = idx
 		}
 	}
 
@@ -2022,14 +2022,83 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	markAsMinedOnLongestChain := make([]chainhash.Hash, 0, 1024)
 
 	iteratorStart := time.Now()
-	totalProcessed := 0
-	skippedCount := 0
-	alreadyMinedCount := 0
-	lockedCount := 0
+	totalProcessed := atomic.Int64{}
+	skippedCount := atomic.Int64{}
+	alreadyMinedCount := atomic.Int64{}
+	lockedCount := atomic.Int64{}
 
+	// Worker pool configuration
+	numWorkers := runtime.NumCPU() / 2
+	workChan := make(chan *utxo.UnminedTransaction, numWorkers*2)
+	var wg sync.WaitGroup
+
+	// Per-worker local buffers to eliminate lock contention
+	type workerResult struct {
+		unminedTxs              []*utxo.UnminedTransaction
+		lockedTxs               []chainhash.Hash
+		markAsMinedOnLongestTxs []chainhash.Hash
+	}
+	workerResults := make([]workerResult, numWorkers)
+
+	// Pre-allocate per-worker buffers
+	for i := range workerResults {
+		workerResults[i].unminedTxs = make([]*utxo.UnminedTransaction, 0, 1024*128)
+		workerResults[i].lockedTxs = make([]chainhash.Hash, 0, 128)
+		workerResults[i].markAsMinedOnLongestTxs = make([]chainhash.Hash, 0, 128)
+	}
+
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			localResult := &workerResults[workerID]
+
+			for unminedTransaction := range workChan {
+				if unminedTransaction.Skip {
+					skippedCount.Add(1)
+					continue
+				}
+
+				if len(unminedTransaction.BlockIDs) > 0 {
+					// If the transaction is already included in a block that is in the best chain, skip it
+					skipAlreadyMined := false
+					for _, blockID := range unminedTransaction.BlockIDs {
+						if bestBlockHeaderIDsMap[blockID] {
+							skipAlreadyMined = true
+							break
+						}
+					}
+
+					if skipAlreadyMined {
+						// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+						alreadyMinedCount.Add(1)
+
+						if unminedTransaction.UnminedSince > 0 {
+							localResult.markAsMinedOnLongestTxs = append(localResult.markAsMinedOnLongestTxs, unminedTransaction.Hash)
+						}
+
+						continue
+					}
+				}
+
+				localResult.unminedTxs = append(localResult.unminedTxs, unminedTransaction)
+
+				if unminedTransaction.Locked {
+					// if the transaction is locked, we need to add it to the locked transactions list, so we can unlock them
+					localResult.lockedTxs = append(localResult.lockedTxs, unminedTransaction.Hash)
+					lockedCount.Add(1)
+				}
+			}
+		}(i)
+	}
+
+	// Feed transactions from the iterator to workers
 	for {
 		unminedTransaction, err := it.Next(ctx)
 		if err != nil {
+			close(workChan)
+			wg.Wait()
 			return errors.NewProcessingError("error getting unmined transaction", err)
 		}
 
@@ -2037,50 +2106,27 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			break
 		}
 
-		totalProcessed++
+		totalProcessed.Add(1)
+		workChan <- unminedTransaction
+	}
 
-		if unminedTransaction.Skip {
-			skippedCount++
-			continue
-		}
+	// Close channel and wait for all workers to finish
+	close(workChan)
+	wg.Wait()
 
-		if len(unminedTransaction.BlockIDs) > 0 {
-			// If the transaction is already included in a block that is in the best chain, skip it
-			skipAlreadyMined := false
-			for _, blockID := range unminedTransaction.BlockIDs {
-				if bestBlockHeaderIDsMap[blockID] {
-					skipAlreadyMined = true
-					break
-				}
-			}
-
-			if skipAlreadyMined {
-				// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
-				alreadyMinedCount++
-
-				if unminedTransaction.UnminedSince > 0 {
-					markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, *unminedTransaction.Hash)
-				}
-
-				continue
-			}
-		}
-
-		unminedTransactions = append(unminedTransactions, unminedTransaction)
-
-		if unminedTransaction.Locked {
-			// if the transaction is locked, we need to add it to the locked transactions list, so we can unlock them
-			lockedTransactions = append(lockedTransactions, *unminedTransaction.Hash)
-			lockedCount++
-		}
+	// Merge per-worker results into final slices
+	for _, result := range workerResults {
+		unminedTransactions = append(unminedTransactions, result.unminedTxs...)
+		lockedTransactions = append(lockedTransactions, result.lockedTxs...)
+		markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, result.markAsMinedOnLongestTxs...)
 	}
 
 	iteratorDuration := time.Since(iteratorStart).Seconds()
 	prometheusBlockAssemblerIteratorProcessingTime.WithLabelValues(fullScanLabel).Observe(iteratorDuration)
-	prometheusBlockAssemblerIteratorTransactionsTotal.WithLabelValues(fullScanLabel).Add(float64(totalProcessed))
-	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "skipped").Add(float64(skippedCount))
-	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "already_mined").Add(float64(alreadyMinedCount))
-	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "locked").Add(float64(lockedCount))
+	prometheusBlockAssemblerIteratorTransactionsTotal.WithLabelValues(fullScanLabel).Add(float64(totalProcessed.Load()))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "skipped").Add(float64(skippedCount.Load()))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "already_mined").Add(float64(alreadyMinedCount.Load()))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "locked").Add(float64(lockedCount.Load()))
 	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "added").Add(float64(len(unminedTransactions)))
 
 	// Always fix data inconsistencies: transactions with block_ids on main chain but unmined_since set
@@ -2136,21 +2182,31 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		}
 	}
 
-	batchStart := time.Now()
-	for _, unminedTransaction := range unminedTransactions {
-		subtreeNode := subtree.Node{
-			Hash:        *unminedTransaction.Hash,
-			Fee:         unminedTransaction.Fee,
-			SizeInBytes: unminedTransaction.Size,
-		}
+	b.logger.Infof("[BlockAssembler] loaded %d unmined transactions into block assembly (total processed: %d, skipped: %d, already mined: %d, locked: %d)",
+		len(unminedTransactions), totalProcessed.Load(), skippedCount.Load(), alreadyMinedCount.Load(), lockedCount.Load())
 
-		addStart := time.Now()
-		if err = b.subtreeProcessor.AddDirectly(subtreeNode, unminedTransaction.TxInpoints, true); err != nil {
+	b.logger.Infof("[loadUnminedTransactions] adding unmined transactions to subtree processor")
+
+	batchStart := time.Now()
+	addStart := time.Now()
+	addTxs := float64(0)
+
+	for idx, unminedTransaction := range unminedTransactions {
+		if err = b.subtreeProcessor.AddDirectly(unminedTransaction.Node, unminedTransaction.TxInpoints, true); err != nil {
 			return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
 		}
-		prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
-		prometheusBlockAssemblerAddDirectlyTotal.Inc()
+
+		// add every 10_000 transactions log the time taken
+		if (idx+1)%10_000 == 0 {
+			prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
+			prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
+			addStart = time.Now()
+			addTxs = 0
+		}
+
+		addTxs++
 	}
+
 	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
 
 	// unlock any locked transactions

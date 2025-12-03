@@ -132,7 +132,7 @@ func (m *MockSubtreeProcessor) AddBatch(nodes []subtree.Node, txInpoints []*subt
 	m.Called(nodes, txInpoints)
 }
 
-func (m *MockSubtreeProcessor) AddDirectly(node subtree.Node, txInpoints subtree.TxInpoints, skipNotification bool) error {
+func (m *MockSubtreeProcessor) AddDirectly(node *subtree.Node, txInpoints *subtree.TxInpoints, skipNotification bool) error {
 	args := m.Called(node, txInpoints, skipNotification)
 
 	if args.Get(0) == nil {
