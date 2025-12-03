@@ -14,7 +14,7 @@ import (
 )
 
 // SetMinedState contains the state returned from setMined operations.
-// Only fields needed for external transaction follow-up (child record DAH updates) are included.
+// Only fields needed for external transaction follow-up (child record and blob storage DAH updates) are included.
 type SetMinedState struct {
 	// BlockIDs is the list of block IDs this transaction is mined in
 	BlockIDs []uint32
@@ -22,6 +22,10 @@ type SetMinedState struct {
 	TotalExtraRecs *int
 	// External indicates if this is an external (large) transaction
 	External bool
+	// OldDeleteAtHeight is the block height before modifications, nil if not set
+	OldDeleteAtHeight *uint32
+	// NewDeleteAtHeight is the block height after modifications, nil if not set
+	NewDeleteAtHeight *uint32
 }
 
 // parseSetMinedState extracts the SetMinedState from Aerospike bins.
@@ -58,7 +62,44 @@ func (s *Store) parseSetMinedState(bins aerospike.BinMap) (SetMinedState, error)
 		}
 	}
 
+	// Parse deleteAtHeight values (old and new)
+	// Since we read DAH twice (before and after modifications), we get an array of results
+	if deleteAtHeightResults, ok := bins[fields.DeleteAtHeight.String()]; ok && deleteAtHeightResults != nil {
+		switch v := deleteAtHeightResults.(type) {
+		case aerospike.OpResults:
+			// OpResults is a []interface{} alias returned by batch operations
+			s.parseDAHFromSlice([]interface{}(v), &state)
+		case []interface{}:
+			// Array of results: [oldValue, ..., newValue]
+			s.parseDAHFromSlice(v, &state)
+		case int:
+			// Single value - treat as both old and new (shouldn't happen with our ops structure)
+			dah := uint32(v)
+			state.OldDeleteAtHeight = &dah
+			state.NewDeleteAtHeight = &dah
+		}
+	}
+
 	return state, nil
+}
+
+// parseDAHFromSlice extracts old and new deleteAtHeight values from a slice.
+// First element is the old value (read before modifications), last element is the new value (read after modifications).
+func (s *Store) parseDAHFromSlice(v []interface{}, state *SetMinedState) {
+	// First element is old value (read before modifications)
+	if len(v) >= 1 && v[0] != nil {
+		if oldDAH, ok := v[0].(int); ok {
+			old := uint32(oldDAH)
+			state.OldDeleteAtHeight = &old
+		}
+	}
+	// Last element is new value (read after modifications)
+	if len(v) >= 2 && v[len(v)-1] != nil {
+		if newDAH, ok := v[len(v)-1].(int); ok {
+			newVal := uint32(newDAH)
+			state.NewDeleteAtHeight = &newVal
+		}
+	}
 }
 
 // parseBlockIDsFromSlice extracts blockIDs from a slice that may be a compound result.
@@ -218,7 +259,15 @@ func (s *Store) SetMinedMultiWithExpressions(ctx context.Context, hashes []*chai
 	listPolicy := aerospike.DefaultListPolicy()
 
 	// Build operations for each transaction
+	// Read old values first (before any modifications) for change detection
 	ops := []*aerospike.Operation{
+		aerospike.GetBinOp(fields.DeleteAtHeight.String()), // Read old DAH value before modifications
+		aerospike.GetBinOp(fields.External.String()),
+		aerospike.GetBinOp(fields.TotalExtraRecs.String()),
+	}
+
+	// Then perform modifications
+	ops = append(ops,
 		// Append to all three lists (filter expression gates these)
 		aerospike.ListAppendWithPolicyOp(listPolicy, fields.BlockIDs.String(), int(minedBlockInfo.BlockID)),
 		aerospike.ListAppendWithPolicyOp(listPolicy, fields.BlockHeights.String(), int(minedBlockInfo.BlockHeight)),
@@ -227,7 +276,7 @@ func (s *Store) SetMinedMultiWithExpressions(ctx context.Context, hashes []*chai
 		aerospike.PutOp(aerospike.NewBin(fields.Locked.String(), false)),
 		// Delete creating bin
 		aerospike.PutOp(aerospike.NewBin(fields.Creating.String(), nil)),
-	}
+	)
 
 	// Clear unminedSince if on longest chain
 	if minedBlockInfo.OnLongestChain {
@@ -248,11 +297,10 @@ func (s *Store) SetMinedMultiWithExpressions(ctx context.Context, hashes []*chai
 		))
 	}
 
-	// Add read operations for follow-up (external transactions need child record DAH updates)
+	// Read final values after modifications (blockIDs and DAH)
 	ops = append(ops,
 		aerospike.GetBinOp(fields.BlockIDs.String()),
-		aerospike.GetBinOp(fields.External.String()),
-		aerospike.GetBinOp(fields.TotalExtraRecs.String()),
+		aerospike.GetBinOp(fields.DeleteAtHeight.String()), // Read new DAH value after modifications
 	)
 
 	// Create batch records
@@ -301,9 +349,6 @@ func (s *Store) processBatchResultsForSetMinedExpressions(
 		DAH  uint32
 	}, 0)
 
-	blockHeightRetention := s.settings.GetUtxoStoreBlockHeightRetention()
-	dahHeight := thisBlockHeight + blockHeightRetention
-
 	// Process each batch record result
 	for i, batchRecord := range batchRecords {
 		batchRec := batchRecord.BatchRec()
@@ -351,18 +396,39 @@ func (s *Store) processBatchResultsForSetMinedExpressions(
 			blockIDs[*hash] = blockIDsUint32
 		}
 
-		// For external transactions, collect follow-up actions for child records
-		// Note: DAH on this record was already set by the expression
-		if state.External && state.TotalExtraRecs != nil && len(state.BlockIDs) > 0 && minedBlockInfo.OnLongestChain {
-			dahSetItems = append(dahSetItems, struct {
-				TxID           *chainhash.Hash
-				ChildCount     int
-				DeleteAtHeight uint32
-			}{TxID: hash, ChildCount: *state.TotalExtraRecs, DeleteAtHeight: dahHeight})
-			externalDAH = append(externalDAH, struct {
-				TxID *chainhash.Hash
-				DAH  uint32
-			}{TxID: hash, DAH: dahHeight})
+		// For external transactions, check if DAH changed and collect follow-up actions
+		if state.External && state.TotalExtraRecs != nil {
+			// Check if deleteAtHeight actually changed
+			dahChanged := false
+			if state.OldDeleteAtHeight == nil && state.NewDeleteAtHeight != nil {
+				dahChanged = true // DAH was set
+			} else if state.OldDeleteAtHeight != nil && state.NewDeleteAtHeight == nil {
+				dahChanged = true // DAH was cleared
+			} else if state.OldDeleteAtHeight != nil && state.NewDeleteAtHeight != nil {
+				dahChanged = *state.OldDeleteAtHeight != *state.NewDeleteAtHeight // DAH value changed
+			}
+
+			if dahChanged {
+				// Update child records DAH if deleteAtHeight is set (not cleared)
+				if state.NewDeleteAtHeight != nil {
+					dahSetItems = append(dahSetItems, struct {
+						TxID           *chainhash.Hash
+						ChildCount     int
+						DeleteAtHeight uint32
+					}{TxID: hash, ChildCount: *state.TotalExtraRecs, DeleteAtHeight: *state.NewDeleteAtHeight})
+				}
+
+				// Update blob storage DAH (handles both set and clear cases)
+				externalDAH = append(externalDAH, struct {
+					TxID *chainhash.Hash
+					DAH  uint32
+				}{TxID: hash, DAH: func() uint32 {
+					if state.NewDeleteAtHeight != nil {
+						return *state.NewDeleteAtHeight
+					}
+					return 0 // 0 signals to clear DAH in blob storage
+				}()})
+			}
 		}
 
 		okUpdates++
