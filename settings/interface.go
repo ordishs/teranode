@@ -374,6 +374,7 @@ type UtxoStoreSettings struct {
 	DBTimeout                         time.Duration
 	UseExternalTxCache                bool
 	ExternalizeAllTransactions        bool
+	ExternalStoreConcurrency          int // Maximum concurrent external storage operations (0 = unlimited)
 	PostgresMaxIdleConns              int
 	PostgresMaxOpenConns              int
 	VerboseDebug                      bool
