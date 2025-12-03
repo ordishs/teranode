@@ -612,7 +612,7 @@ func TestMoveForwardBlock(t *testing.T) {
 
 	assert.Equal(t, int(n-1), stp.currentTxMap.Length()) //nolint:gosec
 
-	stp.currentItemsPerFile = 2
+	stp.currentItemsPerFile.Store(2)
 	_ = stp.utxoStore.SetBlockHeight(1)
 	//nolint:gosec
 	_ = stp.utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))
@@ -778,7 +778,7 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 	// and 1 tx in the current subtree
 	assert.Equal(t, 1, stp.currentSubtree.Length())
 
-	stp.currentItemsPerFile = 2
+	stp.currentItemsPerFile.Store(2)
 	_ = stp.utxoStore.SetBlockHeight(1)
 	//nolint:gosec
 	_ = stp.utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))
@@ -879,7 +879,7 @@ func TestSubtreeMoveForwardBlockNewCurrent(t *testing.T) {
 	// and 0 tx in the current subtree
 	assert.Equal(t, 0, stp.currentSubtree.Length())
 
-	stp.currentItemsPerFile = 2
+	stp.currentItemsPerFile.Store(2)
 	_ = stp.utxoStore.SetBlockHeight(1)
 	//nolint:gosec
 	_ = stp.utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))
@@ -1756,7 +1756,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		originalState := captureSubtreeProcessorState(stp)
 
 		// Reset to invalid size to force failure during moveBackBlock
-		stp.currentItemsPerFile = 3 // Not a power of 2, will cause failure
+		stp.currentItemsPerFile.Store(3) // Not a power of 2, will cause failure
 
 		// Create empty block
 		emptyBlock := &model.Block{
@@ -2656,7 +2656,7 @@ func TestSubtreeProcessor_DynamicSizeAdjustment(t *testing.T) {
 		// Set initial block header to start timing
 		t.Logf("DEBUG: Setting initial block header\n")
 		stp.InitCurrentBlockHeader(blockHeader)
-		initialSize := stp.currentItemsPerFile
+		initialSize := stp.currentItemsPerFile.Load()
 		t.Logf("DEBUG: Initial size: %d\n", initialSize)
 
 		// Create multiple blocks to establish a pattern of fast subtree creation
@@ -2713,11 +2713,11 @@ func TestSubtreeProcessor_DynamicSizeAdjustment(t *testing.T) {
 
 		// Since we're creating subtrees 2.5x faster than target (2.5/sec vs 1/sec),
 		// expect size to increase
-		newSize := stp.currentItemsPerFile
+		newSize := stp.currentItemsPerFile.Load()
 		t.Logf("DEBUG: Final size: initial=%d, final=%d\n", initialSize, newSize)
 		assert.Greater(t, newSize, initialSize, "subtree size should increase when creating too quickly")
-		assert.Equal(t, 0, newSize&(newSize-1), "new size should be power of 2")
-		assert.GreaterOrEqual(t, newSize, 1024, "new size should not be smaller than 1024")
+		assert.Equal(t, int32(0), newSize&(newSize-1), "new size should be power of 2")
+		assert.GreaterOrEqual(t, newSize, int32(1024), "new size should not be smaller than 1024")
 	})
 }
 
@@ -2774,7 +2774,7 @@ func TestSubtreeProcessor_DynamicSizeAdjustmentFast(t *testing.T) {
 		// Set initial block header to start timing
 		t.Logf("DEBUG: Setting initial block header\n")
 		stp.InitCurrentBlockHeader(blockHeader)
-		initialSize := stp.currentItemsPerFile
+		initialSize := stp.currentItemsPerFile.Load()
 		t.Logf("DEBUG: Initial size: %d\n", initialSize)
 
 		// Create multiple blocks to establish a pattern of fast subtree creation
@@ -2827,11 +2827,11 @@ func TestSubtreeProcessor_DynamicSizeAdjustmentFast(t *testing.T) {
 
 		// Since we're creating subtrees 2.5x faster than target (2.5/sec vs 1/sec),
 		// expect size to increase
-		newSize := stp.currentItemsPerFile
+		newSize := stp.currentItemsPerFile.Load()
 		t.Logf("DEBUG: Final size: initial=%d, final=%d\n", initialSize, newSize)
 		assert.Greater(t, newSize, initialSize, "subtree size should increase when creating too quickly")
-		assert.Equal(t, 0, newSize&(newSize-1), "new size should be power of 2")
-		assert.GreaterOrEqual(t, newSize, 1024, "new size should not be smaller than 1024")
+		assert.Equal(t, int32(0), newSize&(newSize-1), "new size should be power of 2")
+		assert.GreaterOrEqual(t, newSize, int32(1024), "new size should not be smaller than 1024")
 	})
 }
 

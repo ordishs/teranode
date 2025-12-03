@@ -270,6 +270,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, errors.NewStorageError("Failed to register udfLUA", err)
 	}
 
+	// Make sure the udf lua scripts are installed in the cluster
+	// update the version of the lua script when a new version is launched, do not re-use the old one
+	if err = registerLuaIfNecessary(logger, client, LuaPackageMined, teranodeLUA); err != nil {
+		return nil, errors.NewStorageError("Failed to register udfLUA mined", err)
+	}
+
 	spendBatchSize := s.settings.UtxoStore.SpendBatcherSize
 	spendBatchDurationStr := s.settings.UtxoStore.SpendBatcherDurationMillis
 	spendBatchDuration := time.Duration(spendBatchDurationStr) * time.Millisecond

@@ -150,7 +150,7 @@ type SubtreeProcessor struct {
 	settings *settings.Settings
 
 	// currentItemsPerFile specifies the maximum number of items per subtree file
-	currentItemsPerFile int
+	currentItemsPerFile atomic.Int32
 
 	// blockStartTime tracks when the current block started
 	blockStartTime time.Time
@@ -360,7 +360,6 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 
 	stp := &SubtreeProcessor{
 		settings:                 tSettings,
-		currentItemsPerFile:      initialItemsPerFile,
 		blockStartTime:           time.Time{},
 		subtreesInBlock:          0,
 		blockIntervals:           make([]time.Duration, 0, 10),
@@ -392,6 +391,7 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 		announcementTicker:       time.NewTicker(tSettings.BlockAssembly.SubtreeAnnouncementInterval),
 	}
 	stp.setCurrentRunningState(StateStarting)
+	stp.currentItemsPerFile.Store(int32(initialItemsPerFile))
 
 	// need to make sure first coinbase tx is counted when we start
 	stp.setTxCountFromSubtrees()
@@ -656,7 +656,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					removeMap := stp.removeMap
 					mapLength := removeMap.Length()
 					currentTxMap := stp.currentTxMap
-					currentItemsPerFile := stp.currentItemsPerFile
+					currentItemsPerFile := int(stp.currentItemsPerFile.Load())
 					validFromMillis := time.Now().Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
 					addedCount := uint64(0)
 
@@ -805,7 +805,9 @@ func (stp *SubtreeProcessor) resetAnnouncementTicker() {
 //   - *subtreepkg.Subtree: The incomplete subtree copy, or nil if creation failed
 //   - error: Any error encountered during subtree creation or node copying
 func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree, error) {
-	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(stp.currentItemsPerFile)
+	itemsPerFile := int(stp.currentItemsPerFile.Load())
+
+	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(itemsPerFile)
 	if err != nil {
 		return nil, err
 	}
@@ -886,7 +888,9 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	stp.chainedSubtrees = make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees)
 	stp.chainedSubtreeCount.Store(0)
 
-	stp.currentSubtree, _ = subtreepkg.NewTreeByLeafCount(stp.currentItemsPerFile)
+	itemsPerFile := int(stp.currentItemsPerFile.Load())
+
+	stp.currentSubtree, _ = subtreepkg.NewTreeByLeafCount(itemsPerFile)
 	if err := stp.currentSubtree.AddCoinbaseNode(); err != nil {
 		return errors.NewProcessingError("[SubtreeProcessor][Reset] error adding coinbase placeholder to new current subtree", err)
 	}
@@ -1162,7 +1166,7 @@ func (stp *SubtreeProcessor) GetUtxoStore() utxostore.Store {
 // Parameters:
 //   - v: New maximum items value
 func (stp *SubtreeProcessor) SetCurrentItemsPerFile(v int) {
-	stp.currentItemsPerFile = v
+	stp.currentItemsPerFile.Store(int32(v))
 }
 
 // TxCount returns the total number of transactions processed.
@@ -1201,7 +1205,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 		return
 	}
 
-	currentSize := stp.currentItemsPerFile
+	currentSize := int(stp.currentItemsPerFile.Load())
 
 	// First check if we have actual subtree utilization data
 	// Count non-nil values in the ring
@@ -1242,7 +1246,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 
 			if newSize != currentSize {
 				stp.logger.Debugf("[adjustSubtreeSize] setting new size from %d to %d (low utilization)\n", currentSize, newSize)
-				stp.currentItemsPerFile = newSize
+				stp.currentItemsPerFile.Store(int32(newSize))
 				prometheusSubtreeProcessorDynamicSubtreeSize.Set(float64(newSize))
 			}
 
@@ -1364,7 +1368,7 @@ func (stp *SubtreeProcessor) adjustSubtreeSize() {
 
 	if newSize != currentSize {
 		stp.logger.Debugf("[adjustSubtreeSize] setting new size from %d to %d\n", currentSize, newSize)
-		stp.currentItemsPerFile = newSize
+		stp.currentItemsPerFile.Store(int32(newSize))
 	}
 
 	prometheusSubtreeProcessorDynamicSubtreeSize.Set(float64(newSize))
@@ -1408,7 +1412,9 @@ func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.T
 	}
 
 	if stp.currentSubtree == nil {
-		stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(stp.currentItemsPerFile)
+		itemsPerFile := int(stp.currentItemsPerFile.Load())
+
+		stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(itemsPerFile)
 		if err != nil {
 			return err
 		}
@@ -1704,7 +1710,9 @@ func (stp *SubtreeProcessor) reChainSubtrees(fromIndex int) error {
 
 	stp.chainedSubtreeCount.Store(fromIndexInt32)
 
-	stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(stp.currentItemsPerFile)
+	itemsPerFile := int(stp.currentItemsPerFile.Load())
+
+	stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(itemsPerFile)
 	if err != nil {
 		return errors.NewProcessingError("error creating new current subtree", err)
 	}
@@ -2361,7 +2369,7 @@ func (stp *SubtreeProcessor) moveBackBlockCreateNewSubtrees(ctx context.Context,
 	}
 
 	// reset the subtree processor
-	subtreeSize := stp.currentItemsPerFile
+	subtreeSize := int(stp.currentItemsPerFile.Load())
 	if !createProperlySizedSubtrees {
 		// if we are moving forward blocks, we do not care about the subtree size
 		// as we will create new subtrees anyway when moving forward so for simplicity and speed,
@@ -2628,7 +2636,7 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 	// Save current state
 	stp.currentTxMap = NewSplitTxInpointsMap(splitMapBuckets)
 
-	subtreeSize := stp.currentItemsPerFile
+	subtreeSize := int(stp.currentItemsPerFile.Load())
 	if !createProperlySizedSubtrees {
 		// if we are moving forward blocks, we do not care about the subtree size
 		// as we will create new subtrees anyway when moving forward so for simplicity and speed,
@@ -3174,7 +3182,7 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 	} else {
 		// Fallback to old calculation but with more reasonable estimate
 		// Average transactions per subtree is typically lower than max capacity
-		avgTxPerSubtree := stp.currentItemsPerFile * 3 / 4 // Assume 75% fill rate
+		avgTxPerSubtree := int(stp.currentItemsPerFile.Load()) * 3 / 4 // Assume 75% fill rate
 		mapSize = len(blockSubtreesMap) * avgTxPerSubtree
 	}
 

@@ -135,18 +135,20 @@ type KafkaSettings struct {
 }
 
 type AerospikeSettings struct {
-	Debug                  bool
-	Host                   string
-	BatchPolicyURL         *url.URL
-	ReadPolicyURL          *url.URL
-	WritePolicyURL         *url.URL
-	QueryPolicyURL         *url.URL
-	Port                   int
-	UseDefaultBasePolicies bool
-	UseDefaultPolicies     bool
-	WarmUp                 bool
-	StoreBatcherDuration   time.Duration
-	StatsRefreshDuration   time.Duration
+	Debug                           bool
+	Host                            string
+	BatchPolicyURL                  *url.URL
+	ReadPolicyURL                   *url.URL
+	WritePolicyURL                  *url.URL
+	QueryPolicyURL                  *url.URL
+	Port                            int
+	UseDefaultBasePolicies          bool
+	UseDefaultPolicies              bool
+	WarmUp                          bool
+	StoreBatcherDuration            time.Duration
+	StatsRefreshDuration            time.Duration
+	EnableSetMinedFilterExpressions bool
+	UseSeparateUDFModules           bool
 }
 
 type AlertSettings struct {

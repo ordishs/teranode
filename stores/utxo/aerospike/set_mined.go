@@ -161,6 +161,10 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 
 	thisBlockHeight := s.blockHeight.Load() + 1
 
+	if !minedBlockInfo.UnsetMined && s.settings.Aerospike.EnableSetMinedFilterExpressions {
+		return s.SetMinedMultiWithExpressions(ctx, hashes, minedBlockInfo)
+	}
+
 	// Get batch records slice from pool
 	batchRecordsPtr := getBatchRecordsSlice(len(hashes))
 	defer putBatchRecordsSlice(batchRecordsPtr)
@@ -182,8 +186,14 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 
 // prepareBatchRecordsForSetMined populates batch records for the setMined operation.
 // The batchRecords slice must be pre-allocated with len(hashes) capacity.
-func (s *Store) prepareBatchRecordsForSetMined(batchRecords []aerospike.BatchRecordIfc, hashes []*chainhash.Hash, minedBlockInfo utxo.MinedBlockInfo, thisBlockHeight uint32) error {
+func (s *Store) prepareBatchRecordsForSetMined(batchRecords []aerospike.BatchRecordIfc, hashes []*chainhash.Hash,
+	minedBlockInfo utxo.MinedBlockInfo, thisBlockHeight uint32) error {
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
+
+	usePackage := LuaPackage
+	if s.settings.Aerospike.UseSeparateUDFModules {
+		usePackage = LuaPackageMined
+	}
 
 	for idx, hash := range hashes {
 		key, err := aerospike.NewKey(s.namespace, s.setName, hash[:])
@@ -194,7 +204,7 @@ func (s *Store) prepareBatchRecordsForSetMined(batchRecords []aerospike.BatchRec
 		batchRecords[idx] = aerospike.NewBatchUDF(
 			batchUDFPolicy,
 			key,
-			LuaPackage,
+			usePackage,
 			"setMined",
 			aerospike.NewValue(minedBlockInfo.BlockID),
 			aerospike.NewValue(minedBlockInfo.BlockHeight),
