@@ -517,7 +517,7 @@ func BenchmarkChannelSendReceive(b *testing.B) {
 	}()
 
 	subtree, _ := subtreepkg.NewTreeByLeafCount(4)
-	txMap := NewSplitTxInpointsMap(1)
+	txMap := NewSplitTxInpointsMap(2, 1)
 
 	b.ResetTimer()
 	b.ReportAllocs()

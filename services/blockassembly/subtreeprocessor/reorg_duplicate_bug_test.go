@@ -133,7 +133,7 @@ func TestReorgDuplicateTransactionBug(t *testing.T) {
 
 		// Create currentTxMap that contains all the transactions
 		// This simulates the state where these transactions were in the mempool
-		currentTxMap := NewSplitTxInpointsMap(256)
+		currentTxMap := NewSplitTxInpointsMap(32, 256)
 
 		// Pre-populate currentTxMap with all transactions (simulating they were in mempool)
 		// Use a common parent hash instead of self-reference

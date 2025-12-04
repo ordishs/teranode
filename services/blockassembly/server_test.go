@@ -254,7 +254,7 @@ func setup(t *testing.T) (*BlockAssembly, *memory.Memory, *subtreepkg.Subtree, s
 	subtree, err := subtreepkg.NewTreeByLeafCount(16)
 	require.NoError(t, err)
 
-	txMap := subtreeprocessor.NewSplitTxInpointsMap(256)
+	txMap := subtreeprocessor.NewSplitTxInpointsMap(32, 256)
 
 	previousHash := chainhash.HashH([]byte("previousHash"))
 
