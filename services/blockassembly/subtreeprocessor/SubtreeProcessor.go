@@ -1498,7 +1498,7 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 	oldSubtreeHash := oldSubtree.RootHash()
 
 	// create a new subtree with the same height as the previous subtree
-	stp.currentSubtree, err = subtreepkg.NewTree(stp.currentSubtree.Size())
+	stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(stp.currentSubtree.Size())
 	if err != nil {
 		return errors.NewProcessingError("[%s] error creating new subtree", oldSubtreeHash.String(), err)
 	}
