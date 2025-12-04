@@ -380,7 +380,7 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 		chainedSubtreeCount:      atomic.Int32{},
 		currentSubtree:           firstSubtree,
 		queue:                    queue,
-		currentTxMap:             NewSplitTxInpointsMap(uint32(initialItemsPerFile), splitMapBuckets), // gosec:nolint
+		currentTxMap:             NewSplitTxInpointsMap(splitMapBuckets),
 		removeMap:                NewSplitSwissMap(256, 1024),
 		blockchainClient:         blockchainClient,
 		subtreeStore:             subtreeStore,
@@ -1529,7 +1529,7 @@ func (stp *SubtreeProcessor) AddBatch(nodes []subtreepkg.Node, txInpoints []*sub
 // Returns:
 //   - error: Any error encountered during addition
 func (stp *SubtreeProcessor) AddDirectly(node *subtreepkg.Node, txInpoints *subtreepkg.TxInpoints, skipNotification bool) error {
-	if ok := stp.currentTxMap.Exists(node.Hash); ok {
+	if _, ok := stp.currentTxMap.Get(node.Hash); ok {
 		return errors.NewInvalidArgumentError("transaction already exists in currentTxMap")
 	}
 
@@ -1935,7 +1935,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 
 	stp.logger.Infof("reorgBlocks with %d moveBackBlocks and %d moveForwardBlocks", len(moveBackBlocks), len(moveForwardBlocks))
 
-	if len(moveForwardBlocks) > 0 && len(moveBackBlocks) == 0 {
+	if len(moveForwardBlocks) == 1 && len(moveBackBlocks) == 0 {
 		// wait for the last block to be processed first, mined_set etc.
 		ok, err := stp.waitForBlockBeingMined(ctx, moveForwardBlocks[len(moveForwardBlocks)-1].Hash())
 		if err != nil {
@@ -1945,43 +1945,6 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		if !ok {
 			return errors.NewProcessingError("[reorgBlocks] timeout waiting for block being mined %s", moveForwardBlocks[len(moveForwardBlocks)-1].Hash().String())
 		}
-
-		// create empty map for processed conflicting hashes
-		processedConflictingHashesMap := make(map[chainhash.Hash]bool)
-
-		// store current state before attempting to move forward the block
-		originalChainedSubtrees := stp.chainedSubtrees
-		originalCurrentSubtree := stp.currentSubtree
-		originalCurrentTxMap := stp.currentTxMap
-		currentBlockHeader := stp.currentBlockHeader
-
-		// Just move forward the blocks and do not go into a full reorg
-		for idx, block := range moveForwardBlocks {
-			// skip dequeue if not the last block
-			skipNotificationsAndDequeue := idx != len(moveForwardBlocks)-1
-
-			if _, err = stp.moveForwardBlock(ctx, block, skipNotificationsAndDequeue, processedConflictingHashesMap, skipNotificationsAndDequeue, true); err != nil {
-				// rollback to previous state
-				stp.chainedSubtrees = originalChainedSubtrees
-				stp.currentSubtree = originalCurrentSubtree
-				stp.currentTxMap = originalCurrentTxMap
-				stp.currentBlockHeader = currentBlockHeader
-
-				// recalculate tx count from subtrees
-				stp.setTxCountFromSubtrees()
-
-				return err
-			} else {
-				// Finalize block processing
-				// this will also set the current block header
-				stp.finalizeBlockProcessing(ctx, block)
-			}
-
-			stp.currentBlockHeader = block.Header
-		}
-
-		return nil
-
 	} else {
 		// other operation, wait for all blocks to be processed first, mined_set etc.
 		if err = stp.WaitForPendingBlocks(ctx); err != nil {
@@ -2675,7 +2638,7 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 // resetSubtreeState resets the current subtree state and returns the old state
 func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (err error) {
 	// Save current state
-	stp.currentTxMap = NewSplitTxInpointsMap(uint32(stp.currentItemsPerFile.Load()), splitMapBuckets) // gosec:nolint
+	stp.currentTxMap = NewSplitTxInpointsMap(splitMapBuckets)
 
 	subtreeSize := int(stp.currentItemsPerFile.Load())
 	if !createProperlySizedSubtrees {
