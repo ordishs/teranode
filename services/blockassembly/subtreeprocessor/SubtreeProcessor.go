@@ -2953,8 +2953,8 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 }
 
 func (stp *SubtreeProcessor) waitForBlockBeingMined(ctx context.Context, blockHash *chainhash.Hash) (bool, error) {
-	// try to wait for the block to be mined for maximum 30 sec
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// try to wait for the block to be mined for maximum 300 sec
+	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 
 	for {
