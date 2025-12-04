@@ -1951,7 +1951,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 
 	stp.logger.Infof("reorgBlocks with %d moveBackBlocks and %d moveForwardBlocks", len(moveBackBlocks), len(moveForwardBlocks))
 
-	if len(moveForwardBlocks) == 1 && len(moveBackBlocks) == 0 {
+	if len(moveForwardBlocks) > 0 && len(moveBackBlocks) == 0 {
 		// wait for the last block to be processed first, mined_set etc.
 		ok, err := stp.waitForBlockBeingMined(ctx, moveForwardBlocks[len(moveForwardBlocks)-1].Hash())
 		if err != nil {
