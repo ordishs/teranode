@@ -2028,8 +2028,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	lockedCount := atomic.Int64{}
 
 	// Worker pool configuration
-	numWorkers := runtime.NumCPU() / 2
-	workChan := make(chan *utxo.UnminedTransaction, numWorkers*2)
+	numWorkers := runtime.NumCPU() * 4
+	workChan := make(chan []*utxo.UnminedTransaction, numWorkers*2)
 	var wg sync.WaitGroup
 
 	// Per-worker local buffers to eliminate lock contention
@@ -2054,40 +2054,42 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			defer wg.Done()
 			localResult := &workerResults[workerID]
 
-			for unminedTransaction := range workChan {
-				if unminedTransaction.Skip {
-					skippedCount.Add(1)
-					continue
-				}
-
-				if len(unminedTransaction.BlockIDs) > 0 {
-					// If the transaction is already included in a block that is in the best chain, skip it
-					skipAlreadyMined := false
-					for _, blockID := range unminedTransaction.BlockIDs {
-						if bestBlockHeaderIDsMap[blockID] {
-							skipAlreadyMined = true
-							break
-						}
-					}
-
-					if skipAlreadyMined {
-						// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
-						alreadyMinedCount.Add(1)
-
-						if unminedTransaction.UnminedSince > 0 {
-							localResult.markAsMinedOnLongestTxs = append(localResult.markAsMinedOnLongestTxs, unminedTransaction.Hash)
-						}
-
+			for batch := range workChan {
+				for _, unminedTransaction := range batch {
+					if unminedTransaction.Skip {
+						skippedCount.Add(1)
 						continue
 					}
-				}
 
-				localResult.unminedTxs = append(localResult.unminedTxs, unminedTransaction)
+					if len(unminedTransaction.BlockIDs) > 0 {
+						// If the transaction is already included in a block that is in the best chain, skip it
+						skipAlreadyMined := false
+						for _, blockID := range unminedTransaction.BlockIDs {
+							if bestBlockHeaderIDsMap[blockID] {
+								skipAlreadyMined = true
+								break
+							}
+						}
 
-				if unminedTransaction.Locked {
-					// if the transaction is locked, we need to add it to the locked transactions list, so we can unlock them
-					localResult.lockedTxs = append(localResult.lockedTxs, unminedTransaction.Hash)
-					lockedCount.Add(1)
+						if skipAlreadyMined {
+							// b.logger.Debugf("[BlockAssembler] skipping unmined transaction %s already included in best chain", unminedTransaction.Hash)
+							alreadyMinedCount.Add(1)
+
+							if unminedTransaction.UnminedSince > 0 {
+								localResult.markAsMinedOnLongestTxs = append(localResult.markAsMinedOnLongestTxs, unminedTransaction.Hash)
+							}
+
+							continue
+						}
+					}
+
+					localResult.unminedTxs = append(localResult.unminedTxs, unminedTransaction)
+
+					if unminedTransaction.Locked {
+						// if the transaction is locked, we need to add it to the locked transactions list, so we can unlock them
+						localResult.lockedTxs = append(localResult.lockedTxs, unminedTransaction.Hash)
+						lockedCount.Add(1)
+					}
 				}
 			}
 		}(i)
@@ -2095,21 +2097,26 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 
 	b.logger.Infof("[loadUnminedTransactions] feeding unmined transactions to %d workers", numWorkers)
 
-	// Feed transactions from the iterator to workers
+	// Feed batches from the iterator to workers
 	for {
-		unminedTransaction, err := it.Next(ctx)
+		batch, err := it.Next(ctx)
 		if err != nil {
 			close(workChan)
 			wg.Wait()
 			return errors.NewProcessingError("error getting unmined transaction", err)
 		}
 
-		if unminedTransaction == nil {
+		if batch == nil || len(batch) == 0 {
 			break
 		}
 
-		totalProcessed.Add(1)
-		workChan <- unminedTransaction
+		totalProcessed.Add(int64(len(batch)))
+
+		if totalProcessed.Load()%100_000 == 0 {
+			b.logger.Infof("[loadUnminedTransactions] processed %d unmined transactions so far", totalProcessed.Load())
+		}
+
+		workChan <- batch
 	}
 
 	// Close channel and wait for all workers to finish

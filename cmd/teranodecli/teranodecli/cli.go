@@ -46,6 +46,7 @@ var commandHelp = map[string]string{
 	"fix-chainwork":           "Fix incorrect chainwork values in blockchain database",
 	"validate-utxo-set":       "Validate UTXO set file",
 	"subtreebench":            "Benchmark SubtreeProcessor throughput with CPU and memory profiling",
+	"loadunminedbench":        "Benchmark loadUnminedTransactions with CPU and memory profiling",
 }
 
 var dangerousCommands = map[string]bool{}
@@ -414,6 +415,16 @@ func Start(args []string, version, commit string) {
 
 		cmd.Execute = func(args []string) error {
 			return runSubtreeBenchmark(*subtreeSize, *producers, *iterations, *duration, *cpuProfile, *memProfile)
+		}
+	case "loadunminedbench":
+		txCount := cmd.FlagSet.Int("tx-count", 1_000_000, "Number of transactions")
+		fullScan := cmd.FlagSet.Bool("full-scan", false, "Use full scan mode")
+		cpuProfile := cmd.FlagSet.String("cpu-profile", "loadunmined_cpu.prof", "CPU profile output")
+		memProfile := cmd.FlagSet.String("mem-profile", "loadunmined_mem.prof", "Memory profile output")
+		aerospikeURL := cmd.FlagSet.String("aerospike-url", "", "Aerospike URL (empty=testcontainer)")
+
+		cmd.Execute = func(args []string) error {
+			return runLoadUnminedBenchmark(*txCount, *fullScan, *cpuProfile, *memProfile, *aerospikeURL)
 		}
 	default:
 		fmt.Printf("Unknown command: %s\n\n", command)

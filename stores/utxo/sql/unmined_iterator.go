@@ -51,7 +51,34 @@ func newUnminedTxIterator(store *Store) (*unminedTxIterator, error) {
 	return it, nil
 }
 
-func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction, error) {
+func (it *unminedTxIterator) Next(ctx context.Context) ([]*utxo.UnminedTransaction, error) {
+	if it.done || it.err != nil || it.rows == nil {
+		return nil, it.err
+	}
+
+	// Read a batch of transactions (up to 16K to match Aerospike iterator batch size)
+	const batchSize = 1024
+	batch := make([]*utxo.UnminedTransaction, 0, batchSize)
+
+	for i := 0; i < batchSize; i++ {
+		tx, err := it.readOne(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if tx == nil {
+			break
+		}
+		batch = append(batch, tx)
+	}
+
+	if len(batch) == 0 {
+		return nil, nil
+	}
+
+	return batch, nil
+}
+
+func (it *unminedTxIterator) readOne(ctx context.Context) (*utxo.UnminedTransaction, error) {
 	if it.done || it.err != nil || it.rows == nil {
 		return nil, it.err
 	}

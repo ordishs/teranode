@@ -26,9 +26,10 @@ type UnminedTransaction struct {
 // It enables streaming access to large sets of unmined transactions without loading them all into memory.
 // Implementations should be safe for concurrent use and handle context cancellation appropriately.
 type UnminedTxIterator interface {
-	// Next advances the iterator and returns the next unmined transaction, or nil if iteration is done.
-	// Returns an error if one occurred during iteration or data retrieval.
-	Next(ctx context.Context) (*UnminedTransaction, error)
+	// Next advances the iterator and returns a batch of unmined transactions, or nil if iteration is done.
+	// The batch size is implementation-dependent and optimized for performance.
+	// Returns an empty slice when iteration is complete, or an error if one occurred during iteration or data retrieval.
+	Next(ctx context.Context) ([]*UnminedTransaction, error)
 	// Err returns the first error encountered during iteration.
 	// Should be called after Next returns nil to check for iteration errors.
 	Err() error

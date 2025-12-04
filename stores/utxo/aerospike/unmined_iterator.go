@@ -25,7 +25,7 @@ type unminedTxIterator struct {
 	err           error
 	done          bool
 	recordset     *as.Recordset
-	resultChan    chan *utxo.UnminedTransaction
+	resultChan    chan []*utxo.UnminedTransaction
 	errorChan     chan error
 	cancelWorkers context.CancelFunc
 	wg            sync.WaitGroup
@@ -88,11 +88,15 @@ func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, erro
 		numWorkers = 1
 	}
 
+	// Buffer size for batch channel - smaller since each item is a batch
+	// With batches of 16K items, 16 buffers = 256K items buffered
+	resultChanSize := numWorkers * 2
+
 	it := &unminedTxIterator{
 		store:         store,
 		fullScan:      fullScan,
 		recordset:     recordset,
-		resultChan:    make(chan *utxo.UnminedTransaction, numWorkers*4),
+		resultChan:    make(chan []*utxo.UnminedTransaction, resultChanSize),
 		errorChan:     make(chan error, 1),
 		cancelWorkers: cancel,
 	}
@@ -118,58 +122,95 @@ func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, erro
 func (it *unminedTxIterator) worker(ctx context.Context, result <-chan *as.Result) {
 	defer it.wg.Done()
 
-	for {
+	const (
+		batchSize          = 16 * 1024
+		contextCheckPeriod = 16 * 1024
+	)
+
+	// Pre-compute field names to avoid repeated String() calls
+	conflictingField := fields.Conflicting.String()
+	coinbaseField := fields.IsCoinbase.String()
+
+	// Local buffer to batch sends and reduce channel contention
+	localBuffer := make([]*utxo.UnminedTransaction, 0, batchSize)
+	itemsProcessed := 0
+
+	// Flush function sends the entire batch as a single slice
+	flush := func() error {
+		if len(localBuffer) == 0 {
+			return nil
+		}
+
+		// Create a copy of the slice to send
+		batchToSend := make([]*utxo.UnminedTransaction, len(localBuffer))
+		copy(batchToSend, localBuffer)
+
 		select {
 		case <-ctx.Done():
+			return ctx.Err()
+		case it.resultChan <- batchToSend:
+		}
+
+		localBuffer = localBuffer[:0]
+		return nil
+	}
+
+	defer func() {
+		_ = flush() // Best effort flush on exit
+	}()
+
+	for {
+		// Only check context every contextCheckPeriod iterations for performance
+		if itemsProcessed%contextCheckPeriod == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+
+		// Read from result channel without select for performance
+		rec, ok := <-result
+		if !ok || rec == nil {
 			return
-		case rec, ok := <-result:
-			if !ok || rec == nil {
-				return
-			}
+		}
 
-			if rec.Err != nil {
-				select {
-				case it.errorChan <- rec.Err:
-				default:
-				}
-				return
-			}
+		if rec.Err != nil {
+			it.errorChan <- rec.Err
+			return
+		}
 
-			// Check if the transaction is conflicting and skip it if so
-			conflictingVal := rec.Record.Bins[fields.Conflicting.String()]
-			if conflictingVal != nil {
-				conflicting, ok := conflictingVal.(bool)
-				if ok && conflicting {
-					continue
-				}
-			}
+		itemsProcessed++
 
-			coinbaseBool, ok := rec.Record.Bins[fields.IsCoinbase.String()].(bool)
-			if ok && coinbaseBool {
-				// Skip coinbase transactions
-				select {
-				case <-ctx.Done():
-					return
-				case it.resultChan <- &utxo.UnminedTransaction{Skip: true}:
-				}
+		// Quick inline filtering checks
+		if conflictingVal := rec.Record.Bins[conflictingField]; conflictingVal != nil {
+			if conflicting, ok := conflictingVal.(bool); ok && conflicting {
 				continue
 			}
+		}
 
-			// Process the record and send to result channel
-			unminedTx, err := it.processRecord(ctx, rec.Record.Bins)
-			if err != nil {
-				select {
-				case it.errorChan <- err:
-				default:
-				}
-				return
-			}
-
-			if unminedTx != nil {
-				select {
-				case <-ctx.Done():
+		if coinbaseBool, ok := rec.Record.Bins[coinbaseField].(bool); ok && coinbaseBool {
+			localBuffer = append(localBuffer, &utxo.UnminedTransaction{Skip: true})
+			if len(localBuffer) >= batchSize {
+				if err := flush(); err != nil {
 					return
-				case it.resultChan <- unminedTx:
+				}
+			}
+			continue
+		}
+
+		// Process the record
+		unminedTx, err := it.processRecord(ctx, rec.Record.Bins)
+		if err != nil {
+			it.errorChan <- err
+			return
+		}
+
+		if unminedTx != nil {
+			localBuffer = append(localBuffer, unminedTx)
+			if len(localBuffer) >= batchSize {
+				if err := flush(); err != nil {
+					return
 				}
 			}
 		}
@@ -233,16 +274,17 @@ func (it *unminedTxIterator) processRecord(ctx context.Context, bins map[string]
 	}, nil
 }
 
-// Next advances the iterator and returns the next unmined transaction.
-// This method now simply reads from the result channel populated by worker goroutines.
+// Next advances the iterator and returns a batch of unmined transactions.
+// This method reads multiple transactions from the result channel populated by worker goroutines
+// for improved performance by amortizing overhead across multiple transactions.
 //
 // Parameters:
-//   - ctx: Context for cancellation (unused in this implementation, kept for interface compatibility)
+//   - ctx: Context for cancellation
 //
 // Returns:
-//   - *utxo.UnminedTransaction: The next unmined transaction, or nil if iteration is complete
+//   - []*utxo.UnminedTransaction: A batch of unmined transactions, or empty slice if iteration is complete
 //   - error: Any error encountered during iteration
-func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction, error) {
+func (it *unminedTxIterator) Next(ctx context.Context) ([]*utxo.UnminedTransaction, error) {
 	if it.done || it.err != nil {
 		return nil, it.err
 	}
@@ -268,14 +310,13 @@ func (it *unminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction
 	default:
 	}
 
-	// Read from result channel
-	tx, ok := <-it.resultChan
+	batch, ok := <-it.resultChan
 	if !ok {
 		it.closeWithLogging()
 		return nil, nil
 	}
 
-	return tx, nil
+	return batch, nil
 }
 
 // transactionData holds the basic transaction data extracted from a record
