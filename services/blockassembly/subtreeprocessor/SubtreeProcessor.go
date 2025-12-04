@@ -1116,6 +1116,14 @@ func (stp *SubtreeProcessor) GetCurrentSubtree() *subtreepkg.Subtree {
 	return stp.currentSubtree
 }
 
+// GetCurrentSubtreeSize returns the maximum size of the current subtree.
+//
+// Returns:
+//   - int: Maximum size of the current subtree
+func (stp *SubtreeProcessor) GetCurrentSubtreeSize() int {
+	return int(stp.currentItemsPerFile.Load())
+}
+
 // GetCurrentTxMap returns the map of transactions currently held in the subtree processor.
 //
 // Returns:
@@ -1131,6 +1139,14 @@ func (stp *SubtreeProcessor) GetCurrentTxMap() TxInpointsMap {
 //   - *txmap.SwissMap: Map of transactions to be removed
 func (stp *SubtreeProcessor) GetRemoveMap() *SplitSwissMap {
 	return stp.removeMap
+}
+
+// GetRemoveMapLength returns the length of the remove map.
+//
+// Returns:
+//   - int: Length of the remove map
+func (stp *SubtreeProcessor) GetRemoveMapLength() int {
+	return stp.removeMap.Length()
 }
 
 // GetChainedSubtrees returns all completed subtrees in the chain.

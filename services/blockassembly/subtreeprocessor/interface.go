@@ -173,6 +173,13 @@ type Interface interface {
 	//   - *util.Subtree: Currently active subtree, nil if none
 	GetCurrentSubtree() *subtree.Subtree
 
+	// GetCurrentSubtreeSize returns the size of the current subtree being processed.
+	// This metric helps monitor subtree growth and processing state.
+	//
+	// Returns:
+	//   - int: Size of the current subtree
+	GetCurrentSubtreeSize() int
+
 	// GetCurrentTxMap returns the current transaction map with input points.
 	// This provides access to the processor's transaction tracking state.
 	//
@@ -187,6 +194,12 @@ type Interface interface {
 	// Returns:
 	//   - *SplitSwissMap: Map of transactions to be removed
 	GetRemoveMap() *SplitSwissMap
+
+	// GetRemoveMapLength returns the number of transactions scheduled for removal.
+	//
+	// Returns:
+	//   - int: Number of transactions in the removal map
+	GetRemoveMapLength() int
 
 	// GetChainedSubtrees returns subtrees that are chained together.
 	// These represent transaction dependencies and processing order.

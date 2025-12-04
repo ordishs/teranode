@@ -16,6 +16,9 @@ import (
 	"github.com/stretchr/testify/mock"
 )
 
+// check that MockSubtreeProcessor implements Interface
+var _ Interface = (*MockSubtreeProcessor)(nil)
+
 // MockSubtreeProcessor implements a mock version of the Interface for testing.
 // This mock provides controllable implementations of all Interface methods,
 // allowing tests to define expected behavior, verify method calls, and
@@ -41,6 +44,11 @@ func (m *MockSubtreeProcessor) GetCurrentTxMap() TxInpointsMap {
 func (m *MockSubtreeProcessor) GetRemoveMap() *SplitSwissMap {
 	args := m.Called()
 	return args.Get(0).(*SplitSwissMap)
+}
+
+func (m *MockSubtreeProcessor) GetRemoveMapLength() int {
+	args := m.Called()
+	return args.Int(0)
 }
 
 func (m *MockSubtreeProcessor) GetCurrentRunningState() State {
@@ -77,6 +85,11 @@ func (m *MockSubtreeProcessor) GetCurrentSubtree() *subtree.Subtree {
 		return nil
 	}
 	return args.Get(0).(*subtree.Subtree)
+}
+
+func (m *MockSubtreeProcessor) GetCurrentSubtreeSize() int {
+	args := m.Called()
+	return args.Get(0).(int)
 }
 
 func (m *MockSubtreeProcessor) GetChainedSubtrees() []*subtree.Subtree {

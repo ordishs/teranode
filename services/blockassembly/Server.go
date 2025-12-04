@@ -1622,27 +1622,37 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 		return nil, errors.NewProcessingError("[GetBlockAssemblyState] error converting subtree count", err)
 	}
 
-	subtreeHashes := ba.blockAssembler.subtreeProcessor.GetSubtreeHashes()
+	// this will block when the subtree processor is busy with someting else
+	// wait only 1 second for this and continue
+	subtreeHashesChan := make(chan []chainhash.Hash, 1)
+	go func() {
+		subtreeHashesChan <- ba.blockAssembler.subtreeProcessor.GetSubtreeHashes()
+	}()
+
+	var subtreeHashes []chainhash.Hash
+	select {
+	case subtreeHashes = <-subtreeHashesChan:
+		// Successfully retrieved subtree hashes
+	case <-time.After(1 * time.Second):
+		// Timeout occurred, continue with empty slice
+		subtreeHashes = []chainhash.Hash{}
+	}
+
 	subtreeHashesStrings := make([]string, 0, len(subtreeHashes))
 	for _, hash := range subtreeHashes {
 		subtreeHashesStrings = append(subtreeHashesStrings, hash.String())
 	}
 
-	removeMap := ba.blockAssembler.subtreeProcessor.GetRemoveMap()
-	removeMapLen32, err := safeconversion.IntToUint32(removeMap.Length())
+	removeMapLen32, err := safeconversion.IntToUint32(ba.blockAssembler.subtreeProcessor.GetRemoveMapLength())
 	if err != nil {
 		return nil, errors.NewProcessingError("[GetBlockAssemblyState] error converting remove map length", err)
 	}
 
 	currentHeader, currentHeight := ba.blockAssembler.CurrentBlock()
 
-	subtreeSize := uint32(0)
-	if currentSubtree := ba.blockAssembler.subtreeProcessor.GetCurrentSubtree(); currentSubtree != nil {
-		// convert to uint32, safe as subtree size cannot exceed uint32
-		subtreeSize, err = safeconversion.IntToUint32(currentSubtree.Size())
-		if err != nil {
-			return nil, errors.NewProcessingError("[GetBlockAssemblyState] error converting current subtree size", err)
-		}
+	subtreeSize, err := safeconversion.IntToUint32(ba.blockAssembler.subtreeProcessor.GetCurrentSubtreeSize())
+	if err != nil {
+		return nil, errors.NewProcessingError("[GetBlockAssemblyState] error converting current subtree size", err)
 	}
 
 	return &blockassembly_api.StateMessage{
