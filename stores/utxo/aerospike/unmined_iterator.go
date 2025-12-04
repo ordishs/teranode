@@ -69,6 +69,7 @@ func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, erro
 
 	policy := util.GetAerospikeQueryPolicy(store.settings)
 	policy.IncludeBinData = true
+	policy.RecordQueueSize = 10 * 1024 * 1024 // 10MB queue for better throughput
 
 	store.logger.Infof("[newUnminedTxIterator] Starting Aerospike query for unmined transactions (fullScan=%t)", fullScan)
 	recordset, err := store.client.Query(policy, stmt)
