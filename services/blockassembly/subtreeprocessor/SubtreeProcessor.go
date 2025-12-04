@@ -733,6 +733,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 
 					// Phase 3: Bulk insert valid nodes into subtrees (single-threaded)
 					// Only nodes with non-zero Hash passed the filters
+					nrAddedInBatch := 0
 					for _, batch := range batches {
 						for _, node := range batch.nodes {
 							// Skip rejected/duplicate nodes (marked with zero hash)
@@ -744,6 +745,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 							if err = stp.currentSubtree.AddSubtreeNodeWithoutLock(node); err != nil {
 								stp.logger.Errorf("addNode failed: error adding node to subtree: %s", err)
 							} else {
+								nrAddedInBatch++
 								addedCount++
 								nrProcessed++
 							}
@@ -755,6 +757,8 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 								}
 							}
 						}
+
+						prometheusSubtreeProcessorDequeuedTxs.Add(float64(nrAddedInBatch))
 					}
 
 					if addedCount > 0 {
@@ -2848,6 +2852,18 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		return nil, errors.NewProcessingError("the block passed in does not match the current block header: [%s] - [%s]", block.Header.StringDump(), stp.currentBlockHeader.StringDump())
 	}
 
+	if len(block.Subtrees) == 0 {
+		// empty block, nothing to do
+		stp.logger.Infof("[moveForwardBlock][%s] block has no subtrees, skipping processing", block.String())
+
+		// create the coinbase after processing all other transaction operations
+		if err = stp.processCoinbaseUtxos(ctx, block); err != nil {
+			return nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
+		}
+
+		return nil, nil
+	}
+
 	stp.logger.Debugf("[moveForwardBlock][%s] resetting subtrees: %v", block.String(), block.Subtrees)
 
 	// Process block subtrees and separate chained subtrees
@@ -3021,6 +3037,8 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap, losingTx
 					_ = stp.addNode(node, txInpoints, skipNotification)
 				}
 			}
+
+			prometheusSubtreeProcessorDequeuedTxs.Add(float64(len(batch.nodes)))
 
 			nrBatchesProcessed++
 			if nrBatchesProcessed > queueLength {
