@@ -659,6 +659,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					currentItemsPerFile := int(stp.currentItemsPerFile.Load())
 					validFromMillis := time.Now().Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
 					addedCount := uint64(0)
+					capSize := stp.currentSubtree.Size()
 
 					// Check if we need to create a new subtree
 					if stp.currentSubtree == nil {
@@ -751,10 +752,13 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 							}
 
 							// Check if subtree is complete
-							if len(stp.currentSubtree.Nodes) >= currentItemsPerFile {
+							if len(stp.currentSubtree.Nodes) >= capSize {
 								if err = stp.processCompleteSubtree(false); err != nil {
 									stp.logger.Errorf("processCompleteSubtree failed: %s", err)
 								}
+
+								// Reset cap size for new subtree
+								capSize = stp.currentSubtree.Size()
 							}
 						}
 
