@@ -234,9 +234,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UnminedTxDiskSortPath:                getString("blockassembly_unminedTxDiskSortPath", "", alternativeContext...),
 			UnminedTxDiskSortEnabled:             getBool("blockassembly_unminedTxDiskSortEnabled", true, alternativeContext...),
 			// getMiningCandidate timeout settings
-			GetMiningCandidateSendTimeout:     getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
-			GetMiningCandidateResponseTimeout: getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
-			SubtreeAnnouncementInterval:       getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
+			GetMiningCandidateSendTimeout:       getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
+			GetMiningCandidateResponseTimeout:   getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
+			SubtreeAnnouncementInterval:         getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
+			ParallelSetIfNotExistsThreshold:     getInt("blockassembly_parallelSetIfNotExistsThreshold", 10_000, alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{

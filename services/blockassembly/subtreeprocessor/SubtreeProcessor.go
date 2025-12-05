@@ -1464,6 +1464,46 @@ func (stp *SubtreeProcessor) addNode(node subtreepkg.Node, parents *subtreepkg.T
 	return nil
 }
 
+// addNodePreValidated adds a node that's already been validated and inserted into currentTxMap.
+// This skips the map check/insertion that addNode performs, avoiding redundant operations.
+// Use this after parallelGetAndSetIfNotExists has already inserted the node into currentTxMap.
+//
+// Parameters:
+//   - node: The node to add to the subtree
+//   - skipNotification: Whether to skip notification of new subtrees
+//
+// Returns:
+//   - error: Any error encountered during addition
+func (stp *SubtreeProcessor) addNodePreValidated(node subtreepkg.Node, skipNotification bool) (err error) {
+	if stp.currentSubtree == nil {
+		itemsPerFile := int(stp.currentItemsPerFile.Load())
+
+		stp.currentSubtree, err = subtreepkg.NewTreeByLeafCount(itemsPerFile)
+		if err != nil {
+			return err
+		}
+
+		// This is the first subtree for this block - we need a coinbase placeholder
+		if err = stp.currentSubtree.AddCoinbaseNode(); err != nil {
+			return err
+		}
+
+		stp.txCount.Add(1)
+	}
+
+	if err = stp.currentSubtree.AddSubtreeNode(node); err != nil {
+		return errors.NewProcessingError("error adding node to subtree", err)
+	}
+
+	if stp.currentSubtree.IsComplete() {
+		if err = stp.processCompleteSubtree(skipNotification); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(context.Background(), "storeSubtree",
 		tracing.WithParentStat(stp.stats),
@@ -2786,30 +2826,64 @@ func (stp *SubtreeProcessor) processOwnBlockNodes(_ context.Context, block *mode
 	return nil
 }
 
-// processOwnBlockSubtreeNodes processes nodes from a subtree for our own block
+// processOwnBlockSubtreeNodes processes nodes from a subtree for our own block.
+// For large node sets (>= ParallelSetIfNotExistsThreshold), uses parallel processing
+// for Get and SetIfNotExists operations to improve performance.
 func (stp *SubtreeProcessor) processOwnBlockSubtreeNodes(block *model.Block, nodes []subtreepkg.Node, currentTxMap TxInpointsMap, removeMapLength int, coinbaseID *chainhash.Hash, skipNotification bool) error {
-	for _, node := range nodes {
-		if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
-			continue
+	parallelThreshold := stp.settings.BlockAssembly.ParallelSetIfNotExistsThreshold
+
+	if len(nodes) >= parallelThreshold {
+		// Parallel path for large node sets
+		wasInserted := make([]bool, len(nodes))
+
+		if err := stp.parallelGetAndSetIfNotExists(nodes, currentTxMap, removeMapLength,
+			stp.settings.BlockAssembly.ProcessRemainderTxHashesConcurrency, wasInserted); err != nil {
+			return errors.NewProcessingError("[processOwnBlockSubtreeNodes][%s] parallel error", block.String(), err)
 		}
 
-		// Skip coinbase if provided
-		if coinbaseID != nil && coinbaseID.Equal(node.Hash) {
-			continue
+		// Sequential subtree insertion using wasInserted slice
+		for idx, node := range nodes {
+			if !wasInserted[idx] {
+				// Skip nodes that weren't successfully inserted:
+				// - Coinbase placeholder
+				// - In removeMap
+				// - Duplicate (SetIfNotExists returned wasSet=false)
+				continue
+			}
+
+			if coinbaseID != nil && coinbaseID.Equal(node.Hash) {
+				continue
+			}
+
+			if err := stp.addNodePreValidated(node, skipNotification); err != nil {
+				return errors.NewProcessingError("[processOwnBlockSubtreeNodes][%s] error adding node %s to subtree", block.String(), node.Hash.String(), err)
+			}
 		}
-
-		if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
-			if err := stp.removeMap.Delete(node.Hash); err != nil {
-				stp.logger.Errorf("[moveForwardBlock][%s] error removing tx from remove map: %s", block.String(), err.Error())
-			}
-		} else {
-			nodeParents, found := currentTxMap.Get(node.Hash)
-			if !found {
-				return errors.NewProcessingError("[moveForwardBlock][%s] error getting node txInpoints from currentTxMap for %s", block.String(), node.Hash.String())
+	} else {
+		// Sequential path for small node sets (avoid goroutine overhead)
+		for _, node := range nodes {
+			if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				continue
 			}
 
-			if err := stp.addNode(node, nodeParents, skipNotification); err != nil {
-				return errors.NewProcessingError("[moveForwardBlock][%s] error adding node %s to subtree", block.String(), node.Hash.String(), err)
+			// Skip coinbase if provided
+			if coinbaseID != nil && coinbaseID.Equal(node.Hash) {
+				continue
+			}
+
+			if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
+				if err := stp.removeMap.Delete(node.Hash); err != nil {
+					stp.logger.Errorf("[moveForwardBlock][%s] error removing tx from remove map: %s", block.String(), err.Error())
+				}
+			} else {
+				nodeParents, found := currentTxMap.Get(node.Hash)
+				if !found {
+					return errors.NewProcessingError("[moveForwardBlock][%s] error getting node txInpoints from currentTxMap for %s", block.String(), node.Hash.String())
+				}
+
+				if err := stp.addNode(node, nodeParents, skipNotification); err != nil {
+					return errors.NewProcessingError("[moveForwardBlock][%s] error adding node %s to subtree", block.String(), node.Hash.String(), err)
+				}
 			}
 		}
 	}
@@ -3204,19 +3278,128 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 		return errors.NewProcessingError("error getting remainder tx difference", err)
 	}
 
-	// add all found tx hashes to the final list, in order
+	// Calculate total nodes for threshold check
+	totalNodes := 0
 	for _, subtreeNodes := range remainderSubtrees {
-		for _, node := range subtreeNodes {
-			parents, ok := currentTxMap.Get(node.Hash)
-			if !ok {
-				return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", node.Hash.String())
-			}
+		totalNodes += len(subtreeNodes)
+	}
 
-			_ = stp.addNode(node, parents, skipNotification)
+	parallelThreshold := stp.settings.BlockAssembly.ParallelSetIfNotExistsThreshold
+
+	if totalNodes >= parallelThreshold {
+		// Parallel path: flatten to single slice, process in parallel, then add sequentially
+		flatNodes := make([]subtreepkg.Node, 0, totalNodes)
+		for _, subtreeNodes := range remainderSubtrees {
+			flatNodes = append(flatNodes, subtreeNodes...)
+		}
+
+		wasInserted := make([]bool, len(flatNodes))
+
+		// Note: removeMapLength is 0 here because removeMap was already processed in Phase 1
+		if err := stp.parallelGetAndSetIfNotExists(flatNodes, currentTxMap, 0,
+			stp.settings.BlockAssembly.ProcessRemainderTxHashesConcurrency, wasInserted); err != nil {
+			return errors.NewProcessingError("[processRemainderTxHashes] parallel error", err)
+		}
+
+		for idx, node := range flatNodes {
+			if !wasInserted[idx] {
+				continue
+			}
+			_ = stp.addNodePreValidated(node, skipNotification)
+		}
+	} else {
+		// Sequential path for small remainder sets (existing behavior)
+		for _, subtreeNodes := range remainderSubtrees {
+			for _, node := range subtreeNodes {
+				parents, ok := currentTxMap.Get(node.Hash)
+				if !ok {
+					return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", node.Hash.String())
+				}
+
+				_ = stp.addNode(node, parents, skipNotification)
+			}
 		}
 	}
 
 	return nil
+}
+
+// parallelGetAndSetIfNotExists processes nodes in parallel, performing Get from currentTxMap
+// and SetIfNotExists on stp.currentTxMap. The wasInserted slice indicates which nodes
+// were successfully inserted (not duplicates, not in removeMap, not coinbase placeholder).
+//
+// Parameters:
+//   - nodes: Slice of nodes to process
+//   - currentTxMap: Source map for parent data (read-only)
+//   - removeMapLength: Cached length of removeMap (0 if empty)
+//   - concurrencyLimit: Maximum number of concurrent goroutines
+//   - wasInserted: Output slice (must be pre-allocated with len(nodes)) marking successful insertions
+//
+// Returns:
+//   - error: First error encountered (if any), otherwise nil
+func (stp *SubtreeProcessor) parallelGetAndSetIfNotExists(
+	nodes []subtreepkg.Node,
+	currentTxMap TxInpointsMap,
+	removeMapLength int,
+	concurrencyLimit int,
+	wasInserted []bool,
+) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	batchSize := (len(nodes) + concurrencyLimit - 1) / concurrencyLimit
+	if batchSize < 1 {
+		batchSize = 1
+	}
+
+	g, _ := errgroup.WithContext(context.Background())
+
+	for i := 0; i < len(nodes); i += batchSize {
+		start := i
+		end := i + batchSize
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+
+		g.Go(func() error {
+			for idx := start; idx < end; idx++ {
+				node := nodes[idx]
+
+				// Skip coinbase placeholder
+				if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+					wasInserted[idx] = false
+					continue
+				}
+
+				// Check and remove from removeMap if present
+				if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
+					if err := stp.removeMap.Delete(node.Hash); err != nil {
+						stp.logger.Errorf("error removing tx from remove map: %s", err.Error())
+					}
+					wasInserted[idx] = false
+					continue
+				}
+
+				// Get parents from old currentTxMap (thread-safe read with RLock)
+				nodeParents, found := currentTxMap.Get(node.Hash)
+				if !found {
+					return errors.NewProcessingError("node %s not found in currentTxMap", node.Hash.String())
+				}
+
+				// SetIfNotExists on new stp.currentTxMap (thread-safe write with Lock)
+				_, wasSet := stp.currentTxMap.SetIfNotExists(node.Hash, nodeParents)
+				wasInserted[idx] = wasSet
+
+				if !wasSet {
+					stp.logger.Debugf("duplicate transaction ignored: %s", node.Hash.String())
+				}
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()
 }
 
 // CreateTransactionMap creates a map of transactions from the provided subtrees.

@@ -263,6 +263,10 @@ type BlockAssemblySettings struct {
 	GetMiningCandidateSendTimeout     time.Duration // Timeout when sending request on internal channel (default: 1s)
 	GetMiningCandidateResponseTimeout time.Duration // Timeout waiting for mining candidate response (default: 10s)
 	SubtreeAnnouncementInterval       time.Duration
+	// ParallelSetIfNotExistsThreshold is the minimum number of nodes required to trigger
+	// parallel processing of Get and SetIfNotExists operations in processOwnBlockSubtreeNodes
+	// and processRemainderTxHashes. Below this threshold, sequential processing is used.
+	ParallelSetIfNotExistsThreshold int
 }
 
 type BlockValidationSettings struct {
