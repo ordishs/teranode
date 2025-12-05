@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/tempstore"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -1943,6 +1944,14 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		return errors.NewServiceError("[BlockAssembler] no utxostore")
 	}
 
+	// Use disk-based sorting for large datasets when:
+	// 1. UnminedTxDiskSortEnabled is true
+	// 2. OnRestartValidateParentChain is false (parent validation requires in-memory for small datasets)
+	if b.settings.BlockAssembly.UnminedTxDiskSortEnabled && !b.settings.BlockAssembly.OnRestartValidateParentChain {
+		b.logger.Infof("[loadUnminedTransactions] using disk-based sorting to reduce RAM usage")
+		return b.loadUnminedTransactionsWithDiskSort(ctx, fullScan)
+	}
+
 	scanHeaders := uint64(1000)
 
 	if !fullScan {
@@ -2227,6 +2236,296 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		} else {
 			b.logger.Infof("[BlockAssembler] unlocked %d previously locked unmined transactions", len(lockedTransactions))
 		}
+	}
+
+	return nil
+}
+
+// sortEntry is a lightweight in-memory structure for sorting.
+// Only 12 bytes per transaction instead of full UnminedTransaction.
+type sortEntry struct {
+	CreatedAt int32  // 4 bytes - sort key
+	Sequence  uint64 // 8 bytes - key to retrieve from temp store
+}
+
+// loadUnminedTransactionsWithDiskSort loads unmined transactions using disk-based sorting
+// to reduce RAM usage. Instead of loading all transaction data into memory, it:
+// 1. Writes transaction data to BadgerDB temp storage
+// 2. Keeps only minimal sort entries (12 bytes each) in memory
+// 3. Sorts in memory by CreatedAt
+// 4. Reads back from disk in sorted order
+func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context, fullScan bool) error {
+	scanHeaders := uint64(1000)
+
+	if !fullScan {
+		// Wait for the unmined_since index to be ready
+		if indexWaiter, ok := b.utxoStore.(interface {
+			WaitForIndexReady(ctx context.Context, indexName string) error
+		}); ok {
+			indexName := "unminedSinceIndex"
+			prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(0)
+
+			start := time.Now()
+			err := indexWaiter.WaitForIndexReady(ctx, indexName)
+
+			duration := time.Since(start).Seconds()
+			if err != nil {
+				b.logger.Warnf("[BlockAssembler] failed to wait for unmined_since index: %v", err)
+				prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(2)
+				prometheusBlockAssemblerUtxoIndexWaitDuration.WithLabelValues(indexName, "error").Observe(duration)
+			} else {
+				prometheusBlockAssemblerUtxoIndexReady.WithLabelValues(indexName).Set(1)
+				prometheusBlockAssemblerUtxoIndexWaitDuration.WithLabelValues(indexName, "success").Observe(duration)
+			}
+		} else {
+			b.logger.Warnf("[BlockAssembler] utxo store does not support WaitForIndexReady")
+			prometheusBlockAssemblerUtxoIndexWaitDuration.WithLabelValues("unminedSinceIndex", "skipped").Observe(0)
+		}
+	} else {
+		_, bestBlockHeaderMeta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+		if err != nil {
+			return errors.NewProcessingError("error getting best block header meta", err)
+		}
+
+		if bestBlockHeaderMeta.Height > 0 {
+			scanHeaders = uint64(bestBlockHeaderMeta.Height)
+		} else {
+			scanHeaders = 1000
+		}
+
+		b.logger.Infof("[BlockAssembler] doing full scan of unmined transactions, scanning last %d headers", scanHeaders)
+	}
+
+	bestBlockHeader, _ := b.CurrentBlock()
+	bestBlockHeaderIDs, err := b.blockchainClient.GetBlockHeaderIDs(ctx, bestBlockHeader.Hash(), scanHeaders)
+	if err != nil {
+		return errors.NewProcessingError("error getting best block headers", err)
+	}
+
+	bestBlockHeaderIDsMap := make(map[uint32]bool, len(bestBlockHeaderIDs))
+	for _, id := range bestBlockHeaderIDs {
+		bestBlockHeaderIDsMap[id] = true
+	}
+
+	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] requesting unmined tx iterator from UTXO store (fullScan=%t)", fullScan)
+	fullScanLabel := "false"
+	if fullScan {
+		fullScanLabel = "true"
+	}
+	start := time.Now()
+	it, err := b.utxoStore.GetUnminedTxIterator(fullScan)
+	duration := time.Since(start).Seconds()
+	if err != nil {
+		prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues(fullScanLabel, "error").Observe(duration)
+		return errors.NewProcessingError("error getting unmined tx iterator", err)
+	}
+	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues(fullScanLabel, "success").Observe(duration)
+	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] successfully created unmined tx iterator")
+
+	// Create temporary BadgerDB store
+	tempStore, err := tempstore.New(tempstore.Options{
+		BasePath: b.settings.BlockAssembly.UnminedTxDiskSortPath,
+		Prefix:   "unmined-sort",
+	})
+	if err != nil {
+		return errors.NewProcessingError("error creating temp store for disk-based sorting", err)
+	}
+	defer func() {
+		if closeErr := tempStore.Close(); closeErr != nil {
+			b.logger.Warnf("[loadUnminedTransactionsWithDiskSort] error closing temp store: %v", closeErr)
+		}
+	}()
+
+	// Lightweight sort entries - only 12 bytes per tx
+	sortEntries := make([]sortEntry, 0, 1024*1024)
+	lockedTransactions := make([]chainhash.Hash, 0, 1024)
+	markAsMinedOnLongestChain := make([]chainhash.Hash, 0, 1024)
+
+	iteratorStart := time.Now()
+	var sequence uint64
+	totalProcessed := atomic.Int64{}
+	skippedCount := atomic.Int64{}
+	alreadyMinedCount := atomic.Int64{}
+	lockedCount := atomic.Int64{}
+
+	// Write batch for efficient disk writes
+	writeBatch := tempStore.NewWriteBatch()
+
+	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] processing unmined transactions and writing to temp store")
+
+	// Process batches from iterator
+	for {
+		batch, err := it.Next(ctx)
+		if err != nil {
+			writeBatch.Cancel()
+			return errors.NewProcessingError("error getting unmined transaction", err)
+		}
+
+		if batch == nil || len(batch) == 0 {
+			break
+		}
+
+		for _, unminedTx := range batch {
+			totalProcessed.Add(1)
+
+			if unminedTx.Skip {
+				skippedCount.Add(1)
+				continue
+			}
+
+			if len(unminedTx.BlockIDs) > 0 {
+				skipAlreadyMined := false
+				for _, blockID := range unminedTx.BlockIDs {
+					if bestBlockHeaderIDsMap[blockID] {
+						skipAlreadyMined = true
+						break
+					}
+				}
+
+				if skipAlreadyMined {
+					alreadyMinedCount.Add(1)
+					if unminedTx.UnminedSince > 0 {
+						markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, unminedTx.Node.Hash)
+					}
+					continue
+				}
+			}
+
+			// Serialize and write to temp store
+			txData, serErr := utxo.SerializeUnminedTransaction(unminedTx)
+			if serErr != nil {
+				writeBatch.Cancel()
+				return errors.NewProcessingError("error serializing unmined transaction", serErr)
+			}
+
+			// Use sequence number as key (8 bytes, big-endian for lexicographic ordering)
+			key := make([]byte, 8)
+			binary.BigEndian.PutUint64(key, sequence)
+
+			if setErr := writeBatch.Set(key, txData); setErr != nil {
+				writeBatch.Cancel()
+				return errors.NewProcessingError("error writing to temp store", setErr)
+			}
+
+			// Add lightweight sort entry
+			sortEntries = append(sortEntries, sortEntry{
+				CreatedAt: int32(unminedTx.CreatedAt),
+				Sequence:  sequence,
+			})
+
+			if unminedTx.Locked {
+				lockedTransactions = append(lockedTransactions, unminedTx.Node.Hash)
+				lockedCount.Add(1)
+			}
+
+			sequence++
+
+			// Flush batch periodically to prevent memory buildup
+			if writeBatch.Count() >= 10000 {
+				if flushErr := writeBatch.Flush(); flushErr != nil {
+					return errors.NewProcessingError("error flushing temp store batch", flushErr)
+				}
+			}
+		}
+
+		if totalProcessed.Load()%100_000 == 0 {
+			b.logger.Infof("[loadUnminedTransactionsWithDiskSort] processed %d unmined transactions so far", totalProcessed.Load())
+		}
+	}
+
+	// Flush any remaining writes
+	if flushErr := writeBatch.Flush(); flushErr != nil {
+		return errors.NewProcessingError("error flushing final temp store batch", flushErr)
+	}
+
+	iteratorDuration := time.Since(iteratorStart).Seconds()
+	prometheusBlockAssemblerIteratorProcessingTime.WithLabelValues(fullScanLabel).Observe(iteratorDuration)
+	prometheusBlockAssemblerIteratorTransactionsTotal.WithLabelValues(fullScanLabel).Add(float64(totalProcessed.Load()))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "skipped").Add(float64(skippedCount.Load()))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "already_mined").Add(float64(alreadyMinedCount.Load()))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "locked").Add(float64(lockedCount.Load()))
+	prometheusBlockAssemblerIteratorTransactionsStats.WithLabelValues(fullScanLabel, "added").Add(float64(len(sortEntries)))
+
+	// Fix data inconsistencies
+	if len(markAsMinedOnLongestChain) > 0 {
+		markStart := time.Now()
+		if err = b.utxoStore.MarkTransactionsOnLongestChain(ctx, markAsMinedOnLongestChain, true); err != nil {
+			return errors.NewProcessingError("error marking transactions as mined on longest chain", err)
+		}
+		prometheusBlockAssemblerMarkTransactionsTime.Observe(time.Since(markStart).Seconds())
+		prometheusBlockAssemblerMarkTransactionsCount.Add(float64(len(markAsMinedOnLongestChain)))
+
+		b.logger.Infof("[BlockAssembler] fixed %d transactions with inconsistent unmined_since", len(markAsMinedOnLongestChain))
+	}
+
+	// Sort the lightweight entries in memory
+	sortStart := time.Now()
+	sort.Slice(sortEntries, func(i, j int) bool {
+		return sortEntries[i].CreatedAt < sortEntries[j].CreatedAt
+	})
+	txCount := len(sortEntries)
+	var countBucket string
+	switch {
+	case txCount < 1000:
+		countBucket = "<1k"
+	case txCount < 10000:
+		countBucket = "1k-10k"
+	case txCount < 100000:
+		countBucket = "10k-100k"
+	case txCount < 1000000:
+		countBucket = "100k-1M"
+	default:
+		countBucket = ">1M"
+	}
+	prometheusBlockAssemblerSortTransactionsTime.WithLabelValues(countBucket).Observe(time.Since(sortStart).Seconds())
+
+	b.logger.Infof("[BlockAssembler] loaded %d unmined transactions into temp store (total processed: %d, skipped: %d, already mined: %d, locked: %d)",
+		len(sortEntries), totalProcessed.Load(), skippedCount.Load(), alreadyMinedCount.Load(), lockedCount.Load())
+
+	b.logger.Infof("[loadUnminedTransactionsWithDiskSort] reading back transactions in sorted order and adding to subtree processor")
+
+	// Read back in sorted order and add to subtree processor
+	batchStart := time.Now()
+	addStart := time.Now()
+	addTxs := float64(0)
+
+	for idx, entry := range sortEntries {
+		// Get transaction data from temp store
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, entry.Sequence)
+
+		txData, getErr := tempStore.Get(key)
+		if getErr != nil {
+			return errors.NewProcessingError("error reading from temp store", getErr)
+		}
+
+		unminedTx, deserErr := utxo.DeserializeUnminedTransaction(txData)
+		if deserErr != nil {
+			return errors.NewProcessingError("error deserializing unmined transaction", deserErr)
+		}
+
+		if err = b.subtreeProcessor.AddDirectly(unminedTx.Node, unminedTx.TxInpoints, true); err != nil {
+			return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
+		}
+
+		if (idx+1)%10_000 == 0 {
+			prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
+			prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
+			addStart = time.Now()
+			addTxs = 0
+		}
+
+		addTxs++
+	}
+
+	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
+
+	// Unlock any locked transactions
+	if len(lockedTransactions) > 0 {
+		if err = b.utxoStore.SetLocked(ctx, lockedTransactions, false); err != nil {
+			return errors.NewProcessingError("[BlockAssembler] failed to unlock %d unmined transactions: %v", len(lockedTransactions), err)
+		}
+		b.logger.Infof("[BlockAssembler] unlocked %d previously locked unmined transactions", len(lockedTransactions))
 	}
 
 	return nil

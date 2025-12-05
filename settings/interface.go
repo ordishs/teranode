@@ -252,6 +252,13 @@ type BlockAssemblySettings struct {
 	ParentValidationBatchSize            int
 	OnRestartRemoveInvalidParentChainTxs bool
 	UseColumnarBatch                     bool
+	// UnminedTxDiskSortPath is the base path for temporary storage during disk-based sorting
+	// of unmined transactions. If empty, os.TempDir() is used.
+	UnminedTxDiskSortPath string
+	// UnminedTxDiskSortEnabled enables disk-based sorting to reduce RAM usage when loading
+	// unmined transactions. When disabled or when OnRestartValidateParentChain is enabled,
+	// the original in-memory approach is used.
+	UnminedTxDiskSortEnabled bool
 	// GetMiningCandidate timeouts
 	GetMiningCandidateSendTimeout     time.Duration // Timeout when sending request on internal channel (default: 1s)
 	GetMiningCandidateResponseTimeout time.Duration // Timeout waiting for mining candidate response (default: 10s)
