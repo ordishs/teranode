@@ -16,8 +16,8 @@ package settings
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
-	"sort"
 	"strings"
 
 	"github.com/bsv-blockchain/teranode/settings"
@@ -26,12 +26,13 @@ import (
 )
 
 // marshalSortedJSON marshals a struct to JSON with sorted keys at all levels.
-// It recursively sorts struct fields and string slices alphabetically.
+// It recursively sorts struct fields alphabetically but leaves arrays/slices unchanged.
 func marshalSortedJSON(v interface{}, indent string) ([]byte, error) {
-	return json.MarshalIndent(sortValue(v), "", indent)
+	sorted := sortValue(v)
+	return json.MarshalIndent(sorted, "", indent)
 }
 
-// sortValue recursively sorts struct fields and string slices
+// sortValue recursively sorts struct fields but leaves slices/arrays unchanged
 func sortValue(v interface{}) interface{} {
 	if v == nil {
 		return nil
@@ -39,6 +40,35 @@ func sortValue(v interface{}) interface{} {
 
 	val := reflect.ValueOf(v)
 	typ := reflect.TypeOf(v)
+
+	// Check if the type implements json.Marshaler - if so, preserve it as-is
+	// to maintain custom JSON marshaling behavior (like hash types that output as hex strings)
+	if _, ok := v.(json.Marshaler); ok {
+		return v
+	}
+
+	// Also check if pointer to this type implements json.Marshaler
+	if val.CanAddr() {
+		if _, ok := val.Addr().Interface().(json.Marshaler); ok {
+			return v
+		}
+	}
+
+	// Additional check: if the pointer type implements json.Marshaler, create a pointer
+	// This matches Go's JSON marshaling behavior which automatically takes addresses when needed
+	ptrType := reflect.PtrTo(typ)
+	if ptrType.Implements(reflect.TypeOf((*json.Marshaler)(nil)).Elem()) {
+		// Create a new pointer to this value to enable custom marshaling
+		newVal := reflect.New(typ)
+		newVal.Elem().Set(val)
+		return newVal.Interface()
+	}
+
+	// Check if this type has a method set that implements json.Marshaler
+	// This handles cases where the interface check above might fail
+	if typ.Implements(reflect.TypeOf((*json.Marshaler)(nil)).Elem()) {
+		return v
+	}
 
 	// Handle pointers
 	if val.Kind() == reflect.Ptr {
@@ -48,23 +78,37 @@ func sortValue(v interface{}) interface{} {
 		return sortValue(val.Elem().Interface())
 	}
 
-	// Handle slices
+	// Handle arrays - preserve byte arrays as-is for potential hex encoding
+	if val.Kind() == reflect.Array {
+		// Special case: byte arrays (like [32]byte hashes) should be preserved as-is
+		if val.Type().Elem().Kind() == reflect.Uint8 {
+			return v
+		}
+
+		// For other arrays, recursively process elements but don't sort the array itself
+		result := make([]interface{}, val.Len())
+		for i := 0; i < val.Len(); i++ {
+			result[i] = sortValue(val.Index(i).Interface())
+		}
+		return result
+	}
+
+	// Handle slices - leave them unchanged, only process nested structs
 	if val.Kind() == reflect.Slice {
 		if val.Len() == 0 {
 			return v
 		}
 
-		// For string slices, sort them
-		if val.Type().Elem().Kind() == reflect.String {
-			sorted := make([]string, val.Len())
+		// Special case: convert byte slices to hex strings instead of base64
+		if val.Type().Elem().Kind() == reflect.Uint8 {
+			bytes := make([]byte, val.Len())
 			for i := 0; i < val.Len(); i++ {
-				sorted[i] = val.Index(i).String()
+				bytes[i] = uint8(val.Index(i).Uint())
 			}
-			sort.Strings(sorted)
-			return sorted
+			return fmt.Sprintf("%x", bytes)
 		}
 
-		// For other slices, recursively sort elements
+		// For other slices, recursively process elements but don't sort the slice itself
 		result := make([]interface{}, val.Len())
 		for i := 0; i < val.Len(); i++ {
 			result[i] = sortValue(val.Index(i).Interface())
