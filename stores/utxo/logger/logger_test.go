@@ -172,12 +172,12 @@ type MockIterator struct {
 	mock.Mock
 }
 
-func (m *MockIterator) Next(ctx context.Context) (*utxo.UnminedTransaction, error) {
+func (m *MockIterator) Next(ctx context.Context) ([]*utxo.UnminedTransaction, error) {
 	args := m.Called(ctx)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
-	return args.Get(0).(*utxo.UnminedTransaction), args.Error(1)
+	return args.Get(0).([]*utxo.UnminedTransaction), args.Error(1)
 }
 
 func (m *MockIterator) Err() error {

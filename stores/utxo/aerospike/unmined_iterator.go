@@ -44,11 +44,102 @@ type unminedTxIterator struct {
 //   - *unminedTxIterator: A new iterator instance ready for use
 //   - error: Any error encountered during iterator initialization
 func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, error) {
-	stmt := as.NewStatement(store.namespace, store.setName)
+	return newUnminedTxIteratorWithPartitions(store, fullScan, runtime.NumCPU())
+}
 
-	if !fullScan {
+// newUnminedTxIteratorWithPartitions creates a new iterator with configurable partition parallelism.
+// It launches multiple concurrent Aerospike partition queries to maximize throughput.
+// Each partition query processes its records directly into batches on the result channel,
+// avoiding intermediate merging for better performance.
+//
+// Parameters:
+//   - store: The Aerospike store instance to iterate over
+//   - fullScan: If true, performs a full scan of all records; if false, applies a filter
+//   - numPartitionQueries: Number of parallel partition queries to run (each handles 4096/n partitions)
+//
+// Returns:
+//   - *unminedTxIterator: A new iterator instance ready for use
+//   - error: Any error encountered during iterator initialization
+func newUnminedTxIteratorWithPartitions(store *Store, fullScan bool, numPartitionQueries int) (*unminedTxIterator, error) {
+	const totalPartitions = 4096 // Aerospike has 4096 partitions
+
+	// Ensure at least 1 partition query
+	if numPartitionQueries < 1 {
+		numPartitionQueries = 1
+	}
+	// Cap at total partitions
+	if numPartitionQueries > totalPartitions {
+		numPartitionQueries = totalPartitions
+	}
+
+	// Calculate partitions per query
+	partitionsPerQuery := totalPartitions / numPartitionQueries
+	remainingPartitions := totalPartitions % numPartitionQueries
+
+	policy := util.GetAerospikeQueryPolicy(store.settings)
+	policy.IncludeBinData = true
+	// Distribute queue size across partition queries
+	policy.RecordQueueSize = (10 * 1024 * 1024) / numPartitionQueries
+	if policy.RecordQueueSize < 1024 {
+		policy.RecordQueueSize = 1024
+	}
+
+	// Create context for workers
+	workerCtx, cancel := context.WithCancel(context.Background())
+
+	// Buffer size for result channel - each partition query writes batches directly
+	// With numPartitionQueries workers each potentially buffering a batch
+	resultChanSize := numPartitionQueries * 2
+
+	it := &unminedTxIterator{
+		store:         store,
+		fullScan:      fullScan,
+		resultChan:    make(chan []*utxo.UnminedTransaction, resultChanSize),
+		errorChan:     make(chan error, numPartitionQueries), // One error slot per partition query
+		cancelWorkers: cancel,
+	}
+
+	store.logger.Infof("[newUnminedTxIterator] Starting %d parallel Aerospike partition queries for unmined transactions (fullScan=%t)", numPartitionQueries, fullScan)
+
+	// Launch partition queries - each processes directly into result channel
+	partitionStart := 0
+	for i := 0; i < numPartitionQueries; i++ {
+		// Calculate partition range for this query
+		partitionCount := partitionsPerQuery
+		if i < remainingPartitions {
+			partitionCount++ // Distribute remaining partitions
+		}
+
+		it.wg.Add(1)
+		go it.partitionWorker(workerCtx, policy, partitionStart, partitionCount)
+
+		partitionStart += partitionCount
+	}
+
+	store.logger.Infof("[newUnminedTxIterator] Aerospike partition queries started successfully")
+
+	// Start a goroutine to close channels after all partition workers finish
+	go func() {
+		it.wg.Wait()
+		close(it.resultChan)
+		close(it.errorChan)
+	}()
+
+	return it, nil
+}
+
+// partitionWorker processes a range of Aerospike partitions and writes batches directly to resultChan
+func (it *unminedTxIterator) partitionWorker(ctx context.Context, policy *as.QueryPolicy, partitionStart, partitionCount int) {
+	defer it.wg.Done()
+
+	stmt := as.NewStatement(it.store.namespace, it.store.setName)
+	if !it.fullScan {
 		if err := stmt.SetFilter(as.NewRangeFilter(fields.UnminedSince.String(), 1, int64(math.MaxUint32))); err != nil {
-			return nil, err
+			select {
+			case it.errorChan <- err:
+			default:
+			}
+			return
 		}
 	}
 
@@ -67,61 +158,26 @@ func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, erro
 		fields.IsCoinbase.String(),
 	}
 
-	policy := util.GetAerospikeQueryPolicy(store.settings)
-	policy.IncludeBinData = true
-	policy.RecordQueueSize = 10 * 1024 * 1024 // 10MB queue for better throughput
+	// Create partition filter for this range
+	partitionFilter := as.NewPartitionFilterByRange(partitionStart, partitionCount)
 
-	store.logger.Infof("[newUnminedTxIterator] Starting Aerospike query for unmined transactions (fullScan=%t)", fullScan)
-	recordset, err := store.client.Query(policy, stmt)
+	recordset, err := it.store.client.QueryPartitions(policy, stmt, partitionFilter)
 	if err != nil {
-		store.logger.Errorf("[newUnminedTxIterator] Aerospike query failed: %v", err)
-		return nil, err
+		it.store.logger.Errorf("[partitionWorker] Aerospike partition query failed (partitions %d-%d): %v", partitionStart, partitionStart+partitionCount-1, err)
+		select {
+		case it.errorChan <- err:
+		default:
+		}
+		return
 	}
-	store.logger.Infof("[newUnminedTxIterator] Aerospike query completed successfully")
+	defer recordset.Close()
 
-	// Create context for workers
-	workerCtx, cancel := context.WithCancel(context.Background())
-
-	// Calculate optimal number of workers (use half the CPUs)
-	numWorkers := runtime.NumCPU() / 2
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-
-	// Buffer size for batch channel - smaller since each item is a batch
-	// With batches of 16K items, 16 buffers = 256K items buffered
-	resultChanSize := numWorkers * 2
-
-	it := &unminedTxIterator{
-		store:         store,
-		fullScan:      fullScan,
-		recordset:     recordset,
-		resultChan:    make(chan []*utxo.UnminedTransaction, resultChanSize),
-		errorChan:     make(chan error, 1),
-		cancelWorkers: cancel,
-	}
-
-	// Start worker goroutines
-	result := recordset.Results()
-	for i := 0; i < numWorkers; i++ {
-		it.wg.Add(1)
-		go it.worker(workerCtx, result)
-	}
-
-	// Start a goroutine to close resultChan after all workers finish
-	go func() {
-		it.wg.Wait()
-		close(it.resultChan)
-		close(it.errorChan)
-	}()
-
-	return it, nil
+	// Process records directly into batches
+	it.processRecordset(ctx, recordset.Results())
 }
 
-// worker processes records from Aerospike in parallel
-func (it *unminedTxIterator) worker(ctx context.Context, result <-chan *as.Result) {
-	defer it.wg.Done()
-
+// processRecordset processes records from a recordset and writes batches to resultChan
+func (it *unminedTxIterator) processRecordset(ctx context.Context, results <-chan *as.Result) {
 	const (
 		batchSize          = 16 * 1024
 		contextCheckPeriod = 16 * 1024
@@ -170,13 +226,16 @@ func (it *unminedTxIterator) worker(ctx context.Context, result <-chan *as.Resul
 		}
 
 		// Read from result channel without select for performance
-		rec, ok := <-result
+		rec, ok := <-results
 		if !ok || rec == nil {
 			return
 		}
 
 		if rec.Err != nil {
-			it.errorChan <- rec.Err
+			select {
+			case it.errorChan <- rec.Err:
+			default:
+			}
 			return
 		}
 
@@ -202,7 +261,10 @@ func (it *unminedTxIterator) worker(ctx context.Context, result <-chan *as.Resul
 		// Process the record
 		unminedTx, err := it.processRecord(ctx, rec.Record.Bins)
 		if err != nil {
-			it.errorChan <- err
+			select {
+			case it.errorChan <- err:
+			default:
+			}
 			return
 		}
 

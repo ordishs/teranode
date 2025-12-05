@@ -300,7 +300,7 @@ func Test_Next_EdgeCases(t *testing.T) {
 
 	t.Run("ChannelClosed", func(t *testing.T) {
 		// Create a closed channel to simulate end of iteration
-		resultChan := make(chan *utxo.UnminedTransaction)
+		resultChan := make(chan []*utxo.UnminedTransaction)
 		close(resultChan)
 
 		errorChan := make(chan error, 1)
