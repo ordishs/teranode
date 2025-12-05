@@ -67,8 +67,9 @@ func setupCommand(name string) *Command {
 		FlagSet:     flag.NewFlagSet(name, flag.ExitOnError),
 	}
 
-	// Add common help flag to all commands
+	// Add common help and printSettings flag to all commands
 	cmd.FlagSet.Bool("help", false, "Show help for this command")
+	cmd.FlagSet.Bool("printSettings", false, "Print settings")
 
 	return cmd
 }
@@ -197,6 +198,7 @@ func Start(args []string, version, commit string) {
 		hash := cmd.FlagSet.String("hash", "", "Hash of the UTXO set / headers to process.")
 		skipHeaders := cmd.FlagSet.Bool("skipHeaders", false, "Skip processing headers.")
 		skipUTXOs := cmd.FlagSet.Bool("skipUTXOs", false, "Skip processing UTXOs.")
+		force := cmd.FlagSet.Bool("force", false, "Force processing even if lastProcessed.dat exists.")
 		cmd.Execute = func(args []string) error {
 			if *inputDir == "" {
 				return errors.NewProcessingError("Please provide an inputDir")
@@ -206,7 +208,7 @@ func Start(args []string, version, commit string) {
 				return errors.NewProcessingError("Please provide a hash")
 			}
 
-			seeder.Seeder(logger, tSettings, *inputDir, *hash, *skipHeaders, *skipUTXOs)
+			seeder.Seeder(logger, tSettings, *inputDir, *hash, *skipHeaders, *skipUTXOs, *force)
 
 			return nil
 		}
@@ -443,6 +445,10 @@ func Start(args []string, version, commit string) {
 		fmt.Printf("Usage of %s:\n", cmd.Name)
 		cmd.FlagSet.PrintDefaults()
 		os.Exit(0)
+	}
+
+	if printSettings := cmd.FlagSet.Lookup("printSettings"); printSettings != nil && printSettings.Value.String() == "true" {
+		cmdSettings.PrintSettings(logger, tSettings, version, commit)
 	}
 
 	// Execute the command

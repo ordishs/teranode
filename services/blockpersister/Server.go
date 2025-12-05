@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockpersister/state"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -383,6 +385,17 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 			return errors.NewConfigurationError("blockstore setting error")
 		}
 
+		var err error
+
+		hashPrefix := -2
+
+		if blockStoreURL.Query().Get("hashPrefix") != "" {
+			hashPrefix, err = strconv.Atoi(blockStoreURL.Query().Get("hashPrefix"))
+			if err != nil {
+				return errors.NewConfigurationError("failed to parse hashPrefix", err)
+			}
+		}
+
 		// Get listener using util.GetListener
 		listener, address, _, err := util.GetListener(u.settings.Context, "blockpersister", "http://", blockPersisterHTTPListenAddress)
 		if err != nil {
@@ -391,7 +404,7 @@ func (u *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 		u.logger.Infof("[BlockPersister] HTTP server listening on %s", address)
 
-		blobStoreServer, err := blob.NewHTTPBlobServer(u.logger, blockStoreURL)
+		blobStoreServer, err := blob.NewHTTPBlobServer(u.logger, blockStoreURL, options.WithHashPrefix(hashPrefix))
 		if err != nil {
 			return errors.NewServiceError("failed to create blob store server", err)
 		}
