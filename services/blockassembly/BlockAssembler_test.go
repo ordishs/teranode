@@ -1962,7 +1962,7 @@ func TestBlockAssembly_Start_InitStateFailures(t *testing.T) {
 		mockUtxoStore := &utxoStore.MockUtxostore{}
 
 		// Create a simple mock iterator that returns no transactions
-		mockIterator := &utxoStore.MockUnminedTxIterator{}
+		mockIterator := utxoStore.MockUnminedTxIterator{}
 		mockUtxoStore.On("GetUnminedTxIterator").Return(mockIterator, nil)
 		mockUtxoStore.On("SetBlockHeight", mock.Anything).Return(nil)
 
