@@ -148,6 +148,7 @@ type AerospikeSettings struct {
 	StoreBatcherDuration            time.Duration
 	StatsRefreshDuration            time.Duration
 	EnableSetMinedFilterExpressions bool
+	EnableSpendFilterExpressions    bool
 	UseSeparateUDFMinedModule       bool
 	SeparateSpendUDFModuleCount     int
 }

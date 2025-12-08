@@ -143,6 +143,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			WarmUp:                          getBool("aerospike_warmUp", true, alternativeContext...),
 			StoreBatcherDuration:            getDuration("aerospike_storeBatcherDuration", 10*time.Millisecond, alternativeContext...),
 			StatsRefreshDuration:            getDuration("aerospike_statsRefresh", 5*time.Second, alternativeContext...),
+			EnableSpendFilterExpressions:    getBool("aerospike_enable_spend_filter_expressions", false, alternativeContext...),
 			EnableSetMinedFilterExpressions: getBool("aerospike_enable_setmined_filter_expressions", false, alternativeContext...),
 			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
 			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
@@ -234,10 +235,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UnminedTxDiskSortPath:                getString("blockassembly_unminedTxDiskSortPath", "", alternativeContext...),
 			UnminedTxDiskSortEnabled:             getBool("blockassembly_unminedTxDiskSortEnabled", true, alternativeContext...),
 			// getMiningCandidate timeout settings
-			GetMiningCandidateSendTimeout:       getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
-			GetMiningCandidateResponseTimeout:   getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
-			SubtreeAnnouncementInterval:         getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
-			ParallelSetIfNotExistsThreshold:     getInt("blockassembly_parallelSetIfNotExistsThreshold", 10_000, alternativeContext...),
+			GetMiningCandidateSendTimeout:     getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
+			GetMiningCandidateResponseTimeout: getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
+			SubtreeAnnouncementInterval:       getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
+			ParallelSetIfNotExistsThreshold:   getInt("blockassembly_parallelSetIfNotExistsThreshold", 10_000, alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{

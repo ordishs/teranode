@@ -43,7 +43,7 @@ import (
 	"github.com/ordishs/gocore"
 )
 
-const confirmations = 1 // 100
+const confirmations = 100
 
 // Server manages the UTXO persistence operations.
 // It coordinates the processing of blocks, extraction of UTXOs, and their persistent storage.

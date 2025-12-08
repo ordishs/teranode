@@ -454,15 +454,21 @@ type keyIgnoreLocked struct {
 	ignoreLocked      bool
 }
 
-// sendSpendBatchLua processes a batch of spend requests via Lua scripts.
+// sendSpendBatchLua processes a batch of spend requests via Lua scripts or expressions.
 // The function:
 //  1. Groups spends by transaction
-//  2. Creates batch UDF operations
-//  3. Executes Lua scripts
+//  2. Creates batch UDF operations or expression-based operations
+//  3. Executes Lua scripts or expressions
 //  4. Handles responses and errors
 //  5. Manages DAH settings
 //  6. Updates external storage
 func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
+	// Use expression-based implementation if enabled
+	if s.settings.Aerospike.EnableSpendFilterExpressions {
+		s.SpendMultiWithExpressions(s.ctx, batch)
+		return
+	}
+
 	start := time.Now()
 	stat := gocore.NewStat("sendSpendBatchLua")
 
