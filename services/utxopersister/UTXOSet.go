@@ -765,11 +765,21 @@ func WriteHeadersToStore(ctx context.Context, logger ulogger.Logger, settings *s
 			return errors.NewStorageError("failed to get block header for hash %s", currentHash.String(), err)
 		}
 
+		// Try to get the full block to extract the coinbase transaction
+		var coinbaseTx *bt.Tx
+		block, _, err := blockchainStore.GetBlock(ctx, currentHash)
+		if err != nil {
+			logger.Warnf("[WriteHeadersToStore] Could not get block %s to extract coinbase tx: %v", currentHash.String(), err)
+		} else if block != nil {
+			coinbaseTx = block.CoinbaseTx
+		}
+
 		blockIndex := &BlockIndex{
 			Hash:        currentHash,
 			Height:      meta.Height,
 			TxCount:     meta.TxCount,
 			BlockHeader: header,
+			CoinbaseTx:  coinbaseTx,
 		}
 
 		allBlocks[*currentHash] = blockIndex
@@ -794,6 +804,7 @@ func WriteHeadersToStore(ctx context.Context, logger ulogger.Logger, settings *s
 		return blocks[i].Height < blocks[j].Height
 	})
 
+	// Use FileStorer which will automatically use the V2 magic header
 	storer, err := filestorer.NewFileStorer(ctx, logger, settings, blobStore, tipHash[:], fileformat.FileTypeUtxoHeaders)
 	if err != nil {
 		return errors.NewStorageError("error creating utxo-headers file", err)
