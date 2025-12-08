@@ -471,6 +471,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			OrphanageMaxSize:                          getInt("subtreevalidation_orphanageMaxSize", 100_000, alternativeContext...),
 			CheckBlockSubtreesConcurrency:             getInt("subtreevalidation_check_block_subtrees_concurrency", 32, alternativeContext...),
 			PauseTimeout:                              getDuration("subtreevalidation_pauseTimeout", 5*time.Minute, alternativeContext...),
+			UseStreamingProcessor:                     getBool("subtreevalidation_useStreamingProcessor", true, alternativeContext...),
 		},
 		Legacy: LegacySettings{
 			WorkingDir:                       getString("legacy_workingDir", "../../data", alternativeContext...),
