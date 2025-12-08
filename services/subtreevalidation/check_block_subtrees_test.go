@@ -37,381 +37,408 @@ func TestCheckBlockSubtrees(t *testing.T) {
 	// Create test headers
 	testHeaders := testhelpers.CreateTestHeaders(t, 1)
 
-	t.Run("EmptyBlock", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Mock blockchain client
-		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-			mock.Anything).
-			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-
-		// Create a block with no subtrees using proper model construction
-		header := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{},
-			Nonce:          0,
-		}
-
-		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{}, 1, 250, 0, 0)
-		require.NoError(t, err)
-
-		blockBytes, err := block.Bytes()
-		require.NoError(t, err)
-
-		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-			Block:   blockBytes,
-			BaseUrl: "http://test.com",
-		}
-
-		response, err := server.CheckBlockSubtrees(context.Background(), request)
-		require.NoError(t, err)
-		assert.True(t, response.Blessed)
-	})
-
-	t.Run("WithSubtrees", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Mock blockchain client
-		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-			mock.Anything).
-			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-
-		// Create test transactions
-		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-		require.NoError(t, err)
-
-		tx2, err := createTestTransaction("6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4")
-		require.NoError(t, err)
-
-		// Create subtree with test transactions
-		subtreeHash := chainhash.Hash{}
-		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
-
-		// Store subtreeData containing the transactions
-		subtreeData := bytes.Buffer{}
-		// Write transactions in the format expected by readTransactionsFromSubtreeDataStream
-		subtreeData.Write(tx1.Bytes())
-		subtreeData.Write(tx2.Bytes())
-
-		err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
-		require.NoError(t, err)
-
-		// Mark the subtree as already validated to avoid calling ValidateSubtreeInternal
-		err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtree, []byte("validated"))
-		require.NoError(t, err)
-
-		// Create a block with subtrees using proper model construction
-		header := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{},
-			Nonce:          0,
-		}
-
-		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 2, 500, 0, 0)
-		require.NoError(t, err)
-
-		blockBytes, err := block.Bytes()
-		require.NoError(t, err)
-
-		// Mock UTXO store Create method
-		server.utxoStore.(*utxo.MockUtxostore).On("Create",
-			mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(&utxometa.Data{}, nil)
-
-		// Mock validator to return success - set up the validator client to succeed
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-
-		// Mock blockchain client
-		server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
-			mock.Anything, mock.Anything, mock.Anything).
-			Return([]uint32{1, 2, 3}, nil)
-
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(true, nil)
-
-		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-			Block:   blockBytes,
-			BaseUrl: "http://test.com",
-		}
-
-		response, err := server.CheckBlockSubtrees(context.Background(), request)
-		require.NoError(t, err)
-		assert.True(t, response.Blessed)
-	})
-
-	t.Run("InvalidBlockData", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Create request with invalid block data
-		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-			Block:   []byte("invalid block data"),
-			BaseUrl: "http://test.com",
-		}
-
-		response, err := server.CheckBlockSubtrees(context.Background(), request)
-		require.Error(t, err)
-		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to get block from blockchain client")
-	})
-
-	t.Run("BlockchainClientError", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Mock blockchain client
-		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-			mock.Anything).
-			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
-
-		// Create test transactions and store them
-		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-		require.NoError(t, err)
-
-		// Create subtree with test transactions
-		subtree, err := subtreepkg.NewTreeByLeafCount(2)
-		require.NoError(t, err)
-
-		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
-
-		subtreeData := subtreepkg.NewSubtreeData(subtree)
-		require.NoError(t, subtreeData.AddTx(tx1, 0))
-
-		subtreeBytes, err := subtree.Serialize()
-		require.NoError(t, err)
-
-		subtreeDataBytes, err := subtreeData.Serialize()
-		require.NoError(t, err)
-
-		// Mark the subtree as already validated to avoid HTTP calls
-		err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
-		require.NoError(t, err)
-
-		err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes)
-		require.NoError(t, err)
-
-		// Create a block with subtrees
-		header := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{},
-			Nonce:          0,
-		}
-
-		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, 1, 400, 0, 0)
-		require.NoError(t, err)
-
-		blockBytes, err := block.Bytes()
-		require.NoError(t, err)
-
-		// Mock blockchain client to return error
-		server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
-			mock.Anything, mock.Anything, mock.Anything).
-			Return([]uint32{}, errors.NewServiceError("blockchain client error"))
-
-		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-			Block:   blockBytes,
-			BaseUrl: "http://localhost:8090",
-		}
-
-		response, err := server.CheckBlockSubtrees(context.Background(), request)
-		require.Error(t, err)
-		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to get block headers from blockchain client")
-	})
-
-	t.Run("HTTPFetchingPath", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Mock blockchain client
-		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-			mock.Anything).
-			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
-
-		// Create subtree hash that doesn't exist in store to trigger HTTP fetching
-		subtreeHash := chainhash.Hash{}
-		copy(subtreeHash[:], []byte("missing_subtree_hash_32_bytes_lng!"))
-
-		// Create a block with the missing subtree
-		header := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{},
-			Nonce:          0,
-		}
-
-		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 1, 400, 0, 0)
-		require.NoError(t, err)
-
-		blockBytes, err := block.Bytes()
-		require.NoError(t, err)
-
-		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-			Block:   blockBytes,
-			BaseUrl: "http://localhost8090", // This will fail HTTP request
-		}
-
-		response, err := server.CheckBlockSubtrees(context.Background(), request)
-		require.Error(t, err)
-		assert.Nil(t, response)
-		// The error message will vary depending on network conditions, but it should be a processing error
-		assert.Contains(t, err.Error(), "CheckBlockSubtreesRequest")
-	})
-
-	t.Run("SubtreeExistsError", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Mock blockchain client
-		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-			mock.Anything).
-			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
-
-		// Create a mock blob store that returns errors
-		mockBlobStore := &MockBlobStore{}
-		server.subtreeStore = mockBlobStore
-
-		// Set up the mock to return an error when checking existence
-		mockBlobStore.On("Exists", mock.Anything, mock.Anything, fileformat.FileTypeSubtree).
-			Return(false, errors.NewStorageError("storage connection failed"))
-
-		// Create a block with subtrees
-		subtreeHash := chainhash.Hash{}
-		copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
-
-		header := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{},
-			Nonce:          0,
-		}
-
-		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 1, 400, 0, 0)
-		require.NoError(t, err)
-
-		blockBytes, err := block.Bytes()
-		require.NoError(t, err)
-
-		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-			Block:   blockBytes,
-			BaseUrl: "http://test.com",
-		}
-
-		response, err := server.CheckBlockSubtrees(context.Background(), request)
-		require.Error(t, err)
-		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to check if subtree exists in store")
-	})
-
-	t.Run("PartialSubtreesExist", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Mock blockchain client
-		server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
-			mock.Anything).
-			Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
-		currentState := blockchain.FSMStateRUNNING
-		server.blockchainClient.(*blockchain.Mock).On("GetFSMCurrentState", mock.Anything).Return(&currentState, nil).Once()
-
-		// Create test transactions
-		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-		require.NoError(t, err)
-
-		tx2, err := createTestTransaction("6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4")
-		require.NoError(t, err)
-
-		missingSubtreeHash := chainhash.Hash{}
-		copy(missingSubtreeHash[:], []byte("missing_subtree_hash_32_bytes___!"))
-
-		subtree, err := subtreepkg.NewTreeByLeafCount(2)
-		require.NoError(t, err)
-
-		require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
-		require.NoError(t, subtree.AddNode(*tx2.TxIDChainHash(), 2, 2))
-
-		subtreeData := subtreepkg.NewSubtreeData(subtree)
-		require.NoError(t, subtreeData.AddTx(tx1, 0))
-		require.NoError(t, subtreeData.AddTx(tx2, 1))
-
-		subtreeBytes, err := subtree.Serialize()
-		require.NoError(t, err)
-
-		subtreeDataBytes, err := subtreeData.Serialize()
-		require.NoError(t, err)
-
-		err = server.subtreeStore.Set(context.Background(), missingSubtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
-		require.NoError(t, err)
-
-		err = server.subtreeStore.Set(context.Background(), missingSubtreeHash[:], fileformat.FileTypeSubtreeData, subtreeDataBytes)
-		require.NoError(t, err)
-
-		// Create a block with both subtrees
-		header := &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{},
-			Nonce:          0,
-		}
-
-		coinbaseTx := &bt.Tx{Version: 1}
-		block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash(), &missingSubtreeHash}, 2, 500, 0, 0)
-		require.NoError(t, err)
-
-		blockBytes, err := block.Bytes()
-		require.NoError(t, err)
-
-		// Mock UTXO store Create method
-		server.utxoStore.(*utxo.MockUtxostore).On("Create",
-			mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-			Return(&utxometa.Data{}, nil)
-
-		// Mock validator and blockchain client
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-
-		server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
-			mock.Anything, mock.Anything, mock.Anything).
-			Return([]uint32{1, 2, 3}, nil)
-
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(true, nil)
-
-		request := &subtreevalidation_api.CheckBlockSubtreesRequest{
-			Block:   blockBytes,
-			BaseUrl: "http://nonexistent-host.com",
-		}
-
-		response, err := server.CheckBlockSubtrees(context.Background(), request)
-		require.Error(t, err)
-		assert.Nil(t, response)
-		assert.Contains(t, err.Error(), "Failed to get subtree tx hashes")
-	})
+	// Run all subtests with both processor modes
+	processorModes := []struct {
+		name             string
+		useStreamingProc bool
+	}{
+		{"LevelBased", false},
+		{"Streaming", true},
+	}
+
+	for _, mode := range processorModes {
+		mode := mode // capture range variable
+		t.Run(mode.name, func(t *testing.T) {
+			t.Run("EmptyBlock", func(t *testing.T) {
+				server, cleanup := setupTestServer(t)
+				defer cleanup()
+				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+
+				// Mock blockchain client
+				server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+					mock.Anything).
+					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+				// Create a block with no subtrees using proper model construction
+				header := &model.BlockHeader{
+					Version:        1,
+					HashPrevBlock:  &chainhash.Hash{},
+					HashMerkleRoot: &chainhash.Hash{},
+					Timestamp:      uint32(time.Now().Unix()),
+					Bits:           model.NBit{},
+					Nonce:          0,
+				}
+
+				coinbaseTx := &bt.Tx{Version: 1}
+				block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{}, 1, 250, 0, 0)
+				require.NoError(t, err)
+
+				blockBytes, err := block.Bytes()
+				require.NoError(t, err)
+
+				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+					Block:   blockBytes,
+					BaseUrl: "http://test.com",
+				}
+
+				response, err := server.CheckBlockSubtrees(context.Background(), request)
+				require.NoError(t, err)
+				assert.True(t, response.Blessed)
+			})
+
+			t.Run("WithSubtrees", func(t *testing.T) {
+				server, cleanup := setupTestServer(t)
+				defer cleanup()
+				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+
+				// Mock blockchain client
+				server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+					mock.Anything).
+					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+				// Create test transactions
+				tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+				require.NoError(t, err)
+
+				tx2, err := createTestTransaction("6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4")
+				require.NoError(t, err)
+
+				// Create subtree with test transactions
+				subtreeHash := chainhash.Hash{}
+				copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
+
+				// Store subtreeData containing the transactions
+				subtreeData := bytes.Buffer{}
+				// Write transactions in the format expected by readTransactionsFromSubtreeDataStream
+				subtreeData.Write(tx1.Bytes())
+				subtreeData.Write(tx2.Bytes())
+
+				err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtreeData, subtreeData.Bytes())
+				require.NoError(t, err)
+
+				// Mark the subtree as already validated to avoid calling ValidateSubtreeInternal
+				err = server.subtreeStore.Set(context.Background(), subtreeHash[:], fileformat.FileTypeSubtree, []byte("validated"))
+				require.NoError(t, err)
+
+				// Create a block with subtrees using proper model construction
+				header := &model.BlockHeader{
+					Version:        1,
+					HashPrevBlock:  &chainhash.Hash{},
+					HashMerkleRoot: &chainhash.Hash{},
+					Timestamp:      uint32(time.Now().Unix()),
+					Bits:           model.NBit{},
+					Nonce:          0,
+				}
+
+				coinbaseTx := &bt.Tx{Version: 1}
+				block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 2, 500, 0, 0)
+				require.NoError(t, err)
+
+				blockBytes, err := block.Bytes()
+				require.NoError(t, err)
+
+				// Mock UTXO store Create method
+				server.utxoStore.(*utxo.MockUtxostore).On("Create",
+					mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(&utxometa.Data{}, nil)
+
+				// Mock validator to return success - set up the validator client to succeed
+				mockValidator := server.validatorClient.(*validator.MockValidatorClient)
+				mockValidator.UtxoStore = server.utxoStore
+
+				// Mock blockchain client
+				server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+					mock.Anything, mock.Anything, mock.Anything).
+					Return([]uint32{1, 2, 3}, nil)
+
+				server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+					mock.Anything, blockchain.FSMStateRUNNING).
+					Return(true, nil)
+
+				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+					Block:   blockBytes,
+					BaseUrl: "http://test.com",
+				}
+
+				response, err := server.CheckBlockSubtrees(context.Background(), request)
+				require.NoError(t, err)
+				assert.True(t, response.Blessed)
+			})
+
+			t.Run("InvalidBlockData", func(t *testing.T) {
+				server, cleanup := setupTestServer(t)
+				defer cleanup()
+				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+
+				// Create request with invalid block data
+				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+					Block:   []byte("invalid block data"),
+					BaseUrl: "http://test.com",
+				}
+
+				response, err := server.CheckBlockSubtrees(context.Background(), request)
+				require.Error(t, err)
+				assert.Nil(t, response)
+				assert.Contains(t, err.Error(), "Failed to get block from blockchain client")
+			})
+
+			t.Run("BlockchainClientError", func(t *testing.T) {
+				server, cleanup := setupTestServer(t)
+				defer cleanup()
+				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+
+				// Mock blockchain client
+				server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+					mock.Anything).
+					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
+
+				// Create test transactions and store them
+				tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+				require.NoError(t, err)
+
+				// Create subtree with test transactions
+				subtree, err := subtreepkg.NewTreeByLeafCount(2)
+				require.NoError(t, err)
+
+				require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+
+				subtreeData := subtreepkg.NewSubtreeData(subtree)
+				require.NoError(t, subtreeData.AddTx(tx1, 0))
+
+				subtreeBytes, err := subtree.Serialize()
+				require.NoError(t, err)
+
+				subtreeDataBytes, err := subtreeData.Serialize()
+				require.NoError(t, err)
+
+				// Mark the subtree as already validated to avoid HTTP calls
+				err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
+				require.NoError(t, err)
+
+				err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes)
+				require.NoError(t, err)
+
+				// Create a block with subtrees
+				header := &model.BlockHeader{
+					Version:        1,
+					HashPrevBlock:  &chainhash.Hash{},
+					HashMerkleRoot: &chainhash.Hash{},
+					Timestamp:      uint32(time.Now().Unix()),
+					Bits:           model.NBit{},
+					Nonce:          0,
+				}
+
+				coinbaseTx := &bt.Tx{Version: 1}
+				block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, 1, 400, 0, 0)
+				require.NoError(t, err)
+
+				blockBytes, err := block.Bytes()
+				require.NoError(t, err)
+
+				// Mock blockchain client to return error
+				server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+					mock.Anything, mock.Anything, mock.Anything).
+					Return([]uint32{}, errors.NewServiceError("blockchain client error"))
+
+				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+					Block:   blockBytes,
+					BaseUrl: "http://localhost:8090",
+				}
+
+				response, err := server.CheckBlockSubtrees(context.Background(), request)
+				require.Error(t, err)
+				assert.Nil(t, response)
+				assert.Contains(t, err.Error(), "Failed to get block headers from blockchain client")
+			})
+
+			t.Run("HTTPFetchingPath", func(t *testing.T) {
+				server, cleanup := setupTestServer(t)
+				defer cleanup()
+				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+
+				// Mock blockchain client
+				server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+					mock.Anything).
+					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
+
+				// Mock GetBlockHeaderIDs - streaming processor calls this early
+				server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+					mock.Anything, mock.Anything, mock.Anything).
+					Return([]uint32{1, 2, 3}, nil).Maybe()
+
+				// Create subtree hash that doesn't exist in store to trigger HTTP fetching
+				subtreeHash := chainhash.Hash{}
+				copy(subtreeHash[:], []byte("missing_subtree_hash_32_bytes_lng!"))
+
+				// Create a block with the missing subtree
+				header := &model.BlockHeader{
+					Version:        1,
+					HashPrevBlock:  &chainhash.Hash{},
+					HashMerkleRoot: &chainhash.Hash{},
+					Timestamp:      uint32(time.Now().Unix()),
+					Bits:           model.NBit{},
+					Nonce:          0,
+				}
+
+				coinbaseTx := &bt.Tx{Version: 1}
+				block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 1, 400, 0, 0)
+				require.NoError(t, err)
+
+				blockBytes, err := block.Bytes()
+				require.NoError(t, err)
+
+				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+					Block:   blockBytes,
+					BaseUrl: "http://localhost8090", // This will fail HTTP request
+				}
+
+				response, err := server.CheckBlockSubtrees(context.Background(), request)
+				require.Error(t, err)
+				assert.Nil(t, response)
+				// Both processor modes should return a processing error
+				assert.True(t, errors.Is(err, errors.ErrProcessing), "error should be a processing error, got: %v", err)
+			})
+
+			t.Run("SubtreeExistsError", func(t *testing.T) {
+				server, cleanup := setupTestServer(t)
+				defer cleanup()
+				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+
+				// Mock blockchain client
+				server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+					mock.Anything).
+					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
+
+				// Create a mock blob store that returns errors
+				mockBlobStore := &MockBlobStore{}
+				server.subtreeStore = mockBlobStore
+
+				// Set up the mock to return an error when checking existence
+				mockBlobStore.On("Exists", mock.Anything, mock.Anything, fileformat.FileTypeSubtree).
+					Return(false, errors.NewStorageError("storage connection failed"))
+
+				// Create a block with subtrees
+				subtreeHash := chainhash.Hash{}
+				copy(subtreeHash[:], []byte("test_subtree_hash_32_bytes_long!"))
+
+				header := &model.BlockHeader{
+					Version:        1,
+					HashPrevBlock:  &chainhash.Hash{},
+					HashMerkleRoot: &chainhash.Hash{},
+					Timestamp:      uint32(time.Now().Unix()),
+					Bits:           model.NBit{},
+					Nonce:          0,
+				}
+
+				coinbaseTx := &bt.Tx{Version: 1}
+				block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{&subtreeHash}, 1, 400, 0, 0)
+				require.NoError(t, err)
+
+				blockBytes, err := block.Bytes()
+				require.NoError(t, err)
+
+				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+					Block:   blockBytes,
+					BaseUrl: "http://test.com",
+				}
+
+				response, err := server.CheckBlockSubtrees(context.Background(), request)
+				require.Error(t, err)
+				assert.Nil(t, response)
+				assert.Contains(t, err.Error(), "Failed to check if subtree exists in store")
+			})
+
+			t.Run("PartialSubtreesExist", func(t *testing.T) {
+				server, cleanup := setupTestServer(t)
+				defer cleanup()
+				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+
+				// Mock blockchain client
+				server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
+					mock.Anything).
+					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil).Once()
+				currentState := blockchain.FSMStateRUNNING
+				server.blockchainClient.(*blockchain.Mock).On("GetFSMCurrentState", mock.Anything).Return(&currentState, nil).Once()
+
+				// Create test transactions
+				tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+				require.NoError(t, err)
+
+				tx2, err := createTestTransaction("6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4")
+				require.NoError(t, err)
+
+				missingSubtreeHash := chainhash.Hash{}
+				copy(missingSubtreeHash[:], []byte("missing_subtree_hash_32_bytes___!"))
+
+				subtree, err := subtreepkg.NewTreeByLeafCount(2)
+				require.NoError(t, err)
+
+				require.NoError(t, subtree.AddNode(*tx1.TxIDChainHash(), 1, 1))
+				require.NoError(t, subtree.AddNode(*tx2.TxIDChainHash(), 2, 2))
+
+				subtreeData := subtreepkg.NewSubtreeData(subtree)
+				require.NoError(t, subtreeData.AddTx(tx1, 0))
+				require.NoError(t, subtreeData.AddTx(tx2, 1))
+
+				subtreeBytes, err := subtree.Serialize()
+				require.NoError(t, err)
+
+				subtreeDataBytes, err := subtreeData.Serialize()
+				require.NoError(t, err)
+
+				err = server.subtreeStore.Set(context.Background(), missingSubtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
+				require.NoError(t, err)
+
+				err = server.subtreeStore.Set(context.Background(), missingSubtreeHash[:], fileformat.FileTypeSubtreeData, subtreeDataBytes)
+				require.NoError(t, err)
+
+				// Create a block with both subtrees
+				header := &model.BlockHeader{
+					Version:        1,
+					HashPrevBlock:  &chainhash.Hash{},
+					HashMerkleRoot: &chainhash.Hash{},
+					Timestamp:      uint32(time.Now().Unix()),
+					Bits:           model.NBit{},
+					Nonce:          0,
+				}
+
+				coinbaseTx := &bt.Tx{Version: 1}
+				block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash(), &missingSubtreeHash}, 2, 500, 0, 0)
+				require.NoError(t, err)
+
+				blockBytes, err := block.Bytes()
+				require.NoError(t, err)
+
+				// Mock UTXO store Create method
+				server.utxoStore.(*utxo.MockUtxostore).On("Create",
+					mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(&utxometa.Data{}, nil)
+
+				// Mock validator and blockchain client
+				mockValidator := server.validatorClient.(*validator.MockValidatorClient)
+				mockValidator.UtxoStore = server.utxoStore
+
+				server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
+					mock.Anything, mock.Anything, mock.Anything).
+					Return([]uint32{1, 2, 3}, nil)
+
+				server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+					mock.Anything, blockchain.FSMStateRUNNING).
+					Return(true, nil)
+
+				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
+					Block:   blockBytes,
+					BaseUrl: "http://nonexistent-host.com",
+				}
+
+				response, err := server.CheckBlockSubtrees(context.Background(), request)
+				require.Error(t, err)
+				assert.Nil(t, response)
+				// Both processor modes should return a processing error
+				assert.True(t, errors.Is(err, errors.ErrProcessing), "error should be a processing error, got: %v", err)
+			})
+		}) // end of mode t.Run
+	} // end of processorModes loop
 }
 
 func TestExtractAndCollectTransactions(t *testing.T) {

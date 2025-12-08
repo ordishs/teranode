@@ -234,10 +234,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UnminedTxDiskSortPath:                getString("blockassembly_unminedTxDiskSortPath", "", alternativeContext...),
 			UnminedTxDiskSortEnabled:             getBool("blockassembly_unminedTxDiskSortEnabled", true, alternativeContext...),
 			// getMiningCandidate timeout settings
-			GetMiningCandidateSendTimeout:       getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
-			GetMiningCandidateResponseTimeout:   getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
-			SubtreeAnnouncementInterval:         getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
-			ParallelSetIfNotExistsThreshold:     getInt("blockassembly_parallelSetIfNotExistsThreshold", 10_000, alternativeContext...),
+			GetMiningCandidateSendTimeout:     getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
+			GetMiningCandidateResponseTimeout: getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
+			SubtreeAnnouncementInterval:       getDuration("blockassembly_subtreeAnnouncementInterval", 10*time.Second, alternativeContext...),
+			ParallelSetIfNotExistsThreshold:   getInt("blockassembly_parallelSetIfNotExistsThreshold", 10_000, alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{
@@ -264,8 +264,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ProcessTxMetaUsingCacheBatchSize:          getInt("blockvalidation_processTxMetaUsingCache_BatchSize", 1024, alternativeContext...),
 			ProcessTxMetaUsingCacheConcurrency:        getInt("blockvalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
 			ProcessTxMetaUsingCacheMissingTxThreshold: getInt("blockvalidation_processTxMetaUsingCache_MissingTxThreshold", 1, alternativeContext...),
-			ProcessTxMetaUsingStoreBatchSize:          getInt("blockvalidation_processTxMetaUsingStore_BatchSize", max(4, runtime.NumCPU()/2), alternativeContext...),
-			ProcessTxMetaUsingStoreConcurrency:        getInt("blockvalidation_processTxMetaUsingStore_Concurrency", 32, alternativeContext...),
+			ProcessTxMetaUsingStoreBatchSize:          getInt("blockvalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
+			ProcessTxMetaUsingStoreConcurrency:        getInt("blockvalidation_processTxMetaUsingStore_Concurrency", max(4, runtime.NumCPU()/2), alternativeContext...),
 			ProcessTxMetaUsingStoreMissingTxThreshold: getInt("blockvalidation_processTxMetaUsingStore_MissingTxThreshold", 1, alternativeContext...),
 			SkipCheckParentMined:                      getBool("blockvalidation_skipCheckParentMined", false, alternativeContext...),
 			SubtreeFoundChConcurrency:                 getInt("blockvalidation_subtreeFoundChConcurrency", 1, alternativeContext...),

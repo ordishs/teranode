@@ -173,12 +173,36 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}, nil
 	}
 
-	// Shared collection for all transactions across subtrees
-	var (
-		subtreeTxs      = make([][]*bt.Tx, len(missingSubtrees))
-		allTransactions = make([]*bt.Tx, 0, block.TransactionCount)
-	)
+	var blockIds map[uint32]bool
 
+	// Use streaming processor if enabled (optimized for very large blocks)
+	if u.settings.SubtreeValidation.UseStreamingProcessor {
+		u.logger.Infof("[CheckBlockSubtrees] Using streaming processor for %d missing subtrees", len(missingSubtrees))
+		blockIds, err = u.processMissingSubtreesStreaming(ctx, request, missingSubtrees, peerID, block)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Shared collection for all transactions across subtrees
+		var (
+			subtreeTxs      = make([][]*bt.Tx, len(missingSubtrees))
+			allTransactions = make([]*bt.Tx, 0, block.TransactionCount)
+		)
+
+		blockIds, err = u.processMissingSubtrees(ctx, request, missingSubtrees, subtreeTxs, peerID, err, allTransactions, block)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	u.processOrphans(ctx, *block.Header.Hash(), block.Height, blockIds)
+
+	return &subtreevalidation_api.CheckBlockSubtreesResponse{
+		Blessed: true,
+	}, nil
+}
+
+func (u *Server) processMissingSubtrees(ctx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest, missingSubtrees []chainhash.Hash, subtreeTxs [][]*bt.Tx, peerID string, err error, allTransactions []*bt.Tx, block *model.Block) (map[uint32]bool, error) {
 	// get all the subtrees that are missing from the peer in parallel
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, u.settings.SubtreeValidation.CheckBlockSubtreesConcurrency)
@@ -265,8 +289,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				}
 
 				// Store the subtreeToCheck for later processing
-				// we not set a DAH as this is part of a block and will be permanently stored anyway
-				if err = u.subtreeStore.Set(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah)); err != nil {
+				if err = u.subtreeStore.Set(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
 					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to store subtree", subtreeHash.String(), err)
 				}
 			}
@@ -438,11 +461,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}
 
-	u.processOrphans(ctx, *block.Header.Hash(), block.Height, blockIds)
-
-	return &subtreevalidation_api.CheckBlockSubtreesResponse{
-		Blessed: true,
-	}, nil
+	return blockIds, err
 }
 
 // extractAndCollectTransactions extracts all transactions from a subtree's data file
