@@ -251,6 +251,12 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		stats:                         gocore.NewStat("blockvalidation"),
 	}
 
+	if uint64(bv.bloomFilterRetentionSize) < bv.settings.BlockValidation.PreviousBlockHeaderCount {
+		// ensure we retain at least as many bloom filters as the previous block header count
+		// we need when validating blocks
+		bv.bloomFilterRetentionSize = uint32(bv.settings.BlockValidation.PreviousBlockHeaderCount + 2) // nolint:gosec
+	}
+
 	go func() {
 		// update stats for the expiring maps every 5 seconds
 		ticker := time.NewTicker(5 * time.Second)

@@ -181,7 +181,7 @@ func createLoadUnminedBenchmarkSettings() *settings.Settings {
 
 	// Use a temporary directory
 	tSettings.DataFolder = os.TempDir() + "/loadunmined_bench"
-	os.MkdirAll(tSettings.DataFolder, 0755)
+	_ = os.MkdirAll(tSettings.DataFolder, 0755)
 
 	// Create a copy of RegressionNetParams
 	chainParams := chaincfg.RegressionNetParams
