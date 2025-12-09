@@ -782,6 +782,8 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 }
 
 func (b *BlockAssembler) initState(ctx context.Context) error {
+	var stateFound bool
+
 	bestBlockHeader, bestBlockHeight, err := b.GetState(ctx)
 	if err != nil {
 		if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), sql.ErrNoRows.Error()) {
@@ -790,23 +792,27 @@ func (b *BlockAssembler) initState(ctx context.Context) error {
 			b.logger.Errorf("[BlockAssembler] error getting state from blockchain db: %v", err)
 		}
 	} else {
+		stateFound = true
+
 		b.logger.Infof("[BlockAssembler] setting best block header from state: %d: %s", bestBlockHeight, bestBlockHeader.Hash())
 		b.setBestBlockHeader(bestBlockHeader, bestBlockHeight)
 		b.subtreeProcessor.InitCurrentBlockHeader(bestBlockHeader)
 	}
 
 	// we did not get any state back from the blockchain db, so we get the current best block header
-	baBestBlockHeader, baBestBlockHeight := b.CurrentBlock()
-	if baBestBlockHeader == nil || baBestBlockHeight == 0 {
-		header, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
-		if err != nil {
-			// we must return an error here since we cannot continue without a best block header
-			return errors.NewProcessingError("[BlockAssembler] error getting best block header: %v", err)
-		} else {
-			hash, _ := b.CurrentBlock()
-			b.logger.Infof("[BlockAssembler] setting best block header from GetBestBlockHeader: %s", hash.Hash())
-			b.setBestBlockHeader(header, meta.Height)
-			b.subtreeProcessor.InitCurrentBlockHeader(header)
+	if !stateFound {
+		baBestBlockHeader, baBestBlockHeight := b.CurrentBlock()
+		if baBestBlockHeader == nil || baBestBlockHeight == 0 {
+			header, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
+			if err != nil {
+				// we must return an error here since we cannot continue without a best block header
+				return errors.NewProcessingError("[BlockAssembler] error getting best block header: %v", err)
+			} else {
+				hash, _ := b.CurrentBlock()
+				b.logger.Infof("[BlockAssembler] setting best block header from GetBestBlockHeader: %s", hash.Hash())
+				b.setBestBlockHeader(header, meta.Height)
+				b.subtreeProcessor.InitCurrentBlockHeader(header)
+			}
 		}
 	}
 
