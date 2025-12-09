@@ -665,6 +665,7 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 	dah := ba.blockAssembler.utxoStore.GetBlockHeight() + ba.settings.GlobalBlockHeightRetention
 
 	subtreeDoneCh := make(chan bool, 1)
+	subtreeStorageDone := make(chan struct{}) // Separate signal for coordinator
 	metaDoneCh := make(chan struct{})
 	allDoneCh := make(chan struct{})
 
@@ -720,6 +721,7 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 
 	// Store subtree in background
 	go func() {
+		defer close(subtreeStorageDone) // Signal coordinator when done
 		storedOK := true
 		if err := ba.subtreeStore.Set(ctx,
 			subtree.RootHash()[:],
@@ -744,9 +746,11 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 	}()
 
 	// Coordinator: wait for both and signal all done
+	// Note: We wait on subtreeStorageDone (not subtreeDoneCh) to avoid racing
+	// with the worker that reads the storedOK value from subtreeDoneCh.
 	go func() {
 		defer close(allDoneCh)
-		<-subtreeDoneCh
+		<-subtreeStorageDone
 		<-metaDoneCh
 	}()
 
