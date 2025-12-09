@@ -276,7 +276,10 @@ func setupServer(t *testing.T) (*BlockAssembly, *memory.Memory) {
 	// Use real blockchain client with memory SQLite instead of mock
 	blockchainClient := testutil.NewMemorySQLiteBlockchainClient(common.Logger, common.Settings, t)
 
-	utxoStore := testutil.NewSQLiteMemoryUTXOStore(common.Ctx, common.Logger, common.Settings, t)
+	// Create cancellable context to properly shut down goroutines
+	ctx, cancel := context.WithCancel(common.Ctx)
+
+	utxoStore := testutil.NewSQLiteMemoryUTXOStore(ctx, common.Logger, common.Settings, t)
 	_ = utxoStore.SetBlockHeight(123)
 
 	s := New(common.Logger, common.Settings, nil, utxoStore, subtreeStore, blockchainClient)
@@ -284,13 +287,15 @@ func setupServer(t *testing.T) (*BlockAssembly, *memory.Memory) {
 	// Skip waiting for pending blocks in tests to prevent mock issues
 	s.SetSkipWaitForPendingBlocks(true)
 
-	require.NoError(t, s.Init(common.Ctx))
+	require.NoError(t, s.Init(ctx))
 
 	// Ensure proper cleanup when test ends
 	t.Cleanup(func() {
+		// Cancel context to stop background goroutines
+		cancel()
+		// Brief sleep to allow goroutines to exit before Stop
+		time.Sleep(20 * time.Millisecond)
 		_ = s.Stop(context.Background())
-		// Brief sleep to allow async goroutines to complete logging before test cleanup
-		time.Sleep(10 * time.Millisecond)
 	})
 
 	return s, subtreeStore
