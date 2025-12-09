@@ -78,65 +78,6 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}()
 
-	// Check if the block is on our chain or will become part of our chain
-	// Only pause subtree processing if this block is on our chain or extending our chain
-	shouldPauseProcessing := false
-
-	bestBlockHeader, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to get best block header", err)
-	}
-
-	if bestBlockHeader.Hash().IsEqual(block.Header.HashPrevBlock) {
-		// If the block's parent is the best block, we can safely assume this block
-		// is extending our chain and should pause subtree processing
-		u.logger.Infof("[CheckBlockSubtrees] Block %s is extending our chain - pausing subtree processing", block.Hash().String())
-		shouldPauseProcessing = true
-	} else {
-		// First check if the block's parent exists
-		parentExists, err := u.blockchainClient.GetBlockExists(ctx, block.Header.HashPrevBlock)
-		if err != nil {
-			u.logger.Warnf("[CheckBlockSubtrees] Failed to check if parent block exists: %v", err)
-			// On error, default to pausing for safety
-			shouldPauseProcessing = true
-		} else if parentExists {
-			// If the parent exists, check if it's on our current chain
-			_, parentMeta, err := u.blockchainClient.GetBlockHeader(ctx, block.Header.HashPrevBlock)
-			if err != nil {
-				u.logger.Warnf("[CheckBlockSubtrees] Failed to get parent block header: %v", err)
-				// On error, default to pausing for safety
-				shouldPauseProcessing = true
-			} else if parentMeta != nil && parentMeta.ID > 0 {
-				// Check if the parent is on the current chain
-				isOnChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{parentMeta.ID})
-				if err != nil {
-					u.logger.Warnf("[CheckBlockSubtrees] Failed to check if parent is on current chain: %v", err)
-					// On error, default to pausing for safety
-					shouldPauseProcessing = true
-				} else {
-					shouldPauseProcessing = isOnChain
-				}
-			}
-		} else {
-			// Parent doesn't exist - this could be a block from a different fork
-			// Don't pause processing for blocks from different forks
-			u.logger.Infof("[CheckBlockSubtrees] Block %s parent %s not found - likely from different fork, not pausing subtree processing", block.Hash().String(), block.Header.HashPrevBlock.String())
-			shouldPauseProcessing = false
-		}
-	}
-
-	// Skip pause lock if we're catching up
-	if shouldPauseProcessing {
-		currentState, err := u.blockchainClient.GetFSMCurrentState(ctx)
-		if err != nil {
-			u.logger.Warnf("[CheckBlockSubtrees] Failed to get FSM state: %v - will pause for safety", err)
-		} else if currentState != nil &&
-			(*currentState == blockchain.FSMStateCATCHINGBLOCKS || *currentState == blockchain.FSMStateLEGACYSYNCING) {
-			u.logger.Infof("[CheckBlockSubtrees] Skipping pause lock - FSM state is %s (catching up)", currentState.String())
-			shouldPauseProcessing = false
-		}
-	}
-
 	// We do not need to stop processing - it does not help
 	// Acquire and manage pause lock with immediate defer for guaranteed cleanup
 	// if shouldPauseProcessing {
