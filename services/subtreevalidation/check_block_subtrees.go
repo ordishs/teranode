@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"sync"
 	"sync/atomic"
 
@@ -182,6 +183,19 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		blockIds, err = u.processMissingSubtreesStreaming(ctx, request, missingSubtrees, peerID, block)
 		if err != nil {
 			return nil, err
+		}
+	} else if u.settings.SubtreeValidation.UseSequentialProcessor {
+		u.logger.Infof("[CheckBlockSubtrees] Using sequential processor for %d missing subtrees", len(missingSubtrees))
+
+		baseURL, err := url.Parse(request.BaseUrl)
+		if err != nil {
+			return nil, errors.NewProcessingError("[CheckBlockSubtrees] Failed to parse base URL %s: %v", request.BaseUrl, err)
+		}
+
+		for _, subtreeHash := range missingSubtrees {
+			if err := u.subtreesHandler(ctx, &subtreeHash, baseURL, request.PeerId); err != nil {
+				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Subtree %s processing failed: %v", subtreeHash.String(), err)
+			}
 		}
 	} else {
 		// Shared collection for all transactions across subtrees
