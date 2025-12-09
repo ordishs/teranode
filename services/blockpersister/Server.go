@@ -23,7 +23,6 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -92,12 +91,12 @@ func deriveStateFilePath(persisterStore *url.URL, stateFileOverride string) (str
 
 	// Try to derive from PersisterStore if it's a file:// URL
 	if persisterStore != nil && persisterStore.Scheme == "file" {
-		// Extract the path from file:// URL
-		storePath := persisterStore.Path
-
-		// Remove query parameters
-		if idx := strings.Index(storePath, "?"); idx != -1 {
-			storePath = storePath[:idx]
+		// Extract the path from file:// URL, matching file store logic
+		var storePath string
+		if persisterStore.Host == "." {
+			storePath = persisterStore.Path[1:] // relative path
+		} else {
+			storePath = persisterStore.Path // absolute path
 		}
 
 		// Place state file in the same directory as the store
