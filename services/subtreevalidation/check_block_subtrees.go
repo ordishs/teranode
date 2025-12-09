@@ -177,6 +177,13 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 	var blockIds map[uint32]bool
 
+	// transaction validation options for blocks
+	validationOptions := []validator.Option{
+		validator.WithSkipPolicyChecks(true),
+		validator.WithCreateConflicting(true),
+		validator.WithIgnoreLocked(true),
+	}
+
 	// Use streaming processor if enabled (optimized for very large blocks)
 	if u.settings.SubtreeValidation.UseStreamingProcessor {
 		u.logger.Infof("[CheckBlockSubtrees] Using streaming processor for %d missing subtrees", len(missingSubtrees))
@@ -193,7 +200,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 
 		for _, subtreeHash := range missingSubtrees {
-			if err := u.subtreesHandler(ctx, &subtreeHash, baseURL, request.PeerId); err != nil {
+			if err := u.subtreesHandler(ctx, &subtreeHash, baseURL, request.PeerId, validationOptions...); err != nil {
 				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Subtree %s processing failed: %v", subtreeHash.String(), err)
 			}
 		}
