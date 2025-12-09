@@ -137,22 +137,23 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}
 
+	// We do not need to stop processing - it does not help
 	// Acquire and manage pause lock with immediate defer for guaranteed cleanup
-	if shouldPauseProcessing {
-		u.logger.Infof("[CheckBlockSubtrees] Block %s is on our chain or extending it - acquiring pause lock across all pods", block.Hash().String())
-
-		releasePause, err := u.setPauseProcessing(ctx)
-		// Always defer - safe to call even on error (returns noopFunc which does nothing)
-		defer releasePause()
-
-		if err != nil {
-			u.logger.Warnf("[CheckBlockSubtrees] Failed to acquire distributed pause lock: %v - continuing without pause", err)
-		} else {
-			u.logger.Infof("[CheckBlockSubtrees] Pause lock acquired successfully for block %s", block.Hash().String())
-		}
-	} else {
-		u.logger.Infof("[CheckBlockSubtrees] Block %s is on a different fork - not pausing subtree processing", block.Hash().String())
-	}
+	// if shouldPauseProcessing {
+	// 	u.logger.Infof("[CheckBlockSubtrees] Block %s is on our chain or extending it - acquiring pause lock across all pods", block.Hash().String())
+	//
+	// 	releasePause, err := u.setPauseProcessing(ctx)
+	// 	// Always defer - safe to call even on error (returns noopFunc which does nothing)
+	// 	defer releasePause()
+	//
+	// 	if err != nil {
+	// 		u.logger.Warnf("[CheckBlockSubtrees] Failed to acquire distributed pause lock: %v - continuing without pause", err)
+	// 	} else {
+	// 		u.logger.Infof("[CheckBlockSubtrees] Pause lock acquired successfully for block %s", block.Hash().String())
+	// 	}
+	// } else {
+	// 	u.logger.Infof("[CheckBlockSubtrees] Block %s is on a different fork - not pausing subtree processing", block.Hash().String())
+	// }
 
 	// validate all the subtrees in the block
 	missingSubtrees := make([]chainhash.Hash, 0, len(block.Subtrees))

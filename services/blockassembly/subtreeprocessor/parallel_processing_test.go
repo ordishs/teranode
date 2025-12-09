@@ -79,7 +79,8 @@ func TestParallelGetAndSetIfNotExistsDuplicates(t *testing.T) {
 	currentTxMap := NewSplitTxInpointsMap(splitMapBuckets)
 
 	for i := 0; i < totalNodes; i++ {
-		hash := uniqueHashes[i%uniqueCount] // Creates duplicates
+		// create duplicates by cycling through unique hashes
+		hash := uniqueHashes[i%uniqueCount] // nolint:gosec
 		nodes[i] = subtreepkg.Node{Hash: hash, Fee: uint64(i), SizeInBytes: 250}
 		currentTxMap.Set(hash, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}})
 	}
@@ -209,7 +210,7 @@ func TestParallelGetAndSetIfNotExistsRemoveMap(t *testing.T) {
 		currentTxMap.Set(hash, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}})
 
 		if i < removeCount {
-			stp.removeMap.Put(hash)
+			_ = stp.removeMap.Put(hash)
 		}
 	}
 

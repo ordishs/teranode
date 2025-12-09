@@ -559,7 +559,7 @@ func (sp *streamingProcessor) filterAlreadyValidated(ctx context.Context, transa
 
 	// Close channel when all batches complete
 	go func() {
-		g.Wait()
+		_ = g.Wait()
 		close(resultsChan)
 	}()
 

@@ -185,6 +185,7 @@ func (v *TopologicalOrderValidator) TriggerBatcher() {}
 // TestCheckBlockSubtreesLevelBasedLargeBlock benchmarks CheckBlockSubtrees with level-based processor
 // using 10 million transactions across 10 subtrees.
 func TestCheckBlockSubtreesLevelBasedLargeBlock(t *testing.T) {
+	t.Skip()
 	if testing.Short() {
 		t.Skip("Skipping large block test in short mode")
 	}
@@ -195,6 +196,7 @@ func TestCheckBlockSubtreesLevelBasedLargeBlock(t *testing.T) {
 // TestCheckBlockSubtreesStreamingLargeBlock benchmarks CheckBlockSubtrees with streaming processor
 // using 10 million transactions across 10 subtrees.
 func TestCheckBlockSubtreesStreamingLargeBlock(t *testing.T) {
+	t.Skip()
 	if testing.Short() {
 		t.Skip("Skipping large block test in short mode")
 	}

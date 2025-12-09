@@ -696,7 +696,7 @@ func TestOverheadBreakdownDetailed(t *testing.T) {
 // optimization at various node counts.
 func BenchmarkParallelGetAndSetIfNotExists(b *testing.B) {
 	testCases := []struct {
-		name     string
+		name      string
 		nodeCount int
 	}{
 		{name: "1k_nodes", nodeCount: 1000},
