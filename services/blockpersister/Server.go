@@ -94,9 +94,6 @@ func deriveStateFilePath(persisterStore *url.URL, stateFileOverride string) (str
 	if persisterStore != nil && persisterStore.Scheme == "file" {
 		// Extract the path from file:// URL
 		storePath := persisterStore.Path
-		if storePath == "" {
-			storePath = persisterStore.Opaque
-		}
 
 		// Remove query parameters
 		if idx := strings.Index(storePath, "?"); idx != -1 {
