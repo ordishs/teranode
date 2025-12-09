@@ -4,6 +4,8 @@ import (
 	"context"
 	"math"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 
 	as "github.com/aerospike/aerospike-client-go/v8"
@@ -44,7 +46,61 @@ type unminedTxIterator struct {
 //   - *unminedTxIterator: A new iterator instance ready for use
 //   - error: Any error encountered during iterator initialization
 func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, error) {
-	return newUnminedTxIteratorWithPartitions(store, fullScan, runtime.NumCPU())
+	queryThreadsLimitStr, err := getConfigValue(store, "query-threads-limit")
+	if err != nil {
+		return nil, err
+	}
+
+	// convert to int
+	queryThreadsLimit, err := strconv.ParseInt(queryThreadsLimitStr, 10, 64)
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to parse query-threads-limit: %v", err)
+	}
+
+	numPartitionQueries := runtime.NumCPU()
+
+	// Ensure we don't exceed query-threads-limit, assuming each partition query uses up to 4 threads
+	queryLimits := int(queryThreadsLimit) / 4 // nolint:gosec
+	if queryThreadsLimit > 0 && numPartitionQueries > queryLimits {
+		numPartitionQueries = queryLimits
+	}
+
+	store.logger.Infof("[newUnminedTxIterator] Using %d parallel Aerospike partition queries for unmined transactions (fullScan=%t)", numPartitionQueries, fullScan)
+
+	return newUnminedTxIteratorWithPartitions(store, fullScan, numPartitionQueries)
+}
+
+func getConfigValue(store *Store, configParam string) (string, error) {
+	// determine number of partition queries based on CPU cores and query-threads-limit
+	// Get the first node in the cluster
+	nodes := store.client.GetNodes()
+	if len(nodes) == 0 {
+		return "", errors.NewProcessingError("no Aerospike nodes available")
+	}
+	node := nodes[0]
+
+	// Request the service context configuration
+	info, err := node.RequestInfo(as.NewInfoPolicy(), "get-config:context=service")
+	if err != nil {
+		return "", errors.NewProcessingError("failed to get info")
+	}
+
+	// The response is a map; the value for our key is a semicolon-separated string
+	configStr, ok := info["get-config:context=service"]
+	if !ok {
+		return "", errors.NewProcessingError("service config not found in response")
+	}
+
+	// Parse the config string to find query-threads-limit
+	configPairs := strings.Split(configStr, ";")
+	for _, pair := range configPairs {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) == 2 && kv[0] == configParam {
+			return kv[1], nil
+		}
+	}
+
+	return "", errors.NewProcessingError("config parameter %s not found", configParam)
 }
 
 // newUnminedTxIteratorWithPartitions creates a new iterator with configurable partition parallelism.
