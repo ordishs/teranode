@@ -363,6 +363,7 @@ func (ba *BlockAssembly) runNewSubtreeListener(ctx context.Context, newSubtreeCh
 			return
 
 		case newSubtreeRequest := <-newSubtreeChan:
+			ba.logger.Infof("[runNewSubtreeListener][%s] New subtree request: %d", newSubtreeRequest.Subtree.RootHash().String(), seq)
 			work := &subtreeStorageWork{
 				seq:     seq,
 				request: newSubtreeRequest,
@@ -392,6 +393,8 @@ func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-ch
 			request:          work.request,
 			skipNotification: work.request.SkipNotification,
 		}
+
+		ba.logger.Infof("[subtreeStorageWorker][%s] Storing subtree (seq=%d)", work.request.Subtree.RootHash().String(), work.seq)
 
 		// Store subtree and meta
 		subtreeDone, allDone, err := ba.storeSubtreeData(ctx, work.request, subtreeRetryChan)
@@ -472,7 +475,10 @@ func (ba *BlockAssembly) subtreeNotificationSender(ctx context.Context, resultCh
 
 			// Send notification if needed
 			if !r.skipNotification && r.storedOK {
+				ba.logger.Infof("[BlockAssembly:Init][%s] sending subtree notification", r.request.Subtree.RootHash().String())
 				ba.sendSubtreeNotification(ctx, *r.request.Subtree.RootHash())
+			} else {
+				ba.logger.Infof("[BlockAssembly:Init][%s] skipping subtree notification (skip=%v, stored=%v)", r.request.Subtree.RootHash().String(), r.skipNotification, r.storedOK)
 			}
 		}
 	}
