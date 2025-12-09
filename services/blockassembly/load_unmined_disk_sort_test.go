@@ -347,9 +347,6 @@ func setupDiskSortTest(t *testing.T) (*BlockAssembler, utxo.Store, func()) {
 		}
 	}()
 
-	// Start the subtree processor
-	ba.subtreeProcessor.Start(ctx)
-
 	cleanup := func() {
 		if ba.subtreeProcessor != nil {
 			ba.subtreeProcessor.Stop(context.Background())

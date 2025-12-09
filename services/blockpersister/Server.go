@@ -82,11 +82,11 @@ type Server struct {
 
 // deriveStateFilePath determines the state file path based on the PersisterStore URL.
 // For file:// URLs, it derives the path from the store location.
-// For other store types (S3, etc.), it requires the blockPersister_stateFile_override setting.
-func deriveStateFilePath(persisterStore *url.URL, stateFileOverride string) (string, error) {
-	// If override is provided, use it
-	if stateFileOverride != "" {
-		return stateFileOverride, nil
+// For other store types (S3, etc.), it requires the blockPersister_stateFile setting.
+func deriveStateFilePath(persisterStore *url.URL, stateFile string) (string, error) {
+	// If state file is provided, use it
+	if stateFile != "" {
+		return stateFile, nil
 	}
 
 	// Try to derive from PersisterStore if it's a file:// URL
@@ -103,8 +103,8 @@ func deriveStateFilePath(persisterStore *url.URL, stateFileOverride string) (str
 		return filepath.Join(storePath, "blockpersister_state.txt"), nil
 	}
 
-	// Non-file store without override - return error
-	return "", errors.NewConfigurationError("blockPersister_stateFile_override is required for non-file store types")
+	// Non-file store without explicit state file - return error
+	return "", errors.NewConfigurationError("blockPersister_stateFile is required for non-file store types")
 }
 
 // WithSetInitialState is an optional configuration function that sets the initial state
@@ -153,7 +153,7 @@ func New(
 	opts ...func(*Server),
 ) *Server {
 	// Determine state file path
-	stateFilePath, err := deriveStateFilePath(tSettings.Block.PersisterStore, tSettings.Block.StateFileOverride)
+	stateFilePath, err := deriveStateFilePath(tSettings.Block.PersisterStore, tSettings.Block.StateFile)
 	if err != nil {
 		logger.Errorf("Failed to determine state file path: %v", err)
 
