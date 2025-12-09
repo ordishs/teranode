@@ -179,7 +179,7 @@ type BlockSettings struct {
 	MinedCacheMaxMB                         int
 	PersisterStore                          *url.URL
 	PersisterHTTPListenAddress              string
-	StateFile                               string
+	StateFileOverride                       string
 	CheckDuplicateTransactionsConcurrency   int
 	GetAndValidateSubtreesConcurrency       int
 	KafkaWorkers                            int

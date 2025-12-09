@@ -296,7 +296,7 @@ func TestSetInitialStateError(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
 	// Create a server with a state file path that will cause error
-	tSettings.Block.StateFile = "/invalid/path/that/does/not/exist/state.dat"
+	tSettings.Block.StateFileOverride = "/invalid/path/that/does/not/exist/state.dat"
 
 	server := New(ctx, logger, tSettings, nil, nil, nil, nil)
 
@@ -358,6 +358,86 @@ func TestNewWithOptions(t *testing.T) {
 	height, err := serverWithOpts.state.GetLastPersistedBlockHeight()
 	assert.NoError(t, err)
 	assert.Equal(t, uint32(42), height)
+}
+
+func TestDeriveStateFilePath(t *testing.T) {
+	tests := []struct {
+		name              string
+		persisterStoreURL string
+		stateFileOverride string
+		expected          string
+		expectError       bool
+	}{
+		{
+			name:              "file store with simple path",
+			persisterStoreURL: "file://./data/blockstore",
+			stateFileOverride: "",
+			expected:          "/data/blockstore/blockpersister_state.txt",
+			expectError:       false,
+		},
+		{
+			name:              "file store with clientName",
+			persisterStoreURL: "file://./data/teranode1/blockstore",
+			stateFileOverride: "",
+			expected:          "/data/teranode1/blockstore/blockpersister_state.txt",
+			expectError:       false,
+		},
+		{
+			name:              "file store with query parameters",
+			persisterStoreURL: "file://./data/blockstore?localTTLStore=file&localTTLStorePath=./data/blockstore-ttl",
+			stateFileOverride: "",
+			expected:          "/data/blockstore/blockpersister_state.txt",
+			expectError:       false,
+		},
+		{
+			name:              "override takes precedence",
+			persisterStoreURL: "file://./data/blockstore",
+			stateFileOverride: "/custom/path/state.txt",
+			expected:          "/custom/path/state.txt",
+			expectError:       false,
+		},
+		{
+			name:              "s3 store without override errors",
+			persisterStoreURL: "s3://bucket-name/blockstore",
+			stateFileOverride: "",
+			expected:          "",
+			expectError:       true,
+		},
+		{
+			name:              "s3 store with override succeeds",
+			persisterStoreURL: "s3://bucket-name/blockstore",
+			stateFileOverride: "/local/path/state.txt",
+			expected:          "/local/path/state.txt",
+			expectError:       false,
+		},
+		{
+			name:              "nil store without override errors",
+			persisterStoreURL: "",
+			stateFileOverride: "",
+			expected:          "",
+			expectError:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var storeURL *url.URL
+			if tt.persisterStoreURL != "" {
+				var err error
+				storeURL, err = url.Parse(tt.persisterStoreURL)
+				require.NoError(t, err)
+			}
+
+			result, err := deriveStateFilePath(storeURL, tt.stateFileOverride)
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, result)
+			}
+		})
+	}
 }
 
 // TestHealthLiveness validates liveness health check
@@ -440,7 +520,7 @@ func TestStateManagement(t *testing.T) {
 
 	// Create a temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	server := New(ctx, logger, tSettings, nil, nil, nil, nil)
 
@@ -504,7 +584,7 @@ func TestStateFileIntegration(t *testing.T) {
 	// Create temp directory for state file
 	tempDir := t.TempDir()
 	stateFile := tempDir + "/test_blocks.dat"
-	tSettings.Block.StateFile = stateFile
+	tSettings.Block.StateFileOverride = stateFile
 
 	// Create first server instance
 	server1 := New(ctx, logger, tSettings, nil, nil, nil, nil)
@@ -1110,7 +1190,7 @@ func TestGetNextBlockToProcess_NormalFlow(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 	tSettings.Block.BlockPersisterPersistAge = 1
 
 	// Create mock blockchain client using existing blockchain.Mock
@@ -1173,7 +1253,7 @@ func TestGetNextBlockToProcess_NoBlocksToProcess(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 	tSettings.Block.BlockPersisterPersistAge = 10 // Large persist age
 
 	// Create mock blockchain client
@@ -1225,7 +1305,7 @@ func TestGetNextBlockToProcess_ReorgDetected(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 	tSettings.Block.BlockPersisterPersistAge = 2
 
 	// Create mock blockchain client
@@ -1295,7 +1375,7 @@ func TestGetNextBlockToProcess_ReorgRecovery(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 	tSettings.Block.BlockPersisterPersistAge = 2
 
 	// Create mock blockchain client
@@ -1403,7 +1483,7 @@ func TestGetNextBlockToProcess_ReorgDetected_DefensiveCheckDisabled(t *testing.T
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 	tSettings.Block.BlockPersisterPersistAge = 2
 	// DISABLE the defensive reorg check
 	tSettings.Block.BlockPersisterEnableDefensiveReorgCheck = false
@@ -1463,7 +1543,7 @@ func TestGetNextBlockToProcess_GetBestBlockHeaderError(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Create mock blockchain client with error injection
 	mockClient := &blockchain.Mock{}
@@ -1492,7 +1572,7 @@ func TestGetNextBlockToProcess_GetBlockByHeightFailure(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 	tSettings.Block.BlockPersisterPersistAge = 1
 
 	// Create mock blockchain client
@@ -1550,7 +1630,7 @@ func TestGetNextBlockToProcess_BlockRetrievalFailure(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Create mock blockchain client
 	mockClient := NewMockBlockchainClient()
@@ -1590,7 +1670,7 @@ func TestGetNextBlockToProcess_EdgeCasePersistAge(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Create mock blockchain client
 	mockClient := NewMockBlockchainClient()
@@ -1652,7 +1732,7 @@ func TestGetNextBlockToProcess_ZeroInitialHeight(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Create mock blockchain client
 	mockClient := NewMockBlockchainClient()
@@ -1699,7 +1779,7 @@ func TestGetNextBlockToProcess_ConcurrentAccess(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Create mock blockchain client
 	mockClient := NewMockBlockchainClient()
@@ -1763,7 +1843,7 @@ func TestGetNextBlockToProcess_ContextCancellation(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Create mock blockchain client
 	mockClient := NewMockBlockchainClient()
@@ -1797,7 +1877,7 @@ func TestStart_FSMTransitionError(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Create mock blockchain client with FSM transition error
 	mockClient := NewMockBlockchainClient()
@@ -1834,7 +1914,7 @@ func TestStart_HTTPServerSetup(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Set HTTP listen address to trigger HTTP server setup
 	tSettings.Block.PersisterHTTPListenAddress = "127.0.0.1:0"
@@ -1895,7 +1975,7 @@ func TestStart_HTTPServerConfigurationError(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Set HTTP listen address but no block store URL
 	tSettings.Block.PersisterHTTPListenAddress = "127.0.0.1:0"
@@ -1939,7 +2019,7 @@ func TestStart_BlockProcessingLoop(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Don't set HTTP listen address
 	tSettings.Block.PersisterHTTPListenAddress = ""
@@ -2020,7 +2100,7 @@ func TestStart_BlockProcessingNoBlocks(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Don't set HTTP listen address
 	tSettings.Block.PersisterHTTPListenAddress = ""
@@ -2076,7 +2156,7 @@ func TestStart_ContextCancellation(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Don't set HTTP listen address
 	tSettings.Block.PersisterHTTPListenAddress = ""
@@ -2135,7 +2215,7 @@ func TestStart_ConcurrentReadyChannelClose(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Don't set HTTP listen address
 	tSettings.Block.PersisterHTTPListenAddress = ""
@@ -2188,7 +2268,7 @@ func TestStart_ProcessingLoopErrorHandling(t *testing.T) {
 
 	// Create temp directory for state file
 	tempDir := t.TempDir()
-	tSettings.Block.StateFile = tempDir + "/blocks.dat"
+	tSettings.Block.StateFileOverride = tempDir + "/blocks.dat"
 
 	// Don't set HTTP listen address
 	tSettings.Block.PersisterHTTPListenAddress = ""

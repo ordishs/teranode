@@ -20,7 +20,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,6 +81,36 @@ type Server struct {
 	state *state.State
 }
 
+// deriveStateFilePath determines the state file path based on the PersisterStore URL.
+// For file:// URLs, it derives the path from the store location.
+// For other store types (S3, etc.), it requires the blockPersister_stateFile_override setting.
+func deriveStateFilePath(persisterStore *url.URL, stateFileOverride string) (string, error) {
+	// If override is provided, use it
+	if stateFileOverride != "" {
+		return stateFileOverride, nil
+	}
+
+	// Try to derive from PersisterStore if it's a file:// URL
+	if persisterStore != nil && persisterStore.Scheme == "file" {
+		// Extract the path from file:// URL
+		storePath := persisterStore.Path
+		if storePath == "" {
+			storePath = persisterStore.Opaque
+		}
+
+		// Remove query parameters
+		if idx := strings.Index(storePath, "?"); idx != -1 {
+			storePath = storePath[:idx]
+		}
+
+		// Place state file in the same directory as the store
+		return filepath.Join(storePath, "blockpersister_state.txt"), nil
+	}
+
+	// Non-file store without override - return error
+	return "", errors.NewConfigurationError("blockPersister_stateFile_override is required for non-file store types")
+}
+
 // WithSetInitialState is an optional configuration function that sets the initial state
 // of the block persister server. This can be used during initialization to establish
 // a known starting point for block persistence operations.
@@ -123,8 +156,15 @@ func New(
 	blockchainClient blockchain.ClientI,
 	opts ...func(*Server),
 ) *Server {
-	// Get blocks file path from config, or use default
-	state := state.New(logger, tSettings.Block.StateFile)
+	// Determine state file path
+	stateFilePath, err := deriveStateFilePath(tSettings.Block.PersisterStore, tSettings.Block.StateFileOverride)
+	if err != nil {
+		logger.Errorf("Failed to determine state file path: %v", err)
+		// Fall back to a default location if derivation fails
+		stateFilePath = "./data/blockpersister_state.txt"
+	}
+
+	state := state.New(logger, stateFilePath)
 
 	u := &Server{
 		ctx:              ctx,
