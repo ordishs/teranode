@@ -21,7 +21,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -533,7 +532,7 @@ func (sp *streamingProcessor) filterAlreadyValidated(ctx context.Context, transa
 			// Use parent context (ctx) instead of errgroup context (gCtx) to prevent
 			// BatchDecorate from being cancelled when other goroutines complete or timeout.
 			// This is important for large batches where database operations may take longer.
-			if err := sp.server.utxoStore.BatchDecorate(ctx, batch, fields.Fee); err != nil {
+			if err := sp.server.utxoStore.BatchDecorate(ctx, batch, TxMetaFieldsForDecorate...); err != nil {
 				return errors.NewStorageError("[filterAlreadyValidated] BatchDecorate failed", err)
 			}
 
