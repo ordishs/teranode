@@ -160,8 +160,9 @@ func New(
 	stateFilePath, err := deriveStateFilePath(tSettings.Block.PersisterStore, tSettings.Block.StateFileOverride)
 	if err != nil {
 		logger.Errorf("Failed to determine state file path: %v", err)
-		// Fall back to a default location if derivation fails
-		stateFilePath = "./data/blockpersister_state.txt"
+
+		// panic - as we cannot continue without a state file
+		panic(err)
 	}
 
 	state := state.New(logger, stateFilePath)
