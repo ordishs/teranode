@@ -539,6 +539,8 @@ type SubtreeValidationSettings struct {
 	// Concurrency limits
 	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
 	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
+	// Streaming processor settings
+	UseStreamingProcessor bool // Feature flag to enable streaming transaction processor for large blocks (default: false)
 }
 
 type LegacySettings struct {
