@@ -464,7 +464,8 @@ func TestUpdateTxMinedStatus_DuplicateDetection(t *testing.T) {
 
 		// Second call should be ignored immediately (duplicate detection)
 		err2 := UpdateTxMinedStatus(ctx, logger, tSettings, mockStore, block, 15, []uint32{}, true)
-		require.NoError(t, err2) // Should return nil (ignored)
+		require.Error(t, err2) // Should return parent not mined error
+		assert.Contains(t, err2.Error(), "already being processed")
 
 		// Wait for first call to complete
 		err1 := <-done1

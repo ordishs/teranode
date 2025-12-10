@@ -40,12 +40,6 @@ var (
 	workerSettings   *settings.Settings
 	workerSettingsMu sync.RWMutex
 
-	// hashesPool pools slices of chainhash.Hash pointers to reduce allocations
-	// during SetMinedMulti batch processing. The New function returns nil,
-	// so callers must handle the case when the pool is empty by allocating
-	// a new slice with the appropriate capacity from settings.
-	hashesPool = sync.Pool{}
-
 	// inFlightBlocks tracks blocks currently being processed to prevent duplicate processing
 	inFlightBlocks   = make(map[uint32]bool)
 	inFlightBlocksMu sync.Mutex
@@ -69,30 +63,6 @@ func getWorkerSettings() *settings.Settings {
 	defer workerSettingsMu.Unlock()
 
 	return workerSettings
-}
-
-// getHashesSlice returns a slice from the pool or allocates a new one with the given capacity.
-func getHashesSlice(capacity int) *[]*chainhash.Hash {
-	if v := hashesPool.Get(); v != nil {
-		s := v.(*[]*chainhash.Hash)
-		*s = (*s)[:0] // reset length but keep capacity
-		return s
-	}
-	s := make([]*chainhash.Hash, 0, capacity)
-	return &s
-}
-
-// putHashesSlice returns a slice to the pool for reuse.
-func putHashesSlice(s *[]*chainhash.Hash) {
-	if s == nil {
-		return
-	}
-	// Clear the slice to allow GC of the hash pointers
-	for i := range *s {
-		(*s)[i] = nil
-	}
-	*s = (*s)[:0]
-	hashesPool.Put(s)
 }
 
 func initWorker(tSettings *settings.Settings) {
@@ -263,12 +233,7 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 		}
 
 		g.Go(func() error {
-			hashesPtr := getHashesSlice(maxMinedBatchSize)
-			hashes := *hashesPtr
-			defer func() {
-				*hashesPtr = hashes // update pointer with potentially reallocated slice
-				putHashesSlice(hashesPtr)
-			}()
+			hashes := make([]*chainhash.Hash, 0, maxMinedBatchSize)
 
 			for idx := 0; idx < len(subtree.Nodes); idx++ {
 				if subtree.Nodes[idx].Hash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
