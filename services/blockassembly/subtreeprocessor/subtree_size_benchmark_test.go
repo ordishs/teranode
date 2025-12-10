@@ -826,7 +826,7 @@ func BenchmarkProcessOwnBlockSubtreeNodesParallel(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// Reset state for each iteration
 				stp.currentTxMap = NewSplitTxInpointsMap(splitMapBuckets)
-				stp.currentSubtree = nil
+				stp.currentSubtree.Store(nil)
 				stp.chainedSubtrees = nil
 
 				_ = stp.processOwnBlockSubtreeNodes(block, nodes, currentTxMap, 0, nil, true)
@@ -877,7 +877,7 @@ func BenchmarkProcessOwnBlockSubtreeNodesSequential(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// Reset state for each iteration
 				stp.currentTxMap = NewSplitTxInpointsMap(splitMapBuckets)
-				stp.currentSubtree = nil
+				stp.currentSubtree.Store(nil)
 				stp.chainedSubtrees = nil
 
 				_ = stp.processOwnBlockSubtreeNodes(block, nodes, currentTxMap, 0, nil, true)
