@@ -45,6 +45,8 @@ type miningCandidateResponse struct {
 	err error
 }
 
+// State represents the current operational state of the BlockAssembler.
+// It tracks the assembler's lifecycle and processing phases.
 type State uint32
 
 const (
