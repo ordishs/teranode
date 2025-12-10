@@ -233,6 +233,11 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 		}
 
 		g.Go(func() error {
+			gCtx, _, endSpan := tracing.Tracer("model").Start(gCtx, "updateTxMinedStatus",
+				tracing.WithDebugLogMessage(logger, "[UpdateTxMinedStatus][%s][%s] starting processing", block.String(), block.Subtrees[subtreeIdx].String()),
+			)
+			defer endSpan()
+
 			hashes := make([]*chainhash.Hash, 0, maxMinedBatchSize)
 
 			for idx := 0; idx < len(subtree.Nodes); idx++ {
