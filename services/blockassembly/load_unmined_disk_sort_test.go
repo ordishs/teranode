@@ -266,11 +266,11 @@ func TestSortEntryOrdering(t *testing.T) {
 	})
 
 	// Verify sorted order
-	assert.Equal(t, int32(100), entries[0].CreatedAt)
-	assert.Equal(t, int32(200), entries[1].CreatedAt)
-	assert.Equal(t, int32(300), entries[2].CreatedAt)
-	assert.Equal(t, int32(400), entries[3].CreatedAt)
-	assert.Equal(t, int32(500), entries[4].CreatedAt)
+	assert.Equal(t, 100, entries[0].CreatedAt)
+	assert.Equal(t, 200, entries[1].CreatedAt)
+	assert.Equal(t, 300, entries[2].CreatedAt)
+	assert.Equal(t, 400, entries[3].CreatedAt)
+	assert.Equal(t, 500, entries[4].CreatedAt)
 }
 
 // setupDiskSortTest creates a BlockAssembler configured for disk sort testing

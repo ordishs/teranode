@@ -181,7 +181,7 @@ func UpdateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 		inFlightBlocksMu.Unlock()
 		logger.Infof("[UpdateTxMinedStatus][%s] blockID %d is already being processed, ignoring duplicate call", block.Hash().String(), blockID)
 		prometheusUpdateTxMinedDuplicates.Inc()
-		return nil
+		return errors.NewBlockParentNotMinedError("[UpdateTxMinedStatus][%s] blockID %d is already being processed", block.Hash().String(), blockID)
 	}
 	// Mark block as in-flight immediately to prevent duplicate processing
 	inFlightBlocks[blockID] = true

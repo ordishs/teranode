@@ -1472,7 +1472,6 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
 
 		// Create empty block
 		emptyBlock := &model.Block{
@@ -1622,7 +1621,6 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
 
 		// Create empty block
 		emptyBlock := &model.Block{
@@ -1744,7 +1742,6 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
 
 		// Add some initial transactions
 		for i := 0; i < 2; i++ {
@@ -1963,7 +1960,6 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
 
 		// Add some initial transactions to create state to verify
 		for i := 0; i < 2; i++ {

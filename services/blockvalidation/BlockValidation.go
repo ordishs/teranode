@@ -885,6 +885,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		if errors.Is(err, errors.ErrBlockInvalid) {
 			// mark the block as invalid in the blockchain
 			return u.markBlockAsInvalid(ctx, block, "contains transactions already on our chain: "+err.Error())
+		} else if errors.Is(err, errors.ErrBlockParentNotMined) {
+			u.logger.Warnf("[setTxMined][%s] skipping, already in progress of setMined for block", block.Hash().String())
+			return nil
 		}
 
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
