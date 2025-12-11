@@ -186,6 +186,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 				server, cleanup := setupTestServer(t)
 				defer cleanup()
 				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
+				server.settings.SubtreeValidation.UseSequentialProcessor = false
 
 				// Mock validator to return success
 				mockValidator := server.validatorClient.(*validator.MockValidatorClient)
