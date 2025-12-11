@@ -47,7 +47,7 @@ type SubtreeProcessorState struct {
 func captureSubtreeProcessorState(stp *SubtreeProcessor) SubtreeProcessorState {
 	return SubtreeProcessorState{
 		ChainedSubtreesCount: len(stp.chainedSubtrees),
-		CurrentSubtreeLength: stp.currentSubtree.Length(),
+		CurrentSubtreeLength: stp.currentSubtree.Load().Length(),
 		TxCount:              stp.TxCount(),
 		CurrentTxMapLength:   stp.currentTxMap.Length(),
 	}
@@ -249,13 +249,19 @@ func Test_RemoveTxFromSubtrees(t *testing.T) {
 		// Create a common parent hash for all transactions
 		parentHash := chainhash.HashH([]byte("parent-tx"))
 
-		// add some random nodes to the subtrees
+		// add some random nodes to the subtrees using the proper public API
 		// Each transaction needs a unique hash and proper parent references
+		nodes := make([]subtreepkg.Node, 42)
+		txInpoints := make([]*subtreepkg.TxInpoints, 42)
 		for i := uint64(0); i < 42; i++ {
 			hash := chainhash.HashH([]byte(fmt.Sprintf("tx-%d", i)))
-			// Use the parent hash instead of self-reference to avoid duplicate skipping
-			_ = stp.addNode(subtreepkg.Node{Hash: hash, Fee: i}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}, true)
+			nodes[i] = subtreepkg.Node{Hash: hash, Fee: i}
+			txInpoints[i] = &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}}
 		}
+		stp.AddBatch(nodes, txInpoints)
+
+		// Wait for transactions to be processed
+		time.Sleep(100 * time.Millisecond)
 
 		// check the length of the subtrees
 		// With 42 unique transactions and 4 items per subtree (including coinbase):
@@ -263,12 +269,12 @@ func Test_RemoveTxFromSubtrees(t *testing.T) {
 		// Subtrees 2-10: 4 txs each = 36 txs
 		// Remaining in current: 42 - 39 = 3 txs
 		t.Logf("Number of chained subtrees: %d", len(stp.chainedSubtrees))
-		t.Logf("Current subtree nodes: %d", len(stp.currentSubtree.Nodes))
+		t.Logf("Current subtree nodes: %d", len(stp.currentSubtree.Load().Nodes))
 		if len(stp.chainedSubtrees) > 5 {
 			t.Logf("Subtree 5 has %d nodes", len(stp.chainedSubtrees[5].Nodes))
 		}
 		assert.Len(t, stp.chainedSubtrees, 10)
-		assert.Len(t, stp.currentSubtree.Nodes, 3)
+		assert.Len(t, stp.currentSubtree.Load().Nodes, 3)
 
 		// get the middle transaction from the middle subtree
 		txHash := stp.chainedSubtrees[5].Nodes[2].Hash
@@ -279,9 +285,12 @@ func Test_RemoveTxFromSubtrees(t *testing.T) {
 
 		require.NoError(t, stp.CheckSubtreeProcessor())
 
-		// Remove a transaction from the subtree
-		err = stp.removeTxFromSubtrees(context.Background(), txHash)
+		// Remove a transaction from the subtree using the proper public API
+		err = stp.Remove(context.Background(), txHash)
 		require.NoError(t, err)
+
+		// Wait for removal to be processed
+		time.Sleep(100 * time.Millisecond)
 
 		// Check the state after removal
 		t.Logf("After removal - Number of chained subtrees: %d", len(stp.chainedSubtrees))
@@ -299,11 +308,11 @@ func Test_RemoveTxFromSubtrees(t *testing.T) {
 		// After removing and rechaining, we may have fewer subtrees due to proper duplicate handling
 		// The rechaining process rebuilds from the removal point, properly detecting duplicates
 		t.Logf("After rechaining - Number of chained subtrees: %d", len(stp.chainedSubtrees))
-		t.Logf("After rechaining - Current subtree nodes: %d", len(stp.currentSubtree.Nodes))
+		t.Logf("After rechaining - Current subtree nodes: %d", len(stp.currentSubtree.Load().Nodes))
 		// We should have at least the subtrees before the removal point
 		assert.GreaterOrEqual(t, len(stp.chainedSubtrees), 5)
 		// Current subtree should have some nodes but may vary due to rechaining
-		assert.GreaterOrEqual(t, len(stp.currentSubtree.Nodes), 0)
+		assert.GreaterOrEqual(t, len(stp.currentSubtree.Load().Nodes), 0)
 
 		// check that the txHash node has been removed from the currentTxMap
 		_, ok = stp.currentTxMap.Get(txHash)
@@ -345,7 +354,9 @@ func TestReChainSubtrees(t *testing.T) {
 	require.NoError(t, err)
 
 	stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
-	stp.Start(t.Context())
+	// NOTE: Do NOT call stp.Start() here - this test directly manipulates internal state
+	// and calls internal methods (addNode, reChainSubtrees) which would cause data races
+	// if the background goroutine is running.
 
 	// Create a common parent hash for all transactions
 	parentHash := chainhash.HashH([]byte("parent-tx"))
@@ -360,7 +371,7 @@ func TestReChainSubtrees(t *testing.T) {
 	// With 42 unique transactions and 4 items per subtree:
 	// 10 complete subtrees + 3 remaining in current
 	assert.Len(t, stp.chainedSubtrees, 10)
-	assert.Len(t, stp.currentSubtree.Nodes, 3)
+	assert.Len(t, stp.currentSubtree.Load().Nodes, 3)
 
 	// check the fee in the middle node the middle subtree
 	assert.Len(t, stp.chainedSubtrees[5].Nodes, 4)
@@ -368,7 +379,10 @@ func TestReChainSubtrees(t *testing.T) {
 	// Index 2 would be tx-21 with fee 21
 	assert.Equal(t, uint64(21), stp.chainedSubtrees[5].Nodes[2].Fee)
 
-	require.NoError(t, stp.CheckSubtreeProcessor())
+	// Check state using internal method (since Start() is not running)
+	errCh := make(chan error, 1)
+	stp.checkSubtreeProcessor(errCh)
+	require.NoError(t, <-errCh)
 
 	node := stp.chainedSubtrees[5].Nodes[2]
 
@@ -394,14 +408,17 @@ func TestReChainSubtrees(t *testing.T) {
 	assert.Len(t, stp.chainedSubtrees[5].Nodes, 4)
 
 	// currentSubtree should have 2 nodes
-	assert.Len(t, stp.currentSubtree.Nodes, 2)
+	assert.Len(t, stp.currentSubtree.Load().Nodes, 2)
 
 	// all chainedSubtrees should have 4 nodes
 	for i := 0; i < 10; i++ {
 		assert.Len(t, stp.chainedSubtrees[i].Nodes, 4)
 	}
 
-	require.NoError(t, stp.CheckSubtreeProcessor())
+	// Check state using internal method (since Start() is not running)
+	errCh2 := make(chan error, 1)
+	stp.checkSubtreeProcessor(errCh2)
+	require.NoError(t, <-errCh2)
 }
 
 func TestGetMerkleProofForCoinbase(t *testing.T) {
@@ -457,7 +474,7 @@ func TestGetMerkleProofForCoinbase(t *testing.T) {
 			require.NoError(t, err)
 
 			if i == 0 {
-				stp.currentSubtree.ReplaceRootNode(hash, 0, 0)
+				stp.currentSubtree.Load().ReplaceRootNode(hash, 0, 0)
 			} else {
 				stp.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{*hash}}})
 			}
@@ -499,7 +516,7 @@ func TestGetMerkleProofForCoinbase(t *testing.T) {
 			require.NoError(t, err)
 
 			if i == 0 {
-				stp.currentSubtree.ReplaceRootNode(hash, 0, 0)
+				stp.currentSubtree.Load().ReplaceRootNode(hash, 0, 0)
 			} else {
 				stp.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{*hash}}})
 			}
@@ -592,7 +609,7 @@ func TestMoveForwardBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		if i == 0 {
-			stp.currentSubtree.ReplaceRootNode(hash, 0, 0)
+			stp.currentSubtree.Load().ReplaceRootNode(hash, 0, 0)
 		} else {
 			stp.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{*hash}}})
 		}
@@ -608,7 +625,7 @@ func TestMoveForwardBlock(t *testing.T) {
 	// there should be 4 chained subtrees
 	assert.Equal(t, 4, len(stp.chainedSubtrees))
 	assert.Equal(t, 4, stp.chainedSubtrees[0].Size())
-	assert.Equal(t, 2, stp.currentSubtree.Length())
+	assert.Equal(t, 2, stp.currentSubtree.Load().Length())
 
 	assert.Equal(t, int(n-1), stp.currentTxMap.Length()) //nolint:gosec
 
@@ -637,7 +654,7 @@ func TestMoveForwardBlock(t *testing.T) {
 	// we added the coinbase placeholder
 	assert.Equal(t, 5, len(stp.chainedSubtrees))
 	assert.Equal(t, 2, stp.chainedSubtrees[0].Size())
-	assert.Equal(t, 1, stp.currentSubtree.Length())
+	assert.Equal(t, 1, stp.currentSubtree.Load().Length())
 
 	// check the currentTxMap, it will have 1 less than the tx count, which has the coinbase placeholder
 	assert.Equal(t, int(stp.TxCount()), stp.currentTxMap.Length()+1) // nolint:gosec
@@ -700,8 +717,8 @@ func TestMoveForwardBlock_LeftInQueue(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Len(t, subtreeProcessor.chainedSubtrees, 0)
-	assert.Len(t, subtreeProcessor.currentSubtree.Nodes, 1)
-	assert.Equal(t, *subtreepkg.CoinbasePlaceholderHash, subtreeProcessor.currentSubtree.Nodes[0].Hash)
+	assert.Len(t, subtreeProcessor.currentSubtree.Load().Nodes, 1)
+	assert.Equal(t, *subtreepkg.CoinbasePlaceholderHash, subtreeProcessor.currentSubtree.Load().Nodes[0].Hash)
 }
 
 func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
@@ -759,7 +776,7 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 		require.NoError(t, err)
 
 		if i == 0 {
-			stp.currentSubtree.ReplaceRootNode(hash, 0, 0)
+			stp.currentSubtree.Load().ReplaceRootNode(hash, 0, 0)
 		} else {
 			stp.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{*hash}}})
 		}
@@ -776,7 +793,7 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 	assert.Equal(t, 4, len(stp.chainedSubtrees))
 	assert.Equal(t, 4, stp.chainedSubtrees[0].Size())
 	// and 1 tx in the current subtree
-	assert.Equal(t, 1, stp.currentSubtree.Length())
+	assert.Equal(t, 1, stp.currentSubtree.Load().Length())
 
 	stp.currentItemsPerFile.Store(2)
 	_ = stp.utxoStore.SetBlockHeight(1)
@@ -801,7 +818,7 @@ func TestIncompleteSubtreeMoveForwardBlock(t *testing.T) {
 
 	wg.Wait()
 	assert.Equal(t, 5, len(stp.chainedSubtrees))
-	assert.Equal(t, 0, stp.currentSubtree.Length())
+	assert.Equal(t, 0, stp.currentSubtree.Load().Length())
 }
 
 // current subtree should have 1 tx which due to the new added coinbase placeholder
@@ -862,7 +879,7 @@ func TestSubtreeMoveForwardBlockNewCurrent(t *testing.T) {
 		require.NoError(t, err)
 
 		if i == 0 {
-			stp.currentSubtree.ReplaceRootNode(hash, 0, 0)
+			stp.currentSubtree.Load().ReplaceRootNode(hash, 0, 0)
 		} else {
 			stp.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{*hash}}})
 		}
@@ -877,7 +894,7 @@ func TestSubtreeMoveForwardBlockNewCurrent(t *testing.T) {
 	assert.Equal(t, 4, len(stp.chainedSubtrees))
 	assert.Equal(t, 4, stp.chainedSubtrees[0].Size())
 	// and 0 tx in the current subtree
-	assert.Equal(t, 0, stp.currentSubtree.Length())
+	assert.Equal(t, 0, stp.currentSubtree.Load().Length())
 
 	stp.currentItemsPerFile.Store(2)
 	_ = stp.utxoStore.SetBlockHeight(1)
@@ -902,7 +919,7 @@ func TestSubtreeMoveForwardBlockNewCurrent(t *testing.T) {
 	wg.Wait()
 	require.NoError(t, err)
 	assert.Equal(t, 4, len(stp.chainedSubtrees))
-	assert.Equal(t, 1, stp.currentSubtree.Length())
+	assert.Equal(t, 1, stp.currentSubtree.Load().Length())
 }
 
 func TestCompareMerkleProofsToSubtrees(t *testing.T) {
@@ -948,7 +965,7 @@ func TestCompareMerkleProofsToSubtrees(t *testing.T) {
 
 	for i, hash := range hashes {
 		if i == 0 {
-			subtreeProcessor.currentSubtree.ReplaceRootNode(hash, 0, 0)
+			subtreeProcessor.currentSubtree.Load().ReplaceRootNode(hash, 0, 0)
 		} else {
 			subtreeProcessor.AddBatch([]subtreepkg.Node{{Hash: *hash, Fee: 111}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{*hash}}})
 		}
@@ -1038,7 +1055,8 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 
 		ctx := context.Background()
 		subtreeProcessor, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, nil, nil, nil, newSubtreeChan)
-		subtreeProcessor.Start(ctx)
+		// NOTE: Do NOT call Start() - this test directly manipulates internal state
+		// (currentSubtree, chainedSubtrees) which would cause data races with the background goroutine
 
 		// Build subtrees manually to simulate an existing block's subtrees
 		parentHash := chainhash.HashH([]byte("parent-tx"))
@@ -1081,10 +1099,11 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 		chainedSubtrees = append(chainedSubtrees, lastSubtree)
 
 		// Setup fresh subtree processor state
-		subtreeProcessor.currentSubtree, err = subtreepkg.NewTree(4)
+		newSubtree, err := subtreepkg.NewTree(4)
 		require.NoError(t, err)
+		subtreeProcessor.currentSubtree.Store(newSubtree)
 		subtreeProcessor.chainedSubtrees = make([]*subtreepkg.Subtree, 0)
-		_ = subtreeProcessor.currentSubtree.AddCoinbaseNode()
+		_ = subtreeProcessor.currentSubtree.Load().AddCoinbaseNode()
 
 		// Setup maps
 		transactionMap := txmap.NewSplitSwissMap(4)    // Transactions that are in the new block
@@ -1108,7 +1127,7 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 		for _, subtree := range subtreeProcessor.chainedSubtrees {
 			remainder = append(remainder, subtree.Nodes...)
 		}
-		remainder = append(remainder, subtreeProcessor.currentSubtree.Nodes...)
+		remainder = append(remainder, subtreeProcessor.currentSubtree.Load().Nodes...)
 
 		// With duplicate detection, only the coinbase should remain (no duplicates added)
 		assert.Equal(t, 1, len(remainder))
@@ -1146,12 +1165,13 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 			// "f923a14068167a9107a0b7cd6102bfa5c0a4c8a72726a82f12e91009fd7e33be",
 		}
 
-		subtreeProcessor.currentSubtree, err = subtreepkg.NewTree(4)
+		newSubtree2, err := subtreepkg.NewTree(4)
 		require.NoError(t, err)
+		subtreeProcessor.currentSubtree.Store(newSubtree2)
 
 		subtreeProcessor.chainedSubtrees = make([]*subtreepkg.Subtree, 0)
 
-		_ = subtreeProcessor.currentSubtree.AddCoinbaseNode()
+		_ = subtreeProcessor.currentSubtree.Load().AddCoinbaseNode()
 
 		// Test scenario 2: Some transactions are in the new block (transactionMap)
 		// Clear the subtreeProcessor state but keep currentTxMap populated
@@ -1180,7 +1200,7 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 			remainder = append(remainder, subtree.Nodes...)
 		}
 
-		remainder = append(remainder, subtreeProcessor.currentSubtree.Nodes...)
+		remainder = append(remainder, subtreeProcessor.currentSubtree.Load().Nodes...)
 
 		// With duplicate detection, only the coinbase remains (no duplicates added)
 		assert.Equal(t, 1, len(remainder))
@@ -1321,32 +1341,18 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 		stp, _ := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
-		stp.Start(t.Context())
+		// NOTE: Do NOT call Start() - this test calls internal methods (moveBackBlock)
+		// which would cause data races with the background goroutine
 
+		// Directly add nodes using internal method since Start() is not running
 		for _, txHash := range txHashes {
-			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
-		}
-
-		// Wait for 4 subtrees to be created
-		for {
-			subtreeCountMutex.Lock()
-			count := subtreeCount
-			subtreeCountMutex.Unlock()
-			if count >= 4 {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-
-		// this is to make sure the subtrees are added to the chain
-		for stp.txCount.Load() < 17 {
-			time.Sleep(100 * time.Millisecond)
+			_ = stp.addNode(subtreepkg.Node{Hash: txHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
 		}
 
 		// there should be 4 chained subtrees
 		assert.Equal(t, 4, len(stp.chainedSubtrees))
 		assert.Equal(t, 4, stp.chainedSubtrees[0].Size())
-		assert.Equal(t, 3, stp.currentSubtree.Length())
+		assert.Equal(t, 3, stp.currentSubtree.Load().Length())
 
 		// create 2 subtrees from the previous block
 		subtree1 := createSubtree(t, 4, true)
@@ -1373,6 +1379,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp.InitCurrentBlockHeader(blockHeader)
 
+		// Call internal moveBackBlock method (safe since Start() is not running)
 		_, _, err = stp.moveBackBlock(context.Background(), &model.Block{
 			Header: prevBlockHeader,
 			Subtrees: []*chainhash.Hash{
@@ -1383,12 +1390,9 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 		}, true)
 		require.NoError(t, err)
 
-		// Wait for any background processing to complete
-		time.Sleep(100 * time.Millisecond)
-
 		assert.Equal(t, 6, len(stp.chainedSubtrees))
 		assert.Equal(t, 4, stp.chainedSubtrees[0].Size())
-		assert.Equal(t, 2, stp.currentSubtree.Length())
+		assert.Equal(t, 2, stp.currentSubtree.Load().Length())
 
 		// check that the nodes from subtree1 and subtree2 are the first nodes
 		for i := 0; i < 4; i++ {
@@ -1402,7 +1406,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 			shouldBeInNode := idx % 4
 
 			if shouldBeInSubtree > len(stp.chainedSubtrees)-1 {
-				assert.Equal(t, txHash, stp.currentSubtree.Nodes[shouldBeInNode].Hash)
+				assert.Equal(t, txHash, stp.currentSubtree.Load().Nodes[shouldBeInNode].Hash)
 			} else {
 				assert.Equal(t, txHash, stp.chainedSubtrees[shouldBeInSubtree].Nodes[shouldBeInNode].Hash)
 			}
@@ -1429,7 +1433,8 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
+		// stp.Start(ctx)
 
 		// Add some initial state to verify it remains unchanged
 		initialTxHash, err := generateTxHash()
@@ -1470,7 +1475,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
 		// Create empty block
 		emptyBlock := &model.Block{
@@ -1489,7 +1494,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		// Verify state after processing empty block
 		assert.Equal(t, 0, len(stp.chainedSubtrees))
-		assert.Equal(t, 1, stp.currentSubtree.Length()) // Should only have coinbase placeholder
+		assert.Equal(t, 1, stp.currentSubtree.Load().Length()) // Should only have coinbase placeholder
 	})
 
 	// Test subtree store errors with state reset verification
@@ -1566,7 +1571,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
 		// Create subtree with only coinbase placeholder
 		coinbaseSubtree, err := subtreepkg.NewTreeByLeafCount(1)
@@ -1595,7 +1600,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		// Verify the coinbase placeholder was handled correctly
 		assert.Equal(t, 0, len(stp.chainedSubtrees))
-		assert.Equal(t, 1, stp.currentSubtree.Length())
+		assert.Equal(t, 1, stp.currentSubtree.Load().Length())
 	})
 
 	// Test SetBlockProcessedAt error (non-critical path)
@@ -1620,7 +1625,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
 		// Create empty block
 		emptyBlock := &model.Block{
@@ -1674,20 +1679,14 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
-		// Add some existing transactions
+		// Add some existing transactions using internal method (Start() is not running)
 		for i := 0; i < 3; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
-			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
+			_ = stp.addNode(subtreepkg.Node{Hash: txHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
 		}
-
-		// Wait for processing to complete
-		for stp.txCount.Load() < 3 {
-			time.Sleep(10 * time.Millisecond)
-		}
-		time.Sleep(50 * time.Millisecond) // Additional buffer time
 
 		// Create single subtree
 		subtree1 := createSubtree(t, 4, true)
@@ -1742,15 +1741,15 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
-		// Add some initial transactions
+		// Add some initial transactions using AddDirectly (Start() is not running)
 		for i := 0; i < 2; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
-			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
+			node := subtreepkg.Node{Hash: txHash, Fee: 1}
+			_ = stp.AddDirectly(&node, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
 		}
-		time.Sleep(50 * time.Millisecond) // Allow processing
 
 		// Capture original state
 		originalState := captureSubtreeProcessorState(stp)
@@ -1794,15 +1793,14 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
-		// Add some initial transactions to create state to verify
+		// Add some initial transactions using internal method (Start() is not running)
 		for i := 0; i < 3; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
-			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
+			_ = stp.addNode(subtreepkg.Node{Hash: txHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
 		}
-		time.Sleep(100 * time.Millisecond) // Allow processing
 
 		// Capture original state
 		originalState := captureSubtreeProcessorState(stp)
@@ -1847,7 +1845,7 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
 		// Add some initial transactions to create state to verify
 		for i := 0; i < 3; i++ {
@@ -1855,7 +1853,6 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 			require.NoError(t, err)
 			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
 		}
-		time.Sleep(100 * time.Millisecond) // Allow processing
 
 		// Capture original state
 		originalState := captureSubtreeProcessorState(stp)
@@ -1905,15 +1902,14 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
-		// Add some initial transactions to create state to verify
+		// Add some initial transactions using internal method (Start() is not running)
 		for i := 0; i < 3; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
-			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
+			_ = stp.addNode(subtreepkg.Node{Hash: txHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
 		}
-		time.Sleep(100 * time.Millisecond) // Allow processing
 
 		// Capture original state
 		originalState := captureSubtreeProcessorState(stp)
@@ -1961,15 +1957,14 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
-		// Add some initial transactions to create state to verify
+		// Add some initial transactions using internal method (Start() is not running)
 		for i := 0; i < 2; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
-			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
+			_ = stp.addNode(subtreepkg.Node{Hash: txHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
 		}
-		time.Sleep(50 * time.Millisecond) // Allow processing
 
 		// Capture original state
 		originalState := captureSubtreeProcessorState(stp)
@@ -2046,15 +2041,14 @@ func TestSubtreeProcessor_moveBackBlock(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
+		// NOTE: Do NOT call Start() - this test calls internal moveBackBlock()
 
-		// Add some initial transactions to create initial state
+		// Add some initial transactions using internal method (Start() is not running)
 		for i := 0; i < 2; i++ {
 			txHash, err := generateTxHash()
 			require.NoError(t, err)
-			stp.AddBatch([]subtreepkg.Node{{Hash: txHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{txHash}}})
+			_ = stp.addNode(subtreepkg.Node{Hash: txHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{txHash}}, true)
 		}
-		time.Sleep(50 * time.Millisecond) // Allow processing
 
 		// Capture original state
 		originalState := captureSubtreeProcessorState(stp)
@@ -2879,7 +2873,7 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 		// Verify transaction was added
 		_, exists := stp.currentTxMap.Get(txHash)
 		require.True(t, exists, "Transaction should be in currentTxMap")
-		require.True(t, stp.currentSubtree.NodeIndex(txHash) >= 0, "Transaction should be in current subtree")
+		require.True(t, stp.currentSubtree.Load().NodeIndex(txHash) >= 0, "Transaction should be in current subtree")
 
 		initialTxCount := stp.TxCount()
 
@@ -2896,7 +2890,7 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 		t.Logf("Transaction still in currentTxMap: %v", stillExists)
 
 		// Check if transaction was removed from current subtree
-		indexAfter := stp.currentSubtree.NodeIndex(txHash)
+		indexAfter := stp.currentSubtree.Load().NodeIndex(txHash)
 		t.Logf("Transaction index in current subtree after removal: %d", indexAfter)
 	})
 
@@ -2930,7 +2924,7 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 
 		for _, hash := range txHashes {
 			_, stillExists := stp.currentTxMap.Get(hash)
-			indexAfter := stp.currentSubtree.NodeIndex(hash)
+			indexAfter := stp.currentSubtree.Load().NodeIndex(hash)
 			t.Logf("Hash %s - still in map: %v, index: %d", hash.String()[:8], stillExists, indexAfter)
 		}
 	})
@@ -2967,7 +2961,7 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 		t.Logf("Chained subtrees after: %d", len(stp.chainedSubtrees))
 
 		_, stillExists := stp.currentTxMap.Get(targetHash)
-		currentIndex := stp.currentSubtree.NodeIndex(targetHash)
+		currentIndex := stp.currentSubtree.Load().NodeIndex(targetHash)
 		t.Logf("Target hash still in map: %v, current subtree index: %d", stillExists, currentIndex)
 
 		// Check chained subtrees
@@ -3260,7 +3254,6 @@ func TestMoveBackBlockChildrenRemoval(t *testing.T) {
 
 		stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, settings, blobStore, nil, utxoStore, newSubtreeChan)
 		require.NoError(t, err)
-		stp.Start(ctx)
 
 		// Use existing coinbase transaction from test data
 		coinbase := coinbaseTx2

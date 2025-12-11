@@ -75,7 +75,7 @@ func TestSubtreeProcessorSizePerformance(t *testing.T) {
 			duration := time.Since(start)
 
 			subtreeCount := len(stp.chainedSubtrees)
-			if stp.currentSubtree.Length() > 1 { // >1 because of coinbase placeholder
+			if stp.currentSubtree.Load().Length() > 1 { // >1 because of coinbase placeholder
 				subtreeCount++
 			}
 
@@ -568,7 +568,7 @@ func BenchmarkSubtreeProcessorOverheadBreakdown(b *testing.B) {
 
 			b.StopTimer()
 			subtreeCount := len(stp.chainedSubtrees)
-			if stp.currentSubtree != nil && stp.currentSubtree.Length() > 0 {
+			if currentSubtree := stp.currentSubtree.Load(); currentSubtree != nil && currentSubtree.Length() > 0 {
 				subtreeCount++
 			}
 			rotations := len(stp.chainedSubtrees)
@@ -826,7 +826,7 @@ func BenchmarkProcessOwnBlockSubtreeNodesParallel(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// Reset state for each iteration
 				stp.currentTxMap = NewSplitTxInpointsMap(splitMapBuckets)
-				stp.currentSubtree = nil
+				stp.currentSubtree.Store(nil)
 				stp.chainedSubtrees = nil
 
 				_ = stp.processOwnBlockSubtreeNodes(block, nodes, currentTxMap, 0, nil, true)
@@ -877,7 +877,7 @@ func BenchmarkProcessOwnBlockSubtreeNodesSequential(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// Reset state for each iteration
 				stp.currentTxMap = NewSplitTxInpointsMap(splitMapBuckets)
-				stp.currentSubtree = nil
+				stp.currentSubtree.Store(nil)
 				stp.chainedSubtrees = nil
 
 				_ = stp.processOwnBlockSubtreeNodes(block, nodes, currentTxMap, 0, nil, true)

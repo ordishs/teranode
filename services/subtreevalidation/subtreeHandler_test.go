@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/assert"
@@ -182,7 +183,7 @@ func TestSubtreesHandler(t *testing.T) {
 			}
 
 			// we only need the httpClient, txMetaStore and validatorClient when blessing a transaction
-			httpmock.Activate()
+			httpmock.ActivateNonDefault(util.HTTPClient())
 			httpmock.RegisterResponder(
 				"GET",
 				`=~subtree_data.*`,

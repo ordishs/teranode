@@ -14,6 +14,8 @@ import (
 	"github.com/bsv-blockchain/teranode/cmd/checkblocktemplate"
 	"github.com/bsv-blockchain/teranode/cmd/filereader"
 	"github.com/bsv-blockchain/teranode/cmd/getfsmstate"
+	"github.com/bsv-blockchain/teranode/cmd/logs"
+	"github.com/bsv-blockchain/teranode/cmd/monitor"
 	"github.com/bsv-blockchain/teranode/cmd/resetblockassembly"
 	"github.com/bsv-blockchain/teranode/cmd/seeder"
 	"github.com/bsv-blockchain/teranode/cmd/setfsmstate"
@@ -47,6 +49,8 @@ var commandHelp = map[string]string{
 	"validate-utxo-set":       "Validate UTXO set file",
 	"subtreebench":            "Benchmark SubtreeProcessor throughput with CPU and memory profiling",
 	"loadunminedbench":        "Benchmark loadUnminedTransactions with CPU and memory profiling",
+	"monitor":                 "Live TUI dashboard for monitoring node status",
+	"logs":                    "Interactive log viewer with filtering and search",
 }
 
 var dangerousCommands = map[string]bool{}
@@ -245,6 +249,17 @@ func Start(args []string, version, commit string) {
 		cmd.Execute = func(args []string) error {
 			getfsmstate.FetchFSMState(logger, tSettings)
 			return nil
+		}
+	case "monitor":
+		cmd.Execute = func(args []string) error {
+			return monitor.Run(logger, tSettings)
+		}
+	case "logs":
+		logFile := cmd.FlagSet.String("file", "./logs/teranode.log", "Path to log file")
+		bufferSize := cmd.FlagSet.Int("buffer", 10000, "Number of log entries to keep in memory")
+
+		cmd.Execute = func(args []string) error {
+			return logs.Run(*logFile, *bufferSize)
 		}
 	case "setfsmstate":
 		targetFsmState := cmd.FlagSet.String("fsmstate", "", "target fsm state (accepted values: running, idle, catchingblocks, legacysyncing)")

@@ -45,6 +45,8 @@ type miningCandidateResponse struct {
 	err error
 }
 
+// State represents the current operational state of the BlockAssembler.
+// It tracks the assembler's lifecycle and processing phases.
 type State uint32
 
 const (
@@ -2147,6 +2149,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 		markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, result.markAsMinedOnLongestTxs...)
 	}
 
+	workerResults = nil // release memory
+
 	iteratorDuration := time.Since(iteratorStart).Seconds()
 	prometheusBlockAssemblerIteratorProcessingTime.WithLabelValues(fullScanLabel).Observe(iteratorDuration)
 	prometheusBlockAssemblerIteratorTransactionsTotal.WithLabelValues(fullScanLabel).Add(float64(totalProcessed.Load()))
@@ -2171,12 +2175,16 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 
 	// order the transactions by createdAt
 	sortStart := time.Now()
+
 	sort.Slice(unminedTransactions, func(i, j int) bool {
 		// sort by createdAt, oldest first
 		return unminedTransactions[i].CreatedAt < unminedTransactions[j].CreatedAt
 	})
+
 	txCount := len(unminedTransactions)
+
 	var countBucket string
+
 	switch {
 	case txCount < 1000:
 		countBucket = "<1k"
@@ -2189,6 +2197,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	default:
 		countBucket = ">1M"
 	}
+
 	prometheusBlockAssemblerSortTransactionsTime.WithLabelValues(countBucket).Observe(time.Since(sortStart).Seconds())
 
 	// Apply parent chain validation if enabled
@@ -2250,7 +2259,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 // sortEntry is a lightweight in-memory structure for sorting.
 // Only 12 bytes per transaction instead of full UnminedTransaction.
 type sortEntry struct {
-	CreatedAt int32  // 4 bytes - sort key
+	CreatedAt int    // 8 bytes - timestamp with milliseconds for sorting
 	Sequence  uint64 // 8 bytes - key to retrieve from temp store
 }
 
@@ -2415,7 +2424,7 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 
 			// Add lightweight sort entry
 			sortEntries = append(sortEntries, sortEntry{
-				CreatedAt: int32(unminedTx.CreatedAt),
+				CreatedAt: unminedTx.CreatedAt,
 				Sequence:  sequence,
 			})
 

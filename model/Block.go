@@ -499,7 +499,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// we only check when we have a subtree store passed in, otherwise this check cannot / should not be done
 	if subtreeStore != nil {
 		// this creates the txMap for the block that is also used in the validOrderAndBlessed check
-		err = b.checkDuplicateTransactions(ctx, settings.Block.CheckDuplicateTransactionsConcurrency)
+		err = b.checkDuplicateTransactions(ctx, logger, settings.Block.CheckDuplicateTransactionsConcurrency)
 		if err != nil {
 			return false, err
 		}
@@ -556,7 +556,7 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
 	coinbaseReward := util.GetBlockSubsidyForHeight(b.Height, params)
 
 	if coinbaseOutputSatoshis > subtreeFees+coinbaseReward {
-		return errors.NewBlockInvalidError("[BLOCK][%s] coinbase output (%d) is greater than the fees + block subsidy (%d)", b.String(), coinbaseOutputSatoshis, subtreeFees+coinbaseReward)
+		return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] coinbase output (%d) is greater than the fees + block subsidy (%d)", b.String(), coinbaseOutputSatoshis, subtreeFees+coinbaseReward)
 	}
 
 	return nil
@@ -571,8 +571,10 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
 //
 // Returns:
 // - error: if a duplicate transaction is found or if there is an error adding the transaction to the txMap
-func (b *Block) checkDuplicateTransactions(ctx context.Context, checkDuplicateTransactionsConcurrency int) error {
-	_, _, deferFn := tracing.Tracer("block").Start(ctx, "checkDuplicateTransactions")
+func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.Logger, checkDuplicateTransactionsConcurrency int) error {
+	_, _, deferFn := tracing.Tracer("block").Start(ctx, "checkDuplicateTransactions",
+		tracing.WithLogMessage(logger, "[checkDuplicateTransactions][%s] called", b.String()),
+	)
 	defer deferFn()
 
 	concurrency := checkDuplicateTransactionsConcurrency
@@ -671,7 +673,9 @@ type validationDependencies struct {
 }
 
 func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger, deps *validationDependencies, validOrderAndBlessedConcurrency int) error {
-	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "validOrderAndBlessed")
+	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "validOrderAndBlessed",
+		tracing.WithLogMessage(logger, "[validOrderAndBlessed][%s] called", b.String()),
+	)
 	defer deferFn()
 
 	if b.txMap == nil {
@@ -703,7 +707,9 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 
 func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps *validationDependencies,
 	validationCtx *validationContext, subtree *subtreepkg.Subtree, sIdx int) error {
-	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "validateSubtree")
+	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "validateSubtree",
+		tracing.WithLogMessage(logger, "[validateSubtree][%s][%s:%d] called", b.String(), subtree.RootHash().String(), sIdx),
+	)
 	defer deferFn()
 
 	var (
@@ -751,34 +757,41 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 	}
 
 	if len(checkParentTxHashes) > 0 {
-		// check all the parent transactions in parallel, this allows us to batch read from the txMetaStore
-		parentG := new(errgroup.Group)
-		util.SafeSetLimit(parentG, 1024*32)
-
-		for _, parentTxStruct := range checkParentTxHashes {
-			parentTxStruct := parentTxStruct
-
-			parentG.Go(func() error {
-				oldParentBlockIDs, err := b.checkParentExistsOnChain(ctx, logger, deps.txMetaStore, parentTxStruct, validationCtx.currentBlockHeaderIDsMap)
-
-				// there are old blocks we need to return to the validator
-				if err == nil && len(oldParentBlockIDs) > 0 {
-					// insert tx id and old parent block ids (i.e. tx's parent block ids) into the map.
-					// Each tx id and its block ids will be checked by the validator separately.
-					deps.oldBlockIDsMap.Set(parentTxStruct.txHash, oldParentBlockIDs)
-				}
-
-				return err
-			})
-		}
-
-		if err = parentG.Wait(); err != nil {
-			// just return the error from above
-			return err
-		}
+		return b.checkParentsExistOnChain(ctx, logger, deps, validationCtx, checkParentTxHashes)
 	}
 
 	return nil
+}
+
+func (b *Block) checkParentsExistOnChain(ctx context.Context, logger ulogger.Logger, deps *validationDependencies,
+	validationCtx *validationContext, checkParentTxHashes []missingParentTx) error {
+	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "checkParentsExistOnChain",
+		tracing.WithLogMessage(logger, "[validateSubtree][%s] called to check %d parent tx hashes", b.String(), len(checkParentTxHashes)),
+	)
+	defer deferFn()
+
+	// check all the parent transactions in parallel, this allows us to batch read from the txMetaStore
+	parentG := new(errgroup.Group)
+	util.SafeSetLimit(parentG, 1024*32)
+
+	for _, parentTxStruct := range checkParentTxHashes {
+		parentTxStruct := parentTxStruct
+
+		parentG.Go(func() error {
+			oldParentBlockIDs, err := b.checkParentExistsOnChain(ctx, logger, deps.txMetaStore, parentTxStruct, validationCtx.currentBlockHeaderIDsMap)
+
+			// there are old blocks we need to return to the validator
+			if err == nil && len(oldParentBlockIDs) > 0 {
+				// insert tx id and old parent block ids (i.e. tx's parent block ids) into the map.
+				// Each tx id and its block ids will be checked by the validator separately.
+				deps.oldBlockIDsMap.Set(parentTxStruct.txHash, oldParentBlockIDs)
+			}
+
+			return err
+		})
+	}
+
+	return parentG.Wait()
 }
 
 type validationContext struct {
@@ -1066,6 +1079,7 @@ func (b *Block) GetSubtrees(ctx context.Context, logger ulogger.Logger, subtreeS
 func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int) error {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "GetAndValidateSubtrees",
 		tracing.WithHistogram(prometheusBlockGetAndValidateSubtrees),
+		tracing.WithLogMessage(logger, "[GetAndValidateSubtrees][%s] fetching and validating subtrees", b.String()),
 	)
 	defer deferFn()
 

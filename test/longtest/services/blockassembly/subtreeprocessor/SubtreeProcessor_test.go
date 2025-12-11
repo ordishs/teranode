@@ -91,11 +91,11 @@ func Test_AddTx(t *testing.T) {
 
 		tx1NodeParents, ok := txMap.Get(node1.Hash)
 		require.True(t, ok)
-		assert.Equal(t, parents, tx1NodeParents, "Expected tx1 node to be in the currentTxMap")
+		assert.Equal(t, parents, *tx1NodeParents, "Expected tx1 node to be in the currentTxMap")
 
 		tx2NodeParents, ok := txMap.Get(node2.Hash)
 		require.True(t, ok)
-		assert.Equal(t, parents, tx2NodeParents, "Expected tx1 node to be in the currentTxMap")
+		assert.Equal(t, parents, *tx2NodeParents, "Expected tx1 node to be in the currentTxMap")
 	})
 }
 

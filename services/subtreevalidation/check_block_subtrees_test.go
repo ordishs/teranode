@@ -192,6 +192,9 @@ func TestCheckBlockSubtrees(t *testing.T) {
 					mock.Anything).
 					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
 
+				currentBlockIDsMap := map[uint32]bool{1: true, 2: true, 3: true}
+				server.currentBlockIDsMap.Store(&currentBlockIDsMap)
+
 				// Create test transactions and store them
 				tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
 				require.NoError(t, err)
@@ -238,7 +241,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 				// Mock blockchain client to return error
 				server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
 					mock.Anything, mock.Anything, mock.Anything).
-					Return([]uint32{}, errors.NewServiceError("blockchain client error"))
+					Return([]uint32{}, errors.NewServiceError("failed to get block IDs map during subtree validation"))
 
 				request := &subtreevalidation_api.CheckBlockSubtreesRequest{
 					Block:   blockBytes,
@@ -248,7 +251,8 @@ func TestCheckBlockSubtrees(t *testing.T) {
 				response, err := server.CheckBlockSubtrees(context.Background(), request)
 				require.Error(t, err)
 				assert.Nil(t, response)
-				assert.Contains(t, err.Error(), "Failed to get block headers from blockchain client")
+				errStr := err.Error()
+				assert.Contains(t, errStr, "failed to get block IDs map during subtree validation")
 			})
 
 			t.Run("HTTPFetchingPath", func(t *testing.T) {

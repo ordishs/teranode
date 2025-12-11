@@ -171,7 +171,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Block: BlockSettings{
 			MinedCacheMaxMB:                         getInt("blockMinedCacheMaxMB", 256, alternativeContext...),
 			PersisterStore:                          getURL("blockPersisterStore", "file://./data/blockstore", alternativeContext...),
-			StateFile:                               getString("blockPersister_stateFile", "file://./data/blockpersister_state.txt", alternativeContext...),
+			StateFile:                               getString("blockPersister_stateFile", "", alternativeContext...),
 			PersisterHTTPListenAddress:              getString("blockPersister_httpListenAddress", ":8083", alternativeContext...),
 			CheckDuplicateTransactionsConcurrency:   getInt("block_checkDuplicateTransactionsConcurrency", -1, alternativeContext...),
 			GetAndValidateSubtreesConcurrency:       getInt("block_getAndValidateSubtreesConcurrency", -1, alternativeContext...),
@@ -233,7 +233,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			OnRestartRemoveInvalidParentChainTxs: getBool("blockassembly_onRestartRemoveInvalidParentChainTxs", false, alternativeContext...),
 			UseColumnarBatch:                     getBool("blockassembly_useColumnarBatch", true, alternativeContext...),
 			UnminedTxDiskSortPath:                getString("blockassembly_unminedTxDiskSortPath", "", alternativeContext...),
-			UnminedTxDiskSortEnabled:             getBool("blockassembly_unminedTxDiskSortEnabled", true, alternativeContext...),
+			UnminedTxDiskSortEnabled:             getBool("blockassembly_unminedTxDiskSortEnabled", false, alternativeContext...),
 			// getMiningCandidate timeout settings
 			GetMiningCandidateSendTimeout:     getDuration("blockassembly_getMiningCandidate_send_timeout", 1*time.Second, alternativeContext...),
 			GetMiningCandidateResponseTimeout: getDuration("blockassembly_getMiningCandidate_response_timeout", 10*time.Second, alternativeContext...),
