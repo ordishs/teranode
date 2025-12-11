@@ -474,6 +474,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PauseTimeout:                              getDuration("subtreevalidation_pauseTimeout", 5*time.Minute, alternativeContext...),
 			UseStreamingProcessor:                     getBool("subtreevalidation_useStreamingProcessor", false, alternativeContext...),
 			UseSequentialProcessor:                    getBool("subtreevalidation_useSequentialProcessor", true, alternativeContext...),
+			EnableBlockChainStateChecks:               getBool("subtreevalidation_enableBlockChainStateChecks", true, alternativeContext...),
 		},
 		Legacy: LegacySettings{
 			WorkingDir:                       getString("legacy_workingDir", "../../data", alternativeContext...),

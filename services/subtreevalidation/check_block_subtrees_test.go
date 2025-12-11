@@ -1519,6 +1519,7 @@ func TestCheckBlockSubtrees_DifferentFork(t *testing.T) {
 	// Create test settings once for all subtests
 	testSettings := settings.NewSettings()
 	testSettings.SubtreeValidation.SpendBatcherSize = 10
+	testSettings.SubtreeValidation.EnableBlockChainStateChecks = true
 
 	tests := []struct {
 		name                  string
@@ -1676,6 +1677,7 @@ func TestCheckBlockSubtrees_ParentBlockErrors(t *testing.T) {
 	t.Run("GetBlockExists_Error", func(t *testing.T) {
 		server, cleanup := setupTestServer(t)
 		defer cleanup()
+		server.settings.SubtreeValidation.EnableBlockChainStateChecks = true
 
 		// Mock GetBestBlockHeader to return a different hash
 		differentHash := chainhash.Hash{}
@@ -1714,6 +1716,7 @@ func TestCheckBlockSubtrees_ParentBlockErrors(t *testing.T) {
 	t.Run("GetBlockHeader_Error", func(t *testing.T) {
 		server, cleanup := setupTestServer(t)
 		defer cleanup()
+		server.settings.SubtreeValidation.EnableBlockChainStateChecks = true
 
 		// Mock GetBestBlockHeader to return a different hash
 		differentHash := chainhash.Hash{}
@@ -1753,6 +1756,7 @@ func TestCheckBlockSubtrees_ParentBlockErrors(t *testing.T) {
 	t.Run("CheckBlockIsInCurrentChain_Error", func(t *testing.T) {
 		server, cleanup := setupTestServer(t)
 		defer cleanup()
+		server.settings.SubtreeValidation.EnableBlockChainStateChecks = true
 
 		// Mock GetBestBlockHeader to return a different hash
 		differentHash := chainhash.Hash{}

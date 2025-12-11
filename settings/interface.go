@@ -542,6 +542,8 @@ type SubtreeValidationSettings struct {
 	// Streaming processor settings
 	UseStreamingProcessor  bool // Feature flag to enable streaming transaction processor for large blocks (default: false)
 	UseSequentialProcessor bool // Feature flag to use sequential processing instead of parallel (default: false)
+	// Blockchain state checking
+	EnableBlockChainStateChecks bool // Feature flag to enable blockchain state checks before processing subtrees (default: true)
 }
 
 type LegacySettings struct {

@@ -168,6 +168,7 @@ func runTimedProcessorTest(t *testing.T, totalTxCount, txPerSubtree int, useStre
 	defer cleanup()
 
 	server.settings.SubtreeValidation.UseStreamingProcessor = useStreaming
+	server.settings.SubtreeValidation.EnableBlockChainStateChecks = false
 
 	// Generate test data with real transactions
 	fixture := testhelpers.GenerateBlockWithSubtrees(t, totalTxCount, txPerSubtree, subtreeStore)
