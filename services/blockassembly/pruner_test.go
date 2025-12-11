@@ -19,6 +19,8 @@ import (
 
 // TestCleanupDuringStartup tests that cleanup runs before loading unmined transactions
 func TestCleanupDuringStartup(t *testing.T) {
+	initPrometheusMetrics()
+
 	t.Run("cleanup runs before loading unmined transactions", func(t *testing.T) {
 		ctx := context.Background()
 		mockStore := new(utxo.MockUtxostore)
@@ -79,13 +81,13 @@ type MockUnminedTxIterator struct {
 	mock.Mock
 }
 
-func (m *MockUnminedTxIterator) Next(ctx context.Context) (*utxo.UnminedTransaction, error) {
+func (m *MockUnminedTxIterator) Next(ctx context.Context) ([]*utxo.UnminedTransaction, error) {
 	args := m.Called(ctx)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 
-	return args.Get(0).(*utxo.UnminedTransaction), args.Error(1)
+	return args.Get(0).([]*utxo.UnminedTransaction), args.Error(1)
 }
 
 func (m *MockUnminedTxIterator) Err() error {
@@ -130,7 +132,7 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 
 		// Iterator should only return normal transactions (conflicting ones are filtered out by the iterator)
 		mockIterator.On("Next", mock.Anything).
-			Return(normalTx, nil).
+			Return([]*utxo.UnminedTransaction{normalTx}, nil).
 			Once()
 
 		// Second call returns nil (end of iteration)
