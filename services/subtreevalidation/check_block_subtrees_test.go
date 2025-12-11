@@ -1489,14 +1489,10 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	orphanage, err := NewOrphanage(time.Minute*10, 100, logger)
 	require.NoError(t, err)
 
-	// Initialize package-level quorum for subtree validation if not already initialized
-	once.Do(func() {
-		tmpDir := t.TempDir()
-		q, err = NewQuorum(logger, subtreeStore, tmpDir)
-		if err != nil {
-			t.Fatalf("Failed to create quorum: %v", err)
-		}
-	})
+	// Create a fresh quorum for this test (bypassing the once guard)
+	tmpDir := t.TempDir()
+	q, err = NewQuorum(logger, subtreeStore, tmpDir)
+	require.NoError(t, err)
 
 	server := &Server{
 		logger:           logger,

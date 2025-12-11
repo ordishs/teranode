@@ -271,14 +271,12 @@ func setupRealServerWithIterationID(t *testing.T, iterationID int) (*Server, blo
 	mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).
 		Return(true, nil).Maybe()
 
-	// Initialize package-level quorum for subtree validation if not already initialized
-	once.Do(func() {
-		tmpDir := t.TempDir()
-		q, err = NewQuorum(logger, subtreeStore, tmpDir)
-		if err != nil {
-			panic(err)
-		}
-	})
+	// Create a fresh quorum for this test (bypassing the once guard)
+	tmpDir := t.TempDir()
+	q, err = NewQuorum(logger, subtreeStore, tmpDir)
+	if err != nil {
+		panic(err)
+	}
 
 	// Create server directly without subscription to avoid blockchain errors
 	server := &Server{
