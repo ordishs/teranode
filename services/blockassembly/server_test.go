@@ -149,6 +149,13 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 		err := server.blockAssembler.Start(t.Context())
 		require.NoError(t, err)
 
+		// Wait for BlockAssembler state to be StateRunning before requesting mining candidate
+		// This prevents race with blockchain notification processing
+		require.Eventually(t, func() bool {
+			state := server.blockAssembler.GetCurrentRunningState()
+			return state == StateRunning
+		}, 5*time.Second, 100*time.Millisecond)
+
 		resp, err := server.GetBlockAssemblyBlockCandidate(t.Context(), &blockassembly_api.EmptyMessage{})
 		require.NoError(t, err)
 
@@ -173,23 +180,49 @@ func TestGetBlockAssemblyBlockCandidate(t *testing.T) {
 		err := server.blockAssembler.Start(t.Context())
 		require.NoError(t, err)
 
+		// Wait for BlockAssembler state to be StateRunning before modifying state
+		require.Eventually(t, func() bool {
+			state := server.blockAssembler.GetCurrentRunningState()
+			return state == StateRunning
+		}, 5*time.Second, 100*time.Millisecond)
+
 		currentHeader, _ := server.blockAssembler.CurrentBlock()
-		server.blockAssembler.setBestBlockHeader(currentHeader, 250) // halvings = 150
+		server.blockAssembler.setBestBlockHeader(currentHeader, 250)
 
-		resp, err := server.GetBlockAssemblyBlockCandidate(t.Context(), &blockassembly_api.EmptyMessage{})
-		require.NoError(t, err)
+		// Wait for the height to settle at 250 before requesting mining candidate
+		// This ensures any pending blockchain notifications have been processed
+		require.Eventually(t, func() bool {
+			_, height := server.blockAssembler.CurrentBlock()
+			t.Logf("Waiting for height to settle at 250, current: %d", height)
+			return height == 250
+		}, 5*time.Second, 100*time.Millisecond, "Height should settle at 250")
 
-		require.NotNil(t, resp)
+		// Use Eventually to repeatedly request until we get the correct block
+		// This handles the case where a blockchain notification arrives between settling and request
+		var block *model.Block
+		require.Eventually(t, func() bool {
+			resp, err := server.GetBlockAssemblyBlockCandidate(t.Context(), &blockassembly_api.EmptyMessage{})
+			if err != nil {
+				t.Logf("Error getting block candidate: %v", err)
+				return false
+			}
+			if resp == nil || resp.Block == nil {
+				t.Logf("Got nil response or block")
+				return false
+			}
 
-		blockBytes := resp.Block
-		require.NotNil(t, blockBytes)
+			block, err = model.NewBlockFromBytes(resp.Block)
+			if err != nil {
+				t.Logf("Error parsing block: %v", err)
+				return false
+			}
 
-		block, err := model.NewBlockFromBytes(blockBytes)
-		require.NoError(t, err)
+			t.Logf("Got block at height %d with coinbase %d", block.Height, block.CoinbaseTx.Outputs[0].Satoshis)
+			return block.Height == 251 && block.CoinbaseTx.Outputs[0].Satoshis == 2500000000
+		}, 5*time.Second, 100*time.Millisecond, "Should get block at height 251 with 2.5 BTC coinbase")
 
 		require.NotNil(t, block)
 		require.NotNil(t, block.Header)
-
 		assert.Equal(t, uint32(251), block.Height)
 		assert.Equal(t, uint64(0), block.TransactionCount)
 		assert.Equal(t, uint64(2500000000), block.CoinbaseTx.Outputs[0].Satoshis)
