@@ -187,13 +187,24 @@ func TestCheckBlockSubtrees(t *testing.T) {
 				defer cleanup()
 				server.settings.SubtreeValidation.UseStreamingProcessor = mode.useStreamingProc
 
+				// Mock validator to return success
+				mockValidator := server.validatorClient.(*validator.MockValidatorClient)
+				mockValidator.UtxoStore = server.utxoStore
+
 				// Mock blockchain client
 				server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader",
 					mock.Anything).
 					Return(testHeaders[0], &model.BlockHeaderMeta{}, nil)
 
+				server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+					mock.Anything, blockchain.FSMStateRUNNING).
+					Return(true, nil).Maybe()
+
 				currentBlockIDsMap := map[uint32]bool{1: true, 2: true, 3: true}
 				server.currentBlockIDsMap.Store(&currentBlockIDsMap)
+
+				bestBlockHeaderMeta := &model.BlockHeaderMeta{Height: 100}
+				server.bestBlockHeaderMeta.Store(bestBlockHeaderMeta)
 
 				// Create test transactions and store them
 				tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
@@ -214,7 +225,7 @@ func TestCheckBlockSubtrees(t *testing.T) {
 				subtreeDataBytes, err := subtreeData.Serialize()
 				require.NoError(t, err)
 
-				// Mark the subtree as already validated to avoid HTTP calls
+				// Store subtree for validation to trigger GetBlockHeaderIDs call
 				err = server.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes)
 				require.NoError(t, err)
 
@@ -1477,6 +1488,15 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	// Create orphanage to avoid nil pointer dereference
 	orphanage, err := NewOrphanage(time.Minute*10, 100, logger)
 	require.NoError(t, err)
+
+	// Initialize package-level quorum for subtree validation if not already initialized
+	once.Do(func() {
+		tmpDir := t.TempDir()
+		q, err = NewQuorum(logger, subtreeStore, tmpDir)
+		if err != nil {
+			t.Fatalf("Failed to create quorum: %v", err)
+		}
+	})
 
 	server := &Server{
 		logger:           logger,

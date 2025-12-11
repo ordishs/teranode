@@ -271,6 +271,15 @@ func setupRealServerWithIterationID(t *testing.T, iterationID int) (*Server, blo
 	mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).
 		Return(true, nil).Maybe()
 
+	// Initialize package-level quorum for subtree validation if not already initialized
+	once.Do(func() {
+		tmpDir := t.TempDir()
+		q, err = NewQuorum(logger, subtreeStore, tmpDir)
+		if err != nil {
+			panic(err)
+		}
+	})
+
 	// Create server directly without subscription to avoid blockchain errors
 	server := &Server{
 		logger:           logger,
@@ -288,6 +297,13 @@ func setupRealServerWithIterationID(t *testing.T, iterationID int) (*Server, blo
 		panic(err)
 	}
 	server.orphanage = orphanage
+
+	// Initialize server state to avoid nil pointer dereference
+	currentBlockIDsMap := map[uint32]bool{100: true, 99: true, 98: true}
+	server.currentBlockIDsMap.Store(&currentBlockIDsMap)
+
+	bestBlockHeaderMeta := &model.BlockHeaderMeta{ID: 100, Height: 100}
+	server.bestBlockHeaderMeta.Store(bestBlockHeaderMeta)
 
 	return server, subtreeStore, func() {
 		// Cleanup

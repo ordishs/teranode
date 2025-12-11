@@ -201,7 +201,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 		for _, subtreeHash := range missingSubtrees {
 			if err := u.subtreesHandler(ctx, &subtreeHash, baseURL, request.PeerId, validationOptions...); err != nil {
-				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Subtree %s processing failed: %v", subtreeHash.String(), err)
+				return nil, errors.NewProcessingError("[CheckBlockSubtrees] Subtree %s processing failed", subtreeHash.String(), err)
 			}
 		}
 	} else {
