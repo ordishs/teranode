@@ -893,10 +893,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
 	}
 
-	// Clear subtrees to free memory - they're no longer needed after UpdateTxMinedStatus
-	// This prevents memory retention in the blockchain store cache if block came from there and was mutated
-	// Note: lastValidatedBlocks cache was already cleared at line 799 when we retrieved the block
-	block.SubtreeSlices = nil
+	// Note: We used to clear block.SubtreeSlices = nil here to free memory, but this caused
+	// data races when the block object was shared with concurrent validation goroutines.
+	// The GC will reclaim SubtreeSlices memory when the block is no longer referenced.
 
 	// update block mined_set to true
 	if err = u.blockchainClient.SetBlockMinedSet(ctx, blockHash); err != nil {
