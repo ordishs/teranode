@@ -136,9 +136,10 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			} else if currentState != nil &&
 				(*currentState == blockchain.FSMStateCATCHINGBLOCKS || *currentState == blockchain.FSMStateLEGACYSYNCING) {
 				u.logger.Infof("[CheckBlockSubtrees] Skipping pause lock - FSM state is %s (catching up)", currentState.String())
-				shouldPauseProcessing = false
 			}
 		}
+
+		u.logger.Debugf("[CheckBlockSubtrees] Fork detection complete: shouldPauseProcessing=%v", shouldPauseProcessing)
 	} else {
 		u.logger.Debugf("[CheckBlockSubtrees] Blockchain state checks are disabled via setting - skipping fork detection")
 	}
