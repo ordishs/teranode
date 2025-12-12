@@ -56,10 +56,15 @@ func newUnminedTxIterator(store *Store, fullScan bool) (*unminedTxIterator, erro
 		return nil, errors.NewProcessingError("failed to parse query-threads-limit: %v", err)
 	}
 
+	// Check that queryThreadsLimit fits in int before conversion
+	if queryThreadsLimit > int64(math.MaxInt) || queryThreadsLimit < int64(math.MinInt) {
+		return nil, errors.NewProcessingError("query-threads-limit value %d out of range for int type", queryThreadsLimit)
+	}
+
 	numPartitionQueries := runtime.NumCPU()
 
 	// Ensure we don't exceed query-threads-limit, assuming each partition query uses up to 4 threads
-	queryLimits := int(queryThreadsLimit) / 4 // nolint:gosec
+	queryLimits := int(queryThreadsLimit) / 4
 	if queryThreadsLimit > 0 && numPartitionQueries > queryLimits {
 		numPartitionQueries = queryLimits
 	}

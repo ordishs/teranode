@@ -4,8 +4,8 @@ import (
 	"sync"
 	"testing"
 
-	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/stretchr/testify/require"
 )
 
