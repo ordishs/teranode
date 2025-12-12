@@ -547,11 +547,7 @@ type SubtreeValidationSettings struct {
 	// Concurrency limits
 	CheckBlockSubtreesConcurrency int           // Concurrency limit for CheckBlockSubtrees operations (default: 32)
 	PauseTimeout                  time.Duration // Maximum duration for subtree processing pauses during block validation (default: 5 minutes)
-	// Streaming processor settings
-	UseStreamingProcessor  bool // Feature flag to enable streaming transaction processor for large blocks (default: false)
-	UseSequentialProcessor bool // Feature flag to use sequential processing instead of parallel (default: false)
-	// Blockchain state checking
-	EnableBlockChainStateChecks bool // Feature flag to enable blockchain state checks before processing subtrees (default: true)
+	TxBatchSize                   int           // Transaction batch size for CheckBlockSubtrees (0 = no batching, default: 1000000)
 	// Level algorithm optimization
 	UseOrderedLevelAlgorithm bool // When true, uses optimized O(V*I) algorithm assuming transactions are ordered (default: true)
 }

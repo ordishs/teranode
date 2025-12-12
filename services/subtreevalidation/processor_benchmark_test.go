@@ -25,9 +25,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// BenchmarkProcessorComparison compares the level-based processor vs streaming processor.
-// This benchmark measures processing time for different block configurations.
-func BenchmarkProcessorComparison(b *testing.B) {
+// BenchmarkSubtreeProcessor benchmarks the subtree processor for different block configurations.
+func BenchmarkSubtreeProcessor(b *testing.B) {
 	testCases := []struct {
 		name         string
 		totalTxCount int
@@ -43,22 +42,16 @@ func BenchmarkProcessorComparison(b *testing.B) {
 	}
 
 	for _, tc := range testCases {
-		// Benchmark level-based processor
-		b.Run("LevelBased/"+tc.name, func(b *testing.B) {
-			runProcessorBenchmark(b, tc.totalTxCount, tc.txPerSubtree, false)
-		})
-
-		// Benchmark streaming processor
-		b.Run("Streaming/"+tc.name, func(b *testing.B) {
-			runProcessorBenchmark(b, tc.totalTxCount, tc.txPerSubtree, true)
+		b.Run(tc.name, func(b *testing.B) {
+			runProcessorBenchmark(b, tc.totalTxCount, tc.txPerSubtree)
 		})
 	}
 }
 
-// TestProcessorComparisonDetailed provides detailed timing comparison between processors.
-func TestProcessorComparisonDetailed(t *testing.T) {
+// TestSubtreeProcessorTiming provides detailed timing for subtree processing.
+func TestSubtreeProcessorTiming(t *testing.T) {
 	if testing.Short() {
-		t.Skip("Skipping detailed processor comparison in short mode")
+		t.Skip("Skipping processor timing test in short mode")
 	}
 
 	testCases := []struct {
@@ -73,21 +66,14 @@ func TestProcessorComparisonDetailed(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			levelBasedDuration := runTimedProcessorTest(t, tc.totalTxCount, tc.txPerSubtree, false)
-			streamingDuration := runTimedProcessorTest(t, tc.totalTxCount, tc.txPerSubtree, true)
-
-			t.Logf("\n=== Processor Comparison: %s ===", tc.name)
-			t.Logf("Level-based:  %v", levelBasedDuration)
-			t.Logf("Streaming:    %v", streamingDuration)
-			if levelBasedDuration > 0 {
-				speedup := float64(levelBasedDuration) / float64(streamingDuration)
-				t.Logf("Speedup:      %.2fx", speedup)
-			}
+			duration := runTimedProcessorTest(t, tc.totalTxCount, tc.txPerSubtree)
+			t.Logf("\n=== Processor Timing: %s ===", tc.name)
+			t.Logf("Duration: %v", duration)
 		})
 	}
 }
 
-func runProcessorBenchmark(b *testing.B, totalTxCount, txPerSubtree int, useStreaming bool) {
+func runProcessorBenchmark(b *testing.B, totalTxCount, txPerSubtree int) {
 	b.Helper()
 
 	// Create a real testing.T for setup (required by test helpers)
@@ -133,7 +119,6 @@ func runProcessorBenchmark(b *testing.B, totalTxCount, txPerSubtree int, useStre
 		// This is done outside the timer
 		b.StopTimer()
 		server, subtreeStore, cleanup := setupRealServerWithIterationID(t, i)
-		server.settings.SubtreeValidation.UseStreamingProcessor = useStreaming
 
 		// Copy subtree data to the fresh store
 		copyStoreData(tempStore, subtreeStore, fixture)
@@ -161,14 +146,11 @@ func runProcessorBenchmark(b *testing.B, totalTxCount, txPerSubtree int, useStre
 	b.ReportMetric(float64(len(fixture.Block.Subtrees)), "subtrees/block")
 }
 
-func runTimedProcessorTest(t *testing.T, totalTxCount, txPerSubtree int, useStreaming bool) time.Duration {
+func runTimedProcessorTest(t *testing.T, totalTxCount, txPerSubtree int) time.Duration {
 	t.Helper()
 
 	server, subtreeStore, cleanup := setupRealServer(t)
 	defer cleanup()
-
-	server.settings.SubtreeValidation.UseStreamingProcessor = useStreaming
-	server.settings.SubtreeValidation.EnableBlockChainStateChecks = false
 
 	// Generate test data with real transactions
 	fixture := testhelpers.GenerateBlockWithSubtrees(t, totalTxCount, txPerSubtree, subtreeStore)

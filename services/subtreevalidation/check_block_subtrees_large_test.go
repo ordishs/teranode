@@ -190,28 +190,12 @@ func TestCheckBlockSubtreesLevelBasedLargeBlock(t *testing.T) {
 		t.Skip("Skipping large block test in short mode")
 	}
 
-	runLargeBlockTest(t, false)
+	runLargeBlockTest(t)
 }
 
-// TestCheckBlockSubtreesStreamingLargeBlock benchmarks CheckBlockSubtrees with streaming processor
-// using 10 million transactions across 10 subtrees.
-func TestCheckBlockSubtreesStreamingLargeBlock(t *testing.T) {
-	t.Skip()
-	if testing.Short() {
-		t.Skip("Skipping large block test in short mode")
-	}
-
-	runLargeBlockTest(t, true)
-}
-
-// runLargeBlockTest is the common implementation for both level-based and streaming tests.
-func runLargeBlockTest(t *testing.T, useStreaming bool) {
-	processorName := "level_based"
-	if useStreaming {
-		processorName = "streaming"
-	}
-
-	t.Logf("=== Large Block Test (%s processor) ===", processorName)
+// runLargeBlockTest is the implementation for large block tests.
+func runLargeBlockTest(t *testing.T) {
+	t.Logf("=== Large Block Test ===")
 	t.Logf("Configuration: %d subtrees, %d tx/subtree, %d total tx", numSubtreesLarge, txPerSubtreeLarge, totalTxLarge)
 	t.Logf("Workers: %d, ~%d tx/chain", numWorkersLarge, txPerChainLarge)
 
@@ -237,7 +221,7 @@ func runLargeBlockTest(t *testing.T, useStreaming bool) {
 	cleanupValidatedSubtrees(t, store, fixture.SubtreeHashes)
 
 	// Setup server using the same blob store and cache directory
-	server, cleanup := setupLargeTestServer(t, cacheDir, store, fixture, useStreaming)
+	server, cleanup := setupLargeTestServer(t, cacheDir, store, fixture)
 	defer cleanup()
 
 	// Prepare request
@@ -251,10 +235,11 @@ func runLargeBlockTest(t *testing.T, useStreaming bool) {
 
 	// Run with profiling
 	profileDir := filepath.Join(cacheDir, "profiles")
+	profileName := "subtree_processor"
 
 	t.Logf("Starting CheckBlockSubtrees test in profileDir: %s", profileDir)
 
-	elapsed := runWithProfiling(t, profileDir, processorName, func() {
+	elapsed := runWithProfiling(t, profileDir, profileName, func() {
 		server.logger = ulogger.New("CheckBlockSubtreesLargeBlockTest", ulogger.WithLevel("info"))
 		_, err := server.CheckBlockSubtrees(t.Context(), request)
 		require.NoError(t, err, errors.UnwrapGRPC(err).Error())
@@ -263,11 +248,11 @@ func runLargeBlockTest(t *testing.T, useStreaming bool) {
 
 	// Report results
 	throughput := float64(fixture.TotalTxCount) / elapsed.Seconds()
-	t.Logf("=== Results (%s) ===", processorName)
+	t.Logf("=== Results ===")
 	t.Logf("Elapsed: %.2fs", elapsed.Seconds())
 	t.Logf("Throughput: %.2f tx/sec", throughput)
-	t.Logf("CPU profile: %s/%s_cpu.prof", profileDir, processorName)
-	t.Logf("Mem profile: %s/%s_mem.prof", profileDir, processorName)
+	t.Logf("CPU profile: %s/%s_cpu.prof", profileDir, profileName)
+	t.Logf("Mem profile: %s/%s_mem.prof", profileDir, profileName)
 }
 
 // cleanupValidatedSubtrees deletes validated .subtree files while keeping .subtreeToCheck and .subtreeData.
@@ -789,7 +774,7 @@ func calculateMerkleRootFromSubtreeHashes(t *testing.T, subtreeHashes []*chainha
 
 // setupLargeTestServer creates a server for large block testing.
 // Uses the provided blob store directly - data was written there during generation.
-func setupLargeTestServer(t *testing.T, cacheDir string, subtreeStore blob.Store, fixture *LargeBlockFixture, useStreaming bool) (*Server, func()) {
+func setupLargeTestServer(t *testing.T, cacheDir string, subtreeStore blob.Store, fixture *LargeBlockFixture) (*Server, func()) {
 	t.Helper()
 
 	logger := ulogger.TestLogger{}
@@ -798,10 +783,9 @@ func setupLargeTestServer(t *testing.T, cacheDir string, subtreeStore blob.Store
 	// Override DataFolder to use our cache directory instead of temp
 	tSettings.DataFolder = cacheDir
 	tSettings.SubtreeValidation.SpendBatcherSize = 1000
-	tSettings.SubtreeValidation.UseStreamingProcessor = useStreaming
 	tSettings.BlockAssembly.Disabled = true
 
-	// Use NullStore for UTXO - we're testing the streaming processor logic, not the UTXO store
+	// Use NullStore for UTXO - we're testing the subtree validation logic, not the UTXO store
 	utxoStore, err := nullstore.NewNullStore()
 	require.NoError(t, err)
 
