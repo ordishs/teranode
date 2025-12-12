@@ -10,10 +10,14 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"runtime"
+	"runtime/pprof"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -34,6 +38,7 @@ import (
 	"github.com/greatroar/blobloom"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 // createTestUTXOStore creates a SQL memory store for testing
@@ -198,7 +203,7 @@ func TestZeroCoverageFunctions(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Try to call it (will likely error but might hit some lines)
@@ -3256,7 +3261,7 @@ func TestBlock_CheckDuplicateInputs_ComprehensiveCoverage(t *testing.T) {
 
 		// Create validation context with empty parent spends map
 		validationCtx := &validationContext{
-			parentSpendsMap: txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap: NewSplitSyncedParentMap(4),
 		}
 
 		// Create subtree hash and node
@@ -3290,7 +3295,7 @@ func TestBlock_CheckDuplicateInputs_ComprehensiveCoverage(t *testing.T) {
 
 		// Create validation context with pre-populated parent spends map
 		validationCtx := &validationContext{
-			parentSpendsMap: txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap: NewSplitSyncedParentMap(4),
 		}
 
 		// Add an inpoint to simulate existing spend
@@ -3299,7 +3304,7 @@ func TestBlock_CheckDuplicateInputs_ComprehensiveCoverage(t *testing.T) {
 			Hash:  testHash,
 			Index: 0,
 		}
-		validationCtx.parentSpendsMap.Set(testInpoint, struct{}{})
+		validationCtx.parentSpendsMap.SetIfNotExists(testInpoint)
 
 		// Create a mock subtree meta slice that would return the same inpoint
 		// This simulates the duplicate input scenario
@@ -3334,7 +3339,7 @@ func TestBlock_CheckDuplicateInputs_ComprehensiveCoverage(t *testing.T) {
 
 		// Create validation context
 		validationCtx := &validationContext{
-			parentSpendsMap: txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap: NewSplitSyncedParentMap(4),
 		}
 
 		// Create empty subtree meta slice (will likely cause GetTxInpoints to error)
@@ -3372,7 +3377,7 @@ func TestBlock_CheckDuplicateInputs_ComprehensiveCoverage(t *testing.T) {
 
 		// Create validation context
 		validationCtx := &validationContext{
-			parentSpendsMap: txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap: NewSplitSyncedParentMap(4),
 		}
 
 		// Test with various edge case values
@@ -3707,7 +3712,7 @@ func TestBlock_ValidateSubtree_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Create subtree with a node
@@ -3776,7 +3781,7 @@ func TestBlock_ValidateSubtree_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Test - should pass since coinbase is skipped
@@ -3851,7 +3856,7 @@ func TestBlock_ValidateSubtree_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Test - exercises the bloom stats logic (may error but that's ok)
@@ -3905,7 +3910,7 @@ func TestBlock_ValidateSubtree_MissingParents(t *testing.T) {
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 		currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}, 2: {}},
-		parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+		parentSpendsMap:             NewSplitSyncedParentMap(4),
 	}
 
 	t.Run("missing parent not found in store", func(t *testing.T) {
@@ -4141,7 +4146,7 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// This should iterate through all 4 nodes in the subtree
@@ -4190,7 +4195,7 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}, 2: {}},
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// This should trigger the parallel parent checking logic:
@@ -4235,7 +4240,7 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Should handle single node subtree gracefully
@@ -4278,7 +4283,7 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}, 2: {}, 3: {}},
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// This should trigger parallel processing with multiple parent checks
@@ -4322,7 +4327,7 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    map[uint32]struct{}{10: {}, 11: {}},
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// This should test the oldBlockIDsMap.Set() logic when old parent blocks are found
@@ -4378,7 +4383,7 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Create subtree and subtree meta
@@ -4422,7 +4427,7 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Create subtree and subtree meta
@@ -4466,7 +4471,7 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Create subtree and subtree meta
@@ -4512,7 +4517,7 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Create subtree and subtree meta
@@ -4557,12 +4562,12 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Add a duplicate input to trigger validation
 		inpoint := subtreepkg.Inpoint{Hash: *parentHash, Index: 0}
-		validationCtx.parentSpendsMap.Set(inpoint, struct{}{})
+		validationCtx.parentSpendsMap.SetIfNotExists(inpoint)
 
 		// Create subtree and subtree meta
 		subtree := &subtreepkg.Subtree{}
@@ -4607,7 +4612,7 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
 			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
 		// Populate the current block header IDs map
@@ -4976,4 +4981,268 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		_ = err
 		// The coinbase placeholder check should be skipped for empty subtrees
 	})
+}
+
+// TestValidateSubtreeBenchmark benchmarks the validateSubtree function with 1M transactions
+// Run with: go test -v -run TestValidateSubtreeBenchmark ./model/ -timeout=30m
+// Profiles saved to: validatesubtree_cpu.prof, validatesubtree_mem.prof
+// This benchmark simulates production: 10 concurrent subtrees sharing a parentSpendsMap
+func TestValidateSubtreeBenchmark(t *testing.T) {
+	t.Skip("Skipping benchmark test in normal test runs. Run with -run TestValidateSubtreeBenchmark to execute.")
+
+	const (
+		numSubtrees        = 10        // Like production: 10 concurrent subtrees
+		txsPerSubtree      = 1_048_576 // 2^20 = 1M per subtree (must be power of 2)
+		numExternalParents = 100       // Per subtree - external parents needing UTXO lookup
+	)
+	totalTxs := numSubtrees * txsPerSubtree
+	benchStartTime := time.Now()
+
+	fmt.Printf("ValidateSubtree Concurrent Benchmark\n")
+	fmt.Printf("=====================================\n")
+	fmt.Printf("Subtrees:         %d (concurrent)\n", numSubtrees)
+	fmt.Printf("Txs per subtree:  %d\n", txsPerSubtree)
+	fmt.Printf("Total Txs:        %d\n", totalTxs)
+	fmt.Printf("CPU Cores:        %d\n", runtime.NumCPU())
+	fmt.Printf("GOMAXPROCS:       %d\n", runtime.GOMAXPROCS(0))
+	fmt.Println()
+
+	// ===== SETUP PHASE (not profiled) =====
+	fmt.Printf("[%s] Setting up benchmark...\n", time.Since(benchStartTime))
+
+	// Create block header
+	prevHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
+	merkleRoot, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
+	bits, _ := NewNBitFromString("207fffff")
+	blockHeader := &BlockHeader{
+		Version:        1,
+		HashPrevBlock:  prevHash,
+		HashMerkleRoot: merkleRoot,
+		Timestamp:      uint32(time.Now().Unix()), // nolint: gosec
+		Bits:           *bits,
+		Nonce:          2,
+	}
+
+	coinbase := &bt.Tx{}
+	block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
+	require.NoError(t, err)
+	block.ID = 1
+
+	// Pre-generate all transaction hashes for all subtrees
+	fmt.Printf("[%s] Pre-generating %d transaction hashes for %d subtrees...\n", time.Since(benchStartTime), totalTxs, numSubtrees)
+	allTxHashes := make([][]chainhash.Hash, numSubtrees)
+	allParentHashes := make([][]chainhash.Hash, numSubtrees)
+
+	var genWg sync.WaitGroup
+	for s := 0; s < numSubtrees; s++ {
+		genWg.Add(1)
+		go func(subtreeIdx int) {
+			defer genWg.Done()
+			allTxHashes[subtreeIdx] = make([]chainhash.Hash, txsPerSubtree)
+			allParentHashes[subtreeIdx] = make([]chainhash.Hash, txsPerSubtree)
+			for i := 0; i < txsPerSubtree; i++ {
+				// Use subtreeIdx in hash to guarantee uniqueness across subtrees
+				allTxHashes[subtreeIdx][i] = chainhash.HashH([]byte(fmt.Sprintf("tx-%d-%d", subtreeIdx, i)))
+				allParentHashes[subtreeIdx][i] = chainhash.HashH([]byte(fmt.Sprintf("parent-%d-%d", subtreeIdx, i)))
+			}
+		}(s)
+	}
+	genWg.Wait()
+	fmt.Printf("[%s] Pre-generation complete.\n", time.Since(benchStartTime))
+
+	// Initialize block's txMap with ALL transaction hashes from all subtrees
+	fmt.Printf("[%s] Initializing txMap with %d hashes...\n", time.Since(benchStartTime), totalTxs)
+	block.txMap = txmap.NewSplitSwissMapUint64(uint32(totalTxs))
+	txIdx := uint64(1) // Start at 1 (0 is coinbase)
+	for s := 0; s < numSubtrees; s++ {
+		for i := 0; i < txsPerSubtree-1; i++ { // -1 because coinbase takes one slot per subtree
+			err = block.txMap.Put(allTxHashes[s][i], txIdx)
+			require.NoError(t, err)
+			txIdx++
+		}
+	}
+	fmt.Printf("[%s] txMap initialized.\n", time.Since(benchStartTime))
+
+	// Create all subtrees and their metadata
+	fmt.Printf("[%s] Creating %d subtrees...\n", time.Since(benchStartTime), numSubtrees)
+	subtrees := make([]*subtreepkg.Subtree, numSubtrees)
+	mockStoreData := make(map[string][]byte)
+
+	for s := 0; s < numSubtrees; s++ {
+		subtree, err := subtreepkg.NewTreeByLeafCount(txsPerSubtree)
+		require.NoError(t, err)
+
+		// Add coinbase placeholder first (only for first subtree in real code, but we need valid subtrees)
+		if s == 0 {
+			err = subtree.AddCoinbaseNode()
+			require.NoError(t, err)
+		} else {
+			// For non-first subtrees, add a regular node in coinbase position
+			err = subtree.AddNode(allTxHashes[s][0], uint64(s*txsPerSubtree), 100)
+			require.NoError(t, err)
+		}
+
+		// Add remaining transaction nodes
+		startIdx := 0
+		if s == 0 {
+			startIdx = 0 // coinbase placeholder already added
+		} else {
+			startIdx = 1 // first hash already used above
+		}
+		for i := startIdx; i < txsPerSubtree-1; i++ {
+			err = subtree.AddNode(allTxHashes[s][i], uint64(s*txsPerSubtree+i+1), 100)
+			require.NoError(t, err)
+		}
+
+		// Create subtree metadata
+		subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
+		for i := 0; i < subtree.Length(); i++ {
+			txInpoints := subtreepkg.NewTxInpoints()
+			// Skip coinbase placeholder in first subtree
+			if s == 0 && i == 0 {
+				subtreeMeta.TxInpoints[i] = txInpoints
+				continue
+			}
+
+			if i <= numExternalParents {
+				// First N transactions reference external parents (need UTXO lookup)
+				txInpoints.ParentTxHashes = append(txInpoints.ParentTxHashes, allParentHashes[s][i])
+				txInpoints.Idxs = append(txInpoints.Idxs, []uint32{0})
+			} else {
+				// Remaining transactions reference the previous tx in the subtree (in txMap)
+				prevIdx := i - 1
+				if prevIdx >= 0 && prevIdx < len(allTxHashes[s]) {
+					txInpoints.ParentTxHashes = append(txInpoints.ParentTxHashes, allTxHashes[s][prevIdx])
+					txInpoints.Idxs = append(txInpoints.Idxs, []uint32{0})
+				}
+			}
+			subtreeMeta.TxInpoints[i] = txInpoints
+		}
+
+		subtreeMetaBytes, err := subtreeMeta.Serialize()
+		require.NoError(t, err)
+
+		subtreeHash := subtree.RootHash()
+		mockStoreData[string(subtreeHash[:])] = subtreeMetaBytes
+		subtrees[s] = subtree
+	}
+	block.SubtreeSlices = subtrees
+	fmt.Printf("[%s] Subtrees created.\n", time.Since(benchStartTime))
+
+	// Create mock subtree store with all metadata
+	mockStore := &mockSubtreeStore{data: mockStoreData}
+
+	// Create UTXO store and populate external parent transactions
+	fmt.Printf("[%s] Creating UTXO store and populating with %d external parent tx records...\n",
+		time.Since(benchStartTime), numSubtrees*numExternalParents)
+	utxoStore := createTestUTXOStore(t)
+
+	for s := 0; s < numSubtrees; s++ {
+		for i := 0; i <= numExternalParents; i++ {
+			parentTx := bt.NewTx()
+			lockingScript, _ := bscript.NewFromHexString("76a914000000000000000000000000000000000000000088ac")
+			parentTx.AddOutput(&bt.Output{
+				Satoshis:      1000,
+				LockingScript: lockingScript,
+			})
+
+			_, err := utxoStore.Create(context.Background(), parentTx, 1,
+				utxo.WithTXID(&allParentHashes[s][i]),
+				utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
+					BlockID:        1,
+					BlockHeight:    1,
+					OnLongestChain: true,
+				}),
+			)
+			if err != nil {
+				fmt.Printf("Warning: failed to create parent tx %d-%d: %v\n", s, i, err)
+			}
+		}
+	}
+	fmt.Printf("[%s] UTXO store populated.\n", time.Since(benchStartTime))
+
+	// Set up validation dependencies (SHARED across all subtrees)
+	deps := &validationDependencies{
+		txMetaStore:              utxoStore,
+		subtreeStore:             mockStore,
+		recentBlocksBloomFilters: []*BlockBloomFilter{},
+		currentChain:             []*BlockHeader{blockHeader},
+		currentBlockHeaderIDs:    []uint32{1},
+		bloomStats:               NewBloomStats(),
+		oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+	}
+
+	// Set up validation context (SHARED - this is where the contention happens!)
+	validationCtx := &validationContext{
+		currentBlockHeaderHashesMap: map[chainhash.Hash]struct{}{*blockHeader.Hash(): {}},
+		currentBlockHeaderIDsMap:    map[uint32]struct{}{1: {}},
+		parentSpendsMap:             NewSplitSyncedParentMap(256), // THE CONTENDED RESOURCE
+	}
+
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+
+	fmt.Printf("[%s] Setup complete. Starting profiled benchmark with %d CONCURRENT subtrees...\n\n",
+		time.Since(benchStartTime), numSubtrees)
+
+	// ===== PROFILING PHASE =====
+
+	// Start CPU profiling
+	cpuFile, err := os.Create("validatesubtree_cpu.prof")
+	require.NoError(t, err)
+
+	err = pprof.StartCPUProfile(cpuFile)
+	require.NoError(t, err)
+
+	// Run the benchmark - ALL SUBTREES CONCURRENTLY (like production!)
+	startTime := time.Now()
+
+	g := new(errgroup.Group)
+	for sIdx := 0; sIdx < numSubtrees; sIdx++ {
+		sIdx := sIdx
+		subtree := subtrees[sIdx]
+		g.Go(func() error {
+			return block.validateSubtree(ctx, logger, deps, validationCtx, subtree, sIdx)
+		})
+	}
+	benchErr := g.Wait()
+
+	elapsed := time.Since(startTime)
+
+	// Stop CPU profiling
+	pprof.StopCPUProfile()
+	err = cpuFile.Close()
+	require.NoError(t, err)
+
+	// Write memory profile
+	runtime.GC()
+	memFile, err := os.Create("validatesubtree_mem.prof")
+	require.NoError(t, err)
+	err = pprof.WriteHeapProfile(memFile)
+	require.NoError(t, err)
+	err = memFile.Close()
+	require.NoError(t, err)
+
+	// Print results
+	actualTotalTxs := numSubtrees * (txsPerSubtree - 1)
+	txPerSec := float64(actualTotalTxs) / elapsed.Seconds()
+
+	fmt.Printf("\nBenchmark Results\n")
+	fmt.Printf("=================\n")
+	fmt.Printf("Concurrent Subtrees: %d\n", numSubtrees)
+	fmt.Printf("Total Transactions:  %d\n", actualTotalTxs)
+	fmt.Printf("Elapsed Time:        %.2fs\n", elapsed.Seconds())
+	fmt.Printf("Throughput:          %.2f tx/sec\n", txPerSec)
+	fmt.Println()
+	fmt.Printf("Profiles written to:\n")
+	fmt.Printf("  CPU:    validatesubtree_cpu.prof\n")
+	fmt.Printf("  Memory: validatesubtree_mem.prof\n")
+	fmt.Println()
+	fmt.Printf("Analyze with:\n")
+	fmt.Printf("  go tool pprof -http=:8080 validatesubtree_cpu.prof\n")
+	fmt.Printf("  go tool pprof -http=:8081 validatesubtree_mem.prof\n")
+
+	if benchErr != nil {
+		fmt.Printf("\nNote: validateSubtree returned error (may be expected): %v\n", benchErr)
+	}
 }

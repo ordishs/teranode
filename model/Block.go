@@ -685,7 +685,7 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: b.buildBlockHeaderHashesMap(deps.currentChain),
 		currentBlockHeaderIDsMap:    b.buildBlockHeaderIDsMap(deps.currentBlockHeaderIDs),
-		parentSpendsMap:             txmap.NewSyncedMap[subtreepkg.Inpoint, struct{}](),
+		parentSpendsMap:             NewSplitSyncedParentMap(256),
 	}
 
 	concurrency := b.getValidationConcurrency(validOrderAndBlessedConcurrency)
@@ -797,7 +797,7 @@ func (b *Block) checkParentsExistOnChain(ctx context.Context, logger ulogger.Log
 type validationContext struct {
 	currentBlockHeaderHashesMap map[chainhash.Hash]struct{}
 	currentBlockHeaderIDsMap    map[uint32]struct{}
-	parentSpendsMap             *txmap.SyncedMap[subtreepkg.Inpoint, struct{}]
+	parentSpendsMap             *SplitSyncedParentMap
 }
 
 func (b *Block) buildBlockHeaderHashesMap(currentChain []*BlockHeader) map[chainhash.Hash]struct{} {
@@ -995,7 +995,7 @@ func (b *Block) checkDuplicateInputs(subtreeMetaSlice *subtreepkg.Meta, validati
 	}
 
 	for _, txInpoint := range txInpoints {
-		if _, valueSet := validationCtx.parentSpendsMap.SetIfNotExists(txInpoint, struct{}{}); !valueSet {
+		if valueSet := validationCtx.parentSpendsMap.SetIfNotExists(txInpoint); !valueSet {
 			return errors.NewBlockInvalidError("[validOrderAndBlessed][%s][%s:%d]:%d transaction %s has duplicate inputs",
 				b.String(), subtreeHash.String(), sIdx, snIdx, subtreeNode.Hash.String())
 		}
@@ -1006,7 +1006,7 @@ func (b *Block) checkDuplicateInputs(subtreeMetaSlice *subtreepkg.Meta, validati
 
 func (b *Block) checkParentTransactions(parentTxHashes []chainhash.Hash, txIdx uint64,
 	subtreeNode subtreepkg.Node, subtreeHash *chainhash.Hash, sIdx, snIdx int) ([]missingParentTx, error) {
-	checkParentTxHashes := make([]missingParentTx, 0, len(parentTxHashes))
+	checkParentTxHashes := make([]missingParentTx, 0, len(parentTxHashes)/16) // assume 1 in 16 parents will be missing
 
 	for _, parentTxHash := range parentTxHashes {
 		parentTxIdx, foundInSameBlock := b.txMap.Get(parentTxHash)
