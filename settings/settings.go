@@ -178,6 +178,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ConcurrencyGetSubtreeHead:         getInt("asset_concurrency_get_subtree_head", 0, alternativeContext...),
 			ConcurrencyGetUtxo:                getInt("asset_concurrency_get_utxo", 0, alternativeContext...),
 			ConcurrencyGetLegacyBlockReader:   getInt("asset_concurrency_get_legacy_block_reader", -1, alternativeContext...), // -1 = NumCPU()
+
+			// Streaming configuration
+			SubtreeDataStreamingChunkSize: getInt("asset_subtreeDataStreamingChunkSize", 10000, alternativeContext...),
 		},
 		Block: BlockSettings{
 			MinedCacheMaxMB:                         getInt("blockMinedCacheMaxMB", 256, alternativeContext...),
