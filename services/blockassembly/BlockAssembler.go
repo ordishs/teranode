@@ -43,6 +43,8 @@ type miningCandidateResponse struct {
 	err error
 }
 
+// State represents the current operational state of the BlockAssembler.
+// It tracks the assembler's lifecycle and processing phases.
 type State uint32
 
 const (
@@ -152,6 +154,7 @@ type BlockAssembler struct {
 
 	// unminedCleanupTicker manages periodic cleanup of old unmined transactions
 	unminedCleanupTicker *time.Ticker
+
 	// cachedCandidate stores the cached mining candidate
 	cachedCandidate *CachedMiningCandidate
 
