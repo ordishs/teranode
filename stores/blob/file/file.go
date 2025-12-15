@@ -102,6 +102,23 @@ type longtermStore interface {
 	Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error)
 }
 
+// semaphoreReadCloser wraps an io.ReadCloser and releases the read semaphore when closed.
+// This ensures the read permit is held for the entire duration of the read operation,
+// not just during file open, making read behavior consistent with write behavior where
+// the write permit is held for the entire streaming write operation.
+type semaphoreReadCloser struct {
+	io.ReadCloser
+	releaseOnce sync.Once
+}
+
+func (r *semaphoreReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.releaseOnce.Do(func() {
+		releaseReadPermit()
+	})
+	return err
+}
+
 // Semaphore configuration constants
 const (
 	defaultReadLimit  = 768 // 75% of original 1024 total
@@ -1260,14 +1277,14 @@ func (s *File) openFileWithFallback(ctx context.Context, merged *options.Options
 	if err := acquireReadPermit(ctx); err != nil {
 		return nil, errors.NewStorageError("[File][openFileWithFallback] failed to acquire read permit", err)
 	}
-	defer releaseReadPermit()
 
 	f, err := os.Open(fileName)
 	if err == nil {
-		return f, nil
+		return &semaphoreReadCloser{ReadCloser: f}, nil
 	}
 
 	if !errors.Is(err, os.ErrNotExist) {
+		releaseReadPermit()
 		return nil, errors.NewStorageError("[File][openFileWithFallback] [%s] failed to open file", fileName, err)
 	}
 
@@ -1275,21 +1292,25 @@ func (s *File) openFileWithFallback(ctx context.Context, merged *options.Options
 	if s.persistSubDir != "" {
 		persistedFilename, err := merged.ConstructFilename(filepath.Join(s.path, s.persistSubDir), key, fileType)
 		if err != nil {
+			releaseReadPermit()
 			return nil, err
 		}
 
 		persistFile, err := os.Open(persistedFilename)
 		if err == nil {
-			return persistFile, nil
+			return &semaphoreReadCloser{ReadCloser: persistFile}, nil
 		}
 
 		if !errors.Is(err, os.ErrNotExist) {
+			releaseReadPermit()
 			return nil, errors.NewStorageError("[File][openFileWithFallback] [%s] failed to open file in persist directory", persistedFilename, err)
 		}
 	}
 
 	// Try longterm storage if available
 	if s.longtermClient != nil {
+		releaseReadPermit()
+
 		fileReader, err := s.longtermClient.GetIoReader(ctx, key, fileType, opts...)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1302,6 +1323,7 @@ func (s *File) openFileWithFallback(ctx context.Context, merged *options.Options
 		return fileReader, nil
 	}
 
+	releaseReadPermit()
 	return nil, errors.ErrNotFound
 }
 
