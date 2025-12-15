@@ -26,7 +26,6 @@ import (
 // The handler skips processing when blockchain FSM is in CATCHINGBLOCKS state and classifies
 // errors to prevent infinite retry loops on unrecoverable failures.
 //
-// Note: Pause/resume is now handled by pausing the Kafka consumer itself (via PauseAll/ResumeAll)
 // rather than blocking in this handler. This prevents session timeouts and improves resource usage.
 func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
 	g, gCtx := errgroup.WithContext(ctx)
