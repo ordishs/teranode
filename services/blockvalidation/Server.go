@@ -1634,7 +1634,7 @@ func (u *Server) addBlockToPriorityQueue(ctx context.Context, blockFound process
 
 		// Check if we're already processing this block in catchup
 		if u.processBlockNotify.Get(*blockFound.hash) != nil {
-			u.logger.Debugf("[addBlockToPriorityQueue] Block %s already being processed in catchup, adding as alternative source", blockFound.hash.String())
+			u.logger.Infof("[addBlockToPriorityQueue] Block %s already being processed in catchup, adding as alternative source", blockFound.hash.String())
 
 			// Add to alternative sources for potential failover
 			catchupBlock := processBlockCatchup{
