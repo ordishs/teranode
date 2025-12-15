@@ -1162,7 +1162,7 @@ func (u *Server) RevalidateBlock(ctx context.Context, request *blockvalidation_a
 		IsRevalidation:          true,
 	}
 
-	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, blockHeaderMeta.PeerID, u.blockValidation.bloomFilterStats, opts)
+	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, blockHeaderMeta.PeerID, opts)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewServiceError("[RevalidateBlock][%s] failed block re-validation", block.String(), err))
 	}
@@ -1278,13 +1278,7 @@ func (u *Server) ValidateBlock(ctx context.Context, request *blockvalidation_api
 
 	oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
 
-	// only get the bloom filters for the current chain
-	bloomFilters, err := u.blockValidation.collectNecessaryBloomFilters(ctx, block, blockHeaders)
-	if err != nil {
-		return nil, errors.WrapGRPC(errors.NewServiceError("[ValidateBlock][%s] failed to collect necessary bloom filters", block.String(), err))
-	}
-
-	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, bloomFilters, blockHeaders, blockHeaderIDs, nil, u.settings); !ok {
+	if ok, err := block.Valid(ctx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings); !ok {
 		return nil, errors.WrapGRPC(errors.NewBlockInvalidError("[ValidateBlock][%s] block is not valid", block.String(), err))
 	}
 
@@ -1386,7 +1380,7 @@ func (u *Server) processBlockFound(ctx context.Context, hash *chainhash.Hash, pe
 		IsRevalidation:          false, // processBlockFound is for new blocks, not revalidation
 	}
 
-	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, baseURL, u.blockValidation.bloomFilterStats, opts)
+	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, baseURL, opts)
 	if err != nil {
 		return errors.NewServiceError("failed block validation BlockFound [%s]", block.String(), err)
 	}

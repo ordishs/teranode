@@ -32,7 +32,6 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
-	"github.com/greatroar/blobloom"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -363,7 +362,7 @@ type SubtreeStore interface {
 }
 
 func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, txMetaStore utxo.Store, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
-	recentBlocksBloomFilters []*BlockBloomFilter, currentChain []*BlockHeader, currentBlockHeaderIDs []uint32, bloomStats *BloomStats, settings *settings.Settings) (bool, error) {
+	currentChain []*BlockHeader, currentBlockHeaderIDs []uint32, settings *settings.Settings) (bool, error) {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "Valid",
 		tracing.WithHistogram(prometheusBlockValid),
 		tracing.WithLogMessage(logger, "[Block:Valid] called for %s", b.Header.String()),
@@ -509,13 +508,11 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	//     Can only be done with a valid texMetaStore passed in
 	if txMetaStore != nil {
 		deps := &validationDependencies{
-			txMetaStore:              txMetaStore,
-			subtreeStore:             subtreeStore,
-			recentBlocksBloomFilters: recentBlocksBloomFilters,
-			currentChain:             currentChain,
-			currentBlockHeaderIDs:    currentBlockHeaderIDs,
-			bloomStats:               bloomStats,
-			oldBlockIDsMap:           oldBlockIDsMap,
+			txMetaStore:           txMetaStore,
+			subtreeStore:          subtreeStore,
+			currentChain:          currentChain,
+			currentBlockHeaderIDs: currentBlockHeaderIDs,
+			oldBlockIDsMap:        oldBlockIDsMap,
 		}
 		err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency)
 		if err != nil {
@@ -663,13 +660,11 @@ func (b *Block) checkDuplicateTransactionsInSubtree(subtree *subtreepkg.Subtree,
 }
 
 type validationDependencies struct {
-	txMetaStore              utxo.Store
-	subtreeStore             SubtreeStore
-	recentBlocksBloomFilters []*BlockBloomFilter
-	currentChain             []*BlockHeader
-	currentBlockHeaderIDs    []uint32
-	bloomStats               *BloomStats
-	oldBlockIDsMap           *txmap.SyncedMap[chainhash.Hash, []uint32]
+	txMetaStore           utxo.Store
+	subtreeStore          SubtreeStore
+	currentChain          []*BlockHeader
+	currentBlockHeaderIDs []uint32
+	oldBlockIDsMap        *txmap.SyncedMap[chainhash.Hash, []uint32]
 }
 
 func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger, deps *validationDependencies, validOrderAndBlessedConcurrency int) error {
@@ -726,12 +721,6 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 	// a subtreeMetaSlice is required for further block validation, so if we cannot get it, we return an error
 	if err != nil {
 		return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice: %v", b.String(), subtreeHash.String(), sIdx, err)
-	}
-
-	if deps.bloomStats != nil {
-		deps.bloomStats.mu.Lock()
-		deps.bloomStats.QueryCounter += uint64(len(subtree.Nodes))
-		deps.bloomStats.mu.Unlock()
 	}
 
 	for snIdx := 0; snIdx < len(subtree.Nodes); snIdx++ {
@@ -825,58 +814,6 @@ func (b *Block) getValidationConcurrency(validOrderAndBlessedConcurrency int) in
 	}
 
 	return concurrency
-}
-
-func (b *Block) checkTxInRecentBlocks(ctx context.Context, deps *validationDependencies, validationCtx *validationContext,
-	subtreeNode subtreepkg.Node, subtreeHash *chainhash.Hash, sIdx, snIdx int) error {
-	// get first 8 bytes of the subtreeNode hash
-	n64 := binary.BigEndian.Uint64(subtreeNode.Hash[:])
-
-	for _, filter := range deps.recentBlocksBloomFilters {
-		// check whether this bloom filter is on our chain
-		if _, found := validationCtx.currentBlockHeaderHashesMap[*filter.BlockHash]; !found {
-			continue
-		}
-
-		if !filter.Filter.Has(n64) {
-			continue
-		}
-
-		// we have a match, check the txMetaStore
-		if deps.bloomStats != nil {
-			deps.bloomStats.mu.Lock()
-			deps.bloomStats.PositiveCounter++
-			deps.bloomStats.mu.Unlock()
-		}
-
-		// there is a chance that the bloom filter has a false positive, but the txMetaStore has pruned
-		// the transaction. This will cause the block to be incorrectly invalidated, but this is the safe
-		// option for now.
-		txMeta, err := deps.txMetaStore.GetMeta(ctx, &subtreeNode.Hash)
-		if err != nil {
-			if errors.Is(err, errors.ErrTxNotFound) {
-				continue
-			}
-
-			return errors.NewStorageError("[validOrderAndBlessed][%s][%s:%d]:%d error getting transaction %s from txMetaStore",
-				b.String(), subtreeHash.String(), sIdx, snIdx, subtreeNode.Hash.String(), err)
-		}
-
-		for _, blockID := range txMeta.BlockIDs {
-			if _, found := validationCtx.currentBlockHeaderIDsMap[blockID]; found {
-				return errors.NewBlockInvalidError("[validOrderAndBlessed][%s][%s:%d]:%d transaction %s has already been mined in block %d",
-					b.String(), subtreeHash.String(), sIdx, snIdx, subtreeNode.Hash.String(), blockID)
-			}
-		}
-
-		if deps.bloomStats != nil {
-			deps.bloomStats.mu.Lock()
-			deps.bloomStats.FalsePositiveCounter++
-			deps.bloomStats.mu.Unlock()
-		}
-	}
-
-	return nil
 }
 
 func (b *Block) checkParentExistsOnChain(gCtx context.Context, logger ulogger.Logger, txMetaStore utxo.Store, parentTxStruct missingParentTx, currentBlockHeaderIDsMap map[uint32]struct{}) ([]uint32, error) {
@@ -1446,40 +1383,6 @@ func (b *Block) Bytes() ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
-}
-
-func (b *Block) NewOptimizedBloomFilter(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int) (*blobloom.Filter, error) {
-	err := b.GetAndValidateSubtrees(ctx, logger, subtreeStore, getAndValidateSubtreesConcurrency)
-	if err != nil {
-		// just return the error from the call above
-		return nil, err
-	}
-
-	filter := blobloom.NewOptimized(blobloom.Config{
-		Capacity: b.TransactionCount, // Expected number of keys.
-		FPRate:   1e-6,               // Accept one false positive per 100,000 lookups.
-	})
-
-	var n64 uint64
-	// insert all transaction ids first 8 bytes to the filter
-	for sIdx := 0; sIdx < len(b.SubtreeSlices); sIdx++ {
-		subtree := b.SubtreeSlices[sIdx]
-		if subtree == nil {
-			return nil, errors.NewProcessingError("[BLOCK][%s] missing subtree %d", b.String(), sIdx)
-		}
-
-		for nodeIdx := 0; nodeIdx < len(subtree.Nodes); nodeIdx++ {
-			if sIdx == 0 && nodeIdx == 0 && subtree.Nodes[nodeIdx].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				// skip coinbase
-				continue
-			}
-
-			n64 = binary.BigEndian.Uint64(subtree.Nodes[nodeIdx].Hash[:])
-			filter.Add(n64)
-		}
-	}
-
-	return filter, nil
 }
 
 func CalculateMedianTimestamp(timestamps []time.Time) (*time.Time, error) {

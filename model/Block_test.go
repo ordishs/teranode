@@ -35,7 +35,6 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
-	"github.com/greatroar/blobloom"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -213,29 +212,6 @@ func TestZeroCoverageFunctions(t *testing.T) {
 		_ = block.validateSubtree(ctx, ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
 	})
 
-	t.Run("checkTxInRecentBlocks minimal", func(t *testing.T) {
-		block := &Block{}
-
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		subtreeNode := subtreepkg.Node{Hash: *txHash}
-
-		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-		}
-
-		validationCtx := &validationContext{
-			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-		}
-
-		// Call with empty filters - should succeed and hit some lines
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		err := block.checkTxInRecentBlocks(ctx, deps, validationCtx, subtreeNode, txHash, 0, 0)
-		assert.NoError(t, err)
-	})
-
 	t.Run("checkParentExistsOnChain minimal", func(t *testing.T) {
 		block := &Block{}
 
@@ -280,13 +256,11 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		subtreeStore := &mockSubtreeStore{shouldError: true}
 		txMetaStore := createTestUTXOStore(t)
 		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		recentBlocksBloomFilters := []*BlockBloomFilter{}
 		currentChain := []*BlockHeader{}
 		currentBlockHeaderIDs := []uint32{}
-		bloomStats := NewBloomStats()
 
 		// This should hit many validation paths
-		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, oldBlockIDsMap, recentBlocksBloomFilters, currentChain, currentBlockHeaderIDs, bloomStats, settings)
+		valid, err := block.Valid(ctx, logger, subtreeStore, txMetaStore, oldBlockIDsMap, currentChain, currentBlockHeaderIDs, settings)
 		// May pass or fail, but we're testing coverage
 		_ = valid
 		_ = err
@@ -318,7 +292,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should fail validation (may hit difficulty or timestamp validation)
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
 		assert.False(t, valid)
 		assert.Error(t, err) // Just verify it fails - the specific error depends on validation order
 	})
@@ -342,7 +316,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the nil coinbase validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
 		assert.False(t, valid)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no coinbase tx")
@@ -375,7 +349,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the median timestamp validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockBloomFilter{}, currentChain, []uint32{}, NewBloomStats(), tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), currentChain, []uint32{}, tSettings)
 		// May pass or fail, but we're testing the median timestamp code path
 		_ = valid
 		_ = err
@@ -400,7 +374,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should hit the coinbase height validation path
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
 		// Will likely fail due to height mismatch, but we're testing the code path
 		_ = valid
 		_ = err
@@ -428,7 +402,7 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		subtreeStore := &mockSubtreeStore{shouldError: true} // Empty store
 
 		// This should hit the subtree validation path
-		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+		valid, err := block.Valid(ctx, logger, subtreeStore, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
 		// Will likely fail due to missing subtree, but we're testing the code path
 		_ = valid
 		_ = err
@@ -451,238 +425,10 @@ func TestBlock_Valid_ComprehensiveCoverage(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should skip median timestamp validation due to empty chain
-		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+		valid, err := block.Valid(ctx, logger, nil, createTestUTXOStore(t), txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings)
 		// Should hit the empty chain path
 		_ = valid
 		_ = err
-	})
-}
-
-// TestBlock_NewOptimizedBloomFilter_ComprehensiveCoverage tests various paths in NewOptimizedBloomFilter
-func TestBlock_NewOptimizedBloomFilter_ComprehensiveCoverage(t *testing.T) {
-	t.Run("error from GetAndValidateSubtrees", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		// Create block with subtrees that will cause GetAndValidateSubtrees to fail
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		// Create block with a subtree hash that doesn't exist in store
-		subtreeHash, _ := chainhash.NewHashFromStr("9daba5e5c8ecdb80e811ef93558e960a6ffed0c481182bd47ac381547361ff25")
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{subtreeHash}, 2, 123, 0, 0)
-		require.NoError(t, err)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		logger := ulogger.TestLogger{}
-		emptySubtreeStore := &mockSubtreeStore{shouldError: true} // Empty store will cause error
-
-		// This should hit the error path from GetAndValidateSubtrees (timeout to avoid retries)
-		filter, err := block.NewOptimizedBloomFilter(ctx, logger, emptySubtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		assert.Nil(t, filter)
-		assert.Error(t, err)
-	})
-
-	t.Run("success with empty subtrees", func(t *testing.T) {
-		// Create block with no subtrees
-		tSettings := test.CreateBaseTestSettings(t)
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Set empty SubtreeSlices to simulate successful GetAndValidateSubtrees
-		block.SubtreeSlices = []*subtreepkg.Subtree{}
-
-		ctx := context.Background()
-		logger := ulogger.TestLogger{}
-
-		// This should succeed and create an empty bloom filter
-		filter, err := block.NewOptimizedBloomFilter(ctx, logger, nil, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		assert.NoError(t, err)
-		assert.NotNil(t, filter)
-	})
-
-	t.Run("nil subtree error path", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		// Skip the GetAndValidateSubtrees call by manually setting up the scenario
-		defer func() {
-			if r := recover(); r != nil {
-				// Expected panic from nil subtree access
-				t.Log("Expected panic from nil subtree")
-			}
-		}()
-
-		// Create block
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Set SubtreeSlices with a nil subtree to trigger error
-		block.SubtreeSlices = []*subtreepkg.Subtree{nil}
-
-		ctx := context.Background()
-		logger := ulogger.TestLogger{}
-
-		// This should hit the nil subtree error path (may panic)
-		_, _ = block.NewOptimizedBloomFilter(ctx, logger, nil, tSettings.Block.GetAndValidateSubtreesConcurrency)
-	})
-
-	t.Run("success with coinbase placeholder", func(t *testing.T) {
-		// Create block
-		tSettings := test.CreateBaseTestSettings(t)
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 2, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create subtree with coinbase placeholder as first node
-		subtree, err := subtreepkg.NewTreeByLeafCount(2)
-		require.NoError(t, err)
-
-		// Add coinbase placeholder as first node using proper method
-		err = subtree.AddCoinbaseNode()
-		require.NoError(t, err)
-
-		// Add another transaction
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		err = subtree.AddNode(*txHash, 1, 100)
-		require.NoError(t, err)
-
-		block.SubtreeSlices = []*subtreepkg.Subtree{subtree}
-
-		ctx := context.Background()
-		logger := ulogger.TestLogger{}
-
-		// This should succeed and skip the coinbase placeholder
-		filter, err := block.NewOptimizedBloomFilter(ctx, logger, nil, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		assert.NoError(t, err)
-		assert.NotNil(t, filter)
-	})
-
-	t.Run("success with multiple subtrees and transactions", func(t *testing.T) {
-		// Create block
-		tSettings := test.CreateBaseTestSettings(t)
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 4, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create multiple subtrees
-		subtree1, err := subtreepkg.NewTreeByLeafCount(2)
-		require.NoError(t, err)
-
-		subtree2, err := subtreepkg.NewTreeByLeafCount(2)
-		require.NoError(t, err)
-
-		// Add transactions to first subtree
-		txHash1, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		txHash2, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-
-		err = subtree1.AddNode(*txHash1, 1, 100)
-		require.NoError(t, err)
-		err = subtree1.AddNode(*txHash2, 1, 100)
-		require.NoError(t, err)
-
-		// Add transactions to second subtree
-		txHash3, _ := chainhash.NewHashFromStr("9daba5e5c8ecdb80e811ef93558e960a6ffed0c481182bd47ac381547361ff25")
-		txHash4, _ := chainhash.NewHashFromStr("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
-
-		err = subtree2.AddNode(*txHash3, 1, 100)
-		require.NoError(t, err)
-		err = subtree2.AddNode(*txHash4, 1, 100)
-		require.NoError(t, err)
-
-		block.SubtreeSlices = []*subtreepkg.Subtree{subtree1, subtree2}
-
-		ctx := context.Background()
-		logger := ulogger.TestLogger{}
-
-		// This should succeed and add all transactions to the bloom filter
-		filter, err := block.NewOptimizedBloomFilter(ctx, logger, nil, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		assert.NoError(t, err)
-		assert.NotNil(t, filter)
-
-		// Test that filter was created successfully (don't rely on specific hash presence)
-		// Bloom filters can have false positives, so we just verify it was created
-		_ = txHash1
-		_ = txHash2
-		_ = txHash3
-		_ = txHash4
-	})
-
-	t.Run("success with mixed subtree - coinbase and regular txs", func(t *testing.T) {
-		// Create block
-		tSettings := test.CreateBaseTestSettings(t)
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 3, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create first subtree with coinbase placeholder and regular tx
-		subtree1, err := subtreepkg.NewTreeByLeafCount(2)
-		require.NoError(t, err)
-
-		// Add coinbase placeholder as first node in first subtree using proper method
-		err = subtree1.AddCoinbaseNode()
-		require.NoError(t, err)
-
-		txHash1, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		err = subtree1.AddNode(*txHash1, 1, 100)
-		require.NoError(t, err)
-
-		// Create second subtree with regular transactions (no coinbase)
-		subtree2, err := subtreepkg.NewTreeByLeafCount(1)
-		require.NoError(t, err)
-
-		txHash2, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-		err = subtree2.AddNode(*txHash2, 1, 100)
-		require.NoError(t, err)
-
-		block.SubtreeSlices = []*subtreepkg.Subtree{subtree1, subtree2}
-
-		ctx := context.Background()
-		logger := ulogger.TestLogger{}
-
-		// This should succeed, skip coinbase, and add regular transactions
-		filter, err := block.NewOptimizedBloomFilter(ctx, logger, nil, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		assert.NoError(t, err)
-		assert.NotNil(t, filter)
-
-		// Test that filter was created successfully
-		// Note: Bloom filters can have false positives, so we just verify creation
-		_ = txHash1
-		_ = txHash2
 	})
 }
 
@@ -1430,7 +1176,7 @@ func TestBlock_ValidWithOneTransaction(t *testing.T) {
 
 	currentChain[0].HashPrevBlock = &chainhash.Hash{}
 	oldBlockIDs := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, oldBlockIDs, nil, currentChain, currentChainIDs, NewBloomStats(), settings)
+	v, err := b.Valid(context.Background(), ulogger.TestLogger{}, subtreeStore, utxoStore, oldBlockIDs, currentChain, currentChainIDs, settings)
 	require.NoError(t, err)
 	require.True(t, v)
 
@@ -1857,65 +1603,6 @@ func TestBlock_SubTreesFromBytes(t *testing.T) {
 	})
 }
 
-func TestBlock_NewOptimizedBloomFilter(t *testing.T) {
-	t.Run("error getting subtrees", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		// Create a test block with subtrees
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		subtreeHash, _ := chainhash.NewHashFromStr("9daba5e5c8ecdb80e811ef93558e960a6ffed0c481182bd47ac381547361ff25")
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{subtreeHash}, 1000, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create a mock subtree store that will fail
-		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		logger := ulogger.TestLogger{}
-
-		// This will fail because the subtree doesn't exist
-		_, err = block.NewOptimizedBloomFilter(ctx, logger, mockSubtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		require.Error(t, err)
-		// With timeout, we expect context deadline exceeded
-		assert.True(t, err != nil)
-	})
-
-	t.Run("missing subtree slice", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		blockHeaderBytes, _ := hex.DecodeString(block1Header)
-		blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
-		require.NoError(t, err)
-
-		coinbase, err := bt.NewTxFromString(CoinbaseHex)
-		require.NoError(t, err)
-
-		subtreeHash, _ := chainhash.NewHashFromStr("9daba5e5c8ecdb80e811ef93558e960a6ffed0c481182bd47ac381547361ff25")
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{subtreeHash}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		logger := ulogger.TestLogger{}
-		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
-
-		// This will fail because the subtree doesn't exist in the store
-		err = block.GetAndValidateSubtrees(ctx, logger, mockSubtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		require.Error(t, err)
-		// With timeout, we expect context deadline exceeded or mock error
-		assert.True(t, err != nil)
-	})
-}
-
 func TestBlock_CheckBlockRewardAndFees(t *testing.T) {
 	t.Run("valid block reward and fees", func(t *testing.T) {
 		blockHeaderBytes, _ := hex.DecodeString(block1Header) // This is a teratestnet block at height 1.  Therefore, the block reward is 50.00000000
@@ -2092,13 +1779,11 @@ func TestBlock_ValidOrderAndBlessed_ErrorCases(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
@@ -2128,13 +1813,11 @@ func TestBlock_ValidOrderAndBlessed_WithSubtrees(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
@@ -2380,7 +2063,7 @@ func TestBlock_Valid_MoreCoverage(t *testing.T) {
 
 		// Call with txMetaStore to trigger validOrderAndBlessed path
 		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 
 		// This might error due to missing subtrees, but we're testing the path
 		_ = valid
@@ -2566,27 +2249,6 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
 
-	t.Run("checkTxInRecentBlocks basic path", func(t *testing.T) {
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		ctx := context.Background()
-		deps := &validationDependencies{
-			recentBlocksBloomFilters: []*BlockBloomFilter{}, // Empty filters
-		}
-
-		validationCtx := &validationContext{
-			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-		}
-
-		hash1, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		subtreeNode := subtreepkg.Node{Hash: *hash1}
-
-		// Should succeed with empty bloom filters
-		err = block.checkTxInRecentBlocks(ctx, deps, validationCtx, subtreeNode, hash1, 0, 0)
-		require.NoError(t, err)
-	})
-
 	t.Run("validateTransaction error paths", func(t *testing.T) {
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
 		require.NoError(t, err)
@@ -2595,9 +2257,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 		block.txMap = txmap.NewSplitSwissMapUint64(10)
 
 		ctx := context.Background()
-		deps := &validationDependencies{
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-		}
+		deps := &validationDependencies{}
 
 		validationCtx := &validationContext{
 			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
@@ -2623,24 +2283,6 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 	// Skip problematic checkDuplicateInputs test for now
 
-	t.Run("NewOptimizedBloomFilter error with get subtrees", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		hash1, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{hash1}, 1000, 123, 0, 0)
-		require.NoError(t, err)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		logger := ulogger.TestLogger{}
-		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
-
-		// This should error trying to get subtrees
-		_, err = block.NewOptimizedBloomFilter(ctx, logger, mockSubtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		require.Error(t, err)
-	})
-
 	t.Run("Valid function path coverage", func(t *testing.T) {
 		tSettings := test.CreateBaseTestSettings(t)
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
@@ -2654,7 +2296,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 		// Test with nil subtreeStore to skip the subtree check
 		valid, err := block.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 
 		// Should succeed because we're skipping most validation
 		require.NoError(t, err)
@@ -2662,7 +2304,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 		// Test with subtreeStore but no txMetaStore to test different paths
 		valid, err = block.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 
 		// This will error due to missing subtrees but tests the path
 		_ = valid
@@ -2670,7 +2312,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 		// Test with txMetaStore to trigger validOrderAndBlessed
 		valid, err = block.Valid(ctx, logger, nil, txMetaStore, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 
 		_ = valid
 		_ = err
@@ -2721,16 +2363,6 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
 
-	t.Run("NewOptimizedBloomFilter additional paths", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Test with nil subtree store - may or may not error depending on empty subtrees
-		_, err = block.NewOptimizedBloomFilter(context.Background(), ulogger.TestLogger{}, nil, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		_ = err // Don't assert error as it may be nil with empty subtrees
-	})
-
 	t.Run("getSubtreeMetaSlice with mock store", func(t *testing.T) {
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
 		require.NoError(t, err)
@@ -2748,24 +2380,6 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 
 		_, err = block.getSubtreeMetaSlice(ctx, mockStore, chainhash.Hash{}, subtree)
 		// May error due to missing data but exercises the code path
-		_ = err
-	})
-
-	t.Run("NewOptimizedBloomFilter with subtrees", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		hash1, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{hash1}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create mock subtree store
-		subtreeStore := &mockSubtreeStore{shouldError: true}
-
-		// Test with empty subtree data to trigger different paths (timeout to avoid retries)
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		_, err = block.NewOptimizedBloomFilter(ctx, ulogger.TestLogger{}, subtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		// This will likely error but tests the code paths
 		_ = err
 	})
 
@@ -2805,14 +2419,14 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		// Test with only subtreeStore
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
 		_, err = block.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 		// Will error but exercises the subtree validation path
 		_ = err
 
 		// Test checkBlockRewardAndFees path with height > 0
 		block.Height = 100
 		_, err = block.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 		// Will error but exercises checkBlockRewardAndFees path
 		_ = err
 	})
@@ -2858,13 +2472,11 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 
 		// Create validation dependencies
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -2915,28 +2527,17 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		err = block.txMap.Put(*hash3, 3)
 		require.NoError(t, err)
 
-		// Create a bloom filter with transactions
-		bloomFilter := &BlockBloomFilter{
-			BlockHash: hash1,
-			Filter:    blobloom.NewOptimized(blobloom.Config{Capacity: 1000, FPRate: 0.01}),
-		}
-		// Add transaction hashes to bloom filter
-		bloomFilter.Filter.Add(binary.BigEndian.Uint64(hash1[:]))
-		bloomFilter.Filter.Add(binary.BigEndian.Uint64(hash2[:]))
-
 		// Create block headers for currentChain
 		blockHeaders := []*BlockHeader{blockHeader}
 		blockHeaderIDs := []uint32{1}
 
 		// Create validation dependencies with comprehensive setup
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{bloomFilter},
-			currentChain:             blockHeaders,
-			currentBlockHeaderIDs:    blockHeaderIDs,
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          blockHeaders,
+			currentBlockHeaderIDs: blockHeaderIDs,
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -2981,7 +2582,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 
 		block1.SubtreeSlices = []*subtreepkg.Subtree{subtree}
 		_, err = block1.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 		_ = err // Exercises checkBlockRewardAndFees path safely
 
 		// Test path 2: GetAndValidateSubtrees path
@@ -2993,7 +2594,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		mockSubtreeStore := &mockSubtreeStore{shouldError: true}
 
 		_, err = block2.Valid(ctx, logger, mockSubtreeStore, nil, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 		_ = err // Exercises GetAndValidateSubtrees path
 
 		// Test path 3: validOrderAndBlessed path with txMetaStore
@@ -3001,7 +2602,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		require.NoError(t, err)
 		txMetaStore := createTestUTXOStore(t)
 		_, err = block3.Valid(ctx, logger, nil, txMetaStore, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 		_ = err // Exercises validOrderAndBlessed path
 
 		// Test path 4: CheckMerkleRoot path
@@ -3016,7 +2617,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 
 		block4.SubtreeSlices = []*subtreepkg.Subtree{subtree2}
 		_, err = block4.Valid(ctx, logger, nil, nil, oldBlockIDs,
-			nil, []*BlockHeader{}, []uint32{}, NewBloomStats(), tSettings)
+			[]*BlockHeader{}, []uint32{}, tSettings)
 		_ = err // Exercises CheckMerkleRoot path
 	})
 
@@ -3056,29 +2657,17 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		err = block.txMap.Put(*hash3, 3)
 		require.NoError(t, err)
 
-		// Create bloom filter that will match some transactions
-		bloomFilter := &BlockBloomFilter{
-			BlockHash: blockHeader.Hash(),
-			Filter:    blobloom.NewOptimized(blobloom.Config{Capacity: 1000, FPRate: 0.01}),
-		}
-
-		// Add transaction patterns to bloom filter to trigger different paths
-		bloomFilter.Filter.Add(binary.BigEndian.Uint64(hash1[:]))
-		bloomFilter.Filter.Add(binary.BigEndian.Uint64(hash2[:]))
-
 		// Create validation context with current block headers
 		currentChain := []*BlockHeader{blockHeader}
 		currentBlockHeaderIDs := []uint32{1}
 
-		// Create dependencies that will exercise bloom filter paths
+		// Create dependencies
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{bloomFilter},
-			currentChain:             currentChain,
-			currentBlockHeaderIDs:    currentBlockHeaderIDs,
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          currentChain,
+			currentBlockHeaderIDs: currentBlockHeaderIDs,
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -3088,7 +2677,6 @@ func TestMaximumCoverageBoost(t *testing.T) {
 
 		// This should exercise deep validation paths including:
 		// - validateSubtree with multiple nodes
-		// - checkTxInRecentBlocks with bloom filter hits
 		// - validateTransaction for each transaction
 		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency)
 		_ = err // Will error but exercises many code paths
@@ -3195,45 +2783,6 @@ func TestMaximumCoverageBoost(t *testing.T) {
 				assert.Error(t, err) // Should error on malformed data
 			})
 		}
-	})
-
-	t.Run("NewOptimizedBloomFilter comprehensive", func(t *testing.T) {
-		tSettings := test.CreateBaseTestSettings(t)
-		hash1, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{hash1}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Test with various subtree store configurations
-		subtreeStore := NewLocalSubtreeStore()
-
-		// Case 1: Empty subtree data (timeout to avoid retries)
-		ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel1()
-
-		_, err = block.NewOptimizedBloomFilter(ctx1, ulogger.TestLogger{}, subtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		_ = err // May error but exercises code paths
-
-		// Case 2: Create actual subtree data
-		subtree, err := subtreepkg.NewTreeByLeafCount(4)
-		require.NoError(t, err)
-		err = subtree.AddNode(*hash1, 1, 100)
-		require.NoError(t, err)
-
-		subtreeBytes, err := subtree.Serialize()
-		require.NoError(t, err)
-
-		// Store actual subtree data
-		err = subtreeStore.Set(context.Background(), hash1[:], fileformat.FileTypeSubtree, subtreeBytes)
-		require.NoError(t, err)
-
-		// Store valid metadata to avoid retries
-		metadataBytes, err := CreateValidSubtreeMetadata(subtree)
-		require.NoError(t, err)
-		err = subtreeStore.Set(context.Background(), hash1[:], fileformat.FileTypeSubtreeMeta, metadataBytes)
-		require.NoError(t, err)
-
-		_, err = block.NewOptimizedBloomFilter(context.Background(), ulogger.TestLogger{}, subtreeStore, tSettings.Block.GetAndValidateSubtreesConcurrency)
-		_ = err // Should exercise more paths with real data
 	})
 }
 
@@ -3402,216 +2951,6 @@ func TestBlock_CheckDuplicateInputs_ComprehensiveCoverage(t *testing.T) {
 			err = block.checkDuplicateInputs(subtreeMetaSlice, validationCtx, subtreeHash, tc.sIdx, tc.snIdx, subtreeNode)
 			_ = err // May error but exercises different code paths
 		}
-	})
-}
-
-// TestBlock_CheckTxInRecentBlocks_ComprehensiveCoverage tests the checkTxInRecentBlocks function
-func TestBlock_CheckTxInRecentBlocks_ComprehensiveCoverage(t *testing.T) {
-	t.Run("no recent block bloom filters", func(t *testing.T) {
-		// Create block with proper initialization
-		prevHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-		merkleRoot, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		bits, _ := NewNBitFromString("207fffff")
-		blockHeader := &BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevHash,
-			HashMerkleRoot: merkleRoot,
-			Timestamp:      uint32(time.Now().Unix()), // nolint: gosec
-			Bits:           *bits,
-			Nonce:          2,
-		}
-		coinbase := &bt.Tx{}
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create validation dependencies with empty bloom filters
-		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			recentBlocksBloomFilters: []*BlockBloomFilter{}, // Empty - should return nil immediately
-		}
-
-		// Create validation context
-		validationCtx := &validationContext{
-			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-		}
-
-		// Create subtree node
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		subtreeNode := subtreepkg.Node{
-			Hash: *txHash,
-		}
-		subtreeHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-
-		// Test with no bloom filters
-		err = block.checkTxInRecentBlocks(context.Background(), deps, validationCtx, subtreeNode, subtreeHash, 0, 0)
-		assert.NoError(t, err) // Should pass with no filters
-	})
-
-	t.Run("bloom filter not on current chain", func(t *testing.T) {
-		// Create block
-		prevHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-		merkleRoot, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		bits, _ := NewNBitFromString("207fffff")
-		blockHeader := &BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevHash,
-			HashMerkleRoot: merkleRoot,
-			Timestamp:      uint32(time.Now().Unix()), // nolint: gosec
-			Bits:           *bits,
-			Nonce:          2,
-		}
-		coinbase := &bt.Tx{}
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create bloom filter
-		filter := blobloom.NewOptimized(blobloom.Config{
-			Capacity: 1000,
-			FPRate:   0.01,
-		})
-		blockHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		bloomFilter := &BlockBloomFilter{
-			Filter:    filter,
-			BlockHash: blockHash,
-		}
-
-		// Create validation dependencies with bloom filter
-		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			recentBlocksBloomFilters: []*BlockBloomFilter{bloomFilter},
-		}
-
-		// Create validation context WITHOUT the block hash (so it's not on current chain)
-		validationCtx := &validationContext{
-			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}), // Empty - bloom filter not on chain
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-		}
-
-		// Create subtree node
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		subtreeNode := subtreepkg.Node{
-			Hash: *txHash,
-		}
-		subtreeHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-
-		// Test - should skip the bloom filter since it's not on current chain
-		err = block.checkTxInRecentBlocks(context.Background(), deps, validationCtx, subtreeNode, subtreeHash, 0, 0)
-		assert.NoError(t, err) // Should pass since filter not on chain
-	})
-
-	t.Run("bloom filter miss", func(t *testing.T) {
-		// Create block
-		prevHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-		merkleRoot, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		bits, _ := NewNBitFromString("207fffff")
-		blockHeader := &BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevHash,
-			HashMerkleRoot: merkleRoot,
-			Timestamp:      uint32(time.Now().Unix()), // nolint: gosec
-			Bits:           *bits,
-			Nonce:          2,
-		}
-		coinbase := &bt.Tx{}
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create bloom filter
-		filter := blobloom.NewOptimized(blobloom.Config{
-			Capacity: 1000,
-			FPRate:   0.01,
-		})
-		blockHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		bloomFilter := &BlockBloomFilter{
-			Filter:    filter,
-			BlockHash: blockHash,
-		}
-
-		// Create validation dependencies with bloom filter
-		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			recentBlocksBloomFilters: []*BlockBloomFilter{bloomFilter},
-		}
-
-		// Create validation context WITH the block hash (so it's on current chain)
-		validationCtx := &validationContext{
-			currentBlockHeaderHashesMap: map[chainhash.Hash]struct{}{
-				*blockHash: {}, // Include the bloom filter's block hash
-			},
-			currentBlockHeaderIDsMap: make(map[uint32]struct{}),
-		}
-
-		// Create subtree node with hash that won't be in the empty bloom filter
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		subtreeNode := subtreepkg.Node{
-			Hash: *txHash,
-		}
-		subtreeHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-
-		// Test - should pass since bloom filter doesn't contain the hash
-		err = block.checkTxInRecentBlocks(context.Background(), deps, validationCtx, subtreeNode, subtreeHash, 0, 0)
-		assert.NoError(t, err) // Should pass since filter doesn't contain hash
-	})
-
-	t.Run("bloom filter hit but tx not found in store", func(t *testing.T) {
-		// Create block
-		prevHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-		merkleRoot, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		bits, _ := NewNBitFromString("207fffff")
-		blockHeader := &BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevHash,
-			HashMerkleRoot: merkleRoot,
-			Timestamp:      uint32(time.Now().Unix()), // nolint: gosec
-			Bits:           *bits,
-			Nonce:          2,
-		}
-		coinbase := &bt.Tx{}
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Create bloom filter and add a hash to it
-		filter := blobloom.NewOptimized(blobloom.Config{
-			Capacity: 1000,
-			FPRate:   0.01,
-		})
-		txHash, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		n64 := binary.BigEndian.Uint64(txHash[:])
-		filter.Add(n64) // Add the hash to bloom filter
-
-		blockHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-		bloomFilter := &BlockBloomFilter{
-			Filter:    filter,
-			BlockHash: blockHash,
-		}
-
-		// Create validation dependencies with bloom filter and bloom stats
-		bloomStats := &BloomStats{}
-		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t), // Empty store - tx won't be found
-			recentBlocksBloomFilters: []*BlockBloomFilter{bloomFilter},
-			bloomStats:               bloomStats,
-		}
-
-		// Create validation context WITH the block hash
-		validationCtx := &validationContext{
-			currentBlockHeaderHashesMap: map[chainhash.Hash]struct{}{
-				*blockHash: {}, // Include the bloom filter's block hash
-			},
-			currentBlockHeaderIDsMap: make(map[uint32]struct{}),
-		}
-
-		// Create subtree node with the hash we added to bloom filter
-		subtreeNode := subtreepkg.Node{
-			Hash: *txHash,
-		}
-		subtreeHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-
-		// Test - should pass since tx not found in store (false positive)
-		err = block.checkTxInRecentBlocks(context.Background(), deps, validationCtx, subtreeNode, subtreeHash, 0, 0)
-		assert.NoError(t, err)                                 // Should pass - false positive
-		assert.Equal(t, uint64(1), bloomStats.PositiveCounter) // Should increment positive counter
 	})
 }
 
@@ -3787,81 +3126,6 @@ func TestBlock_ValidateSubtree_ComprehensiveCoverage(t *testing.T) {
 		// Test - should pass since coinbase is skipped
 		err = block.validateSubtree(context.Background(), ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
 		_ = err // May error but exercises the coinbase skip logic
-	})
-
-	t.Run("validation with bloom stats", func(t *testing.T) {
-		// Create block
-		prevHash, _ := chainhash.NewHashFromStr("000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd")
-		merkleRoot, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		bits, _ := NewNBitFromString("207fffff")
-		blockHeader := &BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevHash,
-			HashMerkleRoot: merkleRoot,
-			Timestamp:      uint32(time.Now().Unix()), // nolint: gosec
-			Bits:           *bits,
-			Nonce:          2,
-		}
-		coinbase := &bt.Tx{}
-		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
-		require.NoError(t, err)
-
-		// Initialize txMap
-		block.txMap = txmap.NewSplitSwissMapUint64(10)
-
-		// Create bloom stats to test the counter increment
-		bloomStats := &BloomStats{}
-
-		// Create subtree with multiple nodes (power of 2)
-		subtree, err := subtreepkg.NewTreeByLeafCount(4)
-		require.NoError(t, err)
-
-		// Add coinbase placeholder first
-		err = subtree.AddCoinbaseNode()
-		require.NoError(t, err)
-
-		// Add regular transaction nodes
-		txHash1, _ := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		err = subtree.AddNode(*txHash1, 1, 100)
-		require.NoError(t, err)
-
-		txHash2, _ := chainhash.NewHashFromStr("1f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		err = subtree.AddNode(*txHash2, 1, 100)
-		require.NoError(t, err)
-
-		txHash3, _ := chainhash.NewHashFromStr("2f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
-		err = subtree.AddNode(*txHash3, 1, 100)
-		require.NoError(t, err)
-
-		// Create mock store with valid subtree metadata
-		subtreeHash := subtree.RootHash()
-		subtreeMetaSlice, err := createValidSubtreeMetadata(subtree)
-		require.NoError(t, err)
-
-		mockStore := &mockSubtreeStore{
-			data: map[string][]byte{
-				string(subtreeHash[:]): subtreeMetaSlice,
-			},
-		}
-
-		// Create validation dependencies with bloom stats
-		deps := &validationDependencies{
-			txMetaStore:    createTestUTXOStore(t),
-			subtreeStore:   mockStore,
-			bloomStats:     bloomStats,
-			oldBlockIDsMap: txmap.NewSyncedMap[chainhash.Hash, []uint32](),
-		}
-
-		// Create validation context
-		validationCtx := &validationContext{
-			currentBlockHeaderHashesMap: make(map[chainhash.Hash]struct{}),
-			currentBlockHeaderIDsMap:    make(map[uint32]struct{}),
-			parentSpendsMap:             NewSplitSyncedParentMap(4),
-		}
-
-		// Test - exercises the bloom stats logic (may error but that's ok)
-		err = block.validateSubtree(context.Background(), ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
-		_ = err // May error but exercises the bloom stats logic
 	})
 }
 
@@ -4134,13 +3398,11 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             mockStore,
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          mockStore,
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4183,13 +3445,11 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             mockStore,
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{1, 2},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          mockStore,
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{1, 2},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4228,13 +3488,11 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             mockStore,
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          mockStore,
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4271,13 +3529,11 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             mockStore,
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{1, 2, 3},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          mockStore,
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{1, 2, 3},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4315,13 +3571,11 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             mockStore,
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{10, 11}, // Higher block IDs
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          mockStore,
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{10, 11}, // Higher block IDs
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4371,13 +3625,11 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 	t.Run("transaction not found in txMap", func(t *testing.T) {
 		// Test case where transaction hash is not in the block's txMap
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4415,13 +3667,11 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4459,13 +3709,11 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4505,13 +3753,11 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		validationCtx := &validationContext{
@@ -4549,13 +3795,11 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		// Add some duplicate inputs to validation context
@@ -4597,13 +3841,11 @@ func TestBlock_ValidateTransaction_ComprehensiveCoverage(t *testing.T) {
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
 		deps := &validationDependencies{
-			txMetaStore:              createTestUTXOStore(t),
-			subtreeStore:             &mockSubtreeStore{shouldError: true},
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               NewBloomStats(),
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			txMetaStore:           createTestUTXOStore(t),
+			subtreeStore:          &mockSubtreeStore{shouldError: true},
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
 		// Add block header IDs to simulate recent blocks
@@ -4841,13 +4083,11 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		deps := &validationDependencies{
-			txMetaStore:              txMetaStore,
-			subtreeStore:             mockBlobStore,
-			recentBlocksBloomFilters: []*BlockBloomFilter{},
-			oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
-			currentChain:             []*BlockHeader{},
-			currentBlockHeaderIDs:    []uint32{},
-			bloomStats:               &BloomStats{},
+			txMetaStore:           txMetaStore,
+			subtreeStore:          mockBlobStore,
+			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			currentChain:          []*BlockHeader{},
+			currentBlockHeaderIDs: []uint32{},
 		}
 
 		// This should pass validation - coinbase placeholder is in correct position
@@ -4894,7 +4134,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 
 		// This should fail the coinbase placeholder check
 		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, &BloomStats{}, tSettings)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4944,7 +4184,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 
 		// This should fail validation - coinbase placeholder must be in first subtree, first position
 		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, &BloomStats{}, tSettings)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings)
 		require.Error(t, err)
 		require.False(t, valid)
 		assert.Contains(t, err.Error(), "first transaction in first subtree is not a coinbase placeholder")
@@ -4976,7 +4216,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		// With empty subtree slices, the validation should pass this check
 		// (it will fail on other validations)
 		oldBlockIDsMap := txmap.NewSyncedMap[chainhash.Hash, []uint32]()
-		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockBloomFilter{}, []*BlockHeader{}, []uint32{}, &BloomStats{}, tSettings)
+		valid, err := block.Valid(ctx, logger, mockBlobStore, txMetaStore, oldBlockIDsMap, []*BlockHeader{}, []uint32{}, tSettings)
 		_ = valid
 		_ = err
 		// The coinbase placeholder check should be skipped for empty subtrees
@@ -5163,13 +4403,11 @@ func TestValidateSubtreeBenchmark(t *testing.T) {
 
 	// Set up validation dependencies (SHARED across all subtrees)
 	deps := &validationDependencies{
-		txMetaStore:              utxoStore,
-		subtreeStore:             mockStore,
-		recentBlocksBloomFilters: []*BlockBloomFilter{},
-		currentChain:             []*BlockHeader{blockHeader},
-		currentBlockHeaderIDs:    []uint32{1},
-		bloomStats:               NewBloomStats(),
-		oldBlockIDsMap:           txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+		txMetaStore:           utxoStore,
+		subtreeStore:          mockStore,
+		currentChain:          []*BlockHeader{blockHeader},
+		currentBlockHeaderIDs: []uint32{1},
+		oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 	}
 
 	// Set up validation context (SHARED - this is where the contention happens!)
