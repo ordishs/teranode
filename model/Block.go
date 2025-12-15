@@ -685,7 +685,7 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 	validationCtx := &validationContext{
 		currentBlockHeaderHashesMap: b.buildBlockHeaderHashesMap(deps.currentChain),
 		currentBlockHeaderIDsMap:    b.buildBlockHeaderIDsMap(deps.currentBlockHeaderIDs),
-		parentSpendsMap:             NewSplitSyncedParentMap(256),
+		parentSpendsMap:             NewSplitSyncedParentMap(4096),
 	}
 
 	concurrency := b.getValidationConcurrency(validOrderAndBlessedConcurrency)
@@ -977,10 +977,15 @@ func (b *Block) validateTransaction(ctx context.Context, deps *validationDepende
 	}
 
 	// Check if transaction has been mined in recent blocks
-	err = b.checkTxInRecentBlocks(ctx, deps, validationCtx, params.subtreeNode, params.subtreeHash, params.sIdx, params.snIdx)
-	if err != nil {
-		return nil, err
-	}
+	//
+	// We do not have to do this anymore, since we are checking for this in setTXMined, which gets the blockIDs for all transactions
+	// returned and checks them against the recent block IDs.
+	// model/update-tx-mined.go:278
+	//
+	// err = b.checkTxInRecentBlocks(ctx, deps, validationCtx, params.subtreeNode, params.subtreeHash, params.sIdx, params.snIdx)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
 	// Check parent transactions
 	return b.checkParentTransactions(parentTxHashes, txIdx, params.subtreeNode, params.subtreeHash, params.sIdx, params.snIdx)
