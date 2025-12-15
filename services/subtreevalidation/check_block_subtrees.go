@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -672,6 +673,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	// Convert transactions to missingTx format for prepareTxsPerLevel
 	missingTxs := make([]missingTx, len(allTransactions))
+	txHashes := make([]chainhash.Hash, len(allTransactions))
 	for i, tx := range allTransactions {
 		if tx == nil {
 			return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at index %d", i)
@@ -681,6 +683,28 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			tx:  tx,
 			idx: i,
 		}
+		txHashes[i] = *tx.TxIDChainHash()
+	}
+
+	// Pre-check: identify transactions that are already validated in cache or UTXO store
+	txMetaSlice := make([]*meta.Data, len(txHashes))
+
+	missed, err := u.processTxMetaUsingCache(ctx, txHashes, txMetaSlice, false)
+	if err != nil {
+		return errors.NewProcessingError("[processTransactionsInLevels] Failed to check txMeta cache", err)
+	}
+
+	if missed > 0 {
+		batched := u.settings.SubtreeValidation.BatchMissingTransactions
+		missed, err = u.processTxMetaUsingStore(ctx, txHashes, txMetaSlice, blockIds, batched, false)
+		if err != nil {
+			return errors.NewProcessingError("[processTransactionsInLevels] Failed to check txMeta store", err)
+		}
+	}
+
+	alreadyValidated := len(txHashes) - missed
+	if alreadyValidated > 0 {
+		u.logger.Infof("[processTransactionsInLevels] Pre-check: %d/%d transactions already validated, %d need validation", alreadyValidated, len(txHashes), missed)
 	}
 
 	// Use the existing prepareTxsPerLevel logic to organize transactions by dependency levels
@@ -764,11 +788,18 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 		for _, mTx := range levelTxs {
 			tx := mTx.tx
+			txIdx := mTx.idx
 			if tx == nil {
 				return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at level %d", level)
 			}
 
 			g.Go(func() error {
+				// Skip transactions that were already validated (found in cache or UTXO store)
+				if txMetaSlice[txIdx] != nil {
+					u.logger.Debugf("[processTransactionsInLevels] Transaction %s already validated (pre-check), skipping", tx.TxIDChainHash().String())
+					return nil
+				}
+
 				// Use existing blessMissingTransaction logic for validation
 				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
 				if err != nil {
