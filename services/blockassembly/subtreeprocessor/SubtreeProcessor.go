@@ -2685,23 +2685,23 @@ func (stp *SubtreeProcessor) processBlockSubtrees(block *model.Block) (map[chain
 
 // createTransactionMapIfNeeded creates a transaction map from block subtrees if needed
 func (stp *SubtreeProcessor) createTransactionMapIfNeeded(ctx context.Context, block *model.Block, blockSubtreesMap map[chainhash.Hash]int) (txmap.TxMap, []chainhash.Hash, error) {
+	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "createTransactionMapIfNeeded",
+		tracing.WithParentStat(stp.stats),
+		tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing subtrees into transaction map", block.String()),
+	)
+
+	defer deferFn()
+
 	var (
+		err              error
 		transactionMap   txmap.TxMap
 		conflictingNodes []chainhash.Hash
 	)
 
 	if len(blockSubtreesMap) > 0 {
-		mapStartTime := time.Now()
-
-		stp.logger.Debugf("[moveForwardBlock][%s] processing subtrees into transaction map", block.String())
-
-		var err error
 		if transactionMap, conflictingNodes, err = stp.CreateTransactionMap(ctx, blockSubtreesMap, len(block.Subtrees), block.TransactionCount); err != nil {
-			// TODO revert the created utxos
 			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error creating transaction map", block.String(), err)
 		}
-
-		stp.logger.Debugf("[moveForwardBlock][%s] processing subtrees into transaction map DONE in %s: %d", block.String(), time.Since(mapStartTime).String(), transactionMap.Length())
 	}
 
 	return transactionMap, conflictingNodes, nil
@@ -2714,6 +2714,13 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 
 	// process conflicting txs
 	if len(conflictingNodes) > 0 {
+		ctx, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "processConflictingTransactions",
+			tracing.WithParentStat(stp.stats),
+			tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing %d conflicting transactions", block.String(), len(conflictingNodes)),
+		)
+
+		defer deferFn()
+
 		// before we process the conflicting transactions, we need to make sure this block has been marked as mined
 		// that would mean any previous block is also marked as mined and the data should be in a correct state
 		// we can then process the conflicting transactions
@@ -3043,9 +3050,13 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 }
 
 func (stp *SubtreeProcessor) waitForBlockBeingMined(ctx context.Context, blockHash *chainhash.Hash) (bool, error) {
-	// try to wait for the block to be mined for maximum 300 sec
-	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
-	defer cancel()
+	ctx, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "waitForBlockBeingMined",
+		tracing.WithParentStat(stp.stats),
+		tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] waiting for block to be mined", blockHash.String()),
+		tracing.WithContextTimeout(300*time.Second),
+	)
+
+	defer deferFn()
 
 	for {
 		select {
@@ -3258,34 +3269,100 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 		st := subtree
 
 		g.Go(func() error {
-			remainderSubtrees[idx] = make([]subtreepkg.Node, 0, len(st.Nodes)/10) // expect max 10% of the nodes to be different
-			// don't use the util function, keep the memory local in this function, no jumping between heap and stack
-			// err = st.Difference(transactionMap, &remainderSubtrees[idx])
-			for _, node := range st.Nodes {
-				if !node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+			nodes := st.Nodes
+			n := len(nodes)
+
+			// Small subtree optimization: skip parallelization overhead
+			if n < 1024 {
+				remainderSubtrees[idx] = make([]subtreepkg.Node, 0, n/10)
+
+				for _, node := range nodes {
+					if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+						continue
+					}
+
 					if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
-						if err := stp.removeMap.Delete(node.Hash); err != nil {
-							stp.logger.Errorf("[SubtreeProcessor] error removing tx from remove map: %s", err.Error())
-						}
-					} else {
-						exists := transactionMap.Exists(node.Hash)
+						_ = stp.removeMap.Delete(node.Hash)
+						continue
+					}
 
-						if exists {
-							// we found a transaction that was in the block, mark it as processed in the transaction map
-							if err := transactionMap.Set(node.Hash, 1); err != nil {
-								return errors.NewProcessingError("error marking tx hash as processed in transaction map: %s", node.Hash.String(), err)
-							}
+					// SetIfExists returns true if key existed and was updated (1 lock instead of 2)
+					existed, _ := transactionMap.SetIfExists(node.Hash, 1)
+					if !existed && (losingTxHashesMap == nil || !losingTxHashesMap.Exists(node.Hash)) {
+						remainderSubtrees[idx] = append(remainderSubtrees[idx], node)
+					}
+				}
+
+				hashCount.Add(int64(len(remainderSubtrees[idx])))
+
+				return nil
+			}
+
+			// Pre-allocate result arrays indexed by position
+			existedInTxMap := make([]bool, n)    // true if SetIfExists found the key
+			existsInLosingMap := make([]bool, n) // true if in losingTxHashesMap
+			isRemoveMap := make([]bool, n)       // true if in removeMap (to delete)
+
+			numWorkers := min(runtime.NumCPU(), n/100, 16)
+			if numWorkers < 2 {
+				numWorkers = 2
+			}
+
+			chunkSize := (n + numWorkers - 1) / numWorkers
+
+			// Phase 1: Parallel SetIfExists + Exists lookups
+			var wg sync.WaitGroup
+			for w := 0; w < numWorkers; w++ {
+				start := w * chunkSize
+				end := min(start+chunkSize, n)
+				if start >= n {
+					break
+				}
+
+				wg.Add(1)
+				go func(start, end int) {
+					defer wg.Done()
+					for i := start; i < end; i++ {
+						node := nodes[i]
+						if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+							continue
 						}
 
-						if !exists && (losingTxHashesMap == nil || !losingTxHashesMap.Exists(node.Hash)) {
-							remainderSubtrees[idx] = append(remainderSubtrees[idx], node)
+						if removeMapLength > 0 && stp.removeMap.Exists(node.Hash) {
+							isRemoveMap[i] = true
+							continue
+						}
+
+						// SetIfExists: atomic check + set (1 lock instead of 2)
+						existed, _ := transactionMap.SetIfExists(node.Hash, 1)
+						existedInTxMap[i] = existed
+
+						if !existed && losingTxHashesMap != nil {
+							existsInLosingMap[i] = losingTxHashesMap.Exists(node.Hash)
 						}
 					}
+				}(start, end)
+			}
+			wg.Wait()
+
+			// Phase 2: Sequential collection (preserves order)
+			remainderSubtrees[idx] = make([]subtreepkg.Node, 0, n/10)
+			for i, node := range nodes {
+				if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+					continue
+				}
+
+				if isRemoveMap[i] {
+					_ = stp.removeMap.Delete(node.Hash)
+					continue
+				}
+
+				if !existedInTxMap[i] && !existsInLosingMap[i] {
+					remainderSubtrees[idx] = append(remainderSubtrees[idx], node)
 				}
 			}
 
 			hashCount.Add(int64(len(remainderSubtrees[idx])))
-
 			return nil
 		})
 	}
@@ -3461,7 +3538,7 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 	}
 
 	stp.logger.Debugf("Allocating transaction map with size: %d", mapSize)
-	transactionMap := txmap.NewSplitSwissMap(mapSize)
+	transactionMap := txmap.NewSplitSwissMap(mapSize, 4096) // 4K buckets
 
 	conflictingNodesPerSubtree := make([][]chainhash.Hash, totalSubtreesInBlock)
 

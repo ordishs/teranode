@@ -1217,6 +1217,124 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 	})
 }
 
+func TestProcessRemainderTxHashes_PreservesOrder(t *testing.T) {
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	go func() {
+		for req := range newSubtreeChan {
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+	defer close(newSubtreeChan)
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 2048 // Large subtree to trigger parallel path
+
+	ctx := context.Background()
+	subtreeProcessor, _ := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, nil, nil, nil, newSubtreeChan)
+
+	t.Run("small subtree preserves order (sequential path)", func(t *testing.T) {
+		// Test with <1024 nodes to exercise sequential path
+		numTx := 500
+		testOrderPreservation(t, subtreeProcessor, numTx)
+	})
+
+	t.Run("large subtree preserves order (parallel path)", func(t *testing.T) {
+		// Test with >1024 nodes to exercise parallel path
+		numTx := 2000
+		testOrderPreservation(t, subtreeProcessor, numTx)
+	})
+}
+
+func testOrderPreservation(t *testing.T, subtreeProcessor *SubtreeProcessor, numTx int) {
+	parentHash := chainhash.HashH([]byte("parent-tx-order-test"))
+
+	// Generate ordered transaction hashes
+	orderedHashes := make([]chainhash.Hash, numTx)
+	for i := 0; i < numTx; i++ {
+		hashBytes := make([]byte, 32)
+		_, err := rand.Read(hashBytes)
+		require.NoError(t, err)
+		orderedHashes[i] = chainhash.Hash(hashBytes)
+	}
+
+	// Calculate needed subtree capacity (power of 2)
+	subtreeCapacity := 1
+	for subtreeCapacity < numTx+10 {
+		subtreeCapacity *= 2
+	}
+
+	// Create a subtree with all transactions in order
+	subtree, err := subtreepkg.NewTreeByLeafCount(subtreeCapacity)
+	require.NoError(t, err)
+	_ = subtree.AddCoinbaseNode()
+
+	for _, hash := range orderedHashes {
+		err = subtree.AddSubtreeNode(subtreepkg.Node{Hash: hash, Fee: 1})
+		require.NoError(t, err)
+	}
+
+	chainedSubtrees := []*subtreepkg.Subtree{subtree}
+
+	// Setup fresh processor state
+	newSubtree, err := subtreepkg.NewTreeByLeafCount(subtreeCapacity)
+	require.NoError(t, err)
+	subtreeProcessor.currentSubtree.Store(newSubtree)
+	subtreeProcessor.chainedSubtrees = make([]*subtreepkg.Subtree, 0)
+	_ = subtreeProcessor.currentSubtree.Load().AddCoinbaseNode()
+
+	// Maps:
+	// - transactionMap: empty (no tx already in block) - all should be remainders
+	// - losingTxHashesMap: empty (no conflicting tx)
+	// - sourceTxMap: populated with all tx (source for parent lookup)
+	// - stp.currentTxMap: cleared (so SetIfNotExists succeeds)
+	transactionMap := txmap.NewSplitSwissMap(numTx, 16)
+	losingTxHashesMap := txmap.NewSplitSwissMap(10, 4)
+
+	// Clear the processor's internal map so SetIfNotExists succeeds
+	subtreeProcessor.GetCurrentTxMap().Clear()
+
+	// Create a separate source map for parent lookups
+	sourceTxMap := NewSplitTxInpointsMap(16)
+	for _, hash := range orderedHashes {
+		sourceTxMap.Set(hash, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{parentHash}})
+	}
+
+	// Process remainder - all tx should come back in order
+	err = subtreeProcessor.processRemainderTxHashes(context.Background(), chainedSubtrees, transactionMap, losingTxHashesMap, sourceTxMap, false)
+	require.NoError(t, err)
+
+	// Collect all remainder nodes from chainedSubtrees and currentSubtree
+	var remainder []subtreepkg.Node
+	for _, st := range subtreeProcessor.chainedSubtrees {
+		for _, node := range st.Nodes {
+			if !node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				remainder = append(remainder, node)
+			}
+		}
+	}
+	currentSt := subtreeProcessor.currentSubtree.Load()
+	for _, node := range currentSt.Nodes {
+		if !node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+			remainder = append(remainder, node)
+		}
+	}
+
+	// Verify order is preserved
+	require.Equal(t, numTx, len(remainder), "Expected %d remainder nodes, got %d", numTx, len(remainder))
+
+	for i, node := range remainder {
+		assert.True(t, node.Hash.Equal(orderedHashes[i]),
+			"Order mismatch at index %d: expected %s, got %s",
+			i, orderedHashes[i].String(), node.Hash.String())
+	}
+
+	// Clean up for next test
+	subtreeProcessor.chainedSubtrees = make([]*subtreepkg.Subtree, 0)
+	subtreeProcessor.GetCurrentTxMap().Clear()
+}
+
 func BenchmarkBlockAssembler_AddTx(b *testing.B) {
 	newSubtreeChan := make(chan NewSubtreeRequest)
 
