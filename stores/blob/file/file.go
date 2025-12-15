@@ -108,14 +108,17 @@ type longtermStore interface {
 // the write permit is held for the entire streaming write operation.
 type semaphoreReadCloser struct {
 	io.ReadCloser
-	releaseOnce sync.Once
 }
 
 func (r *semaphoreReadCloser) Close() error {
 	err := r.ReadCloser.Close()
-	r.releaseOnce.Do(func() {
+	// Only release the semaphore permit if the underlying close was successful.
+	// This provides natural idempotency: subsequent calls will fail at the OS level
+	// (file already closed) and won't release the permit again, avoiding the
+	// possible overhead of using a sync.Once to ensure the permit is released exactly once.
+	if err == nil {
 		releaseReadPermit()
-	})
+	}
 	return err
 }
 
