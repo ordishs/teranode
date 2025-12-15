@@ -671,18 +671,13 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	u.logger.Infof("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
 
-	// Convert transactions to missingTx format for prepareTxsPerLevel
-	missingTxs := make([]missingTx, len(allTransactions))
 	txHashes := make([]chainhash.Hash, len(allTransactions))
+
 	for i, tx := range allTransactions {
 		if tx == nil {
 			return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at index %d", i)
 		}
 
-		missingTxs[i] = missingTx{
-			tx:  tx,
-			idx: i,
-		}
 		txHashes[i] = *tx.TxIDChainHash()
 	}
 
@@ -703,8 +698,27 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	alreadyValidated := len(txHashes) - missed
-	if alreadyValidated > 0 {
+
+	if missed == 0 {
+		u.logger.Infof("[processTransactionsInLevels] All transactions already validated, skipping processing")
+		return nil
+	} else if alreadyValidated > 0 {
 		u.logger.Infof("[processTransactionsInLevels] Pre-check: %d/%d transactions already validated, %d need validation", alreadyValidated, len(txHashes), missed)
+	}
+
+	// Convert transactions to missingTx format for prepareTxsPerLevel
+	missingTxs := make([]missingTx, len(allTransactions))
+
+	for i, tx := range allTransactions {
+		if txMetaSlice[i] != nil {
+			// Transaction already validated, skip
+			continue
+		}
+
+		missingTxs[i] = missingTx{
+			tx:  tx,
+			idx: i,
+		}
 	}
 
 	// Use the existing prepareTxsPerLevel logic to organize transactions by dependency levels
@@ -788,18 +802,17 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 		for _, mTx := range levelTxs {
 			tx := mTx.tx
-			txIdx := mTx.idx
 			if tx == nil {
 				return errors.NewProcessingError("[processTransactionsInLevels] transaction is nil at level %d", level)
 			}
 
-			g.Go(func() error {
-				// Skip transactions that were already validated (found in cache or UTXO store)
-				if txMetaSlice[txIdx] != nil {
-					u.logger.Debugf("[processTransactionsInLevels] Transaction %s already validated (pre-check), skipping", tx.TxIDChainHash().String())
-					return nil
-				}
+			// Skip transactions that were already validated (found in cache or UTXO store)
+			if txMetaSlice[mTx.idx] != nil {
+				u.logger.Debugf("[processTransactionsInLevels] Transaction %s already validated (pre-check), skipping", tx.TxIDChainHash().String())
+				return nil
+			}
 
+			g.Go(func() error {
 				// Use existing blessMissingTransaction logic for validation
 				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
 				if err != nil {
