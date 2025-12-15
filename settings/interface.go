@@ -186,7 +186,8 @@ type AssetSettings struct {
 	ConcurrencyGetLegacyBlockReader   int
 
 	// Streaming configuration
-	SubtreeDataStreamingChunkSize int // Number of transactions to process per chunk when streaming subtree data (default: 10000)
+	SubtreeDataStreamingChunkSize   int // Number of transactions to process per chunk when streaming subtree data (default: 10000)
+	SubtreeDataStreamingConcurrency int // Number of concurrent chunks to fetch in parallel when streaming subtree data (default: 4)
 }
 
 type BlockSettings struct {

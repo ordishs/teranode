@@ -24,6 +24,16 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// chunkResult holds the result of fetching a chunk of transactions from the UTXO store.
+// Used for ordered fan-in: chunks are fetched in parallel but written in order.
+type chunkResult struct {
+	chunkIdx       int              // Index of this chunk for ordered reassembly
+	chunkOffset    int              // Global offset of first tx in this chunk
+	chunkHashes    []chainhash.Hash // Transaction hashes for this chunk
+	chunkMetaSlice []*meta.Data     // Fetched transaction metadata
+	err            error            // Error from fetching, if any
+}
+
 // GetLegacyBlockReader provides a reader interface for retrieving block data in legacy format.
 // It streams block data including header, transactions, and subtrees.
 //
@@ -250,80 +260,159 @@ func (repo *Repository) writeTransactionsViaSubtreeStoreStreaming(ctx context.Co
 
 	totalTxs := len(subtree.Nodes)
 	chunkSize := repo.settings.Asset.SubtreeDataStreamingChunkSize
-
-	// 2. Process transactions in chunks to maintain constant memory usage
-	for offset := 0; offset < totalTxs; offset += chunkSize {
-		// Check for context cancellation between chunks
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		// Calculate chunk boundaries
-		end := offset + chunkSize
-		if end > totalTxs {
-			end = totalTxs
-		}
-		currentChunkSize := end - offset
-
-		// 3. Extract chunk of transaction hashes from subtree
-		chunkHashes := make([]chainhash.Hash, currentChunkSize)
-		for i := 0; i < currentChunkSize; i++ {
-			chunkHashes[i] = subtree.Nodes[offset+i].Hash
-		}
-
-		// 4. Allocate memory for chunk only (not entire subtree)
-		chunkMetaSlice := make([]*meta.Data, currentChunkSize)
-
-		// 5. Fetch chunk from store (reuses existing getTxs method with batch processing)
-		missed, err := repo.getTxs(ctx, chunkHashes, chunkMetaSlice)
-		if err != nil {
-			return errors.NewProcessingError("[writeTransactionsViaSubtreeStoreStreaming][%s] failed to get tx meta from store for chunk at offset %d", subtreeHash.String(), offset, err)
-		}
-
-		if missed > 0 {
-			// Log which transactions are missing in this chunk
-			for i := 0; i < currentChunkSize; i++ {
-				if subtreepkg.CoinbasePlaceholderHash.Equal(chunkHashes[i]) {
-					continue
-				}
-
-				if chunkMetaSlice[i] == nil || chunkMetaSlice[i].Tx == nil {
-					repo.logger.Errorf("[writeTransactionsViaSubtreeStoreStreaming][%s] failed to get tx meta from store for tx %s at offset %d", subtreeHash.String(), chunkHashes[i].String(), offset+i)
-				}
-			}
-
-			return errors.NewProcessingError("[writeTransactionsViaSubtreeStoreStreaming][%s] failed to get %d of %d tx meta from store in chunk at offset %d", subtreeHash.String(), missed, currentChunkSize, offset)
-		}
-
-		// 6. Immediately write chunk to pipe (don't accumulate)
-		for i := 0; i < currentChunkSize; i++ {
-			if subtreepkg.CoinbasePlaceholderHash.Equal(chunkHashes[i]) {
-				if block != nil {
-					// The coinbase tx is not in the txmeta store, so we add in a special coinbase placeholder tx
-					if offset+i != 0 {
-						return errors.NewProcessingError("[writeTransactionsViaSubtreeStoreStreaming] coinbase tx is not first in subtree (index %d)", offset+i)
-					}
-
-					// Write coinbase tx
-					if _, err = w.Write(block.CoinbaseTx.Bytes()); err != nil {
-						return errors.NewProcessingError("[writeTransactionsViaSubtreeStoreStreaming] error writing coinbase tx", err)
-					}
-				}
-			} else {
-				// always write the non-extended normal bytes to the subtree data file !
-				// our peer node should extend the transactions if needed
-				if _, err = w.Write(chunkMetaSlice[i].Tx.Bytes()); err != nil {
-					return errors.NewProcessingError("[writeTransactionsViaSubtreeStoreStreaming] error writing tx at offset %d", offset+i, err)
-				}
-			}
-		}
-
-		// 7. Chunk memory (chunkHashes, chunkMetaSlice) goes out of scope here and can be garbage collected
-		// before processing next chunk, maintaining constant memory usage
+	concurrency := repo.settings.Asset.SubtreeDataStreamingConcurrency
+	if concurrency <= 0 {
+		concurrency = 4
 	}
 
+	// 2. Calculate number of chunks
+	numChunks := (totalTxs + chunkSize - 1) / chunkSize
+	if numChunks == 0 {
+		return nil
+	}
+
+	// 3. Create buffered results channel for fan-in
+	resultsChan := make(chan chunkResult, numChunks)
+
+	// 4. Launch chunk fetch goroutines with limited concurrency
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(g, concurrency)
+
+	for chunkIdx := 0; chunkIdx < numChunks; chunkIdx++ {
+		chunkIdx := chunkIdx // capture for goroutine
+		offset := chunkIdx * chunkSize
+
+		g.Go(func() error {
+			// Check for context cancellation
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+			}
+
+			// Calculate chunk boundaries
+			end := offset + chunkSize
+			if end > totalTxs {
+				end = totalTxs
+			}
+			currentChunkSize := end - offset
+
+			// Extract chunk of transaction hashes from subtree
+			chunkHashes := make([]chainhash.Hash, currentChunkSize)
+			for i := 0; i < currentChunkSize; i++ {
+				chunkHashes[i] = subtree.Nodes[offset+i].Hash
+			}
+
+			// Allocate memory for chunk only
+			chunkMetaSlice := make([]*meta.Data, currentChunkSize)
+
+			// Fetch chunk from store
+			missed, fetchErr := repo.getTxs(gCtx, chunkHashes, chunkMetaSlice)
+			if fetchErr != nil {
+				resultsChan <- chunkResult{chunkIdx: chunkIdx, err: errors.NewProcessingError("[writeTransactionsViaSubtreeStoreStreaming][%s] failed to get tx meta from store for chunk at offset %d", subtreeHash.String(), offset, fetchErr)}
+				return fetchErr
+			}
+
+			if missed > 0 {
+				// Log which transactions are missing in this chunk
+				for i := 0; i < currentChunkSize; i++ {
+					if subtreepkg.CoinbasePlaceholderHash.Equal(chunkHashes[i]) {
+						continue
+					}
+					if chunkMetaSlice[i] == nil || chunkMetaSlice[i].Tx == nil {
+						repo.logger.Errorf("[writeTransactionsViaSubtreeStoreStreaming][%s] failed to get tx meta from store for tx %s at offset %d", subtreeHash.String(), chunkHashes[i].String(), offset+i)
+					}
+				}
+				missErr := errors.NewProcessingError("[writeTransactionsViaSubtreeStoreStreaming][%s] failed to get %d of %d tx meta from store in chunk at offset %d", subtreeHash.String(), missed, currentChunkSize, offset)
+				resultsChan <- chunkResult{chunkIdx: chunkIdx, err: missErr}
+				return missErr
+			}
+
+			// Send successful result
+			resultsChan <- chunkResult{
+				chunkIdx:       chunkIdx,
+				chunkOffset:    offset,
+				chunkHashes:    chunkHashes,
+				chunkMetaSlice: chunkMetaSlice,
+			}
+			return nil
+		})
+	}
+
+	// 5. Close results channel when all fetches complete
+	go func() {
+		_ = g.Wait()
+		close(resultsChan)
+	}()
+
+	// 6. Ordered consumer: collect results and write in chunk order (0, 1, 2, ...)
+	pending := make(map[int]chunkResult)
+	nextChunk := 0
+
+	for result := range resultsChan {
+		// Check for fetch error
+		if result.err != nil {
+			// Drain remaining results and return error
+			for range resultsChan {
+			}
+			return result.err
+		}
+
+		pending[result.chunkIdx] = result
+
+		// Drain all consecutive chunks starting from nextChunk
+		for {
+			chunk, ok := pending[nextChunk]
+			if !ok {
+				break
+			}
+
+			// Write this chunk to the pipe
+			if err = repo.writeChunkToWriter(w, block, chunk.chunkHashes, chunk.chunkMetaSlice, chunk.chunkOffset); err != nil {
+				// Drain remaining results and return error
+				for range resultsChan {
+					// do nothing, just drain the channel
+				}
+				return err
+			}
+
+			delete(pending, nextChunk)
+			nextChunk++
+		}
+	}
+
+	// 7. Check for errgroup errors after channel is drained
+	if err = g.Wait(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// writeChunkToWriter writes a chunk of transactions to the pipe writer in order.
+func (repo *Repository) writeChunkToWriter(w *io.PipeWriter, block *model.Block,
+	chunkHashes []chainhash.Hash, chunkMetaSlice []*meta.Data, chunkOffset int) error {
+	for i := 0; i < len(chunkHashes); i++ {
+		if subtreepkg.CoinbasePlaceholderHash.Equal(chunkHashes[i]) {
+			if block != nil {
+				// The coinbase tx is not in the txmeta store, so we add in a special coinbase placeholder tx
+				if chunkOffset+i != 0 {
+					return errors.NewProcessingError("[writeChunkToWriter] coinbase tx is not first in subtree (index %d)", chunkOffset+i)
+				}
+
+				// Write coinbase tx
+				if _, err := w.Write(block.CoinbaseTx.Bytes()); err != nil {
+					return errors.NewProcessingError("[writeChunkToWriter] error writing coinbase tx", err)
+				}
+			}
+		} else {
+			// always write the non-extended normal bytes to the subtree data file !
+			// our peer node should extend the transactions if needed
+			if _, err := w.Write(chunkMetaSlice[i].Tx.Bytes()); err != nil {
+				return errors.NewProcessingError("[writeChunkToWriter] error writing tx at offset %d", chunkOffset+i, err)
+			}
+		}
+	}
 	return nil
 }
 
