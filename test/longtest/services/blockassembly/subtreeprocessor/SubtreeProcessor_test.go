@@ -63,7 +63,14 @@ func Test_DeserializeHashesFromReaderIntoBuckets(t *testing.T) {
 	_ = pprof.StartCPUProfile(f)
 	defer pprof.StopCPUProfile()
 
-	buckets, _, err := subtreeprocessor.DeserializeHashesFromReaderIntoBuckets(r, 16)
+	buckets := make(map[uint16][]chainhash.Hash, 16)
+	for i := 0; i < 16; i++ {
+		buckets[uint16(i)] = make([]chainhash.Hash, 0)
+	}
+
+	conflictingNodes := make([]chainhash.Hash, 0)
+
+	err := subtreeprocessor.DeserializeHashesFromReaderIntoBuckets(r, 16, &buckets, &conflictingNodes)
 	require.NoError(t, err)
 
 	f, _ = os.Create("mem.prof")

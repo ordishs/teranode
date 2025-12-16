@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/model"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 )
@@ -192,8 +193,8 @@ type Interface interface {
 	// but not yet processed.
 	//
 	// Returns:
-	//   - *SplitSwissMap: Map of transactions to be removed
-	GetRemoveMap() *SplitSwissMap
+	//   - txmap.TxMap: Map of transactions to be removed
+	GetRemoveMap() txmap.TxMap
 
 	// GetRemoveMapLength returns the number of transactions scheduled for removal.
 	//

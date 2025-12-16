@@ -809,7 +809,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	u.logger.Infof("[processTransactionsInLevels] Successfully processed all %d transactions", totalTxCount)
-	
+
 	txMetaSlice = nil //nolint:ineffassign // Intentional early GC hint
 
 	return nil
