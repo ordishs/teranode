@@ -1,81 +1,84 @@
 package subtreeprocessor
 
 import (
+	"sync"
+
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/dolthub/swiss"
 )
 
 type SplitSwissMap struct {
-	m           map[uint16]*txmap.SwissMap
+	m           map[uint16]*swiss.Map[chainhash.Hash, struct{}]
+	mu          map[uint16]*sync.RWMutex
 	nrOfBuckets uint16
+	length      int
 }
 
-var _ txmap.TxHashMap = (*SplitSwissMap)(nil)
-
-func NewSplitSwissMap(nrOfBuckets uint16, length uint32) *SplitSwissMap {
-	m := make(map[uint16]*txmap.SwissMap, nrOfBuckets)
+// NewSplitSwissMap creates a new SplitSwissMap with the specified number of buckets and total length.
+// The length is divided equally among the buckets.
+// This map is safe for concurrent writes, but does not lock when reading.
+//
+// Parameters:
+//   - nrOfBuckets: The number of buckets to split the map into.
+//   - length: The total expected length of the map.
+//
+// Returns:
+//   - A pointer to the newly created SplitSwissMap.
+func NewSplitSwissMap(nrOfBuckets uint16, length int) *SplitSwissMap {
+	m := make(map[uint16]*swiss.Map[chainhash.Hash, struct{}], nrOfBuckets)
+	mu := make(map[uint16]*sync.RWMutex, nrOfBuckets)
 	for i := uint16(0); i < nrOfBuckets; i++ {
-		m[i] = txmap.NewSwissMap(length / uint32(nrOfBuckets))
+		m[i] = swiss.NewMap[chainhash.Hash, struct{}](uint32(length / int(nrOfBuckets)))
+		mu[i] = &sync.RWMutex{}
 	}
 
 	return &SplitSwissMap{
 		m:           m,
+		mu:          mu,
 		nrOfBuckets: nrOfBuckets,
 	}
 }
 
-func (s *SplitSwissMap) Delete(hash chainhash.Hash) error {
-	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Delete(hash)
-}
-
 func (s *SplitSwissMap) Exists(hash chainhash.Hash) bool {
-	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Exists(hash)
-}
-
-func (s *SplitSwissMap) Get(hash chainhash.Hash) (uint64, bool) {
-	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Get(hash)
-}
-
-func (s *SplitSwissMap) Keys() []chainhash.Hash {
-	keys := make([]chainhash.Hash, 0, 1024)
-
-	for _, swissMap := range s.m {
-		keys = append(keys, swissMap.Keys()...)
-	}
-
-	return keys
+	_, ok := s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Get(hash)
+	return ok
 }
 
 func (s *SplitSwissMap) Length() int {
-	length := 0
+	return s.length
+}
 
-	for _, swissMap := range s.m {
-		length += swissMap.Length()
-	}
-
-	return length
+func (s *SplitSwissMap) Buckets() uint16 {
+	return s.nrOfBuckets
 }
 
 func (s *SplitSwissMap) Put(hash chainhash.Hash) error {
-	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Put(hash)
+	bucket := txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)
+
+	s.mu[bucket].Lock()
+	defer s.mu[bucket].Unlock()
+
+	s.m[bucket].Put(hash, struct{}{})
+	s.length++
+
+	return nil
 }
 
-func (s *SplitSwissMap) PutMulti(hashes []chainhash.Hash) error {
+func (s *SplitSwissMap) PutMultiBucket(bucket uint16, hashes []chainhash.Hash) error {
+	s.mu[bucket].Lock()
+	defer s.mu[bucket].Unlock()
+
 	for _, hash := range hashes {
-		if err := s.Put(hash); err != nil {
-			return err
-		}
+		s.m[bucket].Put(hash, struct{}{})
+		s.length++
 	}
 
 	return nil
 }
 
-func (s *SplitSwissMap) Set(hash chainhash.Hash) error {
-	return s.Put(hash)
-}
-
-func (s *SplitSwissMap) Iter(f func(hash chainhash.Hash, value uint64) bool) {
+func (s *SplitSwissMap) Iter(f func(hash chainhash.Hash, v struct{}) bool) {
 	for _, swissMap := range s.m {
 		swissMap.Iter(f)
 	}

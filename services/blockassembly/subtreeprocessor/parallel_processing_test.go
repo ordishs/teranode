@@ -210,7 +210,7 @@ func TestParallelGetAndSetIfNotExistsRemoveMap(t *testing.T) {
 		currentTxMap.Set(hash, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{}})
 
 		if i < removeCount {
-			err := stp.removeMap.Put(hash)
+			err := stp.removeMap.Put(hash, 1)
 			require.NoError(t, err)
 		}
 	}

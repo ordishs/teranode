@@ -126,7 +126,7 @@ type RemainderTransactionParams struct {
 	Block             *model.Block
 	ChainedSubtrees   []*subtreepkg.Subtree
 	CurrentSubtree    *subtreepkg.Subtree
-	TransactionMap    txmap.TxMap
+	TransactionMap    *SplitSwissMap
 	LosingTxHashesMap txmap.TxMap
 	CurrentTxMap      TxInpointsMap
 	SkipDequeue       bool
@@ -223,7 +223,7 @@ type SubtreeProcessor struct {
 	currentTxMap TxInpointsMap
 
 	// removeMap tracks transactions marked for removal
-	removeMap *SplitSwissMap
+	removeMap txmap.TxMap
 
 	// blockchainClient provides access to blockchain data
 	blockchainClient blockchain.ClientI
@@ -382,7 +382,7 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 		chainedSubtreeCount:      atomic.Int32{},
 		queue:                    queue,
 		currentTxMap:             NewSplitTxInpointsMap(splitMapBuckets),
-		removeMap:                NewSplitSwissMap(256, 1024),
+		removeMap:                txmap.NewSplitSwissMap(256, 16),
 		blockchainClient:         blockchainClient,
 		subtreeStore:             subtreeStore,
 		utxoStore:                utxoStore,
@@ -923,7 +923,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 	// clear remove map to prevent memory leak - entries for transactions that were
 	// never dequeued would otherwise accumulate indefinitely across resets
-	stp.removeMap = NewSplitSwissMap(1, 0)
+	stp.removeMap = txmap.NewSplitSwissMap(256, 16)
 
 	// reset tx count
 	stp.setTxCountFromSubtrees()
@@ -1157,7 +1157,7 @@ func (stp *SubtreeProcessor) GetCurrentTxMap() TxInpointsMap {
 //
 // Returns:
 //   - *txmap.SwissMap: Map of transactions to be removed
-func (stp *SubtreeProcessor) GetRemoveMap() *SplitSwissMap {
+func (stp *SubtreeProcessor) GetRemoveMap() txmap.TxMap {
 	return stp.removeMap
 }
 
@@ -1665,7 +1665,7 @@ func (stp *SubtreeProcessor) AddDirectly(node *subtreepkg.Node, txInpoints *subt
 func (stp *SubtreeProcessor) Remove(ctx context.Context, hash chainhash.Hash) error {
 	// add to the removeMap to make sure it gets removed if processing
 	// or if it comes in later after cleaning the subtrees
-	if err := stp.removeMap.Put(hash); err != nil {
+	if err := stp.removeMap.Put(hash, 1); err != nil {
 		return errors.NewProcessingError("error adding tx to remove map", err)
 	}
 
@@ -2175,7 +2175,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	}
 
 	var (
-		transactionMap     txmap.TxMap
+		transactionMap     *SplitSwissMap
 		markOnLongestChain = make([]chainhash.Hash, 0, 1024)
 	)
 
@@ -2188,7 +2188,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		}
 
 		if transactionMap != nil {
-			transactionMap.Iter(func(hash chainhash.Hash, n uint64) bool {
+			transactionMap.Iter(func(hash chainhash.Hash, _ struct{}) bool {
 				// if the transaction is not in the movedBackBlockTxMap, it means it was not part of the blocks we moved back
 				// and therefore needs to be marked in the utxo store as on the longest chain now
 				// since it was on the block moving forward
@@ -2599,7 +2599,7 @@ func (stp *SubtreeProcessor) removeCoinbaseUtxos(ctx context.Context, block *mod
 
 			// add to txRemoveMap to make sure queued transactions are not processed
 			if !stp.removeMap.Exists(childSpendHash) {
-				if err = stp.removeMap.Put(childSpendHash); err != nil {
+				if err = stp.removeMap.Put(childSpendHash, 1); err != nil {
 					return errors.NewProcessingError("[removeCoinbaseUtxos][%s] error adding child spend to remove map for tx %s", block.String(), childSpendHash.String(), err)
 				}
 			}
@@ -2722,7 +2722,7 @@ func (stp *SubtreeProcessor) processBlockSubtrees(block *model.Block) (map[chain
 }
 
 // createTransactionMapIfNeeded creates a transaction map from block subtrees if needed
-func (stp *SubtreeProcessor) createTransactionMapIfNeeded(ctx context.Context, block *model.Block, blockSubtreesMap map[chainhash.Hash]int) (txmap.TxMap, []chainhash.Hash, error) {
+func (stp *SubtreeProcessor) createTransactionMapIfNeeded(ctx context.Context, block *model.Block, blockSubtreesMap map[chainhash.Hash]int) (*SplitSwissMap, []chainhash.Hash, error) {
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "createTransactionMapIfNeeded",
 		tracing.WithParentStat(stp.stats),
 		tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing subtrees into transaction map", block.String()),
@@ -2732,7 +2732,7 @@ func (stp *SubtreeProcessor) createTransactionMapIfNeeded(ctx context.Context, b
 
 	var (
 		err              error
-		transactionMap   txmap.TxMap
+		transactionMap   *SplitSwissMap
 		conflictingNodes []chainhash.Hash
 	)
 
@@ -2987,7 +2987,7 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 // moveForwardBlock cleans out all transactions that are in the current subtrees and also in the block
 // given. It is akin to moving up the blockchain to the next block.
 func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.Block, skipNotification bool,
-	processedConflictingHashesMap map[chainhash.Hash]bool, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap txmap.TxMap, err error) {
+	processedConflictingHashesMap map[chainhash.Hash]bool, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, err error) {
 	if block == nil {
 		return nil, errors.NewProcessingError("[moveForwardBlock] you must pass in a block to moveForwardBlock")
 	}
@@ -3176,7 +3176,7 @@ func (stp *SubtreeProcessor) WaitForPendingBlocks(ctx context.Context) error {
 //
 // Returns:
 //   - error: Any error encountered during processing
-func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap, losingTxHashesMap txmap.TxMap, skipNotification bool) (err error) {
+func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, skipNotification bool) (err error) {
 	queueLength := stp.queue.length()
 	if queueLength > 0 {
 		nrBatchesProcessed := int64(0)
@@ -3290,7 +3290,7 @@ func (stp *SubtreeProcessor) processCoinbaseUtxos(ctx context.Context, block *mo
 // Returns:
 //   - error: Any error encountered during processing
 func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chainedSubtrees []*subtreepkg.Subtree,
-	transactionMap, losingTxHashesMap txmap.TxMap, currentTxMap TxInpointsMap, skipNotification bool) error {
+	transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, currentTxMap TxInpointsMap, skipNotification bool) error {
 	var hashCount atomic.Int64
 
 	// clean out the transactions from the old current subtree that were in the block
@@ -3324,8 +3324,7 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 						continue
 					}
 
-					// SetIfExists returns true if key existed and was updated (1 lock instead of 2)
-					existed, _ := transactionMap.SetIfExists(node.Hash, 1)
+					existed := transactionMap.Exists(node.Hash)
 					if !existed && (losingTxHashesMap == nil || !losingTxHashesMap.Exists(node.Hash)) {
 						remainderSubtrees[idx] = append(remainderSubtrees[idx], node)
 					}
@@ -3372,7 +3371,7 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 						}
 
 						// SetIfExists: atomic check + set (1 lock instead of 2)
-						existed, _ := transactionMap.SetIfExists(node.Hash, 1)
+						existed := transactionMap.Exists(node.Hash)
 						existedInTxMap[i] = existed
 
 						if !existed && losingTxHashesMap != nil {
@@ -3544,8 +3543,7 @@ func (stp *SubtreeProcessor) parallelGetAndSetIfNotExists(
 // Returns:
 //   - util.TxMap: Created transaction map
 //   - error: Any error encountered during map creation
-func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubtreesMap map[chainhash.Hash]int,
-	totalSubtreesInBlock int, estimatedTxCount uint64) (txmap.TxMap, []chainhash.Hash, error) {
+func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubtreesMap map[chainhash.Hash]int, totalSubtreesInBlock int, estimatedTxCount uint64) (*SplitSwissMap, []chainhash.Hash, error) {
 	startTime := time.Now()
 
 	prometheusSubtreeProcessorCreateTransactionMap.Inc()
@@ -3576,7 +3574,7 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 	}
 
 	stp.logger.Debugf("Allocating transaction map with size: %d", mapSize)
-	transactionMap := txmap.NewSplitSwissMap(mapSize, 4096) // 4K buckets
+	transactionMap := NewSplitSwissMap(1024, mapSize) // 4K buckets
 
 	conflictingNodesPerSubtree := make([][]chainhash.Hash, totalSubtreesInBlock)
 
@@ -3624,7 +3622,7 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 				hashes := hashes
 				// put the hashes into the transaction map in parallel, it has already been split into the correct buckets
 				bucketG.Go(func() error {
-					return transactionMap.PutMultiBucket(bucket, hashes, 0)
+					return transactionMap.PutMultiBucket(bucket, hashes)
 				})
 			}
 
@@ -3831,23 +3829,23 @@ func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16, h
 		}
 	}()
 
-	buf := bufio.NewReaderSize(reader, 1024*64)
-
-	if _, err = buf.Discard(48); err != nil { // skip headers
+	// skip headers
+	bytes48 := make([]byte, 48)
+	if _, err = reader.Read(bytes48); err != nil { // skip headers
 		return errors.NewProcessingError("unable to read header", err)
 	}
 
 	// read number of leaves
 	bytes8 := make([]byte, 8)
-	if _, err = io.ReadFull(buf, bytes8); err != nil {
+	if _, err = io.ReadFull(reader, bytes8); err != nil {
 		return errors.NewProcessingError("unable to read number of leaves", err)
 	}
 
 	numLeaves := binary.LittleEndian.Uint64(bytes8)
 
-	var bucket uint16
+	buf := bufio.NewReaderSize(reader, int(numLeaves*48))
 
-	bytes48 := make([]byte, 48)
+	var bucket uint16
 
 	for i := uint64(0); i < numLeaves; i++ {
 		// read all the node data in 1 go

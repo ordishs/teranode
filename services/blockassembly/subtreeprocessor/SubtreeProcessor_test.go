@@ -1106,7 +1106,7 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 		_ = subtreeProcessor.currentSubtree.Load().AddCoinbaseNode()
 
 		// Setup maps
-		transactionMap := txmap.NewSplitSwissMap(4)    // Transactions that are in the new block
+		transactionMap := NewSplitSwissMap(4, 16)      // Transactions that are in the new block
 		losingTxHashesMap := txmap.NewSplitSwissMap(4) // Conflicting transactions to remove
 		currentTxMap := subtreeProcessor.GetCurrentTxMap()
 
@@ -1141,10 +1141,10 @@ func TestSubtreeProcessor_getRemainderTxHashes(t *testing.T) {
 		}
 
 		// Test with some transactions marked as in the new block
-		_ = transactionMap.Put(*hashes[3], 0)  // index 3
-		_ = transactionMap.Put(*hashes[7], 0)  // index 7
-		_ = transactionMap.Put(*hashes[11], 0) // index 11
-		_ = transactionMap.Put(*hashes[15], 0) // index 15
+		_ = transactionMap.Put(*hashes[3])  // index 3
+		_ = transactionMap.Put(*hashes[7])  // index 7
+		_ = transactionMap.Put(*hashes[11]) // index 11
+		_ = transactionMap.Put(*hashes[15]) // index 15
 
 		expectedTxIDs := []string{
 			"4ebd5a35e6b73a5f8e1a3621dba857239538c1b1d26364913f14c85b04e208fc",
@@ -1289,7 +1289,7 @@ func testOrderPreservation(t *testing.T, subtreeProcessor *SubtreeProcessor, num
 	// - losingTxHashesMap: empty (no conflicting tx)
 	// - sourceTxMap: populated with all tx (source for parent lookup)
 	// - stp.currentTxMap: cleared (so SetIfNotExists succeeds)
-	transactionMap := txmap.NewSplitSwissMap(numTx, 16)
+	transactionMap := NewSplitSwissMap(uint16(numTx), 16)
 	losingTxHashesMap := txmap.NewSplitSwissMap(10, 4)
 
 	// Clear the processor's internal map so SetIfNotExists succeeds
@@ -2267,7 +2267,7 @@ func Test_removeMap(t *testing.T) {
 			txHash := chainhash.HashH([]byte(fmt.Sprintf("orphaned-remove-tx-%d", i)))
 			orphanedRemoveHashes[i] = txHash
 			// Add directly to removeMap without ever queuing
-			err := stp.removeMap.Put(txHash)
+			err := stp.removeMap.Put(txHash, 1)
 			require.NoError(t, err)
 		}
 

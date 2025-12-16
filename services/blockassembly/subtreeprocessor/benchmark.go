@@ -16,9 +16,9 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/settings"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
-	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
@@ -290,9 +290,9 @@ func RunProcessRemainderBenchmark(numChainedSubtrees, txsPerSubtree int, cpuProf
 	fmt.Printf("[%s] Created %d transaction hashes.\n", time.Since(benchStartTime), len(allTxHashes))
 
 	// Create transaction map with all transactions (simulating external block)
-	transactionMap := txmap.NewSplitSwissMap(len(allTxHashes), 4096)
-	for i, hash := range allTxHashes {
-		if err := transactionMap.Put(hash, uint64(i)); err != nil {
+	transactionMap := NewSplitSwissMap(1024, len(allTxHashes))
+	for _, hash := range allTxHashes {
+		if err := transactionMap.Put(hash); err != nil {
 			return ProcessRemainderBenchmarkResult{}, errors.NewProcessingError("failed to put hash in transaction map: %w", err)
 		}
 	}
@@ -305,7 +305,7 @@ func RunProcessRemainderBenchmark(numChainedSubtrees, txsPerSubtree int, cpuProf
 	}
 	fmt.Printf("[%s] Current tx map created with %d entries.\n", time.Since(benchStartTime), currentTxMap.Length())
 
-	losingTxHashesMap := txmap.NewSplitSwissMap(10, 4)
+	losingTxHashesMap := txmap.NewSplitSwissMap(4, 10)
 
 	// Create mock block
 	block := &model.Block{
