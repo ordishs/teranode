@@ -49,6 +49,8 @@ var commandHelp = map[string]string{
 	"validate-utxo-set":       "Validate UTXO set file",
 	"subtreebench":            "Benchmark SubtreeProcessor throughput with CPU and memory profiling",
 	"loadunminedbench":        "Benchmark loadUnminedTransactions with CPU and memory profiling",
+	"txmapbench":              "Benchmark CreateTransactionMap with CPU and memory profiling",
+	"remainderbench":          "Benchmark processRemainderTransactionsAndDequeue with CPU and memory profiling",
 	"monitor":                 "Live TUI dashboard for monitoring node status",
 	"logs":                    "Interactive log viewer with filtering and search",
 }
@@ -442,6 +444,24 @@ func Start(args []string, version, commit string) {
 
 		cmd.Execute = func(args []string) error {
 			return runLoadUnminedBenchmark(*txCount, *fullScan, *cpuProfile, *memProfile, *aerospikeURL)
+		}
+	case "txmapbench":
+		numSubtrees := cmd.FlagSet.Int("subtrees", 100, "Number of subtrees")
+		txsPerSubtree := cmd.FlagSet.Int("txs-per-subtree", 1_048_576, "Transactions per subtree")
+		cpuProfile := cmd.FlagSet.String("cpu-profile", "createtransactionmap_cpu.prof", "CPU profile output")
+		memProfile := cmd.FlagSet.String("mem-profile", "createtransactionmap_mem.prof", "Memory profile output")
+
+		cmd.Execute = func(args []string) error {
+			return runCreateTxMapBenchmark(*numSubtrees, *txsPerSubtree, *cpuProfile, *memProfile)
+		}
+	case "remainderbench":
+		numSubtrees := cmd.FlagSet.Int("subtrees", 100, "Number of subtrees")
+		txsPerSubtree := cmd.FlagSet.Int("txs-per-subtree", 1_048_576, "Transactions per subtree")
+		cpuProfile := cmd.FlagSet.String("cpu-profile", "processremaindertxanddequeue_cpu.prof", "CPU profile output")
+		memProfile := cmd.FlagSet.String("mem-profile", "processremaindertxanddequeue_mem.prof", "Memory profile output")
+
+		cmd.Execute = func(args []string) error {
+			return runProcessRemainderBenchmark(*numSubtrees, *txsPerSubtree, *cpuProfile, *memProfile)
 		}
 	default:
 		fmt.Printf("Unknown command: %s\n\n", command)

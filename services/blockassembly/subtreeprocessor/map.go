@@ -25,19 +25,19 @@ func NewSplitSwissMap(nrOfBuckets uint16, length uint32) *SplitSwissMap {
 	}
 }
 
-func (s SplitSwissMap) Delete(hash chainhash.Hash) error {
+func (s *SplitSwissMap) Delete(hash chainhash.Hash) error {
 	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Delete(hash)
 }
 
-func (s SplitSwissMap) Exists(hash chainhash.Hash) bool {
+func (s *SplitSwissMap) Exists(hash chainhash.Hash) bool {
 	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Exists(hash)
 }
 
-func (s SplitSwissMap) Get(hash chainhash.Hash) (uint64, bool) {
+func (s *SplitSwissMap) Get(hash chainhash.Hash) (uint64, bool) {
 	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Get(hash)
 }
 
-func (s SplitSwissMap) Keys() []chainhash.Hash {
+func (s *SplitSwissMap) Keys() []chainhash.Hash {
 	keys := make([]chainhash.Hash, 0, 1024)
 
 	for _, swissMap := range s.m {
@@ -47,7 +47,7 @@ func (s SplitSwissMap) Keys() []chainhash.Hash {
 	return keys
 }
 
-func (s SplitSwissMap) Length() int {
+func (s *SplitSwissMap) Length() int {
 	length := 0
 
 	for _, swissMap := range s.m {
@@ -57,11 +57,11 @@ func (s SplitSwissMap) Length() int {
 	return length
 }
 
-func (s SplitSwissMap) Put(hash chainhash.Hash) error {
+func (s *SplitSwissMap) Put(hash chainhash.Hash) error {
 	return s.m[txmap.Bytes2Uint16Buckets(hash, s.nrOfBuckets)].Put(hash)
 }
 
-func (s SplitSwissMap) PutMulti(hashes []chainhash.Hash) error {
+func (s *SplitSwissMap) PutMulti(hashes []chainhash.Hash) error {
 	for _, hash := range hashes {
 		if err := s.Put(hash); err != nil {
 			return err
@@ -71,11 +71,11 @@ func (s SplitSwissMap) PutMulti(hashes []chainhash.Hash) error {
 	return nil
 }
 
-func (s SplitSwissMap) Set(hash chainhash.Hash) error {
+func (s *SplitSwissMap) Set(hash chainhash.Hash) error {
 	return s.Put(hash)
 }
 
-func (s SplitSwissMap) Iter(f func(hash chainhash.Hash, value uint64) bool) {
+func (s *SplitSwissMap) Iter(f func(hash chainhash.Hash, value uint64) bool) {
 	for _, swissMap := range s.m {
 		swissMap.Iter(f)
 	}

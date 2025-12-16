@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -4247,4 +4246,86 @@ func TestSubtreeProcessor_checkMarkNotOnLongestChain(t *testing.T) {
 		mockBlockchainClient.AssertExpectations(t)
 		mockUtxoStore.AssertExpectations(t)
 	})
+}
+
+// TestCreateTransactionMapBenchmark benchmarks the CreateTransactionMap function with CPU and memory profiling.
+// Run with: go test -v -run TestCreateTransactionMapBenchmark ./services/blockassembly/subtreeprocessor/ -timeout=30m
+// Profiles saved to: createtransactionmap_cpu.prof, createtransactionmap_mem.prof
+// Can also be run from CLI: teranode-cli txmapbench --num-subtrees=100 --txs-per-subtree=1048576
+func TestCreateTransactionMapBenchmark(t *testing.T) {
+	t.Skip("Skipping benchmark test in normal test runs. Run with -run TestCreateTransactionMapBenchmark to execute, or use: teranode-cli txmapbench")
+
+	const (
+		numSubtrees   = 100
+		txsPerSubtree = 1024 * 1024 // 1 million transactions per subtree
+		cpuProfile    = "createtransactionmap_cpu.prof"
+		memProfile    = "createtransactionmap_mem.prof"
+	)
+
+	// Call the shared benchmark function
+	result, err := RunCreateTransactionMapBenchmark(numSubtrees, txsPerSubtree, cpuProfile, memProfile)
+	require.NoError(t, err)
+
+	// Print results
+	fmt.Printf("\nBenchmark Results\n")
+	fmt.Printf("=================\n")
+	fmt.Printf("Subtrees:            %d\n", result.NumSubtrees)
+	fmt.Printf("Total Transactions:  %d\n", result.TotalTxs)
+	fmt.Printf("Elapsed Time:        %.2fs\n", result.Elapsed.Seconds())
+	fmt.Printf("Throughput:          %.2f tx/sec\n", result.TxPerSec)
+	fmt.Printf("Map Length:          %d\n", result.MapLength)
+	fmt.Printf("Conflicting Nodes:   %d\n", result.ConflictingNodes)
+	fmt.Println()
+	fmt.Printf("Profiles written to:\n")
+	fmt.Printf("  CPU:    %s\n", cpuProfile)
+	fmt.Printf("  Memory: %s\n", memProfile)
+	fmt.Println()
+	fmt.Printf("Analyze with:\n")
+	fmt.Printf("  go tool pprof -http=:8080 %s\n", cpuProfile)
+	fmt.Printf("  go tool pprof -http=:8081 %s\n", memProfile)
+
+	if result.BenchErr != nil {
+		fmt.Printf("\nNote: CreateTransactionMap returned error: %v\n", result.BenchErr)
+	}
+}
+
+// TestProcessRemainderTransactionsAndDequeueBenchmark benchmarks the processRemainderTransactionsAndDequeue function
+// with CPU and memory profiling.
+// Run with: go test -v -run TestProcessRemainderTransactionsAndDequeueBenchmark ./services/blockassembly/subtreeprocessor/ -timeout=30m
+// Profiles saved to: processremaindertxanddequeue_cpu.prof, processremaindertxanddequeue_mem.prof
+// Can also be run from CLI: teranode-cli remainderbench --num-chained-subtrees=10 --txs-per-subtree=1048576
+func TestProcessRemainderTransactionsAndDequeueBenchmark(t *testing.T) {
+	t.Skip("Skipping benchmark test in normal test runs. Run with -run TestProcessRemainderTransactionsAndDequeueBenchmark to execute, or use: teranode-cli remainderbench")
+
+	const (
+		numChainedSubtrees = 10
+		txsPerSubtree      = 1024 * 1024 // 1 million transactions per subtree
+		cpuProfile         = "processremaindertxanddequeue_cpu.prof"
+		memProfile         = "processremaindertxanddequeue_mem.prof"
+	)
+
+	// Call the shared benchmark function
+	result, err := RunProcessRemainderBenchmark(numChainedSubtrees, txsPerSubtree, cpuProfile, memProfile)
+	require.NoError(t, err)
+
+	// Print results
+	fmt.Printf("\nBenchmark Results\n")
+	fmt.Printf("=================\n")
+	fmt.Printf("Chained Subtrees:    %d\n", result.NumChainedSubtrees)
+	fmt.Printf("Total Transactions:  %d\n", result.TotalTxs)
+	fmt.Printf("Elapsed Time:        %.2fs\n", result.Elapsed.Seconds())
+	fmt.Printf("Throughput:          %.2f tx/sec\n", result.TxPerSec)
+	fmt.Printf("Remainder Nodes:     %d\n", result.RemainderCount)
+	fmt.Println()
+	fmt.Printf("Profiles written to:\n")
+	fmt.Printf("  CPU:    %s\n", cpuProfile)
+	fmt.Printf("  Memory: %s\n", memProfile)
+	fmt.Println()
+	fmt.Printf("Analyze with:\n")
+	fmt.Printf("  go tool pprof -http=:8080 %s\n", cpuProfile)
+	fmt.Printf("  go tool pprof -http=:8081 %s\n", memProfile)
+
+	if result.BenchErr != nil {
+		fmt.Printf("\nNote: processRemainderTransactionsAndDequeue returned error: %v\n", result.BenchErr)
+	}
 }

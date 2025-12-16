@@ -1200,6 +1200,35 @@ func (stp *SubtreeProcessor) SetCurrentItemsPerFile(v int) {
 	stp.currentItemsPerFile.Store(int32(v))
 }
 
+// SetCurrentSubtree sets the current subtree (primarily for testing/benchmarks).
+//
+// Parameters:
+//   - subtree: The subtree to set as current
+func (stp *SubtreeProcessor) SetCurrentSubtree(subtree *subtreepkg.Subtree) {
+	stp.currentSubtree.Store(subtree)
+}
+
+// SetChainedSubtrees sets the chained subtrees slice (primarily for testing/benchmarks).
+//
+// Parameters:
+//   - subtrees: The slice of chained subtrees
+func (stp *SubtreeProcessor) SetChainedSubtrees(subtrees []*subtreepkg.Subtree) {
+	stp.chainedSubtrees = subtrees
+}
+
+// ProcessRemainderTransactionsAndDequeue is an exported wrapper for processRemainderTransactionsAndDequeue
+// (primarily for testing/benchmarks).
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - params: Parameters for remainder transaction processing
+//
+// Returns:
+//   - error: Any error encountered during processing
+func (stp *SubtreeProcessor) ProcessRemainderTransactionsAndDequeue(ctx context.Context, params *RemainderTransactionParams) error {
+	return stp.processRemainderTransactionsAndDequeue(ctx, params)
+}
+
 // TxCount returns the total number of transactions processed.
 //
 // Returns:
@@ -3564,9 +3593,18 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 				_ = subtreeReader.Close()
 			}()
 
-			// TODO add metrics about how many txs we are reading per second
-			txHashBuckets, conflictingNodes, err := DeserializeHashesFromReaderIntoBuckets(subtreeReader, transactionMap.Buckets())
-			if err != nil {
+			// Calculate expected bucket size with better distribution
+			nBuckets := transactionMap.Buckets()
+
+			txHashBuckets := make(map[uint16][]chainhash.Hash, nBuckets)
+			for i := uint16(0); i < nBuckets; i++ {
+				txHashBuckets[i] = make([]chainhash.Hash, 0, 512)
+			}
+
+			conflictingNodes := make([]chainhash.Hash, 0, 32)
+
+			// read leaves
+			if err = DeserializeHashesFromReaderIntoBuckets(subtreeReader, nBuckets, &txHashBuckets, &conflictingNodes); err != nil {
 				return errors.NewProcessingError("error deserializing subtree: %s", st.String(), err)
 			}
 
@@ -3777,7 +3815,7 @@ func (stp *SubtreeProcessor) getBLockIDsMap(ctx context.Context, losingTxHashesM
 // Returns:
 //   - map[uint16][][32]byte: Map of bucketed hash arrays
 //   - error: Any error encountered during deserialization
-func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16) (hashes map[uint16][]chainhash.Hash, conflictingNodes []chainhash.Hash, err error) {
+func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16, hashes *map[uint16][]chainhash.Hash, conflictingNodes *[]chainhash.Hash) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = errors.NewProcessingError("recovered in DeserializeHashesFromReaderIntoBuckets: %v", r)
@@ -3787,30 +3825,16 @@ func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16) (
 	buf := bufio.NewReaderSize(reader, 1024*64)
 
 	if _, err = buf.Discard(48); err != nil { // skip headers
-		return nil, nil, errors.NewProcessingError("unable to read header", err)
+		return errors.NewProcessingError("unable to read header", err)
 	}
 
 	// read number of leaves
 	bytes8 := make([]byte, 8)
 	if _, err = io.ReadFull(buf, bytes8); err != nil {
-		return nil, nil, errors.NewProcessingError("unable to read number of leaves", err)
+		return errors.NewProcessingError("unable to read number of leaves", err)
 	}
 
 	numLeaves := binary.LittleEndian.Uint64(bytes8)
-
-	// read leaves
-	hashes = make(map[uint16][]chainhash.Hash, nBuckets)
-	// Calculate expected bucket size with better distribution
-	expectedPerBucket := int(numLeaves / uint64(nBuckets))
-	// Add 20% buffer for uneven distribution, minimum 16 elements
-	bucketCapacity := expectedPerBucket + expectedPerBucket/5
-	if bucketCapacity < 16 {
-		bucketCapacity = 16
-	}
-
-	for i := uint16(0); i < nBuckets; i++ {
-		hashes[i] = make([]chainhash.Hash, 0, bucketCapacity)
-	}
 
 	var bucket uint16
 
@@ -3819,36 +3843,33 @@ func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16) (
 	for i := uint64(0); i < numLeaves; i++ {
 		// read all the node data in 1 go
 		if _, err = io.ReadFull(buf, bytes48); err != nil {
-			return nil, nil, errors.NewProcessingError("unable to read node", err)
+			return errors.NewProcessingError("unable to read node", err)
 		}
 
 		bucket = txmap.Bytes2Uint16Buckets(chainhash.Hash(bytes48[:32]), nBuckets)
-		hashes[bucket] = append(hashes[bucket], chainhash.Hash(bytes48[:32]))
+		(*hashes)[bucket] = append((*hashes)[bucket], chainhash.Hash(bytes48[:32]))
 	}
 
 	// read conflicting txs
 	if _, err = io.ReadFull(buf, bytes8); err != nil {
-		return nil, nil, errors.NewProcessingError("unable to read number of conflicting txs", err)
+		return errors.NewProcessingError("unable to read number of conflicting txs", err)
 	}
 
 	numConflicting := binary.LittleEndian.Uint64(bytes8)
 
 	// Pre-allocate exact size for conflicting nodes to avoid reallocation
 	if numConflicting > 0 {
-		conflictingNodes = make([]chainhash.Hash, 0, numConflicting)
 		bytes32 := make([]byte, 32)
 		for i := uint64(0); i < numConflicting; i++ {
 			if _, err = io.ReadFull(buf, bytes32); err != nil {
-				return nil, nil, errors.NewProcessingError("unable to read node", err)
+				return errors.NewProcessingError("unable to read node", err)
 			}
 
-			conflictingNodes = append(conflictingNodes, chainhash.Hash(bytes32))
+			*conflictingNodes = append(*conflictingNodes, chainhash.Hash(bytes32))
 		}
-	} else {
-		conflictingNodes = make([]chainhash.Hash, 0)
 	}
 
-	return hashes, conflictingNodes, nil
+	return nil
 }
 
 // Stop gracefully shuts down the SubtreeProcessor.
