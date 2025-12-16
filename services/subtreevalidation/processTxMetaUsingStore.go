@@ -5,6 +5,7 @@ package subtreevalidation
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -20,6 +21,36 @@ import (
 )
 
 var TxMetaFieldsForDecorate = []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.Conflicting, fields.BlockIDs, fields.Creating}
+
+// unresolvedMetaDataSlicePool reduces allocation pressure by reusing
+// []*utxo.UnresolvedMetaData slices during batch tx metadata processing.
+var unresolvedMetaDataSlicePool = sync.Pool{}
+
+// getUnresolvedMetaDataSlice returns a slice from the pool or allocates a new one.
+func getUnresolvedMetaDataSlice(capacity int) *[]*utxo.UnresolvedMetaData {
+	if v := unresolvedMetaDataSlicePool.Get(); v != nil {
+		s := v.(*[]*utxo.UnresolvedMetaData)
+		if cap(*s) >= capacity {
+			*s = (*s)[:0]
+			return s
+		}
+	}
+	s := make([]*utxo.UnresolvedMetaData, 0, capacity)
+	return &s
+}
+
+// putUnresolvedMetaDataSlice returns a slice to the pool after clearing references.
+func putUnresolvedMetaDataSlice(s *[]*utxo.UnresolvedMetaData) {
+	if s == nil {
+		return
+	}
+	// Clear references to allow GC of pointed-to objects
+	for i := range *s {
+		(*s)[i] = nil
+	}
+	*s = (*s)[:0]
+	unresolvedMetaDataSlicePool.Put(s)
+}
 
 // processTxMetaUsingStore attempts to retrieve transaction metadata from the underlying store
 // for a batch of transactions. It supports both batched and individual transaction retrieval.
@@ -63,7 +94,12 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 			g.Go(func() error {
 				end := subtree.Min(i+batchSize, len(txHashes))
 
-				missingTxHashesCompacted := make([]*utxo.UnresolvedMetaData, 0, end-i)
+				missingTxHashesCompactedPtr := getUnresolvedMetaDataSlice(end - i)
+				missingTxHashesCompacted := *missingTxHashesCompactedPtr
+				defer func() {
+					*missingTxHashesCompactedPtr = missingTxHashesCompacted
+					putUnresolvedMetaDataSlice(missingTxHashesCompactedPtr)
+				}()
 
 				for j := 0; j < subtree.Min(batchSize, len(txHashes)-i); j++ {
 					select {
