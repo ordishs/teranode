@@ -449,7 +449,7 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 		// append height value to values here to get rid of extra call.
 		// it is safe to modify txMetaBytes itself because data.Data.MetaBytes() creates a brand new slice.
 		startingLenOfTxMetaBytes := len(txMetaBytes)
-		txMetaBytes = append(txMetaBytes, 0, 0, 0, 0) // grow the siz by 4
+		txMetaBytes = append(txMetaBytes, 0, 0, 0, 0) // grow the size by 4
 		binary.BigEndian.PutUint32(txMetaBytes[startingLenOfTxMetaBytes:], currentBlockHeight)
 
 		keys = append(keys, data.Hash.CloneBytes())
