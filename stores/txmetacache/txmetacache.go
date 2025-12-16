@@ -212,7 +212,7 @@ func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
 		return err
 	}
 
-	return t.SetCacheFromBytes(hash[:], txMetaBytes)
+	return t.SetCacheFromBytes(hash.CloneBytes(), txMetaBytes)
 }
 
 // SetCacheFromBytes adds or updates transaction metadata in the cache using raw byte slices.
