@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -4298,7 +4299,7 @@ func TestProcessRemainderTransactionsAndDequeueBenchmark(t *testing.T) {
 	t.Skip("Skipping benchmark test in normal test runs. Run with -run TestProcessRemainderTransactionsAndDequeueBenchmark to execute, or use: teranode-cli remainderbench")
 
 	const (
-		numChainedSubtrees = 10
+		numChainedSubtrees = 100
 		txsPerSubtree      = 1024 * 1024 // 1 million transactions per subtree
 		cpuProfile         = "processremaindertxanddequeue_cpu.prof"
 		memProfile         = "processremaindertxanddequeue_mem.prof"

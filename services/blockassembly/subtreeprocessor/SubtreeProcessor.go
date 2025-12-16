@@ -51,6 +51,7 @@ import (
 )
 
 const splitMapBuckets = 4 * 1024
+const maxBatchesPerIteration = 64
 
 // Job represents a mining job with its associated data.
 // A Job encapsulates all the information needed for a miner to attempt finding a valid
@@ -433,6 +434,8 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 
 			var (
 				err error
+				// Phase 1: Dequeue multiple batches
+				dequeueBatches = make([]*TxBatch, 0, maxBatchesPerIteration)
 			)
 
 			for {
@@ -647,18 +650,42 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					}
 
 				default:
-					var err error
-
 					stp.setCurrentRunningState(StateDequeue)
 
-					nrProcessed := 0
+					// Phase 1: Dequeue multiple batches
+					dequeueBatches = dequeueBatches[:0] // Reset slice without reallocating
+
+					// Calculate validFromMillis based on DoubleSpendWindow
+					validFromMillis := int64(0)
+					if stp.settings.BlockAssembly.DoubleSpendWindow > 0 {
+						validFromMillis = time.Now().Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
+					}
+
+					for batchNum := 0; batchNum < maxBatchesPerIteration; batchNum++ {
+						batch, found := stp.queue.dequeueBatch(validFromMillis)
+						if !found {
+							break
+						}
+
+						dequeueBatches = append(dequeueBatches, batch)
+					}
+
+					if len(dequeueBatches) == 0 {
+						runtime.Gosched()
+						stp.setCurrentRunningState(StateRunning)
+						continue
+					}
+
+					var (
+						err         error
+						nrProcessed = 0
+					)
 
 					// Cache these — they are read on every single iteration
 					removeMap := stp.removeMap
 					mapLength := removeMap.Length()
 					currentTxMap := stp.currentTxMap
 					currentItemsPerFile := int(stp.currentItemsPerFile.Load())
-					validFromMillis := time.Now().Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
 					addedCount := uint64(0)
 					currentSubtree := stp.currentSubtree.Load()
 					capSize := currentSubtree.Size()
@@ -683,31 +710,13 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 						addedCount++
 					}
 
-					// Phase 1: Dequeue multiple batches
-					const maxBatchesPerIteration = 64
-					batches := make([]*TxBatch, 0, maxBatchesPerIteration)
-
-					for batchNum := 0; batchNum < maxBatchesPerIteration; batchNum++ {
-						batch, found := stp.queue.dequeueBatch(validFromMillis)
-						if !found {
-							break
-						}
-						batches = append(batches, batch)
-					}
-
-					if len(batches) == 0 {
-						runtime.Gosched()
-						stp.setCurrentRunningState(StateRunning)
-						continue
-					}
-
 					// Phase 2: Filter batches in parallel goroutines
 					// Each goroutine marks rejected nodes by zeroing their Hash.
 					// The maps (removeMap, currentTxMap) are thread-safe.
 					var zeroHash chainhash.Hash
 					var filterWg sync.WaitGroup
 
-					for _, batch := range batches {
+					for _, batch := range dequeueBatches {
 						filterWg.Add(1)
 						go func(b *TxBatch) {
 							defer filterWg.Done()
@@ -739,7 +748,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					// Phase 3: Bulk insert valid nodes into subtrees (single-threaded)
 					// Only nodes with non-zero Hash passed the filters
 					nrAddedInBatch := 0
-					for _, batch := range batches {
+					for _, batch := range dequeueBatches {
 						for _, node := range batch.nodes {
 							// Skip rejected/duplicate nodes (marked with zero hash)
 							if node.Hash == zeroHash {
