@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -210,6 +211,107 @@ func Benchmark_txMetaCache_Get(b *testing.B) {
 
 	err = g.Wait()
 	require.NoError(b, err)
+}
+
+type decoratingNullStore struct {
+	*nullstore.NullStore
+	metaData *meta.Data
+}
+
+func (s *decoratingNullStore) BatchDecorate(_ context.Context, items []*utxo.UnresolvedMetaData, _ ...fields.FieldName) error {
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		it.Data = s.metaData
+		it.Err = nil
+	}
+	return nil
+}
+
+func makeUnresolvedMetaForBench(n int) []*utxo.UnresolvedMetaData {
+	unresolved := make([]*utxo.UnresolvedMetaData, n)
+	for i := 0; i < n; i++ {
+		h := chainhash.HashH([]byte(string(rune(i))))
+		unresolved[i] = &utxo.UnresolvedMetaData{Hash: h}
+	}
+	return unresolved
+}
+
+// Benchmark_txMetaCache_BatchDecorate_1k benchmarks the actual TxMetaCache.BatchDecorate implementation
+func Benchmark_txMetaCache_BatchDecorate_1k(b *testing.B) {
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(b)
+
+	ns, err := nullstore.NewNullStore()
+	require.NoError(b, err)
+	require.NoError(b, ns.SetBlockHeight(100))
+
+	metaData := &meta.Data{
+		Fee:         100,
+		SizeInBytes: 111,
+		TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{}},
+		BlockIDs:    make([]uint32, 0),
+	}
+
+	store := &decoratingNullStore{
+		NullStore: ns,
+		metaData:  metaData,
+	}
+
+	c, err := NewTxMetaCache(ctx, settings.NewSettings(), logger, store, Unallocated)
+	require.NoError(b, err)
+	cache := c.(*TxMetaCache)
+
+	const numTx = 1_000
+	unresolved := makeUnresolvedMetaForBench(numTx)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for iter := 0; iter < b.N; iter++ {
+		if err := cache.BatchDecorate(ctx, unresolved, fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.Conflicting, fields.BlockIDs, fields.Creating); err != nil {
+			b.Fatalf("BatchDecorate failed: %v", err)
+		}
+	}
+}
+
+// Benchmark_txMetaCache_BatchDecorate_100k benchmarks the actual TxMetaCache.BatchDecorate implementation.
+func Benchmark_txMetaCache_BatchDecorate_100k(b *testing.B) {
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(b)
+
+	ns, err := nullstore.NewNullStore()
+	require.NoError(b, err)
+	require.NoError(b, ns.SetBlockHeight(100))
+
+	metaData := &meta.Data{
+		Fee:         100,
+		SizeInBytes: 111,
+		TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{}},
+		BlockIDs:    make([]uint32, 0),
+	}
+
+	store := &decoratingNullStore{
+		NullStore: ns,
+		metaData:  metaData,
+	}
+
+	c, err := NewTxMetaCache(ctx, settings.NewSettings(), logger, store, Unallocated)
+	require.NoError(b, err)
+	cache := c.(*TxMetaCache)
+
+	const numTx = 100_000
+	unresolved := makeUnresolvedMetaForBench(numTx)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for iter := 0; iter < b.N; iter++ {
+		if err := cache.BatchDecorate(ctx, unresolved, fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.Conflicting, fields.BlockIDs, fields.Creating); err != nil {
+			b.Fatalf("BatchDecorate failed: %v", err)
+		}
+	}
 }
 
 func TestMap(t *testing.T) {
