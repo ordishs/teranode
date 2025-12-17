@@ -878,9 +878,15 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 
 	ba.logger.Debugf("[AddTx] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
 
-	txInpoints, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
-	if err != nil {
-		return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
+	var txInpoints subtreepkg.TxInpoints
+	if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+		txInpoints, err = subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
+		if err != nil {
+			return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
+		}
+	} else {
+		// Create empty TxInpoints if not storing for subtree meta
+		txInpoints = subtreepkg.TxInpoints{}
 	}
 
 	if !ba.settings.BlockAssembly.Disabled {
@@ -968,10 +974,18 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 	nodes := make([]subtreepkg.Node, len(requests))
 	txInpointsList := make([]*subtreepkg.TxInpoints, len(requests))
 
+	var err error
+
 	for i, req := range requests {
-		inpoints, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
-		if err != nil {
-			return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
+		var txInpoints subtreepkg.TxInpoints
+		if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+			txInpoints, err = subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
+			if err != nil {
+				return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
+			}
+		} else {
+			// Create empty TxInpoints if not storing for subtree meta
+			txInpoints = subtreepkg.TxInpoints{}
 		}
 
 		nodes[i] = subtreepkg.Node{
@@ -979,7 +993,7 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 			Fee:         req.Fee,
 			SizeInBytes: req.Size,
 		}
-		txInpointsList[i] = &inpoints
+		txInpointsList[i] = &txInpoints
 	}
 
 	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
@@ -1104,9 +1118,14 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 			Fee:         req.Fees[i],
 			SizeInBytes: req.Sizes[i],
 		}
-		txInpointsList[i] = &subtreepkg.TxInpoints{
-			ParentTxHashes: parentTxHashes,
-			Idxs:           idxs,
+
+		if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+			txInpointsList[i] = &subtreepkg.TxInpoints{
+				ParentTxHashes: parentTxHashes,
+				Idxs:           idxs,
+			}
+		} else {
+			txInpointsList[i] = &subtreepkg.TxInpoints{}
 		}
 	}
 

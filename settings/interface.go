@@ -283,6 +283,7 @@ type BlockAssemblySettings struct {
 	// parallel processing of Get and SetIfNotExists operations in processOwnBlockSubtreeNodes
 	// and processRemainderTxHashes. Below this threshold, sequential processing is used.
 	ParallelSetIfNotExistsThreshold int
+	StoreTxInpointsForSubtreeMeta   bool
 }
 
 type BlockValidationSettings struct {
