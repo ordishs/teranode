@@ -15,7 +15,6 @@ import (
 	"github.com/cespare/xxhash"
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sys/unix"
 )
 
 // ImprovedCache Design Calculations and Memory Model:
@@ -118,6 +117,37 @@ func calcMaxSlabChunks(maxBucketBytes uint64, maxChunks uint64) uint64 {
 	}
 
 	return ch
+}
+
+// calcInitialAllocChunks determines the optimal initial allocation size for a bucket
+// based on its maximum slab size and total capacity. For small buckets, it allocates
+// the full size upfront to minimize syscall overhead. For large buckets, it starts at
+// 25% capacity to enable exponential growth and memory efficiency for lightly-used buckets.
+func calcInitialAllocChunks(maxSlabChunks uint64, maxChunks uint64) uint64 {
+	// If the bucket's total capacity is small (≤128KB), allocate everything upfront
+	// regardless of maxSlabChunks limit. This avoids multiple mmaps for tiny buckets.
+	if maxChunks <= 32 {
+		// Small bucket: allocate full capacity upfront.
+		// For a 1GB cache with 8192 buckets, each bucket gets 32 chunks (128KB).
+		// Better to do 1 mmap of 32 chunks than 4 mmaps of 8 chunks each.
+		return maxChunks
+	}
+
+	// For larger buckets, respect the per-mmap slab limit but start smart.
+	if maxSlabChunks <= 32 {
+		// If the slab limit itself is small, allocate full slab upfront.
+		return maxSlabChunks
+	}
+
+	// Large buckets: start at 25% of slab size or minimum 8 chunks.
+	// This enables exponential growth (8→16→32→...) for memory efficiency
+	// while ensuring reasonable initial allocation.
+	initial := maxSlabChunks / 4
+	if initial < minSlabChunks {
+		initial = minSlabChunks
+	}
+
+	return initial
 }
 
 // -------------------------------------------------------------------
@@ -665,12 +695,8 @@ func (b *bucketTrimmed) Reset() {
 	b.gen = 1
 	b.overWriting = false
 	// Keep allocatedChunks (we keep the mmap'd chunks in freeChunks for reuse),
-	// but reset growth so small future usage doesn't immediately mmap big slabs.
-	if b.maxSlabChunks > 0 && minSlabChunks > b.maxSlabChunks {
-		b.nextAllocChunks = b.maxSlabChunks
-	} else {
-		b.nextAllocChunks = minSlabChunks
-	}
+	// but reset growth with smart initial sizing based on bucket capacity.
+	b.nextAllocChunks = calcInitialAllocChunks(b.maxSlabChunks, uint64(len(b.chunks)))
 	b.mu.Unlock()
 }
 
@@ -932,11 +958,11 @@ func (b *bucketTrimmed) getChunk() ([]byte, error) {
 			return nil, errors.NewProcessingError("cannot allocate more chunks; bucket is at maxChunks=%d", maxChunks)
 		}
 
-		// Dynamic slab size (minSlabChunks, 2x, 4x, ...) up to per-bucket maxSlabChunks,
-		// capped by remaining capacity.
+		// Dynamic slab size with smart initial sizing, then exponential growth
+		// up to per-bucket maxSlabChunks, capped by remaining capacity.
 		slabChunks := b.nextAllocChunks
 		if slabChunks == 0 {
-			slabChunks = minSlabChunks
+			slabChunks = calcInitialAllocChunks(b.maxSlabChunks, maxChunks)
 		}
 		maxSlab := b.maxSlabChunks
 		if maxSlab == 0 {
@@ -956,14 +982,14 @@ func (b *bucketTrimmed) getChunk() ([]byte, error) {
 
 		// Allocate offheap memory, so GOGC won't take into account cache size.
 		// This should reduce free memory waste.
-		data, err := unix.Mmap(-1, 0, slabBytes, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+		data, err := allocateNamedMmap(slabBytes)
 		if err != nil {
-			return nil, errors.NewProcessingError("cannot allocate %d bytes via mmap", slabBytes, err)
+			return nil, err
 		}
 
 		b.allocatedChunks += slabChunks
 		if b.nextAllocChunks == 0 {
-			b.nextAllocChunks = minSlabChunks
+			b.nextAllocChunks = calcInitialAllocChunks(b.maxSlabChunks, maxChunks)
 		}
 		b.nextAllocChunks <<= 1
 		if b.nextAllocChunks > maxSlab {
@@ -1052,9 +1078,9 @@ func (b *bucketPreallocated) Init(maxBytes uint64, trimRatio int) error {
 	}
 
 	// allocate memory for all chunks of the bucket
-	data, err := unix.Mmap(-1, 0, int(maxBytes), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	data, err := allocateNamedMmap(int(maxBytes))
 	if err != nil {
-		return errors.NewProcessingError("cannot allocate %d bytes via mmap", maxBytes, err)
+		return err
 	}
 
 	for len(data) > 0 {
@@ -1376,12 +1402,8 @@ func (b *bucketUnallocated) Reset() {
 	b.gen = 1
 
 	// Keep allocatedChunks -> we keep the mmap'd chunks in freeChunks for reuse,
-	// but reset growth so small future usage doesn't immediately mmap big slabs.
-	if b.maxSlabChunks > 0 && minSlabChunks > b.maxSlabChunks {
-		b.nextAllocChunks = b.maxSlabChunks
-	} else {
-		b.nextAllocChunks = minSlabChunks
-	}
+	// but reset growth with smart initial sizing based on bucket capacity.
+	b.nextAllocChunks = calcInitialAllocChunks(b.maxSlabChunks, uint64(len(b.chunks)))
 
 	b.mu.Unlock()
 }
@@ -1624,7 +1646,7 @@ func (b *bucketUnallocated) getChunk() ([]byte, error) {
 
 		slabChunks := b.nextAllocChunks
 		if slabChunks == 0 {
-			slabChunks = minSlabChunks
+			slabChunks = calcInitialAllocChunks(b.maxSlabChunks, maxChunks)
 		}
 
 		maxSlab := b.maxSlabChunks
@@ -1648,9 +1670,9 @@ func (b *bucketUnallocated) getChunk() ([]byte, error) {
 
 		// Allocate offheap memory, so GOGC won't take into account cache size.
 		// This should reduce free memory waste.
-		data, err := unix.Mmap(-1, 0, slabBytes, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+		data, err := allocateNamedMmap(slabBytes)
 		if err != nil {
-			return nil, errors.NewProcessingError("cannot allocate %d bytes via mmap", slabBytes, err)
+			return nil, err
 		}
 
 		// increase number of already allocated chunks.
@@ -1658,7 +1680,7 @@ func (b *bucketUnallocated) getChunk() ([]byte, error) {
 
 		// Exponential growth for the next allocation.
 		if b.nextAllocChunks == 0 {
-			b.nextAllocChunks = minSlabChunks
+			b.nextAllocChunks = calcInitialAllocChunks(b.maxSlabChunks, maxChunks)
 		}
 
 		// move to next power of two.
