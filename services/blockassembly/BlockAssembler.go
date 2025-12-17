@@ -2187,6 +2187,8 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	// order the transactions by createdAt
 	sortStart := time.Now()
 
+	b.logger.Infof("[loadUnminedTransactions] sorting %d unmined transactions by createdAt", len(unminedTransactions))
+
 	sort.Slice(unminedTransactions, func(i, j int) bool {
 		// sort by createdAt, oldest first
 		return unminedTransactions[i].CreatedAt < unminedTransactions[j].CreatedAt
@@ -2250,8 +2252,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 			addTxs = 0
 		}
 
+		unminedTransactions[idx] = nil // release memory
+
 		addTxs++
 	}
+
+	unminedTransactions = nil // release memory
 
 	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
 

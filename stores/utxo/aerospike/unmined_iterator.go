@@ -208,14 +208,16 @@ func (it *unminedTxIterator) partitionWorker(ctx context.Context, policy *as.Que
 		fields.TxID.String(),
 		fields.Fee.String(),
 		fields.SizeInBytes.String(),
-		fields.External.String(),
-		fields.Inputs.String(),
 		fields.CreatedAt.String(),
 		fields.Conflicting.String(),
 		fields.Locked.String(),
 		fields.BlockIDs.String(),
 		fields.UnminedSince.String(),
 		fields.IsCoinbase.String(),
+	}
+
+	if it.store.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+		stmt.BinNames = append(stmt.BinNames, fields.TxInpoints.String())
 	}
 
 	// Create partition filter for this range
@@ -353,22 +355,28 @@ func (it *unminedTxIterator) processRecord(ctx context.Context, bins map[string]
 	}
 
 	// Process external transaction if needed
-	txInpoints, err := it.processTransactionInpoints(ctx, txData, bins)
-	if err != nil {
-		if it.fullScan {
-			// In full scan mode, if we encounter an error processing inpoints and the transaction
-			// has block IDs, it has already been mined. We can skip it.
-			return &utxo.UnminedTransaction{
-				Node: &subtree.Node{
-					Hash:        *txData.hash,
-					Fee:         txData.fee,
-					SizeInBytes: txData.size,
-				},
-				Skip: true,
-			}, nil
-		}
+	var txInpoints subtree.TxInpoints
+	if it.store.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+		txInpoints, err = it.processTransactionInpoints(ctx, txData, bins)
+		if err != nil {
+			if it.fullScan {
+				// In full scan mode, if we encounter an error processing inpoints and the transaction
+				// has block IDs, it has already been mined. We can skip it.
+				return &utxo.UnminedTransaction{
+					Node: &subtree.Node{
+						Hash:        *txData.hash,
+						Fee:         txData.fee,
+						SizeInBytes: txData.size,
+					},
+					Skip: true,
+				}, nil
+			}
 
-		return nil, errors.NewProcessingError("failed to process transaction inpoints for %s", txData.hash.String(), err)
+			return nil, errors.NewProcessingError("failed to process transaction inpoints for %s", txData.hash.String(), err)
+		}
+	} else {
+		// If not storing inpoints, return empty
+		txInpoints = subtree.TxInpoints{}
 	}
 
 	// Extract created_at timestamp

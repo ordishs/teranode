@@ -592,8 +592,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		return nil
 	}
 
-	u.logger.Infof("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
-
 	txHashes := make([]chainhash.Hash, len(allTransactions))
 
 	for i, tx := range allTransactions {
@@ -613,6 +611,8 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	if missed > 0 {
+		u.logger.Infof("[processTransactionsInLevels] Pre-check: %d/%d transactions missed in cache, checking UTXO store", missed, len(txHashes))
+
 		batched := u.settings.SubtreeValidation.BatchMissingTransactions
 		missed, err = u.processTxMetaUsingStore(ctx, txHashes, txMetaSlice, blockIds, batched, false)
 		if err != nil {
@@ -643,6 +643,8 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			idx: i,
 		}
 	}
+
+	u.logger.Infof("[processTransactionsInLevels] Organizing %d transactions into dependency levels", len(allTransactions))
 
 	// Use the existing prepareTxsPerLevel logic to organize transactions by dependency levels
 	maxLevel, txsPerLevel, err := u.selectPrepareTxsPerLevel(ctx, missingTxs)

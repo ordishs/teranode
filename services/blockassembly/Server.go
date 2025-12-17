@@ -670,7 +670,7 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 	allDoneCh := make(chan struct{})
 
 	// Build, serialize, and store subtree meta in background
-	if subtreeRequest.ParentTxMap != nil {
+	if subtreeRequest.ParentTxMap != nil && ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
 		go func() {
 			defer close(metaDoneCh)
 			subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
