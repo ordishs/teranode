@@ -34,6 +34,7 @@ package subtreevalidation
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -876,7 +877,8 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	u.logger.Debugf("[getSubtreeTxHashes][%s] getting subtree from %s", subtreeHash.String(), url)
 
 	// TODO add the metric for how long this takes
-	body, err := util.DoHTTPRequestBodyReader(spanCtx, url)
+	// body, err := util.DoHTTPRequestBodyReader(spanCtx, url)
+	subtreeBytes, err := util.DoHTTPRequest(spanCtx, url)
 	if err != nil {
 		// check whether this is a 404 error
 		if errors.Is(err, errors.ErrNotFound) {
@@ -888,27 +890,28 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 
 		return nil, errors.NewExternalError("[getSubtreeTxHashes][%s] failed to do http request on host %s", subtreeHash.String(), baseURL, err)
 	}
-	defer body.Close()
+	// defer body.Close()
 
 	stat.NewStat("2. http fetch subtree").AddTime(start)
 
 	start = gocore.CurrentTime()
-	buffer := make([]byte, chainhash.HashSize)
+	hashBuffer := make([]byte, chainhash.HashSize)
 
 	// Use pooled bufio.Reader
-	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
-	bufferedReader.Reset(body)
-	defer func() {
-		bufferedReader.Reset(nil)
-		bufioReaderPool.Put(bufferedReader)
-	}()
+	// bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+	// bufferedReader.Reset(body)
+	// defer func() {
+	// 	bufferedReader.Reset(nil)
+	// 	bufioReaderPool.Put(bufferedReader)
+	// }()
+	buf := bytes.NewReader(subtreeBytes)
 
 	u.logger.Debugf("[getSubtreeTxHashes][%s] processing subtree response into tx hashes", subtreeHash.String())
 
 	for {
-		n, err := io.ReadFull(bufferedReader, buffer)
+		n, err := io.ReadFull(buf, hashBuffer)
 		if n > 0 {
-			txHashes = append(txHashes, chainhash.Hash(buffer))
+			txHashes = append(txHashes, chainhash.Hash(hashBuffer))
 		}
 
 		if err != nil {
