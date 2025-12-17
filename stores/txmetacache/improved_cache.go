@@ -853,9 +853,17 @@ func (b *bucketTrimmed) getChunk() ([]byte, error) {
 	if len(b.freeChunks) == 0 {
 		// Allocate offheap memory, so GOGC won't take into account cache size.
 		// This should reduce free memory waste.
-		data, err := unix.Mmap(-1, 0, ChunkSize*chunksPerAlloc, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+		// Calculate how many chunks this bucket actually needs to avoid over-allocation.
+		// len(b.chunks) gives us maxChunks from Init, which is the maximum this bucket will ever use.
+		maxChunksNeeded := len(b.chunks)
+		chunksToAlloc := chunksPerAlloc
+		if maxChunksNeeded < chunksPerAlloc {
+			chunksToAlloc = maxChunksNeeded
+		}
+
+		data, err := unix.Mmap(-1, 0, ChunkSize*chunksToAlloc, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
 		if err != nil {
-			return nil, errors.NewProcessingError("cannot allocate %d bytes via mmap", ChunkSize*chunksPerAlloc, err)
+			return nil, errors.NewProcessingError("cannot allocate %d bytes via mmap", ChunkSize*chunksToAlloc, err)
 		}
 
 		for len(data) > 0 {
@@ -1468,9 +1476,17 @@ func (b *bucketUnallocated) getChunk() ([]byte, error) {
 	if len(b.freeChunks) == 0 {
 		// Allocate offheap memory, so GOGC won't take into account cache size.
 		// This should reduce free memory waste.
-		data, err := unix.Mmap(-1, 0, ChunkSize*chunksPerAlloc, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+		// Calculate how many chunks this bucket actually needs to avoid over-allocation.
+		// len(b.chunks) gives us maxChunks from Init, which is the maximum this bucket will ever use.
+		maxChunksNeeded := len(b.chunks)
+		chunksToAlloc := chunksPerAlloc
+		if maxChunksNeeded < chunksPerAlloc {
+			chunksToAlloc = maxChunksNeeded
+		}
+
+		data, err := unix.Mmap(-1, 0, ChunkSize*chunksToAlloc, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
 		if err != nil {
-			return nil, errors.NewProcessingError("cannot allocate %d bytes via mmap", ChunkSize*chunksPerAlloc, err)
+			return nil, errors.NewProcessingError("cannot allocate %d bytes via mmap", ChunkSize*chunksToAlloc, err)
 		}
 
 		for len(data) > 0 {
