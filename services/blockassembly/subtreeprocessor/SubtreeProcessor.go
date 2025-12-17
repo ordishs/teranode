@@ -1639,16 +1639,108 @@ func (stp *SubtreeProcessor) AddBatch(nodes []subtreepkg.Node, txInpoints []*sub
 // Returns:
 //   - error: Any error encountered during addition
 func (stp *SubtreeProcessor) AddDirectly(node *subtreepkg.Node, txInpoints *subtreepkg.TxInpoints, skipNotification bool) error {
-	if ok := stp.currentTxMap.Exists(node.Hash); ok {
-		return errors.NewInvalidArgumentError("transaction already exists in currentTxMap")
-	}
-
-	err := stp.addNode(*node, txInpoints, skipNotification)
-	if err != nil {
+	if err := stp.addNode(*node, txInpoints, skipNotification); err != nil {
 		return errors.NewProcessingError("error adding node directly to subtree", err)
 	}
 
 	stp.txCount.Add(1)
+
+	return nil
+}
+
+// AddNodesDirectly adds a batch of unmined transactions directly to the processor without going through the queue.
+// It performs parallel filtering/insertion into currentTxMap and sequential insertion into subtrees.
+// This bypasses the queue and is useful for bulk loading transactions at startup.
+//
+// Parameters:
+//   - txs: Unmined transactions to add
+//   - skipNotification: Whether to skip notification of new subtrees
+//
+// Returns:
+//   - error: Any error encountered during addition
+func (stp *SubtreeProcessor) AddNodesDirectly(txs []*utxostore.UnminedTransaction, skipNotification bool) error {
+	if len(txs) == 0 {
+		return nil
+	}
+
+	// Phase 1: Parallel insertion into currentTxMap using 1024 batches
+	const numWorkers = 1024
+	currentTxMap := stp.currentTxMap
+	txCount := len(txs)
+
+	if txCount > 0 {
+		var filterWg sync.WaitGroup
+
+		// Calculate batch size per worker
+		batchSize := (txCount + numWorkers - 1) / numWorkers
+
+		for w := 0; w < numWorkers; w++ {
+			start := w * batchSize
+			if start >= txCount {
+				break
+			}
+			end := start + batchSize
+			if end > txCount {
+				end = txCount
+			}
+
+			filterWg.Add(1)
+			go func(startIdx, endIdx int) {
+				defer filterWg.Done()
+				for i := startIdx; i < endIdx; i++ {
+					currentTxMap.Set(txs[i].Hash, txs[i].TxInpoints)
+				}
+			}(start, end)
+		}
+
+		filterWg.Wait()
+	}
+
+	// Phase 2: Sequential insertion into subtrees (single-threaded)
+	currentItemsPerFile := int(stp.currentItemsPerFile.Load())
+	currentSubtree := stp.currentSubtree.Load()
+	addedCount := uint64(0)
+
+	// Ensure we have a subtree
+	if currentSubtree == nil {
+		newSubtree, err := subtreepkg.NewTreeByLeafCount(currentItemsPerFile)
+		if err != nil {
+			return errors.NewProcessingError("error creating new subtree", err)
+		}
+		stp.currentSubtree.Store(newSubtree)
+		currentSubtree = newSubtree
+
+		// This is the first subtree for this block - we need a coinbase placeholder
+		if err = currentSubtree.AddCoinbaseNode(); err != nil {
+			return errors.NewProcessingError("error adding coinbase placeholder", err)
+		}
+		addedCount++
+	}
+
+	capSize := currentSubtree.Size()
+
+	for _, tx := range txs {
+		// Add to current subtree
+		if err := currentSubtree.AddSubtreeNodeWithoutLock(*tx.Node); err != nil {
+			return errors.NewProcessingError("AddNodesDirectly: error adding node to subtree: %s", err)
+		}
+
+		addedCount++
+
+		// Check if subtree is complete
+		if len(currentSubtree.Nodes) >= capSize {
+			if err := stp.processCompleteSubtree(skipNotification); err != nil {
+				return errors.NewProcessingError("error processing complete subtree", err)
+			}
+
+			currentSubtree = stp.currentSubtree.Load()
+			capSize = currentSubtree.Size()
+		}
+	}
+
+	if addedCount > 0 {
+		stp.txCount.Add(addedCount)
+	}
 
 	return nil
 }

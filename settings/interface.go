@@ -275,6 +275,7 @@ type BlockAssemblySettings struct {
 	// unmined transactions. When disabled or when OnRestartValidateParentChain is enabled,
 	// the original in-memory approach is used.
 	UnminedTxDiskSortEnabled bool
+	UnminedLoadingBatchSize  int
 	// GetMiningCandidate timeouts
 	GetMiningCandidateSendTimeout     time.Duration // Timeout when sending request on internal channel (default: 1s)
 	GetMiningCandidateResponseTimeout time.Duration // Timeout waiting for mining candidate response (default: 10s)

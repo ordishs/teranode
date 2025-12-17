@@ -2215,15 +2215,19 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 
 	// Apply parent chain validation if enabled
 	if b.settings.BlockAssembly.OnRestartValidateParentChain {
+		var err error
+
 		validateStart := time.Now()
 		beforeCount := len(unminedTransactions)
-		var err error
+
 		unminedTransactions, err = b.validateParentChain(ctx, unminedTransactions, bestBlockHeaderIDsMap)
 		if err != nil {
 			// Context was cancelled during parent validation
 			return err
 		}
+
 		prometheusBlockAssemblerValidateParentChainTime.Observe(time.Since(validateStart).Seconds())
+
 		filteredCount := beforeCount - len(unminedTransactions)
 		if filteredCount > 0 {
 			prometheusBlockAssemblerValidateParentChainFiltered.Add(float64(filteredCount))
@@ -2239,22 +2243,56 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	addStart := time.Now()
 	addTxs := float64(0)
 
-	for idx, unminedTransaction := range unminedTransactions {
-		if err = b.subtreeProcessor.AddDirectly(unminedTransaction.Node, unminedTransaction.TxInpoints, true); err != nil {
-			return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
-		}
+	// Use batch insertion if UnminedLoadingBatchSize is set (> 0)
+	batchSize := b.settings.BlockAssembly.UnminedLoadingBatchSize // default 10 million
+	if batchSize > 0 {
+		// Batch mode: use AddNodesDirectly for parallel currentTxMap insertion
+		// Process directly from original slice to avoid doubling memory usage
+		totalTxs := len(unminedTransactions)
+		for start := 0; start < totalTxs; start += batchSize {
+			end := start + batchSize
+			if end > totalTxs {
+				end = totalTxs
+			}
 
-		// add every 10_000 transactions log the time taken
-		if (idx+1)%10_000 == 0 {
-			prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
-			prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
+			// Pass slice segment directly - no copy needed
+			batch := unminedTransactions[start:end]
+			if err = b.subtreeProcessor.AddNodesDirectly(batch, true); err != nil {
+				return errors.NewProcessingError("error adding unmined transactions batch to subtree processor", err)
+			}
+
+			batchCount := len(batch)
+			addTxs += float64(batchCount)
+
+			// Log progress of batch addition
+			prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(addStart).Seconds())
+			prometheusBlockAssemblerAddDirectlyTotal.Add(float64(batchCount))
 			addStart = time.Now()
-			addTxs = 0
+
+			// Nil out processed elements to allow GC of UnminedTransaction objects
+			for j := start; j < end; j++ {
+				unminedTransactions[j] = nil
+			}
 		}
+	} else {
+		// Sequential mode: use AddDirectly for each transaction
+		for idx, unminedTransaction := range unminedTransactions {
+			if err = b.subtreeProcessor.AddDirectly(unminedTransaction.Node, unminedTransaction.TxInpoints, true); err != nil {
+				return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
+			}
 
-		unminedTransactions[idx] = nil // release memory
+			// add every 10_000 transactions log the time taken
+			if (idx+1)%10_000 == 0 {
+				prometheusBlockAssemblerAddDirectlyTime.Observe(time.Since(addStart).Seconds())
+				prometheusBlockAssemblerAddDirectlyTotal.Add(addTxs)
+				addStart = time.Now()
+				addTxs = 0
+			}
 
-		addTxs++
+			unminedTransactions[idx] = nil // release memory
+
+			addTxs++
+		}
 	}
 
 	unminedTransactions = nil // release memory

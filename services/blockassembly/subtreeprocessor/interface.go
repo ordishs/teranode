@@ -70,6 +70,18 @@ type Interface interface {
 	// Note: This method bypasses the normal queue processing and should be used
 	AddDirectly(node *subtreepkg.Node, txInpoints *subtreepkg.TxInpoints, skipNotification bool) error
 
+	// AddNodesDirectly adds a batch of unmined transactions directly to the processor without going through the queue.
+	// It performs parallel filtering/insertion into currentTxMap and sequential insertion into subtrees.
+	// This bypasses the queue and is useful for bulk loading transactions at startup.
+	//
+	// Parameters:
+	//   - txs: Unmined transactions to add
+	//   - skipNotification: Whether to skip notification of new subtrees
+	//
+	// Returns:
+	//   - error: Any error encountered during addition
+	AddNodesDirectly(txs []*utxostore.UnminedTransaction, skipNotification bool) error
+
 	// GetCurrentRunningState returns the current operational state of the processor.
 	// This provides visibility into whether the processor is running, stopped,
 	// resetting, or in another operational state.
