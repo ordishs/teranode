@@ -2031,7 +2031,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	prometheusBlockAssemblerGetUnminedTxIteratorTime.WithLabelValues(fullScanLabel, "success").Observe(duration)
 	b.logger.Infof("[loadUnminedTransactions] successfully created unmined tx iterator, starting to process transactions")
 
-	unminedTransactions := make([]*utxo.UnminedTransaction, 0, 1024*1024) // preallocate a large slice to avoid reallocations
+	unminedTransactions := make([]*utxo.UnminedTransaction, 0, 16*1024*1024) // preallocate a large slice to avoid reallocations
 	lockedTransactions := make([]chainhash.Hash, 0, 1024)
 
 	// keep track of transactions that we need to mark as mined on the longest chain
@@ -2101,6 +2101,11 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 						}
 					}
 
+					if !b.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+						// clear the TxInpoints to save memory if we are not using subtree meta
+						unminedTransaction.TxInpoints = &subtree.TxInpoints{}
+					}
+
 					localResult.unminedTxs = append(localResult.unminedTxs, unminedTransaction)
 
 					if unminedTransaction.Locked {
@@ -2144,10 +2149,15 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, fullScan b
 	b.logger.Infof("[loadUnminedTransactions] completed processing unmined transactions from iterator, merging results")
 
 	// Merge per-worker results into final slices
-	for _, result := range workerResults {
-		unminedTransactions = append(unminedTransactions, result.unminedTxs...)
-		lockedTransactions = append(lockedTransactions, result.lockedTxs...)
-		markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, result.markAsMinedOnLongestTxs...)
+	for idx := range workerResults {
+		unminedTransactions = append(unminedTransactions, workerResults[idx].unminedTxs...)
+		workerResults[idx].unminedTxs = nil // Clear slice to release memory
+
+		lockedTransactions = append(lockedTransactions, workerResults[idx].lockedTxs...)
+		workerResults[idx].lockedTxs = nil // Clear slice to release memory
+
+		markAsMinedOnLongestChain = append(markAsMinedOnLongestChain, workerResults[idx].markAsMinedOnLongestTxs...)
+		workerResults[idx].markAsMinedOnLongestTxs = nil // Clear slice to release memory
 	}
 
 	workerResults = nil // release memory

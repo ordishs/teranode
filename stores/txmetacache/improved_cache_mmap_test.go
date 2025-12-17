@@ -157,7 +157,7 @@ func TestTxMetaCache_Unallocated_Memory_1_2_3_GiB(t *testing.T) {
 				heapPath,
 				allocsPath,
 			)
-			require.NoError(t, os.WriteFile(reportPath, []byte(report), 0o644))
+			require.NoError(t, os.WriteFile(reportPath, []byte(report), 0o644)) // nolint:gosec
 
 			t.Logf("wrote heap profile: %s", heapPath)
 			t.Logf("wrote allocs profile: %s", allocsPath)
