@@ -1203,7 +1203,7 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 						// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
 						// data before storing it on disk
 						// Use buffered reader to reduce syscalls - each tx.ReadFrom() makes many small reads
-						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, bufio.NewReaderSize(body, 64*1024))
+						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, bufio.NewReaderSize(body, 1024*1024))
 						_ = body.Close()
 						if err != nil {
 							u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
@@ -1662,7 +1662,7 @@ func (u *Server) getMissingTransactionsFromFile(ctx context.Context, subtreeHash
 	defer subtreeDataReader.Close()
 
 	// Use buffered reader to reduce syscalls - each tx.ReadFrom() makes many small reads
-	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, bufio.NewReaderSize(subtreeDataReader, 64*1024))
+	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, bufio.NewReaderSize(subtreeDataReader, 1024*1024))
 	if err != nil {
 		return nil, err
 	}
