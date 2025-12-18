@@ -562,7 +562,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					originalCurrentTxMap := stp.currentTxMap
 					currentBlockHeader := stp.currentBlockHeader
 
-					if _, err = stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true); err != nil {
+					if _, err = stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, true, true); err != nil {
 						// rollback to previous state
 						stp.chainedSubtrees = originalChainedSubtrees
 						stp.currentSubtree.Store(originalCurrentSubtree)
@@ -2917,7 +2917,7 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 	if params.TransactionMap != nil && params.TransactionMap.Length() > 0 {
 		_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "processRemainderTransactionsAndDequeue",
 			tracing.WithParentStat(stp.stats),
-			tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing %d remainder tx hashes into subtrees", params.Block.String(), params.TransactionMap.Length()),
+			tracing.WithLogMessage(stp.logger, "[moveForwardBlock][%s] processing %d remainder tx hashes into subtrees", params.Block.String(), stp.TxCount()-uint64(params.TransactionMap.Length())),
 		)
 
 		defer deferFn()
