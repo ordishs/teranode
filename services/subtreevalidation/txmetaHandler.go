@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"google.golang.org/protobuf/proto"
@@ -32,57 +31,38 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 		return nil
 	}
 
-	startTime := time.Now()
+	// Process the message asynchronously to avoid blocking the Kafka consumer.
+	// Errors are logged but do not prevent message acknowledgment.
+	go func() {
+		startTime := time.Now()
 
-	var m kafkamessage.KafkaTxMetaTopicMessage
-	if err := proto.Unmarshal(msg.ConsumerMessage.Value, &m); err != nil {
-		return err
-	}
+		var m kafkamessage.KafkaTxMetaTopicMessage
 
-	hash, err := chainhash.NewHashFromStr(m.TxHash)
-	if err != nil {
-		return err
-	}
-	delete := m.Action == kafkamessage.KafkaTxMetaActionType_DELETE
-	txMetaBytes := m.Content
+		if err := proto.Unmarshal(msg.ConsumerMessage.Value, &m); err != nil {
+			return
+		}
 
-	if delete {
-		if err := u.DelTxMetaCache(ctx, hash); err != nil {
-			prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
+		hash, err := chainhash.NewHashFromStr(m.TxHash)
+		if err != nil {
+			return
+		}
 
-			wrappedErr := errors.NewProcessingError("[txmetaHandler][%s] failed to delete tx meta data", hash, err)
-			if errors.Is(err, errors.ErrProcessing) {
-				// log the wrapped error, instead of throwing an error on Kafka. The message will never be able to be
-				// added to the tx meta cache, so we don't want to keep trying to process it.
-				u.logger.Warnf(wrappedErr.Error())
-
-				return nil
+		if m.Action == kafkamessage.KafkaTxMetaActionType_DELETE {
+			if err = u.DelTxMetaCache(ctx, hash); err != nil {
+				prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
+				u.logger.Errorf("[txmetaHandler][%s] failed to delete tx meta data: %v", hash, err)
 			}
 
-			return wrappedErr
+			prometheusSubtreeValidationDelTXMetaCacheKafka.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
+		} else {
+			if err = u.SetTxMetaCacheFromBytes(ctx, hash[:], m.Content); err != nil {
+				prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
+				u.logger.Debugf("[txmetaHandler][%s] failed to set tx meta data: %v", hash, err)
+			}
+
+			prometheusSubtreeValidationSetTXMetaCacheKafka.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
 		}
-
-		prometheusSubtreeValidationDelTXMetaCacheKafka.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
-
-		return nil
-	}
-
-	if err := u.SetTxMetaCacheFromBytes(ctx, hash[:], txMetaBytes); err != nil {
-		prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
-
-		wrappedErr := errors.NewProcessingError("[txmetaHandler][%s] failed to set tx meta data", hash, err)
-		if errors.Is(err, errors.ErrProcessing) {
-			// log the wrapped error, instead of throwing an error on Kafka. The message will never be able to be
-			// added to the tx meta cache, so we don't want to keep trying to process it.
-			u.logger.Debugf(wrappedErr.Error())
-
-			return nil
-		}
-
-		return wrappedErr
-	}
-
-	prometheusSubtreeValidationSetTXMetaCacheKafka.Observe(float64(time.Since(startTime).Microseconds()) / 1_000_000)
+	}()
 
 	return nil
 }
