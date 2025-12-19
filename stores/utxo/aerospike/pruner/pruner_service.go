@@ -439,13 +439,14 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 	partitionsPerQuery := totalPartitions / numPartitionQueries
 	remainingPartitions := totalPartitions % numPartitionQueries
 
-	// Setup query policy with production-tuned settings (same as unmined_iterator.go)
+	// Setup query policy with production-tuned settings
 	// Clone the existing query policy and adjust RecordQueueSize for parallel queries
 	policy := *s.queryPolicy // Copy the existing policy
-	policy.RecordQueueSize = (10 * 1024 * 1024) / numPartitionQueries
-	if policy.RecordQueueSize < 1024 {
-		policy.RecordQueueSize = 1024
-	}
+
+	// RecordQueueSize is number of records (not bytes!) to buffer per worker
+	// Optimal: 2-5x chunk size for good pipelining without excessive memory
+	// 5000 records/worker × 16 workers = 80K records buffered = ~80MB total (at 1KB/record)
+	policy.RecordQueueSize = 5000
 
 	s.logger.Infof("Starting parallel pruning with %d partition workers for height %d (safe cleanup height: %d)",
 		numPartitionQueries, blockHeight, safeCleanupHeight)
