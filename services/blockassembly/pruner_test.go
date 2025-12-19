@@ -143,10 +143,10 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		// Setup mock subtree processor
 		mockSubtreeProcessor := &subtreeprocessor.MockSubtreeProcessor{}
 
-		// Should only be called once for the normal transaction
-		mockSubtreeProcessor.On("AddDirectly", mock.MatchedBy(func(node *subtree.Node) bool {
-			return node.Hash.String() == normalTxs[0].Hash.String()
-		}), mock.Anything, true).Return(nil).Once()
+		// Should only be called once for the normal transaction batch
+		mockSubtreeProcessor.On("AddNodesDirectly", mock.MatchedBy(func(txs []*utxo.UnminedTransaction) bool {
+			return len(txs) == 1 && txs[0].Hash.String() == normalTxs[0].Hash.String()
+		}), true).Return(nil).Once()
 		// GetCurrentBlockHeader may be called multiple times during loading
 		mockSubtreeProcessor.On("GetCurrentBlockHeader").Return(blockHeader1, nil).Maybe()
 
