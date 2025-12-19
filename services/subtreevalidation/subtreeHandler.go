@@ -29,7 +29,7 @@ import (
 // rather than blocking in this handler. This prevents session timeouts and improves resource usage.
 func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.KafkaMessage) error {
 	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(int(math.Max(4, float64(runtime.NumCPU()/2))))
+	g.SetLimit(int(math.Max(4, float64(runtime.NumCPU()))))
 
 	return func(msg *kafka.KafkaMessage) error {
 		if msg == nil {
