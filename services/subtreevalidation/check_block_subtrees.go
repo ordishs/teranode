@@ -18,7 +18,6 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
@@ -603,7 +602,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	}
 
 	// Pre-check: identify transactions that are already validated in cache or UTXO store
-	txMetaSlice := make([]*meta.Data, len(txHashes))
+	txMetaSlice := make([]metaSliceItem, len(txHashes))
 
 	missed, err := u.processTxMetaUsingCache(ctx, txHashes, txMetaSlice, false)
 	if err != nil {
@@ -633,7 +632,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	missingTxs := make([]missingTx, len(allTransactions))
 
 	for i, tx := range allTransactions {
-		if txMetaSlice[i] != nil {
+		if txMetaSlice[i].isSet {
 			// Transaction already validated, skip
 			continue
 		}
@@ -732,7 +731,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 
 			// Skip transactions that were already validated (found in cache or UTXO store)
-			if txMetaSlice[mTx.idx] != nil {
+			if txMetaSlice[mTx.idx].isSet {
 				u.logger.Debugf("[processTransactionsInLevels] Transaction %s already validated (pre-check), skipping", tx.TxIDChainHash().String())
 				return nil
 			}

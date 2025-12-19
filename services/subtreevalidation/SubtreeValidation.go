@@ -432,13 +432,9 @@ func (u *Server) checkCounterConflictingOnCurrentChain(ctx context.Context, txHa
 				return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] counter conflicting tx is frozen", txHash.String())
 			}
 
-			counterConflictingTxMeta, err := u.utxoStore.GetMeta(gCtx, &counterConflictingTxHash)
-			if err != nil {
+			counterConflictingTxMeta := &meta.Data{}
+			if err := u.utxoStore.GetMeta(gCtx, &counterConflictingTxHash, counterConflictingTxMeta); err != nil {
 				return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx meta", txHash.String(), err)
-			}
-
-			if counterConflictingTxMeta == nil {
-				return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] counter conflicting tx meta is nil", txHash.String())
 			}
 
 			counterConflictingTxMetas[idx] = counterConflictingTxMeta
@@ -501,6 +497,16 @@ type ValidateSubtree struct {
 	// When true, validation stops at the first error for quick failure detection.
 	// When false, validation attempts to process all transactions to collect comprehensive error information.
 	AllowFailFast bool
+}
+
+type metaSliceItem struct {
+	fee         uint64
+	sizeInBytes uint64
+	coinbase    bool
+	conflicting bool
+	creating    bool
+	isSet       bool
+	txInpoints  subtreepkg.TxInpoints
 }
 
 // ValidateSubtreeInternal performs the actual validation of a subtree.
@@ -610,7 +616,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 	// txMetaSlice will be populated with the txMeta data for each txHash
 	// in the retry attempts, only the tx hashes that are missing will be retried, not the whole subtree
-	txMetaSlice := make([]*meta.Data, len(txHashes))
+	txMetaSlice := make([]metaSliceItem, len(txHashes))
 
 	for attempt := 1; attempt <= maxRetries+1; attempt++ {
 		prometheusSubtreeValidationValidateSubtreeRetry.Inc()
@@ -681,7 +687,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			missingTxHashesCompacted := make([]utxo.UnresolvedMetaData, 0, missed)
 
 			for idx, txHash := range txHashes {
-				if txMetaSlice[idx] == nil && !txHash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
+				if !txMetaSlice[idx].isSet && !txHash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
 					missingTxHashesCompacted = append(missingTxHashesCompacted, utxo.UnresolvedMetaData{
 						Hash: txHash,
 						Idx:  idx,
@@ -717,8 +723,6 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 	start = gocore.CurrentTime()
 
-	var txMeta *meta.Data
-
 	u.logger.Debugf("[ValidateSubtreeInternal][%s] adding %d nodes to subtree instance", v.SubtreeHash.String(), len(txHashes))
 
 	for idx, txHash := range txHashes {
@@ -732,23 +736,22 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			continue
 		}
 
-		txMeta = txMetaSlice[idx]
-		if txMeta == nil {
+		if !txMetaSlice[idx].isSet {
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] tx meta not found in txMetaSlice at index %d: %s", v.SubtreeHash.String(), idx, txHash.String())
 		}
 
-		if txMeta.IsCoinbase {
+		if txMetaSlice[idx].coinbase {
 			// Not recoverable, returning TxInvalid error
 			return nil, errors.NewTxInvalidError("[ValidateSubtreeInternal][%s] invalid subtree index for coinbase tx %d: %s", v.SubtreeHash.String(), idx, txHash.String())
 		}
 
 		// finally add the transaction hash and fee to the subtree
-		if err = subtree.AddNode(txHash, txMeta.Fee, txMeta.SizeInBytes); err != nil {
+		if err = subtree.AddNode(txHash, txMetaSlice[idx].fee, txMetaSlice[idx].sizeInBytes); err != nil {
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to add node to subtree / subtreeMeta", v.SubtreeHash.String(), err)
 		}
 
 		// mark the transaction as conflicting if it is
-		if txMeta.Conflicting {
+		if txMetaSlice[idx].conflicting {
 			if err = subtree.AddConflictingNode(txHash); err != nil {
 				return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to add conflicting node to subtree", v.SubtreeHash.String(), err)
 			}
@@ -757,7 +760,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		// add the txMeta data we need for block validation
 		subtreeIdx := subtree.Length() - 1
 
-		if err = subtreeMeta.SetTxInpoints(subtreeIdx, txMeta.TxInpoints); err != nil {
+		if err = subtreeMeta.SetTxInpoints(subtreeIdx, txMetaSlice[idx].txInpoints); err != nil {
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to set parent tx hash in subtreeMeta", v.SubtreeHash.String(), err)
 		}
 	}
@@ -977,7 +980,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 // Returns:
 //   - error: Any error encountered during retrieval or validation
 func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
-	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL string, txMetaSlice []*meta.Data, blockHeight uint32,
+	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL string, txMetaSlice []metaSliceItem, blockHeight uint32,
 	blockIds map[uint32]bool, validationOptions ...validator.Option) (err error) {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "SubtreeValidation:processMissingTransactions",
 		tracing.WithDebugLogMessage(u.logger, "[processMissingTransactions][%s] processing %d missing txs", subtreeHash.String(), len(missingTxHashes)),
@@ -1087,7 +1090,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 					missedMu.Unlock()
 					u.logger.Infof("[validateSubtree][%s] tx meta is nil [%s]", subtreeHash.String(), tx.TxIDChainHash().String())
 				} else {
-					if txMetaSlice[txIdx] != nil {
+					if txMetaSlice[txIdx].isSet {
 						u.logger.Debugf("[validateSubtree][%s] tx meta already exists in txMetaSlice at index %d: %s", subtreeHash.String(), txIdx, tx.TxIDChainHash().String())
 						errorsFound.Add(1)
 
@@ -1098,7 +1101,15 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 						return nil
 					}
 
-					txMetaSlice[txIdx] = txMeta
+					txMetaSlice[txIdx] = metaSliceItem{
+						fee:         txMeta.Fee,
+						sizeInBytes: txMeta.SizeInBytes,
+						coinbase:    txMeta.IsCoinbase,
+						conflicting: txMeta.Conflicting,
+						creating:    txMeta.Creating,
+						isSet:       true,
+						txInpoints:  txMeta.TxInpoints,
+					}
 				}
 
 				return nil

@@ -104,13 +104,13 @@ func (m *mockCache) Get(ctx context.Context, hash *chainhash.Hash, fields ...fie
 	return args.Get(0).(*meta.Data), args.Error(1)
 }
 
-func (m *mockCache) GetMeta(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
-	args := m.Called(ctx, hash)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
+func (m *mockCache) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
+	args := m.Called(ctx, hash, data)
+	if result := args.Get(0); result != nil {
+		*data = *result.(*meta.Data)
 	}
 
-	return args.Get(0).(*meta.Data), args.Error(1)
+	return args.Error(1)
 }
 
 func (m *mockCache) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {

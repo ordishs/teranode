@@ -290,30 +290,29 @@ func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) err
 // 2. Validates that the data is not empty
 // 3. Checks if the data has expired based on block height
 // All these conditions have corresponding metrics incremented for monitoring.
-func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*meta.Data, error) {
-	cachedBytes := make([]byte, 0)
+func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash, txmetaData *meta.Data) (bool, error) {
+	cachedBytes := make([]byte, 0, 64)
 
 	if err := t.cache.Get(&cachedBytes, hash[:]); err != nil {
 		t.metrics.misses.Add(1)
 
-		return nil, err
+		return false, err
 	}
 
 	if len(cachedBytes) == 0 {
 		t.metrics.misses.Add(1)
 		t.logger.Warnf("txMetaCache empty for %s", hash.String())
 
-		return nil, nil
+		return false, nil
 	}
 
 	t.metrics.hits.Add(1)
 
-	txmetaData := meta.Data{}
-	if err := meta.NewMetaDataFromBytes(cachedBytes, &txmetaData); err != nil {
-		return nil, errors.NewProcessingError("Failed to unmarshal txmetaData", err)
+	if err := meta.NewMetaDataFromBytes(cachedBytes, txmetaData); err != nil {
+		return false, errors.NewProcessingError("Failed to unmarshal txmetaData", err)
 	}
 
-	return &txmetaData, nil
+	return true, nil
 }
 
 // GetMeta retrieves transaction metadata for a given transaction hash, first checking the cache
@@ -322,51 +321,49 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 // Parameters:
 // - ctx: Context for the operation
 // - hash: Transaction hash to retrieve metadata for
+// - data: Pre-allocated meta.Data struct to populate with the retrieved metadata
 //
 // Returns:
-// - The transaction metadata if found
 // - Error if retrieval fails
 //
 // This is one of the primary interface methods that proxies calls to the underlying store
 // with a caching layer in between for improved performance.
-func (t *TxMetaCache) GetMeta(ctx context.Context, hash *chainhash.Hash) (*meta.Data, error) {
+func (t *TxMetaCache) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
 	cachedBytes := make([]byte, 0)
 
 	err := t.cache.Get(&cachedBytes, hash[:])
 	if err != nil && !errors.Is(err, errors.ErrNotFound) {
-		return nil, err
+		return err
 	}
 
 	if len(cachedBytes) > 0 {
 		t.metrics.hits.Add(1)
 
-		txmetaData := meta.Data{}
-		if err = meta.NewMetaDataFromBytes(cachedBytes, &txmetaData); err != nil {
-			return nil, err
+		if err = meta.NewMetaDataFromBytes(cachedBytes, data); err != nil {
+			return err
 		}
 
-		txmetaData.BlockIDs = make([]uint32, 0) // this is expected behavior, needs to be non-nil
+		data.BlockIDs = make([]uint32, 0) // this is expected behavior, needs to be non-nil
 
-		return &txmetaData, nil
+		return nil
 	}
 
 	t.metrics.misses.Add(1)
 	t.logger.Warnf("txMetaCache GetMeta miss for %s", hash.String())
 
-	txMeta, err := t.utxoStore.GetMeta(ctx, hash)
-	if err != nil {
-		return nil, err
+	if err := t.utxoStore.GetMeta(ctx, hash, data); err != nil {
+		return err
 	}
 
 	prometheusBlockValidationTxMetaCacheGetOrigin.Add(1)
 
 	// add to cache, but only if the blockIDs have not been set
-	if len(txMeta.BlockIDs) == 0 {
+	if len(data.BlockIDs) == 0 {
 		// don't return errors from SetCache, as it is not critical if the cache fails to set
-		_ = t.SetCache(hash, txMeta)
+		_ = t.SetCache(hash, data)
 	}
 
-	return txMeta, nil
+	return nil
 }
 
 // Get retrieves transaction data from the underlying store.
