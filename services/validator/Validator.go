@@ -9,11 +9,13 @@ package validator
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/bsv-blockchain/go-batcher"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
@@ -67,7 +69,19 @@ const (
 	// not spendable (OP_FALSE OP_RETURN).  This applies to outputs after the
 	// Genesis upgrade.
 	DustLimit = uint64(1)
+
+	// txmetaActionADD represents the ADD action for txmeta batch messages
+	txmetaActionADD = byte(0)
+	// txmetaActionDELETE represents the DELETE action for txmeta batch messages
+	txmetaActionDELETE = byte(1)
 )
+
+// txmetaBatchItem represents an item to be batched for TxMeta Kafka messages.
+type txmetaBatchItem struct {
+	hash      *chainhash.Hash
+	metaBytes []byte
+	isDelete  bool
+}
 
 // Validator implements comprehensive Bitcoin SV transaction validation and manages the complete lifecycle
 // of transactions from initial validation through block assembly integration. This struct serves as the
@@ -123,6 +137,9 @@ type Validator struct {
 
 	// rejectedTxKafkaProducerClient publishes rejected transaction events
 	rejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI
+
+	// txmetaBatcher batches TxMeta Kafka messages for efficient publishing
+	txmetaBatcher *batcher.Batcher[txmetaBatchItem]
 }
 
 // New creates a new Validator instance with the provided configuration.
@@ -163,6 +180,19 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	if v.rejectedTxKafkaProducerClient != nil { // tests may not set this
 		v.rejectedTxKafkaProducerClient.Start(ctx, make(chan *kafka.Message, 10_000))
+	}
+
+	// Initialize TxMeta batcher if batch size is configured
+	txmetaBatchSize := tSettings.Validator.TxMetaBatchSize
+	txmetaBatchTimeout := tSettings.Validator.TxMetaBatchTimeoutMs
+	if txmetaBatchSize > 0 && v.txmetaKafkaProducerClient != nil {
+		duration := time.Duration(txmetaBatchTimeout) * time.Millisecond
+		sendBatch := func(batch []*txmetaBatchItem) {
+			v.sendTxMetaBatch(batch)
+		}
+		b := batcher.New(txmetaBatchSize, duration, sendBatch, true)
+		v.txmetaBatcher = b
+		logger.Infof("TxMeta batching enabled: batchSize=%d, timeout=%dms", txmetaBatchSize, txmetaBatchTimeout)
 	}
 
 	return v, nil
@@ -812,23 +842,100 @@ func (v *Validator) sendTxMetaToKafka(data *meta.Data, txHash *chainhash.Hash) e
 		v.logger.Warnf("stored tx meta maybe too big for txmeta cache, size: %d, parent hash count: %d", len(metaBytes), len(data.TxInpoints.ParentTxHashes))
 	}
 
-	value, err := proto.Marshal(&kafkamessage.KafkaTxMetaTopicMessage{
-		TxHash:  txHash.String(),
-		Action:  kafkamessage.KafkaTxMetaActionType_ADD,
-		Content: metaBytes,
-	})
-	if err != nil {
-		return err
-	}
+	// Use batcher if available, otherwise send directly
+	if v.txmetaBatcher != nil {
+		v.txmetaBatcher.Put(&txmetaBatchItem{
+			hash:      txHash,
+			metaBytes: metaBytes,
+			isDelete:  false,
+		})
+	} else {
+		// Fallback: send single item as batch format for consistency
+		value := serializeTxMetaBatch([]*txmetaBatchItem{{
+			hash:      txHash,
+			metaBytes: metaBytes,
+			isDelete:  false,
+		}})
 
-	v.txmetaKafkaProducerClient.Publish(&kafka.Message{
-		Key:   []byte(txHash.String()),
-		Value: value,
-	})
+		v.txmetaKafkaProducerClient.Publish(&kafka.Message{
+			Key:   nil,
+			Value: value,
+		})
+	}
 
 	prometheusValidatorSendToBlockValidationKafka.Observe(float64(time.Since(startKafka).Microseconds()) / 1_000_000)
 
 	return nil
+}
+
+// sendTxMetaBatch serializes and publishes a batch of TxMeta items to Kafka.
+func (v *Validator) sendTxMetaBatch(batch []*txmetaBatchItem) {
+	if len(batch) == 0 {
+		return
+	}
+
+	value := serializeTxMetaBatch(batch)
+
+	v.txmetaKafkaProducerClient.Publish(&kafka.Message{
+		Key:   nil,
+		Value: value,
+	})
+}
+
+// serializeTxMetaBatch serializes a batch of TxMeta items to raw bytes.
+// Format:
+// [4 bytes]  - entry count (uint32, little-endian)
+// For each entry:
+//
+//	[32 bytes] - tx hash (raw bytes)
+//	[1 byte]   - action (0=ADD, 1=DELETE)
+//	[4 bytes]  - content length (uint32, little-endian) - 0 for DELETE
+//	[N bytes]  - content (metaBytes) - only for ADD
+func serializeTxMetaBatch(batch []*txmetaBatchItem) []byte {
+	// Calculate total size
+	size := 4 // entry count
+	for _, item := range batch {
+		size += 32 + 1 + 4 // hash + action + length
+		if !item.isDelete {
+			size += len(item.metaBytes)
+		}
+	}
+
+	buf := make([]byte, size)
+	offset := 0
+
+	// Write entry count
+	binary.LittleEndian.PutUint32(buf[offset:], uint32(len(batch)))
+	offset += 4
+
+	// Write each entry
+	for _, item := range batch {
+		// Write hash (32 bytes)
+		copy(buf[offset:], item.hash[:])
+		offset += 32
+
+		// Write action (1 byte)
+		if item.isDelete {
+			buf[offset] = txmetaActionDELETE
+		} else {
+			buf[offset] = txmetaActionADD
+		}
+		offset++
+
+		// Write content length (4 bytes)
+		if item.isDelete {
+			binary.LittleEndian.PutUint32(buf[offset:], 0)
+			offset += 4
+		} else {
+			binary.LittleEndian.PutUint32(buf[offset:], uint32(len(item.metaBytes)))
+			offset += 4
+			// Write content
+			copy(buf[offset:], item.metaBytes)
+			offset += len(item.metaBytes)
+		}
+	}
+
+	return buf
 }
 
 // spendUtxos attempts to spend the UTXOs referenced by transaction inputs.

@@ -365,6 +365,8 @@ type ValidatorSettings struct {
 	HTTPRateLimit             int
 	KafkaMaxMessageBytes      int // Maximum Kafka message size in bytes for transaction validation
 	UseLocalValidator         bool
+	TxMetaBatchSize           int // Batch size for TxMeta Kafka messages (0 = disabled)
+	TxMetaBatchTimeoutMs      int // Batch timeout in milliseconds for TxMeta Kafka messages
 }
 
 type RegionSettings struct {
