@@ -767,72 +767,9 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 	stat.NewStat("6. addAllTxHashFeeSizesToSubtree").AddTime(start)
 
-	// does the merkle tree give the correct root?
-	merkleRoot := subtree.RootHash()
-	if !merkleRoot.IsEqual(&v.SubtreeHash) {
-		return nil, errors.NewSubtreeInvalidError("subtree root hash does not match", err)
+	if err = u.storeSubtreeFiles(ctx, stat, &v.SubtreeHash, subtree, subtreeMeta); err != nil {
+		return nil, err
 	}
-
-	//
-	// store subtree meta in store
-	//
-	u.logger.Debugf("[ValidateSubtreeInternal][%s] serialize subtree meta", v.SubtreeHash.String())
-
-	completeSubtreeMetaBytes, err := subtreeMeta.Serialize()
-	if err != nil {
-		return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to serialize subtree meta", v.SubtreeHash.String(), err)
-	}
-
-	start = gocore.CurrentTime()
-
-	u.logger.Debugf("[ValidateSubtreeInternal][%s] store subtree meta", v.SubtreeHash.String())
-
-	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
-
-	err = u.subtreeStore.Set(ctx, merkleRoot[:], fileformat.FileTypeSubtreeMeta, completeSubtreeMetaBytes, options.WithDeleteAt(dah))
-
-	stat.NewStat("7. storeSubtreeMeta").AddTime(start)
-
-	if err != nil {
-		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			u.logger.Warnf("[ValidateSubtreeInternal][%s] subtree meta already exists in store", v.SubtreeHash.String())
-		} else {
-			return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to store subtree meta", v.SubtreeHash.String(), err)
-		}
-	}
-
-	//
-	// store subtree in store
-	//
-	u.logger.Debugf("[ValidateSubtreeInternal][%s] serialize subtree", v.SubtreeHash.String())
-
-	completeSubtreeBytes, err := subtree.Serialize()
-	if err != nil {
-		return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to serialize subtree", v.SubtreeHash.String(), err)
-	}
-
-	start = gocore.CurrentTime()
-
-	u.logger.Debugf("[ValidateSubtreeInternal][%s] store subtree", v.SubtreeHash.String())
-
-	err = u.subtreeStore.Set(ctx,
-		merkleRoot[:],
-		fileformat.FileTypeSubtree,
-		completeSubtreeBytes,
-		options.WithDeleteAt(dah),
-	)
-
-	stat.NewStat("8. storeSubtree").AddTime(start)
-
-	if err != nil {
-		if errors.Is(err, errors.ErrBlobAlreadyExists) {
-			u.logger.Warnf("[ValidateSubtreeInternal][%s] subtree already exists in store", v.SubtreeHash.String())
-		} else {
-			return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to store subtree", v.SubtreeHash.String(), err)
-		}
-	}
-
-	_ = u.SetSubtreeExists(&v.SubtreeHash)
 
 	// only set this on no errors
 	prometheusSubtreeValidationValidateSubtreeDuration.Observe(float64(time.Since(startTotal).Microseconds()) / 1_000_000)
@@ -845,6 +782,90 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	}
 
 	return subtree, nil
+}
+
+func (u *Server) storeSubtreeFiles(ctx context.Context, stat *gocore.Stat, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, subtreeMeta *subtreepkg.Meta) error {
+	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "storeSubtreeFiles",
+		tracing.WithParentStat(stat),
+		tracing.WithDebugLogMessage(u.logger, "[storeSubtreeFiles][%s] called", subtreeHash.String()),
+	)
+	defer deferFn()
+
+	// does the merkle tree give the correct root?
+	merkleRoot := subtree.RootHash()
+	if !merkleRoot.IsEqual(subtreeHash) {
+		return errors.NewSubtreeInvalidError("subtree root hash does not match")
+	}
+
+	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		//
+		// store subtree meta in store
+		//
+		u.logger.Debugf("[ValidateSubtreeInternal][%s] serialize subtree meta", subtreeHash.String())
+
+		completeSubtreeMetaBytes, err := subtreeMeta.Serialize()
+		if err != nil {
+			return errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to serialize subtree meta", subtreeHash.String(), err)
+		}
+
+		u.logger.Debugf("[ValidateSubtreeInternal][%s] store subtree meta", subtreeHash.String())
+
+		if err = u.subtreeStore.Set(gCtx,
+			merkleRoot[:],
+			fileformat.FileTypeSubtreeMeta,
+			completeSubtreeMetaBytes,
+			options.WithDeleteAt(dah),
+		); err != nil {
+			if errors.Is(err, errors.ErrBlobAlreadyExists) {
+				u.logger.Warnf("[ValidateSubtreeInternal][%s] subtree meta already exists in store", subtreeHash.String())
+			} else {
+				return errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to store subtree meta", subtreeHash.String(), err)
+			}
+		}
+
+		return nil
+	})
+
+	g.Go(func() error {
+		//
+		// store subtree in store
+		//
+		u.logger.Debugf("[ValidateSubtreeInternal][%s] serialize subtree", subtreeHash.String())
+
+		completeSubtreeBytes, err := subtree.Serialize()
+		if err != nil {
+			return errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to serialize subtree", subtreeHash.String(), err)
+		}
+
+		u.logger.Debugf("[ValidateSubtreeInternal][%s] store subtree", subtreeHash.String())
+
+		if err = u.subtreeStore.Set(gCtx,
+			merkleRoot[:],
+			fileformat.FileTypeSubtree,
+			completeSubtreeBytes,
+			options.WithDeleteAt(dah),
+		); err != nil {
+			if errors.Is(err, errors.ErrBlobAlreadyExists) {
+				u.logger.Warnf("[ValidateSubtreeInternal][%s] subtree already exists in store", subtreeHash.String())
+			} else {
+				return errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to store subtree", subtreeHash.String(), err)
+			}
+		}
+
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	_ = u.SetSubtreeExists(subtreeHash)
+
+	return nil
 }
 
 // getSubtreeTxHashes retrieves transaction hashes for a subtree from a remote source.
