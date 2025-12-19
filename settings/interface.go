@@ -495,6 +495,7 @@ type PrunerSettings struct {
 	UTXOChunkSize              int           // Number of records to process in each chunk before batch flushing (default: 1000)
 	UTXOChunkGroupLimit        int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
 	UTXOProgressLogInterval    time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
+	UTXOPartitionQueries       int           // Number of parallel Aerospike partition queries for UTXO pruning (0 = auto-detect based on CPU cores and query-threads-limit)
 }
 
 type SubtreeValidationSettings struct {

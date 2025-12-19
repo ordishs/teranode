@@ -447,6 +447,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UTXOChunkSize:              getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                          // Chunk size for batch operations
 			UTXOChunkGroupLimit:        getInt("pruner_utxoChunkGroupLimit", 10, alternativeContext...),                      // Process 10 chunks in parallel
 			UTXOProgressLogInterval:    getDuration("pruner_utxoProgressLogInterval", 30*time.Second, alternativeContext...), // Progress every 30s
+			UTXOPartitionQueries:       getInt("pruner_utxoPartitionQueries", 0, alternativeContext...),                      // 0 = auto-detect based on CPU cores
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
