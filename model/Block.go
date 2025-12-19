@@ -871,8 +871,8 @@ func ErrCheckParentExistsOnChain(gCtx context.Context, currentBlockHeaderIDsMap 
 	headerErr := errors.NewBlockError("currentBlockHeaderIDs: %v", currentBlockHeaderIDsMap)
 	headerErr = errors.NewBlockError("parent TxMeta: %v", parentTxMeta, headerErr)
 
-	txMeta, err := txMetaStore.GetMeta(gCtx, &parentTxStruct.txHash)
-	if err != nil {
+	txMeta := &meta.Data{}
+	if err := txMetaStore.GetMeta(gCtx, &parentTxStruct.txHash, txMeta); err != nil {
 		headerErr = errors.NewProcessingError("txMetaStore error getting transaction %s: %v", parentTxStruct.txHash.String(), err, headerErr)
 	} else {
 		headerErr = errors.NewProcessingError("tx TxMeta: %v", txMeta, headerErr)

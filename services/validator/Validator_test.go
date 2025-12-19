@@ -987,9 +987,10 @@ func TestValidator_TwoPhaseCommitTransaction(t *testing.T) {
 	_, err = utxoStore.Create(ctx, tx, 100, utxostore.WithLocked(true))
 	require.NoError(t, err)
 
-	meta, err := utxoStore.GetMeta(ctx, tx.TxIDChainHash())
+	metaData := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), metaData)
 	require.NoError(t, err)
-	require.True(t, meta.Locked)
+	require.True(t, metaData.Locked)
 
 	v := &Validator{
 		logger:      ulogger.TestLogger{},
@@ -1005,9 +1006,10 @@ func TestValidator_TwoPhaseCommitTransaction(t *testing.T) {
 	err = v.twoPhaseCommitTransaction(ctx, tx, tx.TxID())
 	require.NoError(t, err)
 
-	meta, err = utxoStore.GetMeta(ctx, tx.TxIDChainHash())
+	metaData = &meta.Data{}
+	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), metaData)
 	require.NoError(t, err)
-	assert.False(t, meta.Locked)
+	assert.False(t, metaData.Locked)
 }
 
 func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
@@ -1032,9 +1034,10 @@ func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
 	_, err = utxoStore.Create(ctx, tx, 100, utxostore.WithLocked(false))
 	require.NoError(t, err)
 
-	meta, err := utxoStore.GetMeta(ctx, tx.TxIDChainHash())
+	metaData := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), metaData)
 	require.NoError(t, err)
-	assert.False(t, meta.Locked, "TX should be spendable before 2-phase commit")
+	assert.False(t, metaData.Locked, "TX should be spendable before 2-phase commit")
 
 	v := &Validator{
 		logger:      ulogger.TestLogger{},
@@ -1050,9 +1053,10 @@ func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
 	err = v.twoPhaseCommitTransaction(ctx, tx, tx.TxID())
 	assert.NoError(t, err)
 
-	meta, err = utxoStore.GetMeta(ctx, tx.TxIDChainHash())
+	metaData = &meta.Data{}
+	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), metaData)
 	require.NoError(t, err)
-	assert.False(t, meta.Locked, "TX should remain spendable after 2-phase commit")
+	assert.False(t, metaData.Locked, "TX should remain spendable after 2-phase commit")
 }
 
 // FailingUtxoStore provides a test double that simulates UTXO store failures.
@@ -1110,9 +1114,10 @@ func TestValidator_TwoPhaseCommitTransaction_SetLockedFails(t *testing.T) {
 	err = v.twoPhaseCommitTransaction(ctx, tx, tx.TxID())
 	assert.Error(t, err)
 
-	meta, err := utxoStore.GetMeta(ctx, tx.TxIDChainHash())
+	metaData := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), metaData)
 	require.NoError(t, err)
-	require.True(t, meta.Locked)
+	require.True(t, metaData.Locked)
 }
 
 func TestValidator_LockedFlagChangedIfBlockAssemblyStoreSucceeds(t *testing.T) {
@@ -1164,9 +1169,10 @@ func TestValidator_LockedFlagChangedIfBlockAssemblyStoreSucceeds(t *testing.T) {
 	_, err = v.ValidateWithOptions(ctx, txs[1], 2, opts)
 	require.NoError(t, err)
 
-	meta, err := utxoStore.GetMeta(ctx, txs[1].TxIDChainHash())
+	metaData := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, txs[1].TxIDChainHash(), metaData)
 	require.NoError(t, err)
-	assert.False(t, meta.Locked, "Flag should be unset after successful block assembly")
+	assert.False(t, metaData.Locked, "Flag should be unset after successful block assembly")
 }
 
 func TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx(t *testing.T) {
@@ -1222,7 +1228,8 @@ func TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx(t *testing.T
 	_, err = v.ValidateWithOptions(ctx, txs[1], 2, opts)
 	require.NoError(t, err)
 
-	meta, err := utxoStore.GetMeta(ctx, txs[1].TxIDChainHash())
+	metaData := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, txs[1].TxIDChainHash(), metaData)
 	require.NoError(t, err)
-	assert.True(t, meta.Locked, "Flag should be set if block assembly did not store tx")
+	assert.True(t, metaData.Locked, "Flag should be set if block assembly did not store tx")
 }

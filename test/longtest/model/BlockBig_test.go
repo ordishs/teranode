@@ -418,7 +418,8 @@ func TestBigBlock_Valid(t *testing.T) {
 	reqTxId, err := chainhash.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
 	require.NoError(t, err)
 
-	data, err := teranode_model.TestCachedTxMetaStore.GetMeta(context.Background(), reqTxId)
+	data := &meta.Data{}
+	err = teranode_model.TestCachedTxMetaStore.GetMeta(context.Background(), reqTxId, data)
 	require.NoError(t, err)
 	require.Equal(t, &meta.Data{
 		Fee:         1,

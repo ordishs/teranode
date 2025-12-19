@@ -2,10 +2,8 @@ package txmetacache
 
 import (
 	"context"
-	"fmt"
 	"net/url"
 	"testing"
-	"unsafe"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -45,7 +43,8 @@ func Test_txMetaCache_GetMeta(t *testing.T) {
 		ctx := context.Background()
 
 		c, _ := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
-		_, err := c.GetMeta(ctx, &chainhash.Hash{})
+		metaGet := &meta.Data{}
+		err := c.GetMeta(ctx, &chainhash.Hash{}, metaGet)
 		require.Error(t, err)
 	})
 
@@ -55,15 +54,16 @@ func Test_txMetaCache_GetMeta(t *testing.T) {
 		c, err := NewTxMetaCache(ctx, settings.NewSettings(), ulogger.TestLogger{}, utxoStore, Unallocated)
 		require.NoError(t, err)
 
-		meta, err := c.Create(ctx, coinbaseTx, 100)
+		metaCreated, err := c.Create(ctx, coinbaseTx, 100)
 		require.NoError(t, err)
 
 		hash, _ := chainhash.NewHashFromStr("a6fa2d4d23292bef7e13ffbb8c03168c97c457e1681642bf49b3e2ba7d26bb89")
-		metaGet, err := c.GetMeta(ctx, hash)
+		metaGet := &meta.Data{}
+		err = c.GetMeta(ctx, hash, metaGet)
 		require.NoError(t, err)
 
-		meta.Tx = nil // Tx should not be set in the cache, so we set it to nil for comparison
-		require.Equal(t, meta, metaGet)
+		metaCreated.Tx = nil // Tx should not be set in the cache, so we set it to nil for comparison
+		require.Equal(t, metaCreated, metaGet)
 	})
 
 	t.Run("test set cache", func(t *testing.T) {
@@ -83,7 +83,8 @@ func Test_txMetaCache_GetMeta(t *testing.T) {
 		err := c.(*TxMetaCache).SetCache(hash, metaData)
 		require.NoError(t, err)
 
-		metaGet, err := c.GetMeta(ctx, hash)
+		metaGet := &meta.Data{}
+		err = c.GetMeta(ctx, hash, metaGet)
 		require.NoError(t, err)
 
 		metaData.Tx = nil // Tx should not be set in the cache, so we set it to nil for comparison
@@ -101,7 +102,8 @@ func Test_txMetaCache_GetMeta(t *testing.T) {
 		err = c.(*TxMetaCache).SetCache(tests.Tx.TxIDChainHash(), metaData)
 		require.NoError(t, err)
 
-		metaGet, err := c.GetMeta(ctx, tests.Tx.TxIDChainHash())
+		metaGet := &meta.Data{}
+		err = c.GetMeta(ctx, tests.Tx.TxIDChainHash(), metaGet)
 		require.NoError(t, err)
 
 		metaData.Tx = nil // Tx should not be set in the cache, so we set it to nil for comparison
@@ -167,7 +169,7 @@ func Benchmark_txMetaCache_Get(b *testing.B) {
 	c, _ := NewTxMetaCache(ctx, settings.NewSettings(), logger, utxoStore, Unallocated)
 	cache := c.(*TxMetaCache)
 
-	meta := &meta.Data{
+	metaData := &meta.Data{
 		Fee:         100,
 		SizeInBytes: 111,
 		TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{}},
@@ -182,7 +184,7 @@ func Benchmark_txMetaCache_Get(b *testing.B) {
 		hash := chainhash.HashH([]byte(string(rune(i))))
 		hashes[i] = hash
 
-		if err := cache.SetCache(&hash, meta); err != nil {
+		if err := cache.SetCache(&hash, metaData); err != nil {
 			b.Fatalf("pre-population of cache failed: %v", err)
 		}
 	}
@@ -196,14 +198,13 @@ func Benchmark_txMetaCache_Get(b *testing.B) {
 		i := i
 
 		g.Go(func() error {
-			data, err := cache.GetMeta(context.Background(), &hash)
+			data := &meta.Data{}
+			err := cache.GetMeta(context.Background(), &hash, data)
 			_ = data
 
 			if err != nil {
 				b.Fatalf("cache miss, iteration %d: %v", i, err)
 			}
-
-			fmt.Println("data size: ", unsafe.Sizeof(data))
 
 			return nil
 		})
@@ -397,6 +398,15 @@ func Test_txMetaCache_GetFunctions(t *testing.T) {
 		// Test Get with specific fields should never return anything from the cache
 		_, err = cache.Get(ctx, hash, fields.Fee, fields.SizeInBytes)
 		require.Error(t, err)
+
+		var found bool
+
+		metaDataGet := &meta.Data{}
+		found, err = cache.GetMetaCached(ctx, *hash, metaDataGet)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, uint64(100), metaDataGet.Fee)
+		require.Equal(t, uint64(111), metaDataGet.SizeInBytes)
 	})
 
 	t.Run("test Get with non-existent hash", func(t *testing.T) {
@@ -420,10 +430,13 @@ func Test_txMetaCache_GetFunctions(t *testing.T) {
 		require.Error(t, err)
 		require.Nil(t, metaGet)
 
+		var found bool
+
 		// Test GetMetaCached with non-existent hash
-		metaGet, err = cache.GetMetaCached(ctx, *hash)
+		found, err = cache.GetMetaCached(ctx, *hash, metaGet)
 		require.Error(t, err)
 		require.Nil(t, metaGet)
+		require.False(t, found)
 	})
 }
 
@@ -487,12 +500,14 @@ func Test_txMetaCache_MultiOperations(t *testing.T) {
 		require.NoError(t, err)
 
 		// Verify data can be retrieved
-		metaGet1, err := cache.GetMeta(ctx, hash1)
+		metaGet1 := &meta.Data{}
+		err = cache.GetMeta(ctx, hash1, metaGet1)
 		require.NoError(t, err)
 		require.NotNil(t, metaGet1)
 		require.Equal(t, metaData1.Fee, metaGet1.Fee)
 
-		metaGet2, err := cache.GetMeta(ctx, hash2)
+		metaGet2 := &meta.Data{}
+		err = cache.GetMeta(ctx, hash2, metaGet2)
 		require.NoError(t, err)
 		require.NotNil(t, metaGet2)
 		require.Equal(t, metaData2.Fee, metaGet2.Fee)
