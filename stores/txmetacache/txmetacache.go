@@ -306,13 +306,6 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 		return nil, nil
 	}
 
-	if !t.returnValue(cachedBytes) {
-		t.logger.Debugf("txMetaCache has the value %s, but it is too old with height: %d, returning nil", hash.String(), readHeightFromValue(cachedBytes))
-		t.metrics.hitOldTx.Add(1)
-
-		return nil, nil
-	}
-
 	t.metrics.hits.Add(1)
 
 	txmetaData := meta.Data{}
@@ -345,13 +338,6 @@ func (t *TxMetaCache) GetMeta(ctx context.Context, hash *chainhash.Hash) (*meta.
 	}
 
 	if len(cachedBytes) > 0 {
-		if !t.returnValue(cachedBytes) {
-			t.logger.Debugf("txMetaCache has the value %s, but it is too old with height: %d, returning nil", hash.String(), readHeightFromValue(cachedBytes))
-			t.metrics.hitOldTx.Add(1)
-
-			return nil, nil
-		}
-
 		t.metrics.hits.Add(1)
 
 		txmetaData := meta.Data{}
@@ -424,8 +410,6 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 	keys := make([][]byte, 0, len(hashes))
 	values := make([][]byte, 0, len(hashes))
 
-	currentBlockHeight := t.utxoStore.GetBlockHeight()
-
 	for _, data := range hashes {
 		if data == nil || data.Data == nil {
 			continue
@@ -445,12 +429,6 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 			}
 			continue
 		}
-
-		// append height value to values here to get rid of extra call.
-		// it is safe to modify txMetaBytes itself because data.Data.MetaBytes() creates a brand new slice.
-		startingLenOfTxMetaBytes := len(txMetaBytes)
-		txMetaBytes = append(txMetaBytes, 0, 0, 0, 0) // grow the size by 4
-		binary.BigEndian.PutUint32(txMetaBytes[startingLenOfTxMetaBytes:], currentBlockHeight)
 
 		keys = append(keys, data.Hash.CloneBytes())
 		values = append(values, txMetaBytes)
@@ -710,57 +688,6 @@ func (t *TxMetaCache) appendHeightToValue(txMetaBytes []byte) []byte {
 	binary.BigEndian.PutUint32(valueWithHeight[len(txMetaBytes):], height)
 
 	return valueWithHeight
-}
-
-// readHeightFromValue reads the encoded block height from the end of a cached value.
-// This is used to determine if a cached entry is still valid based on the current blockchain height.
-//
-// Parameters:
-// - value: The cached value with height information appended
-//
-// Returns:
-// - The block height (uint32) that was extracted from the last 4 bytes of the value
-//
-// This function is the counterpart to appendHeightToValue and extracts the little-endian uint32
-// that was previously appended.
-func readHeightFromValue(value []byte) uint32 {
-	return binary.BigEndian.Uint32(value[len(value)-4:])
-}
-
-// returnValue determines if a cached value should be returned based on its age in blocks.
-// This implements the expiration logic for cached transaction metadata to ensure fresh data.
-//
-// Parameters:
-// - valueBytes: The cached value containing metadata and the block height
-//
-// Returns:
-// - true if the value is fresh enough to use, false if it's too old and should be ignored
-//
-// The determination is based on the configured noOfBlocksToKeepInTxMetaCache setting,
-// which indicates how many blocks worth of transaction metadata should be kept in the cache.
-// If the metadata is older than this threshold, it is considered stale and not returned.
-func (t *TxMetaCache) returnValue(valueBytes []byte) bool {
-	// get the current block height from the utxo store
-	utxoBlockHeight := t.utxoStore.GetBlockHeight()
-
-	// if the block height is less than the noOfBlocksToKeepInTxMetaCache, we should return the value
-	if utxoBlockHeight <= t.noOfBlocksToKeepInTxMetaCache {
-		return true
-	}
-
-	// calculate the block height to keep in cache
-	blockHeightToKeepInCacheThreshold := utxoBlockHeight - t.noOfBlocksToKeepInTxMetaCache
-
-	// check the height of the tx
-	valueHeight := readHeightFromValue(valueBytes)
-
-	// if the tx is too old we are not returning it
-	if valueHeight < blockHeightToKeepInCacheThreshold {
-		return false
-	}
-
-	// if the tx is not too old, we return the value
-	return true
 }
 
 // GetCacheStats retrieves current operational statistics from the underlying cache.
