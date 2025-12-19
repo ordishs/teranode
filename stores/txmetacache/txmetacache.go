@@ -740,13 +740,16 @@ func readHeightFromValue(value []byte) uint32 {
 // which indicates how many blocks worth of transaction metadata should be kept in the cache.
 // If the metadata is older than this threshold, it is considered stale and not returned.
 func (t *TxMetaCache) returnValue(valueBytes []byte) bool {
+	// get the current block height from the utxo store
+	utxoBlockHeight := t.utxoStore.GetBlockHeight()
+
 	// if the block height is less than the noOfBlocksToKeepInTxMetaCache, we should return the value
-	if t.utxoStore.GetBlockHeight() <= t.noOfBlocksToKeepInTxMetaCache {
+	if utxoBlockHeight <= t.noOfBlocksToKeepInTxMetaCache {
 		return true
 	}
 
 	// calculate the block height to keep in cache
-	blockHeightToKeepInCacheThreshold := t.utxoStore.GetBlockHeight() - t.noOfBlocksToKeepInTxMetaCache
+	blockHeightToKeepInCacheThreshold := utxoBlockHeight - t.noOfBlocksToKeepInTxMetaCache
 
 	// check the height of the tx
 	valueHeight := readHeightFromValue(valueBytes)
