@@ -308,10 +308,13 @@ func (s *Service) partitionWorker(
 	ctx context.Context,
 	blockHeight uint32,
 	safeCleanupHeight uint32,
-	policy *aerospike.QueryPolicy,
 	partitionStart int,
 	partitionCount int,
 ) (processed int64, skipped int64, err error) {
+
+	// Each worker creates its own policy for complete independence (no shared state)
+	policy := *s.queryPolicy
+	policy.RecordQueueSize = s.chunkSize * s.chunkGroupLimit
 
 	// Create statement with delete_at_height filter
 	stmt := aerospike.NewStatement(s.namespace, s.set)
@@ -333,7 +336,7 @@ func (s *Service) partitionWorker(
 	partitionFilter := aerospike.NewPartitionFilterByRange(partitionStart, partitionCount)
 
 	// Query this partition range
-	recordset, err := s.client.QueryPartitions(policy, stmt, partitionFilter)
+	recordset, err := s.client.QueryPartitions(&policy, stmt, partitionFilter)
 	if err != nil {
 		s.logger.Errorf("[partitionWorker] Aerospike partition query failed (partitions %d-%d): %v",
 			partitionStart, partitionStart+partitionCount-1, err)
@@ -439,15 +442,6 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 	partitionsPerQuery := totalPartitions / numPartitionQueries
 	remainingPartitions := totalPartitions % numPartitionQueries
 
-	// Setup query policy with production-tuned settings
-	// Clone the existing query policy and adjust RecordQueueSize for parallel queries
-	policy := *s.queryPolicy // Copy the existing policy
-
-	// RecordQueueSize is number of records (not bytes!) to buffer per worker
-	// Optimal: 2-5x chunk size for good pipelining without excessive memory
-	// 5000 records/worker × 16 workers = 80K records buffered = ~80MB total (at 1KB/record)
-	policy.RecordQueueSize = 5000
-
 	s.logger.Infof("Starting parallel pruning with %d partition workers for height %d (safe cleanup height: %d)",
 		numPartitionQueries, blockHeight, safeCleanupHeight)
 
@@ -466,7 +460,7 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 		go func(start, count int) {
 			defer wg.Done() // Call Done() AFTER sending to channel
 			processed, skipped, err := s.partitionWorker(ctx, blockHeight, safeCleanupHeight,
-				&policy, start, count)
+				start, count)
 			results <- workerResult{processed, skipped, err}
 		}(partitionStart, partitionCount)
 
