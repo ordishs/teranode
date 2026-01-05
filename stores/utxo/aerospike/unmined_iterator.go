@@ -217,7 +217,8 @@ func (it *unminedTxIterator) partitionWorker(ctx context.Context, policy *as.Que
 	}
 
 	if it.store.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
-		stmt.BinNames = append(stmt.BinNames, fields.TxInpoints.String())
+		stmt.BinNames = append(stmt.BinNames, fields.External.String())
+		stmt.BinNames = append(stmt.BinNames, fields.Inputs.String())
 	}
 
 	// Create partition filter for this range
@@ -303,6 +304,12 @@ func (it *unminedTxIterator) processRecordset(ctx context.Context, results <-cha
 
 		itemsProcessed++
 
+		// check whether this is a main record (split records are loaded when full is set)
+		// createAt is not set for split records
+		if rec.Record.Bins[fields.CreatedAt.String()] == nil {
+			continue
+		}
+
 		// Quick inline filtering checks
 		if conflictingVal := rec.Record.Bins[conflictingField]; conflictingVal != nil {
 			if conflicting, ok := conflictingVal.(bool); ok && conflicting {
@@ -379,10 +386,10 @@ func (it *unminedTxIterator) processRecord(ctx context.Context, bins map[string]
 		txInpoints = subtree.TxInpoints{}
 	}
 
-	// Extract created_at timestamp
+	// Extract createdAt timestamp
 	createdAt, err := it.extractCreatedAt(bins)
 	if err != nil {
-		return nil, errors.NewProcessingError("invalid created_at for %s", txData.hash.String(), err)
+		return nil, errors.NewProcessingError("invalid createdAt for %s", txData.hash.String(), err)
 	}
 
 	locked, err := it.extractLocked(bins)
@@ -542,12 +549,12 @@ func (it *unminedTxIterator) processInternalTransactionInpoints(bins map[string]
 func (it *unminedTxIterator) extractCreatedAt(bins map[string]interface{}) (int, error) {
 	createdAtVal, ok := bins[fields.CreatedAt.String()]
 	if !ok || createdAtVal == nil {
-		return 0, errors.NewProcessingError("created_at not found")
+		return 0, errors.NewProcessingError("%s not found", fields.CreatedAt.String())
 	}
 
 	createdAt, ok := createdAtVal.(int)
 	if !ok {
-		return 0, errors.NewProcessingError("created_at not int64")
+		return 0, errors.NewProcessingError("%s not int64", fields.CreatedAt.String())
 	}
 
 	return createdAt, nil
