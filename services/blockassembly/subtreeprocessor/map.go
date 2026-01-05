@@ -2,7 +2,6 @@ package subtreeprocessor
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -14,7 +13,6 @@ type SplitSwissMap struct {
 	m           map[uint16]*swiss.Map[chainhash.Hash, struct{}]
 	mu          map[uint16]*sync.RWMutex
 	nrOfBuckets uint16
-	length      atomic.Int64
 }
 
 // NewSplitSwissMap creates a new SplitSwissMap with the specified number of buckets and total length.
@@ -48,7 +46,15 @@ func (s *SplitSwissMap) Exists(hash chainhash.Hash) bool {
 }
 
 func (s *SplitSwissMap) Length() int {
-	return int(s.length.Load())
+	var length int
+
+	for bucket := uint16(0); bucket < s.nrOfBuckets; bucket++ {
+		s.mu[bucket].Lock()
+		length += s.m[bucket].Count()
+		s.mu[bucket].Unlock()
+	}
+
+	return length
 }
 
 func (s *SplitSwissMap) Buckets() uint16 {
@@ -62,7 +68,6 @@ func (s *SplitSwissMap) Put(hash chainhash.Hash) error {
 	defer s.mu[bucket].Unlock()
 
 	s.m[bucket].Put(hash, struct{}{})
-	s.length.Add(1)
 
 	return nil
 }
@@ -73,7 +78,6 @@ func (s *SplitSwissMap) PutMultiBucket(bucket uint16, hashes []chainhash.Hash) e
 
 	for _, hash := range hashes {
 		s.m[bucket].Put(hash, struct{}{})
-		s.length.Add(1)
 	}
 
 	return nil
