@@ -239,17 +239,17 @@ type MockUnminedTxIterator struct {
 	mock.Mock
 }
 
-func (m MockUnminedTxIterator) Next(ctx context.Context) ([]*UnminedTransaction, error) {
+func (m *MockUnminedTxIterator) Next(ctx context.Context) ([]*UnminedTransaction, error) {
 	args := m.Called(ctx)
 	return args.Get(0).([]*UnminedTransaction), args.Error(1)
 }
 
-func (m MockUnminedTxIterator) Err() error {
+func (m *MockUnminedTxIterator) Err() error {
 	args := m.Called()
 	return args.Error(0)
 }
 
-func (m MockUnminedTxIterator) Close() error {
+func (m *MockUnminedTxIterator) Close() error {
 	args := m.Called()
 	return args.Error(0)
 }

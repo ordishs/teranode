@@ -34,7 +34,7 @@ func TestPreserveParentsOfOldUnminedTransactions_Coverage(t *testing.T) {
 
 	t.Run("handles query error", func(t *testing.T) {
 		mockStore := new(MockUtxostore)
-		mockStore.On("GetUnminedTxIterator", mock.Anything).Return(MockUnminedTxIterator{}, errors.NewStorageError("failed to query old unmined transactions")) // To satisfy deferred close
+		mockStore.On("GetUnminedTxIterator", mock.Anything).Return(&MockUnminedTxIterator{}, errors.NewStorageError("failed to query old unmined transactions")) // To satisfy deferred close
 
 		count, err := PreserveParentsOfOldUnminedTransactions(ctx, mockStore, 10, tSettings, logger)
 		assert.Error(t, err)
