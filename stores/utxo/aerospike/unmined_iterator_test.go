@@ -82,7 +82,7 @@ func Test_extractCreatedAt(t *testing.T) {
 		bins := map[string]interface{}{}
 		_, err := it.extractCreatedAt(bins)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "created_at not found")
+		assert.Contains(t, err.Error(), "createdAt not found")
 	})
 
 	t.Run("NilCreatedAt", func(t *testing.T) {
@@ -91,7 +91,7 @@ func Test_extractCreatedAt(t *testing.T) {
 		}
 		_, err := it.extractCreatedAt(bins)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "created_at not found")
+		assert.Contains(t, err.Error(), "createdAt not found")
 	})
 
 	t.Run("InvalidCreatedAtType", func(t *testing.T) {
@@ -100,7 +100,7 @@ func Test_extractCreatedAt(t *testing.T) {
 		}
 		_, err := it.extractCreatedAt(bins)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "created_at not int64")
+		assert.Contains(t, err.Error(), "createdAt not int64")
 	})
 }
 

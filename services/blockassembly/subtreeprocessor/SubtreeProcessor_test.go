@@ -3213,6 +3213,9 @@ func TestRemoveCoinbaseUtxosChildrenRemoval(t *testing.T) {
 		stp.AddBatch([]subtreepkg.Node{{Hash: childHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{childHash}}})
 		stp.AddBatch([]subtreepkg.Node{{Hash: grandchildHash, Fee: 1}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{grandchildHash}}})
 
+		// wait until batches are processed
+		waitForSubtreeProcessorQueueToEmpty(t, stp)
+
 		// Verify child transactions are in subtree before removal
 		childrenBefore, err := utxo.GetAndLockChildren(ctx, utxoStore, *coinbase.TxIDChainHash())
 		require.NoError(t, err)

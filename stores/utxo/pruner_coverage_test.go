@@ -34,8 +34,7 @@ func TestPreserveParentsOfOldUnminedTransactions_Coverage(t *testing.T) {
 
 	t.Run("handles query error", func(t *testing.T) {
 		mockStore := new(MockUtxostore)
-		mockStore.On("QueryOldUnminedTransactions", mock.Anything, uint32(5)).
-			Return([]chainhash.Hash(nil), errors.NewStorageError("query failed"))
+		mockStore.On("GetUnminedTxIterator", mock.Anything).Return(MockUnminedTxIterator{}, errors.NewStorageError("failed to query old unmined transactions")) // To satisfy deferred close
 
 		count, err := PreserveParentsOfOldUnminedTransactions(ctx, mockStore, 10, tSettings, logger)
 		assert.Error(t, err)
@@ -53,11 +52,22 @@ func TestPreserveParentsOfOldUnminedTransactions_Coverage(t *testing.T) {
 		// Create TxInpoints from the transaction
 		txInpoints, _ := subtree.NewTxInpointsFromTx(tx)
 
-		mockStore.On("QueryOldUnminedTransactions", mock.Anything, uint32(5)).
-			Return([]chainhash.Hash{hash1}, nil)
+		mockIterator := &MockUnminedTxIterator{}
+		mockIterator.On("Next", ctx, mock.Anything).Return([]*UnminedTransaction{{
+			Node: &subtree.Node{Hash: hash1},
+			TxInpoints: &subtree.TxInpoints{
+				ParentTxHashes: []chainhash.Hash{hash1},
+				Idxs:           [][]uint32{{0}},
+			},
+			CreatedAt:    100,
+			UnminedSince: 1,
+		}}, nil).Once()
+		mockIterator.On("Next", ctx, mock.Anything).Return([]*UnminedTransaction{}, nil).Maybe()
+		mockIterator.On("Close").Return(nil).Once()
+		mockStore.On("GetUnminedTxIterator", mock.Anything).Return(mockIterator, nil) // To satisfy deferred close
 
 		mockStore.On("Get", mock.Anything, &hash1, mock.Anything).
-			Return(&meta.Data{TxInpoints: txInpoints}, nil)
+			Return(&meta.Data{TxInpoints: txInpoints}, nil).Maybe()
 
 		mockStore.On("PreserveTransactions", mock.Anything, mock.Anything, mock.Anything).
 			Return(nil)

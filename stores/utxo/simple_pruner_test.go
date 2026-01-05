@@ -4,11 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 // Simple test that covers the early return path to boost coverage
@@ -38,10 +38,10 @@ func TestCleanupCutoffCalculation(t *testing.T) {
 	settings.UtxoStore.UnminedTxRetention = 5
 
 	mockStore := new(MockUtxostore)
-	// Mock QueryOldUnminedTransactions to verify the cutoff calculation
-	// Block height 15 - retention 5 = cutoff 10
-	mockStore.On("QueryOldUnminedTransactions", ctx, uint32(10)).
-		Return([]chainhash.Hash{}, nil)
+	mockIterator := &MockUnminedTxIterator{}
+	mockIterator.On("Next", ctx, mock.Anything).Return([]*UnminedTransaction{}, nil).Maybe()
+	mockIterator.On("Close").Return(nil).Once()
+	mockStore.On("GetUnminedTxIterator", mock.Anything).Return(mockIterator, nil) // To satisfy deferred close
 
 	count, err := PreserveParentsOfOldUnminedTransactions(ctx, mockStore, 15, settings, logger)
 
@@ -58,9 +58,8 @@ func TestPreserveParentsOfOldUnminedTransactions_StorageError(t *testing.T) {
 	settings.UtxoStore.UnminedTxRetention = 5
 
 	mockStore := new(MockUtxostore)
-	// Mock a storage error
-	mockStore.On("QueryOldUnminedTransactions", ctx, uint32(5)).
-		Return([]chainhash.Hash(nil), errors.NewStorageError("storage error"))
+	mockIterator := &MockUnminedTxIterator{}
+	mockStore.On("GetUnminedTxIterator", mock.Anything).Return(mockIterator, errors.NewStorageError("failed to query old unmined transactions")) // To satisfy deferred close
 
 	count, err := PreserveParentsOfOldUnminedTransactions(ctx, mockStore, 10, settings, logger)
 

@@ -76,7 +76,7 @@ func (m *MockUtxostore) GetMeta(ctx context.Context, hash *chainhash.Hash, data 
 	if result := args.Get(0); result != nil {
 		*data = *result.(*meta.Data)
 	}
-	return args.Error(1)
+	return args.Error(0)
 }
 
 // Spend mocks the spending of transaction outputs in the UTXO store.
@@ -235,16 +235,21 @@ func (m *MockUtxostore) ProcessExpiredPreservations(ctx context.Context, current
 }
 
 // MockUnminedTxIterator is a simple mock implementation of utxo.UnminedTxIterator for testing
-type MockUnminedTxIterator struct{}
+type MockUnminedTxIterator struct {
+	mock.Mock
+}
 
 func (m MockUnminedTxIterator) Next(ctx context.Context) ([]*UnminedTransaction, error) {
-	return nil, nil // No more transactions
+	args := m.Called(ctx)
+	return args.Get(0).([]*UnminedTransaction), args.Error(1)
 }
 
 func (m MockUnminedTxIterator) Err() error {
-	return nil
+	args := m.Called()
+	return args.Error(0)
 }
 
 func (m MockUnminedTxIterator) Close() error {
-	return nil
+	args := m.Called()
+	return args.Error(0)
 }
