@@ -131,8 +131,9 @@ func (s *Server) Init(ctx context.Context) error {
 								// Try to queue pruning (non-blocking - channel has buffer of 1)
 								select {
 								case s.prunerCh <- height32:
-									s.logger.Debugf("Queued pruning for height %d from BlockPersisted notification", height32)
+									s.logger.Infof("Queued pruning for height %d from BlockPersisted notification", height32)
 								default:
+									s.logger.Warnf("Pruner channel full, skipping height %d (pruner already running)", height32)
 								}
 							}
 						}
@@ -182,8 +183,9 @@ func (s *Server) Init(ctx context.Context) error {
 					// Try to queue pruning (non-blocking - channel has buffer of 1)
 					select {
 					case s.prunerCh <- state.CurrentHeight:
-						s.logger.Debugf("Queued pruning for height %d from Block notification (mined_set=true)", state.CurrentHeight)
+						s.logger.Infof("Queued pruning for height %d from Block notification (mined_set=true)", state.CurrentHeight)
 					default:
+						s.logger.Warnf("Pruner channel full, skipping height %d (pruner already running)", state.CurrentHeight)
 					}
 				}
 			}
