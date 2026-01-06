@@ -2,27 +2,51 @@ package pruner
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util/retry"
 )
 
 // checkBlockAssemblySafeForPruner verifies that block assembly is in "running" state
 // and safe to proceed with pruner operations. Returns true if safe, false otherwise.
+// This function will retry checking the block assembly state until the configured
+// timeout is reached, allowing for temporary state transitions (e.g., brief reorgs).
 func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase string, height uint32) bool {
-	state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
+	// Create a context with timeout based on settings
+	timeoutCtx, cancel := context.WithTimeout(ctx, s.settings.Pruner.BlockAssemblyWaitTimeout)
+	defer cancel()
+
+	// Use retry logic to wait for Block Assembly to be in "running" state
+	_, err := retry.Retry(timeoutCtx, s.logger, func() (bool, error) {
+		state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
+		if err != nil {
+			return false, errors.NewProcessingError("failed to get block assembly state", err)
+		}
+
+		if state.BlockAssemblyState != "running" {
+			return false, errors.NewProcessingError("block assembly state is %s (not running)", state.BlockAssemblyState)
+		}
+
+		// State is "running", success!
+		return true, nil
+	},
+		retry.WithBackoffDurationType(1*time.Second),
+		retry.WithBackoffMultiplier(2),
+		retry.WithRetryCount(0), // Will be controlled by timeout context
+		retry.WithMessage(fmt.Sprintf("[Pruner] Waiting for block assembly to be ready for %s at height %d", phase, height)),
+	)
+
 	if err != nil {
-		s.logger.Errorf("Failed to get block assembly state before %s: %v", phase, err)
-		prunerErrors.WithLabelValues("state_check").Inc()
+		// Timeout or persistent error - log and skip pruning
+		s.logger.Warnf("Skipping %s for height %d: block assembly wait timeout or error: %v", phase, height, err)
+		prunerSkipped.WithLabelValues("block_assembly_timeout").Inc()
 		return false
 	}
 
-	if state.BlockAssemblyState != "running" {
-		s.logger.Infof("Skipping %s for height %d: block assembly state is %s (not running)", phase, height, state.BlockAssemblyState)
-		prunerSkipped.WithLabelValues("not_running").Inc()
-		return false
-	}
-
+	// Block Assembly is ready
 	return true
 }
 

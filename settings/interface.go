@@ -524,6 +524,7 @@ type CoinbaseSettings struct {
 type PrunerSettings struct {
 	GRPCListenAddress          string
 	GRPCAddress                string
+	BlockAssemblyWaitTimeout   time.Duration // Maximum time to wait for Block Assembly to be in "running" state before skipping pruning (default: 10m)
 	UTXODefensiveEnabled       bool          // Enable defensive checks before deleting UTXO transactions (verify children are mined > BlockHeightRetention blocks ago)
 	UTXODefensiveBatchReadSize int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
 	UTXOChunkSize              int           // Number of records to process in each chunk before batch flushing (default: 1000)
