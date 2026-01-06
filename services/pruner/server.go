@@ -123,8 +123,14 @@ func (s *Server) Init(ctx context.Context) error {
 					if heightStr, ok := notification.Metadata.Metadata["height"]; ok {
 						if height, err := strconv.ParseUint(heightStr, 10, 32); err == nil {
 							height32 := uint32(height)
-							s.lastPersistedHeight.Store(height32)
-							s.logger.Debugf("Updated persisted height to %d", height32)
+							oldHeight := s.lastPersistedHeight.Swap(height32)
+
+							// Log at INFO level when Block Persister first becomes active (transition from 0)
+							if oldHeight == 0 && height32 > 0 {
+								s.logger.Infof("Block Persister is now active, pruner will follow BlockPersisted notifications (persisted height: %d)", height32)
+							} else {
+								s.logger.Debugf("Updated persisted height to %d", height32)
+							}
 
 							// Trigger pruning when block persister completes a block
 							if height32 > s.lastProcessedHeight.Load() {
@@ -145,6 +151,7 @@ func (s *Server) Init(ctx context.Context) error {
 				persistedHeight := s.lastPersistedHeight.Load()
 				if persistedHeight > 0 {
 					// Block persister is running - BlockPersisted notifications will handle pruning
+					s.logger.Debugf("Block notification received but Block Persister is active (persisted height: %d), using BlockPersisted notifications instead", persistedHeight)
 					continue
 				}
 
