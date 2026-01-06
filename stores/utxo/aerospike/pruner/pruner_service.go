@@ -85,14 +85,15 @@ type Service struct {
 	indexReady  atomic.Bool
 
 	// Configuration values extracted from settings for performance
-	utxoBatchSize          int
-	blockHeightRetention   uint32
-	defensiveEnabled       bool
-	defensiveBatchReadSize int
-	chunkSize              int
-	chunkGroupLimit        int
-	progressLogInterval    time.Duration
-	partitionQueries       int // Number of parallel partition queries (0 = auto-detect)
+	utxoBatchSize                  int
+	blockHeightRetention           uint32
+	defensiveEnabled               bool
+	defensiveBatchReadSize         int
+	chunkSize                      int
+	chunkGroupLimit                int
+	progressLogInterval            time.Duration
+	partitionQueries               int     // Number of parallel partition queries (0 = auto-detect)
+	connectionPoolWarningThreshold float64 // Threshold for connection pool auto-adjustment (0.0-1.0)
 
 	// Cached field names (avoid repeated String() allocations in hot paths)
 	fieldTxID, fieldUtxos, fieldInputs, fieldDeletedChildren, fieldExternal        string
@@ -187,11 +188,12 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		blockHeightRetention:   tSettings.GetUtxoStoreBlockHeightRetention(),
 		defensiveEnabled:       tSettings.Pruner.UTXODefensiveEnabled,
 		defensiveBatchReadSize: tSettings.Pruner.UTXODefensiveBatchReadSize,
-		chunkSize:              tSettings.Pruner.UTXOChunkSize,
-		chunkGroupLimit:        tSettings.Pruner.UTXOChunkGroupLimit,
-		progressLogInterval:    tSettings.Pruner.UTXOProgressLogInterval,
-		partitionQueries:       tSettings.Pruner.UTXOPartitionQueries,
-		fieldTxID:              fields.TxID.String(),
+		chunkSize:                      tSettings.Pruner.UTXOChunkSize,
+		chunkGroupLimit:                tSettings.Pruner.UTXOChunkGroupLimit,
+		progressLogInterval:            tSettings.Pruner.UTXOProgressLogInterval,
+		partitionQueries:               tSettings.Pruner.UTXOPartitionQueries,
+		connectionPoolWarningThreshold: tSettings.Pruner.ConnectionPoolWarningThreshold,
+		fieldTxID:                      fields.TxID.String(),
 		fieldUtxos:             fields.Utxos.String(),
 		fieldInputs:            fields.Inputs.String(),
 		fieldDeletedChildren:   fields.DeletedChildren.String(),
@@ -211,6 +213,9 @@ func (s *Service) Start(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// Validate connection pool settings and auto-adjust if necessary
+	s.validateConnectionPoolSettings()
 
 	go func() {
 		if err := s.indexWaiter.WaitForIndexReady(ctx, IndexName); err != nil {
@@ -298,6 +303,54 @@ func (s *Service) calculatePartitionWorkers() int {
 
 	// Ensure at least 1 worker, cap at total partitions
 	return max(1, min(numPartitionQueries, 4096))
+}
+
+// getConnectionQueueSize returns the Aerospike connection pool size from the client.
+// Returns 128 as fallback if client doesn't support the method.
+func (s *Service) getConnectionQueueSize() int {
+	if s.client != nil {
+		return s.client.GetConnectionQueueSize()
+	}
+	return 128 // Default fallback
+}
+
+// validateConnectionPoolSettings validates that pruner concurrency settings won't exceed
+// the Aerospike connection pool. If they would, automatically adjusts chunkGroupLimit
+// to prevent connection pool exhaustion and logs a WARNING.
+func (s *Service) validateConnectionPoolSettings() {
+	// Get Aerospike ConnectionQueueSize from client
+	connectionQueueSize := s.getConnectionQueueSize()
+
+	// Calculate max concurrent connections pruner will use
+	numWorkers := s.calculatePartitionWorkers()
+	maxPrunerConnections := (numWorkers * s.chunkGroupLimit) + numWorkers
+
+	// Calculate recommended max using configured threshold
+	recommendedMax := int(float64(connectionQueueSize) * s.connectionPoolWarningThreshold)
+
+	if maxPrunerConnections > recommendedMax {
+		// Auto-adjust chunkGroupLimit to prevent connection pool exhaustion
+		adjusted := recommendedMax / (numWorkers + 1)
+		if adjusted < 1 {
+			adjusted = 1 // Ensure at least 1
+		}
+
+		s.logger.Warnf(
+			"Pruner concurrency would exhaust Aerospike connection pool. "+
+				"Max pruner connections: %d, ConnectionQueueSize: %d, Recommended max: %d. "+
+				"Auto-adjusting pruner_utxoChunkGroupLimit from %d to %d to prevent exhaustion.",
+			maxPrunerConnections, connectionQueueSize, recommendedMax,
+			s.chunkGroupLimit, adjusted,
+		)
+		s.chunkGroupLimit = adjusted
+	} else {
+		s.logger.Infof(
+			"Pruner connection pool validation passed. Max pruner connections: %d, "+
+				"ConnectionQueueSize: %d (%.1f%% utilization)",
+			maxPrunerConnections, connectionQueueSize,
+			float64(maxPrunerConnections)/float64(connectionQueueSize)*100,
+		)
+	}
 }
 
 // partitionWorker processes a range of Aerospike partitions and returns counts
