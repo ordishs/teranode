@@ -393,6 +393,13 @@ if [ -z "$ACTION" ]; then
     usage
 fi
 
+# Only allow a single sub-command
+if [ $# -gt 1 ]; then
+    echo "Error: Only one command allowed at a time. Got: $*" >&2
+    echo "" >&2
+    usage
+fi
+
 case "$ACTION" in
     up|start)
         start_all
