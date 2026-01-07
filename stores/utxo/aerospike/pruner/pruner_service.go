@@ -172,36 +172,36 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	batchPolicy := util.GetAerospikeBatchPolicy(tSettings)
 
 	service := &Service{
-		logger:                 opts.Logger,
-		client:                 opts.Client,
-		external:               opts.ExternalStore,
-		namespace:              opts.Namespace,
-		set:                    opts.Set,
-		ctx:                    opts.Ctx,
-		indexWaiter:            opts.IndexWaiter,
-		queryPolicy:            queryPolicy,
-		writePolicy:            writePolicy,
-		batchWritePolicy:       batchWritePolicy,
-		batchPolicy:            batchPolicy,
-		getPersistedHeight:     opts.GetPersistedHeight,
-		utxoBatchSize:          tSettings.UtxoStore.UtxoBatchSize,
-		blockHeightRetention:   tSettings.GetUtxoStoreBlockHeightRetention(),
-		defensiveEnabled:       tSettings.Pruner.UTXODefensiveEnabled,
-		defensiveBatchReadSize: tSettings.Pruner.UTXODefensiveBatchReadSize,
+		logger:                         opts.Logger,
+		client:                         opts.Client,
+		external:                       opts.ExternalStore,
+		namespace:                      opts.Namespace,
+		set:                            opts.Set,
+		ctx:                            opts.Ctx,
+		indexWaiter:                    opts.IndexWaiter,
+		queryPolicy:                    queryPolicy,
+		writePolicy:                    writePolicy,
+		batchWritePolicy:               batchWritePolicy,
+		batchPolicy:                    batchPolicy,
+		getPersistedHeight:             opts.GetPersistedHeight,
+		utxoBatchSize:                  tSettings.UtxoStore.UtxoBatchSize,
+		blockHeightRetention:           tSettings.GetUtxoStoreBlockHeightRetention(),
+		defensiveEnabled:               tSettings.Pruner.UTXODefensiveEnabled,
+		defensiveBatchReadSize:         tSettings.Pruner.UTXODefensiveBatchReadSize,
 		chunkSize:                      tSettings.Pruner.UTXOChunkSize,
 		chunkGroupLimit:                tSettings.Pruner.UTXOChunkGroupLimit,
 		progressLogInterval:            tSettings.Pruner.UTXOProgressLogInterval,
 		partitionQueries:               tSettings.Pruner.UTXOPartitionQueries,
 		connectionPoolWarningThreshold: tSettings.Pruner.ConnectionPoolWarningThreshold,
 		fieldTxID:                      fields.TxID.String(),
-		fieldUtxos:             fields.Utxos.String(),
-		fieldInputs:            fields.Inputs.String(),
-		fieldDeletedChildren:   fields.DeletedChildren.String(),
-		fieldExternal:          fields.External.String(),
-		fieldDeleteAtHeight:    fields.DeleteAtHeight.String(),
-		fieldTotalExtraRecs:    fields.TotalExtraRecs.String(),
-		fieldUnminedSince:      fields.UnminedSince.String(),
-		fieldBlockHeights:      fields.BlockHeights.String(),
+		fieldUtxos:                     fields.Utxos.String(),
+		fieldInputs:                    fields.Inputs.String(),
+		fieldDeletedChildren:           fields.DeletedChildren.String(),
+		fieldExternal:                  fields.External.String(),
+		fieldDeleteAtHeight:            fields.DeleteAtHeight.String(),
+		fieldTotalExtraRecs:            fields.TotalExtraRecs.String(),
+		fieldUnminedSince:              fields.UnminedSince.String(),
+		fieldBlockHeights:              fields.BlockHeights.String(),
 	}
 
 	return service, nil
@@ -367,7 +367,7 @@ func (s *Service) partitionWorker(
 
 	// Each worker creates its own policy for complete independence (no shared state)
 	policy := *s.queryPolicy
-	policy.RecordQueueSize = s.chunkSize * s.chunkGroupLimit
+	policy.RecordQueueSize = s.chunkSize // Optimal: buffer = 1x chunk size for good pipelining
 
 	// Create statement with delete_at_height filter
 	stmt := aerospike.NewStatement(s.namespace, s.set)
