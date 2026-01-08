@@ -52,6 +52,7 @@ type Settings struct {
 	Alert                        AlertSettings
 	Asset                        AssetSettings
 	Block                        BlockSettings
+	BlockPersister               BlockPersisterSettings
 	BlockAssembly                BlockAssemblySettings
 	BlockChain                   BlockChainSettings
 	BlockValidation              BlockValidationSettings
@@ -193,8 +194,6 @@ type AssetSettings struct {
 
 type BlockSettings struct {
 	MinedCacheMaxMB                       int
-	PersisterStore                        *url.URL
-	PersisterHTTPListenAddress            string
 	CheckDuplicateTransactionsConcurrency int
 	GetAndValidateSubtreesConcurrency     int
 	KafkaWorkers                          int
@@ -205,15 +204,10 @@ type BlockSettings struct {
 	FinalizeBlockValidationConcurrency    int
 	GetMissingTransactions                int
 	QuorumTimeout                         time.Duration
-	BlockPersisterConcurrency             int
-	BatchMissingTransactions              bool
 	ProcessTxMetaUsingStoreBatchSize      int
-	SkipUTXODelete                        bool
 	UTXOPersisterBufferSize               string
 	TxStore                               *url.URL
 	UTXOPersisterDirect                   bool
-	BlockPersisterPersistSleep            time.Duration
-	BlockPersisterProcessUTXOFiles        bool
 	UtxoStore                             *url.URL
 	FileStoreReadConcurrency              int
 	FileStoreWriteConcurrency             int
@@ -614,4 +608,14 @@ type RPCSettings struct {
 
 type FaucetSettings struct {
 	HTTPListenAddress string
+}
+
+type BlockPersisterSettings struct {
+	Store                    *url.URL
+	HTTPListenAddress        string
+	Concurrency              int
+	BatchMissingTransactions bool
+	SkipUTXODelete           bool
+	PersistSleep             time.Duration
+	ProcessUTXOFiles         bool
 }
