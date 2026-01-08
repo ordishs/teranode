@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/util/retry"
 )
@@ -46,6 +47,45 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 	}
 
 	// Block Assembly is ready
+	return true
+}
+
+// waitForBlockMinedStatus waits for the block to have mined_set=true, indicating that
+// block validation has completed. Returns true if mined, false otherwise.
+// This function will retry checking the mined status until the configured timeout is reached,
+// allowing time for block validation to complete.
+func (s *Server) waitForBlockMinedStatus(ctx context.Context, blockHash *chainhash.Hash) bool {
+	// Create a context with timeout based on settings
+	timeoutCtx, cancel := context.WithTimeout(ctx, s.settings.Pruner.BlockAssemblyWaitTimeout)
+	defer cancel()
+
+	// Use retry logic to wait for block to have mined_set=true
+	_, err := retry.Retry(timeoutCtx, s.logger, func() (bool, error) {
+		isMined, err := s.blockchainClient.GetBlockIsMined(ctx, blockHash)
+		if err != nil {
+			return false, errors.NewProcessingError("failed to check mined_set status", err)
+		}
+
+		if !isMined {
+			return false, errors.NewProcessingError("block has mined_set=false")
+		}
+
+		// Block has mined_set=true, success!
+		return true, nil
+	},
+		retry.WithBackoffDurationType(1*time.Second),
+		retry.WithBackoffMultiplier(2),
+		retry.WithRetryCount(0), // Will be controlled by timeout context
+		retry.WithMessage(fmt.Sprintf("[Pruner] Waiting for block %s to have mined_set=true", blockHash)),
+	)
+
+	if err != nil {
+		// Timeout or persistent error - log and skip
+		s.logger.Debugf("Block %s mined_set wait timeout or error: %v", blockHash, err)
+		return false
+	}
+
+	// Block has mined_set=true
 	return true
 }
 

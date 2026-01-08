@@ -3,7 +3,7 @@
 //
 // Trigger mechanism (event-driven):
 // 1. Primary: BlockPersisted notifications (when block persister is running)
-// 2. Fallback: Block notifications with mined_set=true check (when persister not running)
+// 2. Fallback: Block notifications with mined_set=true wait (when persister not running)
 //
 // Pruner operations only execute when safe to do so (i.e., when block assembly is in "running"
 // state and not performing reorgs or resets).
@@ -35,7 +35,7 @@ import (
 
 // Server implements the Pruner service which handles periodic pruner operations
 // for the UTXO store. It uses event-driven triggers: BlockPersisted notifications (primary)
-// and Block notifications with mined_set check (fallback when persister not running).
+// and Block notifications with mined_set wait (fallback when persister not running).
 type Server struct {
 	pruner_api.UnsafePrunerAPIServer
 
@@ -106,7 +106,7 @@ func (s *Server) Init(ctx context.Context) error {
 
 	// Subscribe to blockchain notifications for event-driven pruning:
 	// - BlockPersisted: Triggers pruning when block persister completes (primary)
-	// - Block: Checks mined_set=true and triggers if persister not running (fallback)
+	// - Block: Waits for mined_set=true and triggers if persister not running (fallback)
 	// Also tracks persisted height for coordination with store-level pruner safety checks
 	subscriptionCh, err := s.blockchainClient.Subscribe(ctx, "Pruner")
 	if err != nil {
@@ -147,7 +147,7 @@ func (s *Server) Init(ctx context.Context) error {
 				}
 
 			case model.NotificationType_Block:
-				// Fallback trigger: if block persister is not running, check if block has mined_set=true
+				// Fallback trigger: if block persister is not running, wait for block to have mined_set=true
 				persistedHeight := s.lastPersistedHeight.Load()
 				if persistedHeight > 0 {
 					// Block persister is running - BlockPersisted notifications will handle pruning
@@ -155,7 +155,7 @@ func (s *Server) Init(ctx context.Context) error {
 					continue
 				}
 
-				// Block persister not running - check if block has mined_set=true before triggering
+				// Block persister not running - wait for block to have mined_set=true before triggering
 				if notification.Hash == nil {
 					s.logger.Debugf("Block notification missing hash, skipping")
 					continue
@@ -167,15 +167,8 @@ func (s *Server) Init(ctx context.Context) error {
 					continue
 				}
 
-				// Check if block has mined_set=true (block validation completed)
-				isMined, err := s.blockchainClient.GetBlockIsMined(ctx, blockHash)
-				if err != nil {
-					s.logger.Debugf("Failed to check mined_set status for block %s: %v", blockHash, err)
-					continue
-				}
-
-				if !isMined {
-					s.logger.Debugf("Block %s has mined_set=false, skipping pruning trigger", blockHash)
+				// Wait for block to have mined_set=true (block validation completed)
+				if !s.waitForBlockMinedStatus(ctx, blockHash) {
 					continue
 				}
 
@@ -235,7 +228,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	// Note: Polling worker not needed - pruning is triggered by:
 	// 1. BlockPersisted notifications (when block persister is running)
-	// 2. Block notifications with mined_set check (when persister not running)
+	// 2. Block notifications with mined_set wait (when persister not running)
 
 	// Start gRPC server (BLOCKING - must be last)
 	if err := util.StartGRPCServer(ctx, s.logger, s.settings, "pruner",
