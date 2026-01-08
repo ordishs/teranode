@@ -21,7 +21,7 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 
 	// Use retry logic to wait for Block Assembly to be in "running" state
 	_, err := retry.Retry(timeoutCtx, s.logger, func() (bool, error) {
-		state, err := s.blockAssemblyClient.GetBlockAssemblyState(ctx)
+		state, err := s.blockAssemblyClient.GetBlockAssemblyState(timeoutCtx)
 		if err != nil {
 			return false, errors.NewProcessingError("failed to get block assembly state", err)
 		}
@@ -61,7 +61,7 @@ func (s *Server) waitForBlockMinedStatus(ctx context.Context, blockHash *chainha
 
 	// Use retry logic to wait for block to have mined_set=true
 	_, err := retry.Retry(timeoutCtx, s.logger, func() (bool, error) {
-		isMined, err := s.blockchainClient.GetBlockIsMined(ctx, blockHash)
+		isMined, err := s.blockchainClient.GetBlockIsMined(timeoutCtx, blockHash)
 		if err != nil {
 			return false, errors.NewProcessingError("failed to check mined_set status", err)
 		}
