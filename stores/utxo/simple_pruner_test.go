@@ -27,7 +27,7 @@ func TestPreserveParentsOfOldUnminedTransactions_EarlyReturn(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 0, count)
 	// Should not call any store methods due to early return
-	mockStore.AssertNotCalled(t, "QueryOldUnminedTransactions")
+	mockStore.AssertNotCalled(t, "GetUnminedTxIterator")
 }
 
 // Test the cutoff calculation logic
@@ -65,6 +65,6 @@ func TestPreserveParentsOfOldUnminedTransactions_StorageError(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Equal(t, 0, count)
-	assert.Contains(t, err.Error(), "failed to query old unmined transactions")
+	assert.Contains(t, err.Error(), "failed to get unmined tx iterator")
 	mockStore.AssertExpectations(t)
 }
