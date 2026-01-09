@@ -241,6 +241,9 @@ type MockUnminedTxIterator struct {
 
 func (m *MockUnminedTxIterator) Next(ctx context.Context) ([]*UnminedTransaction, error) {
 	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
 	return args.Get(0).([]*UnminedTransaction), args.Error(1)
 }
 

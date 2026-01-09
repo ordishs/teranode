@@ -13,7 +13,6 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
-
 // PreserveParentsOfOldUnminedTransactions protects parent transactions of old unmined transactions from deletion.
 // This is a store-agnostic implementation that works with any Store implementation.
 // It follows the same pattern as ProcessConflicting, using the Store interface methods.
@@ -74,15 +73,16 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 	processedCount := 0
 
 	for {
-		batch, err := iterator.Next(ctx)
+		unminedBatch, err := iterator.Next(ctx)
 		if err != nil {
 			return 0, errors.NewStorageError("failed to iterate unmined transactions", err)
 		}
-		if len(batch) == 0 {
+		if unminedBatch == nil {
 			break
 		}
 
-		for _, unminedTx := range batch {
+		// Process each transaction in the batch
+		for _, unminedTx := range unminedBatch {
 			// Skip special markers
 			if unminedTx.Skip {
 				continue
@@ -91,7 +91,7 @@ func PreserveParentsOfOldUnminedTransactions(ctx context.Context, s Store, block
 			// Filter for old unmined transactions (UnminedSince <= cutoffBlockHeight)
 			if unminedTx.UnminedSince > 0 && unminedTx.UnminedSince <= int(cutoffBlockHeight) {
 				// TxInpoints already available - no Get() call needed!
-				if unminedTx.TxInpoints != nil && len(unminedTx.TxInpoints.ParentTxHashes) > 0 {
+				if len(unminedTx.TxInpoints.ParentTxHashes) > 0 {
 					for _, parentHash := range unminedTx.TxInpoints.ParentTxHashes {
 						allParents[parentHash] = struct{}{}
 					}

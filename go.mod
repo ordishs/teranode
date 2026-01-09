@@ -13,7 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.29.9
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.17.66
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.78.2
-	github.com/bitcoin-sv/bdk/module/gobdk v1.2.0-beta11
+	github.com/bitcoin-sv/bdk/module/gobdk v1.2.0
 	github.com/bitcoin-sv/go-sdk v1.1.21
 	github.com/bsv-blockchain/go-bt/v2 v2.5.2
 	github.com/bsv-blockchain/go-chaincfg v1.5.3

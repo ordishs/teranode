@@ -8,12 +8,34 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
+
+// mockIterator is a configurable mock iterator for testing
+type mockIterator struct {
+	mock.Mock
+}
+
+func (m *mockIterator) Next(ctx context.Context) ([]*UnminedTransaction, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]*UnminedTransaction), args.Error(1)
+}
+
+func (m *mockIterator) Err() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockIterator) Close() error {
+	args := m.Called()
+	return args.Error(0)
+}
 
 // Simple tests focused on achieving code coverage
 
@@ -29,17 +51,18 @@ func TestPreserveParentsOfOldUnminedTransactions_Coverage(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, 0, count)
 		// Should not call any store methods
-		mockStore.AssertNotCalled(t, "QueryOldUnminedTransactions")
+		mockStore.AssertNotCalled(t, "GetUnminedTxIterator")
 	})
 
-	t.Run("handles query error", func(t *testing.T) {
+	t.Run("handles iterator error", func(t *testing.T) {
 		mockStore := new(MockUtxostore)
-		mockStore.On("GetUnminedTxIterator", mock.Anything).Return(&MockUnminedTxIterator{}, errors.NewStorageError("failed to query old unmined transactions")) // To satisfy deferred close
+		mockStore.On("GetUnminedTxIterator").
+			Return((*MockUnminedTxIterator)(nil), errors.NewStorageError("iterator failed"))
 
 		count, err := PreserveParentsOfOldUnminedTransactions(ctx, mockStore, 10, tSettings, logger)
 		assert.Error(t, err)
 		assert.Equal(t, 0, count)
-		assert.Contains(t, err.Error(), "failed to query old unmined transactions")
+		assert.Contains(t, err.Error(), "failed to get unmined tx iterator")
 		mockStore.AssertExpectations(t)
 	})
 
@@ -52,23 +75,19 @@ func TestPreserveParentsOfOldUnminedTransactions_Coverage(t *testing.T) {
 		// Create TxInpoints from the transaction
 		txInpoints, _ := subtree.NewTxInpointsFromTx(tx)
 
-		mockIterator := &MockUnminedTxIterator{}
-		mockIterator.On("Next", ctx, mock.Anything).Return([]*UnminedTransaction{{
-			Node: &subtree.Node{Hash: hash1},
-			TxInpoints: &subtree.TxInpoints{
-				ParentTxHashes: []chainhash.Hash{hash1},
-				Idxs:           [][]uint32{{0}},
+		// Create mock iterator
+		mockIter := new(mockIterator)
+		mockIter.On("Next", mock.Anything).Return([]*UnminedTransaction{
+			{
+				Node:         &subtree.Node{Hash: hash1},
+				TxInpoints:   &txInpoints,
+				UnminedSince: 4, // Old enough (cutoff is 5)
 			},
-			CreatedAt:    100,
-			UnminedSince: 1,
-		}}, nil).Once()
-		mockIterator.On("Next", ctx, mock.Anything).Return([]*UnminedTransaction{}, nil).Maybe()
-		mockIterator.On("Close").Return(nil).Once()
-		mockStore.On("GetUnminedTxIterator", mock.Anything).Return(mockIterator, nil) // To satisfy deferred close
+		}, nil).Once()
+		mockIter.On("Next", mock.Anything).Return(([]*UnminedTransaction)(nil), nil).Once() // End iteration
+		mockIter.On("Close").Return(nil)
 
-		mockStore.On("Get", mock.Anything, &hash1, mock.Anything).
-			Return(&meta.Data{TxInpoints: txInpoints}, nil).Maybe()
-
+		mockStore.On("GetUnminedTxIterator").Return(mockIter, nil)
 		mockStore.On("PreserveTransactions", mock.Anything, mock.Anything, mock.Anything).
 			Return(nil)
 
@@ -77,6 +96,7 @@ func TestPreserveParentsOfOldUnminedTransactions_Coverage(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, 1, count)
 		mockStore.AssertExpectations(t)
+		mockIter.AssertExpectations(t)
 	})
 }
 
