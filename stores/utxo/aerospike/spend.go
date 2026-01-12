@@ -686,8 +686,6 @@ func (s *Store) handleParseError(batchByKey []aerospike.MapValue, batch []*batch
 
 // handleSpendSignal handles signals from spend operations
 func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *chainhash.Hash, childCount int, thisBlockHeight uint32) {
-	dahHeight := thisBlockHeight + s.settings.GetUtxoStoreBlockHeightRetention()
-
 	switch signal {
 	case LuaSignalAllSpent:
 		if err := s.handleExtraRecords(ctx, txID, 1); err != nil {
@@ -695,11 +693,17 @@ func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *c
 		}
 
 	case LuaSignalDAHSet:
-		if err := s.SetDAHForChildRecords(txID, childCount, dahHeight); err != nil {
-			s.logger.Errorf("Failed to set DAH for child records: %v", err)
-		}
-		if err := s.setDAHExternalTransaction(ctx, txID, dahHeight); err != nil {
-			s.logger.Errorf("Failed to set DAH for external transaction: %v", err)
+		// Only set DAH if BlockHeightRetention is configured (> 0)
+		// When retention is 0, it means "don't use automatic retention"
+		if retention := s.settings.GetUtxoStoreBlockHeightRetention(); retention > 0 {
+			dahHeight := thisBlockHeight + retention
+
+			if err := s.SetDAHForChildRecords(txID, childCount, dahHeight); err != nil {
+				s.logger.Errorf("Failed to set DAH for child records: %v", err)
+			}
+			if err := s.setDAHExternalTransaction(ctx, txID, dahHeight); err != nil {
+				s.logger.Errorf("Failed to set DAH for external transaction: %v", err)
+			}
 		}
 
 	case LuaSignalDAHUnset:
