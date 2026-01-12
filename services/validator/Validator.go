@@ -313,8 +313,8 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 	v.logger.Debugf("[ValidateWithOptions] Validate tx %s", tx.TxID())
 	if txMetaData, err = v.validateInternal(ctx, tx, blockHeight, validationOptions); err != nil {
 		if v.rejectedTxKafkaProducerClient != nil { // tests may not set this
-			// TODO which errors should we be sending here?
-			if !errors.Is(err, errors.ErrStorageError) && !errors.Is(err, errors.ErrServiceError) && !errors.Is(err, errors.ErrTxMissingParent) {
+			// TODO should this also announce transactions with missing parents etc.?
+			if errors.Is(err, errors.ErrTxInvalid) {
 				if v.blockchainClient != nil {
 					var (
 						state *blockchain.FSMStateType
@@ -973,9 +973,9 @@ func (v *Validator) sendToBlockAssembler(ctx context.Context, bData *blockassemb
 
 	_ = reservedUtxos
 
-	//if v.settings.Validator.VerboseDebug {
+	// if v.settings.Validator.VerboseDebug {
 	v.logger.Debugf("[Validator] sending tx %s to block assembler", bData.TxIDChainHash.String())
-	//}
+	// }
 
 	if _, err := v.blockAssembler.Store(ctx, &bData.TxIDChainHash, bData.Fee, bData.Size, bData.TxInpoints); err != nil {
 		e := errors.NewServiceError("error calling blockAssembler Store()", err)
