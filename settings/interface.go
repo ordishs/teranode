@@ -511,7 +511,6 @@ type SubtreeValidationSettings struct {
 	ProcessTxMetaUsingCacheBatchSize          int
 	ProcessTxMetaUsingCacheConcurrency        int
 	ProcessTxMetaUsingCacheMissingTxThreshold int
-	SubtreeBlockHeightRetention               uint32
 	SubtreeDAHConcurrency                     int
 	TxMetaCacheEnabled                        bool
 	TxMetaCacheMaxMB                          int
