@@ -354,8 +354,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPRateLimit:             getInt("validator_httpRateLimit", 1024, alternativeContext...),
 			KafkaMaxMessageBytes:      getInt("validator_kafka_maxMessageBytes", 1024*1024, alternativeContext...), // Default 1MB
 			UseLocalValidator:         getBool("useLocalValidator", false, alternativeContext...),
-			TxMetaBatchSize:           getInt("validator_txmeta_batchSize", 1024, alternativeContext...),
-			TxMetaBatchTimeoutMs:      getInt("validator_txmeta_batchTimeoutMs", 5, alternativeContext...),
+			TxMetaKafkaBatchSize:      getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
+			TxMetaKafkaBatchTimeoutMs: getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),
 		},
 		Region: RegionSettings{
 			Name: getString("regionName", "defaultRegionName", alternativeContext...),

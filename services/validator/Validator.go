@@ -138,8 +138,8 @@ type Validator struct {
 	// rejectedTxKafkaProducerClient publishes rejected transaction events
 	rejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI
 
-	// txmetaBatcher batches TxMeta Kafka messages for efficient publishing
-	txmetaBatcher *batcher.Batcher[txmetaBatchItem]
+	// txmetaKafkaBatcher batches TxMeta Kafka messages for efficient publishing
+	txmetaKafkaBatcher *batcher.Batcher[txmetaBatchItem]
 }
 
 // New creates a new Validator instance with the provided configuration.
@@ -182,17 +182,17 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		v.rejectedTxKafkaProducerClient.Start(ctx, make(chan *kafka.Message, 10_000))
 	}
 
-	// Initialize TxMeta batcher if batch size is configured
-	txmetaBatchSize := tSettings.Validator.TxMetaBatchSize
-	txmetaBatchTimeout := tSettings.Validator.TxMetaBatchTimeoutMs
-	if txmetaBatchSize > 0 && v.txmetaKafkaProducerClient != nil {
-		duration := time.Duration(txmetaBatchTimeout) * time.Millisecond
+	// Initialize TxMeta Kafka batcher if batch size is configured
+	txmetaKafkaBatchSize := tSettings.Validator.TxMetaKafkaBatchSize
+	txmetaKafkaBatchTimeout := tSettings.Validator.TxMetaKafkaBatchTimeoutMs
+	if txmetaKafkaBatchSize > 0 && v.txmetaKafkaProducerClient != nil {
+		duration := time.Duration(txmetaKafkaBatchTimeout) * time.Millisecond
 		sendBatch := func(batch []*txmetaBatchItem) {
 			v.sendTxMetaBatch(batch)
 		}
-		b := batcher.New(txmetaBatchSize, duration, sendBatch, true)
-		v.txmetaBatcher = b
-		logger.Infof("TxMeta batching enabled: batchSize=%d, timeout=%dms", txmetaBatchSize, txmetaBatchTimeout)
+		b := batcher.New(txmetaKafkaBatchSize, duration, sendBatch, true)
+		v.txmetaKafkaBatcher = b
+		logger.Infof("TxMeta Kafka batching enabled: batchSize=%d, timeout=%dms", txmetaKafkaBatchSize, txmetaKafkaBatchTimeout)
 	}
 
 	return v, nil
@@ -843,8 +843,8 @@ func (v *Validator) sendTxMetaToKafka(data *meta.Data, txHash *chainhash.Hash) e
 	}
 
 	// Use batcher if available, otherwise send directly
-	if v.txmetaBatcher != nil {
-		v.txmetaBatcher.Put(&txmetaBatchItem{
+	if v.txmetaKafkaBatcher != nil {
+		v.txmetaKafkaBatcher.Put(&txmetaBatchItem{
 			hash:      txHash,
 			metaBytes: metaBytes,
 			isDelete:  false,
