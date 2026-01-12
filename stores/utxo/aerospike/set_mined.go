@@ -206,10 +206,6 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 		ChildCount     int
 		DeleteAtHeight uint32
 	}, 0)
-	externalDAH := make([]struct {
-		TxID *chainhash.Hash
-		DAH  uint32
-	}, 0)
 	// DAH timing assumption:
 	// - thisBatch operates under a fixed block-processing context.
 	// - thisBlockHeight and retention are immutable for the duration of SetMinedMulti() execution.
@@ -268,10 +264,7 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 						ChildCount     int
 						DeleteAtHeight uint32
 					}{TxID: hashes[idx], ChildCount: res.ChildCount, DeleteAtHeight: dahHeight})
-					externalDAH = append(externalDAH, struct {
-						TxID *chainhash.Hash
-						DAH  uint32
-					}{TxID: hashes[idx], DAH: dahHeight})
+					// External store DAH is disabled - lifecycle managed by pruner service
 				}
 			case LuaSignalDAHUnset:
 				dahUnsetItems = append(dahUnsetItems, struct {
@@ -279,10 +272,7 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 					ChildCount     int
 					DeleteAtHeight uint32
 				}{TxID: hashes[idx], ChildCount: res.ChildCount, DeleteAtHeight: 0})
-				externalDAH = append(externalDAH, struct {
-					TxID *chainhash.Hash
-					DAH  uint32
-				}{TxID: hashes[idx], DAH: 0})
+				// External store DAH is disabled - lifecycle managed by pruner service
 			}
 		}
 	}
@@ -315,11 +305,8 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 		}
 	}
 
-	if len(externalDAH) > 0 {
-		if err := s.setDAHExternalTransactionMulti(ctx, externalDAH); err != nil {
-			postErr = errors.Join(postErr, err)
-		}
-	}
+	// External store DAH is disabled - lifecycle managed by pruner service
+	// setDAHExternalTransactionMulti removed as it would no-op
 
 	if postErr != nil {
 		return blockIDs, errors.NewError("aerospike setMined follow-up batch errors", postErr)
@@ -391,18 +378,14 @@ func (s *Store) handleSetMinedSignal(ctx context.Context, signal LuaSignal, hash
 			if err := s.SetDAHForChildRecords(hash, childCount, dahHeight); err != nil {
 				errs = errors.Join(errs, err)
 			}
-			if err := s.setDAHExternalTransaction(ctx, hash, dahHeight); err != nil {
-				errs = errors.Join(errs, err)
-			}
+			// External store DAH is disabled - lifecycle managed by pruner service
 		}
 
 	case LuaSignalDAHUnset:
 		if err := s.SetDAHForChildRecords(hash, childCount, 0); err != nil {
 			errs = errors.Join(errs, err)
 		}
-		if err := s.setDAHExternalTransaction(ctx, hash, 0); err != nil {
-			errs = errors.Join(errs, err)
-		}
+		// External store DAH is disabled - lifecycle managed by pruner service
 	}
 
 	return errs
