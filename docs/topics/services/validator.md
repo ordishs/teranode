@@ -551,11 +551,12 @@ The Validator notifies the Block Assembly service of new transactions through gR
 
 The Validator service behavior is controlled by several key configuration parameters:
 
-- **`KafkaMaxMessageBytes`** (default: 1MB): Controls size-based routing - large transactions that exceed this threshold are routed via HTTP instead of Kafka to avoid message size limitations.
-- **`UseLocalValidator`** (default: false): Determines whether to use a local validator instance or connect to a remote validator service via gRPC.
-- **`KafkaWorkers`** (default: 0): Controls the number of concurrent Kafka message processing workers. When set to 0, Kafka consumer processing is disabled.
-- **`HTTPRateLimit`** (default: 1024): Sets the rate limit for HTTP API requests to prevent service overload.
-- **`VerboseDebug`** (default: false): Enables detailed validation logging for troubleshooting.
+- **`validator_kafkaWorkers`** (default: 0): Controls the number of concurrent Kafka message processing workers. When set to 0, Kafka consumer processing is disabled.
+- **`validator_httpRateLimit`** (default: 1024): Sets the rate limit for HTTP API requests to prevent service overload.
+- **`validator_verbose_debug`** (default: false): Enables detailed validation logging for troubleshooting.
+- **`validator_useLocalValidator`** (default: false): Determines whether to use a local validator instance or connect to a remote validator service via gRPC.
+
+**Note:** While these settings are available in the codebase, they are advanced options and may not be listed in the default `settings.conf` file. For a complete list of all available settings, see the [Validator Settings Reference](../../references/settings/services/validator_settings.md).
 
 ### Rejected Transaction Handling
 
