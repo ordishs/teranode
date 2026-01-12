@@ -17,7 +17,7 @@
     - [4.2. Block Validation Service Role](#42-block-validation-service-role)
     - [4.3. Block Assembly Service Role](#43-block-assembly-service-role)
 5. [Data Model Impact](#5-data-model-impact)
-6. [Configuration Options](#6-configuration-options)
+6. [Internal Implementation Options](#6-internal-implementation-options)
 7. [Flow Diagrams](#7-flow-diagrams)
 8. [Related Documentation](#8-related-documentation)
 
