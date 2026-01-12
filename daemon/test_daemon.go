@@ -668,6 +668,7 @@ func GetPorts(appSettings *settings.Settings) []int {
 		getPortFromString(appSettings.Propagation.GRPCListenAddress),
 		getPortFromString(appSettings.Faucet.HTTPListenAddress),
 		getPortFromURL(appSettings.RPC.RPCListenerURL),
+		getPortFromString(appSettings.Pruner.GRPCListenAddress),
 	}
 
 	// remove all where port == 0
