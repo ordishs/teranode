@@ -401,10 +401,10 @@ func newStore(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOpt
 	}
 
 	// Parse disableDAH URL parameter
-	// This can be set via URL (?disableDAH=true) or via StoreOption (WithDisableDAH(true))
-	// URL parameter takes precedence over StoreOption
-	if disableDAH := storeURL.Query().Get("disableDAH"); disableDAH == "true" {
-		options.DisableDAH = true
+	// This can be set via URL (?disableDAH=true/false) or via StoreOption (WithDisableDAH(true/false))
+	// URL parameter takes precedence over StoreOption (bidirectional override)
+	if disableDAH := storeURL.Query().Get("disableDAH"); disableDAH != "" {
+		options.DisableDAH = disableDAH == "true"
 	}
 
 	if len(options.SubDirectory) > 0 {
