@@ -706,8 +706,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	for i, record := range batchRecords {
 		batchRecord := record.BatchRec()
 		if batchRecord.Err != nil {
-			s.logger.Warnf("[PreserveTransactions] Failed to preserve tx %s: %v",
-				txIDs[i].String(), batchRecord.Err)
+			s.logger.Warnf("[PreserveTransactions] Failed to preserve tx %s: %v", txIDs[i].String(), batchRecord.Err)
 			continue
 		}
 
@@ -724,21 +723,18 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			case LuaStatusOK:
 				if res.Signal == LuaSignalPreserve {
 					// Handle external transaction preservation
-					if err := s.preserveUntilExternalTransaction(ctx, &txIDs[i], preserveUntilHeight); err != nil {
-						s.logger.Errorf("[PreserveTransactions] Failed to preserve external files for tx %s: %v",
-							txIDs[i].String(), err)
-						continue
-					}
+					// if err = s.preserveUntilExternalTransaction(ctx, &txIDs[i], preserveUntilHeight); err != nil {
+					// 	s.logger.Errorf("[PreserveTransactions] Failed to preserve external files for tx %s: %v", txIDs[i].String(), err)
+					// 	continue
+					// }
 				}
 
 				preservedCount++
 			case LuaStatusError:
 				if res.ErrorCode == LuaErrorCodeTxNotFound {
-					s.logger.Warnf("[PreserveTransactions] Transaction not found for tx %s",
-						txIDs[i].String())
+					s.logger.Debugf("[PreserveTransactions] Transaction not found for tx %s", txIDs[i].String())
 				} else {
-					s.logger.Errorf("[PreserveTransactions] Error preserving tx %s: %s",
-						txIDs[i].String(), res.Message)
+					s.logger.Errorf("[PreserveTransactions] Error preserving tx %s: %s", txIDs[i].String(), res.Message)
 				}
 			}
 		} else {
