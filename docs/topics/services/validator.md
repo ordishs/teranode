@@ -501,23 +501,18 @@ The Validator implements a structured error handling system to categorize and re
 
 The Validator leverages concurrency to optimize transaction processing performance:
 
-1. **Parallel UTXO Saving**:
-
-    - The `saveInParallel` flag enables concurrent UTXO updates
-    - Improves throughput by processing multiple transactions simultaneously
-
-2. **Batching**:
+1. **Batching**:
 
     - Transactions can be validated in batches for higher throughput
     - Batch processing is configurable and used by both Propagation and Subtree Validation services
     - The `TriggerBatcher()` method initiates batch processing when sufficient transactions accumulate
 
-3. **Error Group Pattern**:
+2. **Error Group Pattern**:
 
     - Uses Go's `errgroup` package for coordinated concurrent execution
     - Maintains proper error propagation in concurrent processing flows
 
-4. **Two-Phase Commit Process**:
+3. **Two-Phase Commit Process**:
 
     - The `twoPhaseCommitTransaction` method ensures atomic transaction processing
     - Prevents partial updates in case of failures during concurrent processing
