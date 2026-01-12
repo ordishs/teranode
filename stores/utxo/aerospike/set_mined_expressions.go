@@ -452,12 +452,6 @@ func (s *Store) processBatchResultsForSetMinedExpressions(
 		}
 	}
 
-	if len(externalDAH) > 0 {
-		if err := s.setDAHExternalTransactionMulti(ctx, externalDAH); err != nil {
-			postErr = errors.Join(postErr, err)
-		}
-	}
-
 	if postErr != nil {
 		return blockIDs, errors.NewError("aerospike setMined follow-up batch errors", postErr)
 	}

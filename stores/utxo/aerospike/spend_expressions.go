@@ -483,12 +483,6 @@ func (s *Store) processSpendBatchResultsExpressions(
 		}
 	}
 
-	if len(externalDAH) > 0 {
-		if err := s.setDAHExternalTransactionMulti(ctx, externalDAH); err != nil {
-			postErr = errors.Join(postErr, err)
-		}
-	}
-
 	if postErr != nil {
 		s.logger.Errorf("[SPEND_BATCH_EXP] follow-up errors: %v", postErr)
 	}
