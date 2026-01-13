@@ -21,7 +21,7 @@ func init() {
 }
 
 var (
-	blockWait = 500 * time.Second
+	blockWait = 5 * time.Second
 )
 
 // TestDoubleSpendScenarios tests various double-spend scenarios in a blockchain.
