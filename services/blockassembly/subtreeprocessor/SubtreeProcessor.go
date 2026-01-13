@@ -2757,17 +2757,25 @@ func (stp *SubtreeProcessor) moveBackBlockGetSubtrees(ctx context.Context, block
 				return nil
 			}
 
-			subtreeMetaReader, err := stp.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
-			if err != nil {
-				return errors.NewServiceError("[moveBackBlock:GetSubtrees][%s] error getting subtree meta %s", block.String(), subtreeHash.String(), err)
-			}
+			if stp.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
+				subtreeMetaReader, err := stp.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeMeta)
+				if err != nil {
+					return errors.NewServiceError("[moveBackBlock:GetSubtrees][%s] error getting subtree meta %s", block.String(), subtreeHash.String(), err)
+				}
 
-			subtreeMeta, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
-			if err != nil {
-				return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
-			}
+				subtreeMeta, err := subtreepkg.NewSubtreeMetaFromReader(subtree, subtreeMetaReader)
+				if err != nil {
+					return errors.NewProcessingError("[moveBackBlock:GetSubtrees][%s] error deserializing subtree meta", block.String(), err)
+				}
 
-			subtreeMetaTxInpoints[idx] = subtreeMeta.TxInpoints
+				subtreeMetaTxInpoints[idx] = subtreeMeta.TxInpoints
+			} else {
+				subtreeMetaTxInpoints[idx] = make([]subtreepkg.TxInpoints, len(subtree.Nodes))
+
+				for i := range subtreeMetaTxInpoints[idx] {
+					subtreeMetaTxInpoints[idx][i] = subtreepkg.TxInpoints{}
+				}
+			}
 
 			// process conflicting hashes
 			if len(subtree.ConflictingNodes) > 0 {
