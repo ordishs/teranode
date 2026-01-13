@@ -562,7 +562,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					originalCurrentTxMap := stp.currentTxMap
 					currentBlockHeader := stp.currentBlockHeader
 
-					if _, err = stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, true, true); err != nil {
+					if _, err = stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true); err != nil {
 						// rollback to previous state
 						stp.chainedSubtrees = originalChainedSubtrees
 						stp.currentSubtree.Store(originalCurrentSubtree)
