@@ -643,7 +643,7 @@ func (td *TestDaemon) StopDaemonDependencies() {
 
 // WaitForPortsFree waits for the specified ports to be free on localhost.
 func WaitForPortsFree(t *testing.T, ctx context.Context, settings *settings.Settings) {
-	require.NoError(t, wait.ForPortsFree(ctx, "localhost", GetPorts(settings), 60*time.Second, 100*time.Millisecond))
+	require.NoError(t, wait.ForPortsFree(ctx, "localhost", GetPorts(settings), 30*time.Second, 100*time.Millisecond))
 }
 
 // GetPorts returns a slice of ports from the provided settings.
