@@ -629,6 +629,25 @@ func (c *Client) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint
 	return resp.GetIsPartOfCurrentChain(), nil
 }
 
+// CheckBlockIsAncestorOfBlock checks if any of the given block IDs are ancestors of the block with the given hash.
+// This is used for double-spend detection on fork blocks where we need to check against
+// the fork's ancestor chain rather than the main chain.
+func (c *Client) CheckBlockIsAncestorOfBlock(ctx context.Context, blockIDs []uint32, blockHash *chainhash.Hash) (bool, error) {
+	if len(blockIDs) == 0 {
+		return false, nil
+	}
+
+	resp, err := c.client.CheckBlockIsAncestorOfBlock(ctx, &blockchain_api.CheckBlockIsAncestorOfBlockRequest{
+		BlockIDs:  blockIDs,
+		BlockHash: blockHash[:],
+	})
+	if err != nil {
+		return false, errors.UnwrapGRPC(err)
+	}
+
+	return resp.GetIsAncestor(), nil
+}
+
 // GetChainTips retrieves information about all known tips in the block tree.
 func (c *Client) GetChainTips(ctx context.Context) ([]*model.ChainTip, error) {
 	c.logger.Debugf("[Blockchain Client] Getting chain tips")
