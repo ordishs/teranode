@@ -20,6 +20,9 @@ var (
 	// prometheusBlockAssemblyAddTx measures transaction addition time
 	prometheusBlockAssemblyAddTx prometheus.Histogram
 
+	// prometheusBlockAssemblyAddCounter counts number of transactions added
+	prometheusBlockAssemblyAddTxCounter prometheus.Counter
+
 	// prometheusBlockAssemblyRemoveTx measures transaction removal time
 	prometheusBlockAssemblyRemoveTx prometheus.Histogram
 
@@ -72,6 +75,7 @@ var (
 	prometheusBlockAssemblerAddDirectlyTime             prometheus.Histogram
 	prometheusBlockAssemblerAddDirectlyTotal            prometheus.Counter
 	prometheusBlockAssemblerAddDirectlyBatchTime        prometheus.Histogram
+	prometheusBlockAssemblerSubtreeStoredHist           prometheus.Histogram
 )
 
 var (
@@ -104,6 +108,15 @@ func _initPrometheusMetrics() {
 			Name:      "add_tx",
 			Help:      "Histogram of AddTx in the blockassembly service",
 			Buckets:   util.MetricsBucketsMicroSeconds,
+		},
+	)
+
+	prometheusBlockAssemblyAddTxCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockassembly",
+			Name:      "add_tx_counter",
+			Help:      "Number of transactions added in the blockassembly service",
 		},
 	)
 
@@ -165,12 +178,13 @@ func _initPrometheusMetrics() {
 		},
 	)
 
-	prometheusBlockAssemblerSubtreeCreated = promauto.NewCounter(
-		prometheus.CounterOpts{
+	prometheusBlockAssemblerSubtreeStoredHist = promauto.NewHistogram(
+		prometheus.HistogramOpts{
 			Namespace: "teranode",
 			Subsystem: "blockassembly",
-			Name:      "subtree_created",
-			Help:      "Number of subtrees created in the block assembler",
+			Name:      "subtree_stored",
+			Help:      "Histogram of subtree stored duration in block assembler",
+			Buckets:   util.MetricsBucketsMilliSeconds,
 		},
 	)
 

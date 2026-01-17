@@ -18,6 +18,12 @@ ifndef GIT_VERSION
   GIT_TIMESTAMP := $(shell ./scripts/determine-git-version.sh --makefile | grep "^GIT_TIMESTAMP=" | cut -d'=' -f2)
 endif
 
+# Cross-compilation environment variables
+# These can be overridden when calling make, e.g.: make build GOOS=linux GOARCH=amd64
+CGO_ENABLED ?= 1
+GOOS ?= $(shell go env GOOS)
+GOARCH ?= $(shell go env GOARCH)
+
 .PHONY: set_debug_flags
 set_debug_flags:
 ifeq ($(DEBUG),true)
@@ -89,31 +95,31 @@ clean_backup:
 
 .PHONY: build-teranode-with-dashboard
 build-teranode-with-dashboard: set_debug_flags set_txmetacache_flag build-dashboard
-	go build -mod=readonly -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION} -X main.StartFromState=${START_FROM_STATE}"  -gcflags "all=${DEBUG_FLAGS}" -o teranode.run .
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -mod=readonly -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION} -X main.StartFromState=${START_FROM_STATE}"  -gcflags "all=${DEBUG_FLAGS}" -o teranode.run .
 
 .PHONY: build-teranode
 build-teranode: set_debug_flags set_txmetacache_flag
-	go build -mod=readonly -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION}" -gcflags "all=${DEBUG_FLAGS}" -o teranode.run .
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -mod=readonly -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION}" -gcflags "all=${DEBUG_FLAGS}" -o teranode.run .
 
 .PHONY: build-teranode-no-debug
 build-teranode-no-debug: set_txmetacache_flag
-	go build -mod=readonly -a -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION} -s -w" -gcflags "-l -B" -o teranode_no_debug.run .
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -mod=readonly -a -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION} -s -w" -gcflags "-l -B" -o teranode_no_debug.run .
 
 .PHONY: build-teranode-ci
 build-teranode-ci: set_debug_flags set_txmetacache_flag
-	go build -mod=readonly -race -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION}" -gcflags "all=${DEBUG_FLAGS}" -o teranode.run .
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -mod=readonly -race -tags aerospike,${TXMETA_TAG} --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION}" -gcflags "all=${DEBUG_FLAGS}" -o teranode.run .
 
 .PHONY: build-chainintegrity
 build-chainintegrity: set_debug_flags
-	go build -o chainintegrity.run ./compose/cmd/chainintegrity/
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o chainintegrity.run ./compose/cmd/chainintegrity/
 
 .PHONY: build-tx-blaster
 build-tx-blaster: set_debug_flags
-	go build --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION}" -gcflags "all=${DEBUG_FLAGS}" -o blaster.run ./cmd/txblaster/
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION}" -gcflags "all=${DEBUG_FLAGS}" -o blaster.run ./cmd/txblaster/
 
 .PHONY: build-teranode-cli
 build-teranode-cli:
-	go build -mod=readonly -o teranode-cli ./cmd/teranodecli
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -mod=readonly -o teranode-cli ./cmd/teranodecli
 
 # .PHONY: build-propagation-blaster
 # build-propagation-blaster: set_debug_flags
@@ -185,15 +191,20 @@ sequentialtest-aerospike:
 testall: test longtest sequentialtest
 
 # run tests in the test/e2e/daemon directory
+# Tests run in parallel by default - each test gets unique ports and data directories
 .PHONY: smoketest
 smoketest:
 	@command -v gotestsum >/dev/null 2>&1 || { echo "gotestsum not found. Installing..."; $(MAKE) install-tools; }
 	@mkdir -p /tmp/teranode-test-results
-	cd test/e2e/daemon/ready && gotestsum --format pkgname -- -v -count=1 -race -timeout=5m -parallel 1 -run . 2>&1 | tee /tmp/teranode-test-results/smoketest-results.txt
+	cd test/e2e/daemon/ready && gotestsum --format pkgname -- -v -count=1 -race -timeout=5m -parallel 2 -run . 2>&1 | tee /tmp/teranode-test-results/smoketest-results.txt
 
-	# cd test/e2e/daemon && go test -race -tags "testtxmetacache" -count=1 -timeout=5m -parallel 1 -coverprofile=coverage.out ./test/e2e/daemon/ready/... 2>&1 | grep -v "ld: warning:"
-	# cd test/e2e/daemon/ready && go test -v -count=1 -race -timeout=5m -parallel 1 -run . 2>&1 | tee /tmp/teranode-test-results/smoketest-results.txt
-
+# run chain integrity tests - multi-node tests with deep chain verification
+# This test mines blocks across multiple nodes and verifies chain consistency
+.PHONY: chainintegrity
+chainintegrity:
+	@command -v gotestsum >/dev/null 2>&1 || { echo "gotestsum not found. Installing..."; $(MAKE) install-tools; }
+	@mkdir -p /tmp/teranode-test-results
+	cd test/e2e/chainintegrity && gotestsum --format pkgname -- -v -count=1 -race -timeout=35m -run . 2>&1 | tee /tmp/teranode-test-results/chainintegrity-results.txt
 
 .PHONY: nightly-tests
 nightly-tests:
