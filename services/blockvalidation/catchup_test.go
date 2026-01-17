@@ -26,6 +26,7 @@ import (
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
 	"github.com/jellydator/ttlcache/v3"
@@ -99,7 +100,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 			suite.MockBlockchain.On("GetBlockExists", mock.Anything, blocks[i].Header.Hash()).Return(false, nil).Maybe()
 		}
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		var headersBytes []byte
@@ -152,7 +153,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 		// Mock GetBlockExists for any header to return false
 		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		requestCount := 0
@@ -258,7 +259,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{targetBlock.Header.Hash()}
 		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, targetBlock.Header.Hash(), mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		httpmock.RegisterResponder(
@@ -294,7 +295,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{targetBlock.Header.Hash()}
 		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, targetBlock.Header.Hash(), mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		httpmock.RegisterResponder(
@@ -331,7 +332,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{targetBlock.Header.Hash()}
 		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, targetBlock.Header.Hash(), mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		invalidBytes := make([]byte, 160)
@@ -380,7 +381,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 			suite.MockBlockchain.On("GetBlockExists", mock.Anything, blocks[i].Header.Hash()).Return(false, nil).Maybe()
 		}
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		requestCount := 0
@@ -446,7 +447,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 
 		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		requestCount := 0
@@ -519,7 +520,7 @@ func TestCatchupGetBlockHeaders(t *testing.T) {
 		}
 		suite.MockBlockchain.On("GetBlockLocator", mock.Anything, bestBlock.Header.Hash(), uint32(50)).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		var headersBytes []byte
@@ -688,7 +689,7 @@ func TestServer_blockFoundCh_triggersCatchupCh(t *testing.T) {
 	require.NoError(t, err)
 
 	// Activate httpmock before registering responders
-	httpmock.Activate()
+	httpmock.ActivateNonDefault(util.HTTPClient())
 	// Don't deactivate httpmock - it causes race conditions when goroutines are still
 	// processing HTTP requests during test cleanup. The mock state will be reset by
 	// other tests that activate httpmock.
@@ -810,7 +811,6 @@ func prefillBlockPriorityQueueForTest(t *testing.T, pq *BlockPriorityQueue, coun
 }
 
 func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
-	t.Skip("Skipping test that hangs - needs proper cleanup")
 	initPrometheusMetrics()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -819,99 +819,86 @@ func TestServer_blockFoundCh_triggersCatchupCh_BlockLocator(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.BlockValidation.UseCatchupWhenBehind = true
 
-	blocks := testhelpers.CreateTestBlockChain(t, 10)
-	block1 := blocks[0]
-	block2 := blocks[1]
-	block1Bytes, err := block1.Bytes()
-	require.NoError(t, err)
+	// Create test blocks
+	blocks := testhelpers.CreateTestBlockChain(t, 4)
 
-	hashes := make([]*chainhash.Hash, len(blocks))
+	// Create mock blockchain client
+	mockBlockchainClient := &blockchain.Mock{}
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	// Return a buffered channel for Subscribe so BlockValidation.start() doesn't block
+	subscriptionCh := make(chan *blockchain_api.Notification, 10)
+	defer close(subscriptionCh)
+	mockBlockchainClient.On("Subscribe", mock.Anything, mock.Anything).Return(subscriptionCh, nil)
+	mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+	mockBlockchainClient.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
+	mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{blocks[0].Header}, []*model.BlockHeaderMeta{{Height: 100}}, nil)
+	mockBlockchainClient.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil)
 
-	for i, block := range blocks {
-		hashes[i] = block.Header.Hash()
-	}
+	// Mock GetBestBlockHeader - returns block at height 100 so queue appears behind
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(blocks[0].Header, &model.BlockHeaderMeta{Height: 100}, nil)
 
+	// Mock HTTP responses for block requests
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+
+	// Register block responses
 	for _, block := range blocks {
 		blockBytes, err := block.Bytes()
 		require.NoError(t, err)
-		httpmock.RegisterResponder("GET", `=~^http://peer[0-9]+/block/[a-f0-9]+$`, httpmock.NewBytesResponder(200, blockBytes))
+		httpmock.RegisterResponder(
+			"GET",
+			fmt.Sprintf("=~^http://peer0/block/%s", block.Header.Hash().String()),
+			httpmock.NewBytesResponder(200, blockBytes),
+		)
 	}
 
-	httpmock.RegisterResponder(
-		"GET",
-		`=~^http://peer[0-9]+/headers_from_common_ancestor/[a-f0-9]+`,
-		httpmock.NewBytesResponder(200, block1Bytes),
-	)
-
-	mockBlockchain := &blockchain.Mock{}
-	mockBlockchain.On("GetBlock", mock.Anything, mock.Anything).Return(&model.Block{}, nil)
-	mockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
-	mockBlockchain.On("Subscribe", mock.Anything, mock.Anything).Return((chan *blockchain_api.Notification)(nil), nil)
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{1}, nil)
-	mockBlockchain.On("InvalidateBlock", mock.Anything, mock.Anything).Return([]chainhash.Hash{}, nil)
-	mockBlockchain.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("GetBlocksSubtreesNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchain.On("CatchUpBlocks", mock.Anything).Return(nil)
-	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(block2.Header, &model.BlockHeaderMeta{Height: 2}, nil)
-	mockBlockchain.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(hashes[:1], nil)
-
-	fsmState := blockchain_api.FSMStateType_CATCHINGBLOCKS
-	mockBlockchain.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
-	mockBlockchain.On("Run", mock.Anything, mock.Anything).Return(nil)
-
-	blockFoundCh := make(chan processBlockFound, 1)
-	catchupCh := make(chan processBlockCatchup, 1)
-
-	blockValidation := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, nil, nil, nil, nil, nil)
+	// Create base server instance
 	baseServer := &Server{
 		logger:              ulogger.TestLogger{},
 		settings:            tSettings,
-		blockFoundCh:        blockFoundCh,
-		catchupCh:           catchupCh,
-		stats:               gocore.NewStat("test"),
-		blockValidation:     blockValidation,
-		blockchainClient:    mockBlockchain,
+		blockFoundCh:        make(chan processBlockFound, 10),
+		catchupCh:           make(chan processBlockCatchup, 10),
+		blockValidation:     NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchainClient, nil, nil, nil, nil, nil),
+		blockchainClient:    mockBlockchainClient,
 		forkManager:         NewForkManager(ulogger.TestLogger{}, tSettings),
 		subtreeStore:        nil,
 		txStore:             nil,
 		utxoStore:           nil,
 		processBlockNotify:  ttlcache.New[chainhash.Hash, bool](),
 		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
+		stats:               gocore.NewStat("test"),
 	}
 
-	require.NoError(t, blockValidation.blockHashesCurrentlyValidated.Put(*block1.Header.Hash()))
-	require.NoError(t, blockValidation.blockHashesCurrentlyValidated.Put(*block2.Header.Hash()))
+	// Create test server wrapper
+	server := &testServer{
+		Server: baseServer,
+		blocks: blocks,
+	}
 
-	// Ensure processBlockNotify is stopped on cleanup
-	defer func() {
-		if baseServer.processBlockNotify != nil {
-			baseServer.processBlockNotify.Stop()
-		}
-	}()
+	// Create block found request - will be processed directly
+	pbf1 := processBlockFound{hash: blocks[0].Header.Hash(), baseURL: "http://peer0", errCh: make(chan error, 1)}
 
-	err = baseServer.Init(context.Background())
+	// Fill blockFoundCh with 4+ blocks to trigger catchup path (condition: len > 3)
+	server.blockFoundCh <- processBlockFound{hash: blocks[1].Header.Hash(), baseURL: "http://peer0", errCh: make(chan error, 1)}
+	server.blockFoundCh <- processBlockFound{hash: blocks[2].Header.Hash(), baseURL: "http://peer0", errCh: make(chan error, 1)}
+	server.blockFoundCh <- processBlockFound{hash: blocks[3].Header.Hash(), baseURL: "http://peer0", errCh: make(chan error, 1)}
+	server.blockFoundCh <- processBlockFound{hash: blocks[0].Header.Hash(), baseURL: "http://peer0", errCh: make(chan error, 1)}
+
+	// Process the first block - this should trigger catchup since:
+	// 1. len(blockFoundCh) > 3 makes shouldConsiderCatchup true
+	// 2. GetBlockExists returns false for parent, triggering catchup
+	err := server.processBlockFoundChannel(ctx, pbf1)
 	require.NoError(t, err)
 
-	// Fill blockFoundCh to trigger the catchup path
-	for _, block := range blocks {
-		blockFoundCh <- processBlockFound{
-			hash:    block.Header.Hash(),
-			baseURL: "http://peer0",
-			errCh:   make(chan error, 1),
-		}
-	}
-
-	// there should be 4 catchups
-	for i := 0; i < 10; i++ {
-		select {
-		case got := <-catchupCh:
-			assert.NotNil(t, got.block)
-			assert.Equal(t, "http://peer0", got.baseURL)
-		case <-time.After(time.Second):
-			t.Logf("processBlockFoundChannel did not put anything on catchupCh")
-		}
+	// Verify catchup channel received the block
+	select {
+	case got := <-server.catchupCh:
+		assert.NotNil(t, got.block)
+		assert.Equal(t, "http://peer0", got.baseURL)
+		// The block sent to catchup should be blocks[0] since its parent doesn't exist
+		assert.Equal(t, blocks[0].Header.Hash().String(), got.block.Header.Hash().String())
+	case <-time.After(time.Second):
+		t.Fatal("processBlockFoundChannel did not put anything on catchupCh")
 	}
 }
 
@@ -944,7 +931,7 @@ func TestProcessBlockFoundChannelCatchup(t *testing.T) {
 	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(blocks[0].Header, &model.BlockHeaderMeta{Height: 100}, nil).Once()
 
 	// Mock HTTP responses for block requests
-	httpmock.Activate()
+	httpmock.ActivateNonDefault(util.HTTPClient())
 	defer httpmock.DeactivateAndReset()
 
 	// Mock block responses for each peer
@@ -1052,11 +1039,8 @@ func TestCatchup(t *testing.T) {
 		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 		blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
-		bloomFilterStats:              model.NewBloomStats(),
 		utxoStore:                     mockUTXOStore,
-		recentBlocksBloomFilters:      txmap.NewSyncedMap[chainhash.Hash, *model.BlockBloomFilter](100),
 		subtreeStore:                  blobmemory.New(),
-		blockBloomFiltersBeingCreated: txmap.NewSwissMap(0),
 		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
 	}
 
@@ -1223,7 +1207,6 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 			blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 			blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 			blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
-			bloomFilterStats:              model.NewBloomStats(),
 			utxoStore:                     mockUTXOStore,
 		}
 
@@ -1287,7 +1270,7 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 			nil, errors.NewServiceError("not found"),
 		).Maybe()
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Simulate server returning headers in chunks
@@ -1377,7 +1360,7 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, blocks[0].Header.Hash()).Return(true, nil).Maybe()
 
 		// Activate httpmock and register responder
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		httpmock.RegisterResponder(
@@ -1422,7 +1405,7 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{blocks[0].Header.Hash()}
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Always return network error to trigger circuit breaker
@@ -1539,7 +1522,7 @@ func TestCatchupIntegrationScenarios(t *testing.T) {
 		// This is needed because FilterNewHeaders will check various headers
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Mock the /blocks/ endpoint for fetching actual blocks
@@ -1641,7 +1624,7 @@ func TestCatchupErrorScenarios(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{blocks[0].Header.Hash()}
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Simulate network timeout
@@ -1706,7 +1689,7 @@ func TestCatchupErrorScenarios(t *testing.T) {
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
 
 		// Setup HTTP mocks
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Return invalid header bytes (not divisible by block header size)
@@ -1761,7 +1744,7 @@ func TestCatchupErrorScenarios(t *testing.T) {
 		}
 
 		// Setup HTTP mocks
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Create headers with some corrupt data
@@ -1851,7 +1834,7 @@ func TestCatchupErrorScenarios(t *testing.T) {
 			nil,
 		)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Return valid headers
@@ -1904,7 +1887,7 @@ func TestCatchupErrorScenarios(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{blocks[0].Header.Hash()}
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Return 404 error
@@ -1952,7 +1935,7 @@ func TestCatchupErrorScenarios(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{blocks[0].Header.Hash()}
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Return response that triggers malicious detection
@@ -2000,7 +1983,7 @@ func TestCatchupErrorScenarios(t *testing.T) {
 		locatorHashes := []*chainhash.Hash{blocks[0].Header.Hash()}
 		mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 		defer httpmock.DeactivateAndReset()
 
 		// Simulate different errors for different requests
@@ -2385,7 +2368,7 @@ func SkipTestCatchupPerformanceWithHeaderCache(t *testing.T) {
 		}, nil).Maybe()
 
 	// Setup HTTP mock for header fetching
-	httpmock.Activate()
+	httpmock.ActivateNonDefault(util.HTTPClient())
 	defer httpmock.DeactivateAndReset()
 
 	// Create headers starting with common ancestor (block 0) followed by blocks 1-9
@@ -2528,7 +2511,7 @@ func BenchmarkCatchupWithHeaderCache(b *testing.B) {
 		mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
 			Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil).Maybe()
 
-		httpmock.Activate()
+		httpmock.ActivateNonDefault(util.HTTPClient())
 
 		// Create headers
 		headersBytes := []byte{}
@@ -2594,7 +2577,7 @@ func TestCatchup_NoRepeatedHeaderFetching(t *testing.T) {
 	requestCount := 0
 	var lastBlockLocator string
 
-	httpmock.Activate()
+	httpmock.ActivateNonDefault(util.HTTPClient())
 	defer httpmock.DeactivateAndReset()
 
 	httpmock.RegisterResponder(
@@ -3087,11 +3070,8 @@ func setupTestCatchupServer(t *testing.T) (*Server, *blockchain.Mock, *utxo.Mock
 		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 		blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
-		bloomFilterStats:              model.NewBloomStats(),
 		utxoStore:                     mockUTXOStore,
-		recentBlocksBloomFilters:      txmap.NewSyncedMap[chainhash.Hash, *model.BlockBloomFilter](100),
 		subtreeStore:                  blobmemory.New(),
-		blockBloomFiltersBeingCreated: txmap.NewSwissMap(0),
 		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
 	}
 
@@ -3181,11 +3161,8 @@ func setupTestCatchupServerWithConfig(t *testing.T, config *testhelpers.TestServ
 		blockHashesCurrentlyValidated: txmap.NewSwissMap(0),
 		blocksCurrentlyValidating:     txmap.NewSyncedMap[chainhash.Hash, *validationResult](),
 		blockExistsCache:              expiringmap.New[chainhash.Hash, bool](120 * time.Minute),
-		bloomFilterStats:              model.NewBloomStats(),
 		utxoStore:                     mockUTXOStore,
-		recentBlocksBloomFilters:      txmap.NewSyncedMap[chainhash.Hash, *model.BlockBloomFilter](100),
 		subtreeStore:                  blobmemory.New(),
-		blockBloomFiltersBeingCreated: txmap.NewSwissMap(0),
 		lastValidatedBlocks:           expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute),
 	}
 
@@ -3375,7 +3352,7 @@ func TestCheckpointValidationWithSuboptimalAncestor(t *testing.T) {
 	}
 
 	// Set up HTTP mock to return these headers
-	httpmock.Activate()
+	httpmock.ActivateNonDefault(util.HTTPClient())
 	defer httpmock.DeactivateAndReset()
 
 	httpmock.RegisterResponder(
@@ -3443,10 +3420,9 @@ func TestCheckpointValidationHeightCalculation(t *testing.T) {
 	assert.False(t, catchupCtx.useQuickValidation, "Quick validation is currently disabled (needs more testing)")
 }
 
-// TestCheckpointValidationWithWrongHeights demonstrates that the corrected logic
-// prevents the scenario of suboptimal common ancestors causing wrong height calculations
-func TestCheckpointValidationWithWrongHeights(t *testing.T) {
-	t.Skip("This test artificially creates an inconsistent scenario that shouldn't occur with corrected logic")
+// TestCheckpointValidationSkipsCheckpointsBelowAncestor verifies that checkpoint validation
+// correctly skips checkpoints that are below the common ancestor height
+func TestCheckpointValidationSkipsCheckpointsBelowAncestor(t *testing.T) {
 	suite := NewCatchupTestSuite(t)
 	defer suite.Cleanup()
 
@@ -3456,56 +3432,41 @@ func TestCheckpointValidationWithWrongHeights(t *testing.T) {
 	// Set up checkpoints - include one below common ancestor (should be skipped) and one above (should be verified)
 	suite.Server.settings.ChainCfgParams = &chaincfg.Params{
 		Checkpoints: []chaincfg.Checkpoint{
-			{Height: 2, Hash: blocks[2].Header.Hash()},   // Below common ancestor (3) - should be skipped
+			{Height: 2, Hash: blocks[2].Header.Hash()},   // Below common ancestor (7) - should be skipped
 			{Height: 10, Hash: blocks[10].Header.Hash()}, // Above common ancestor - should be verified
 		},
 	}
 
-	// Create catchup context simulating WRONG common ancestor
-	// We need to set up the original headers that would have been returned by the peer
-	wrongCommonAncestorHash := blocks[3].Header.Hash()
-
-	// Original headers from peer (blocks 3-14, with block 3 being the wrong common ancestor)
-	originalPeerHeaders := make([]*model.BlockHeader, 12) // blocks 3-14
-	for i := 0; i < 12; i++ {
-		originalPeerHeaders[i] = blocks[3+i].Header
-	}
-
+	// Create catchup context with common ancestor at height 7
+	// Headers we're processing are blocks 8-14
 	catchupCtx := &CatchupContext{
 		blockUpTo: &model.Block{
 			Header: blocks[14].Header,
 			Height: 14,
 		},
-		commonAncestorHash: wrongCommonAncestorHash,
+		commonAncestorHash: blocks[7].Header.Hash(),
 		commonAncestorMeta: &model.BlockHeaderMeta{
-			Height: 3, // WRONG: should be 7, but algorithm picked 3
+			Height: 7,
 		},
-		// Headers we're processing: blocks 8-14 (after filtering out 4-7 that we already have)
+		// Headers we're processing: blocks 8-14 (after the common ancestor at height 7)
 		blockHeaders: []*model.BlockHeader{
-			blocks[8].Header,  // height should be 8
-			blocks[9].Header,  // height should be 9
-			blocks[10].Header, // height should be 10 - checkpoint!
-			blocks[11].Header, // height should be 11
-			blocks[12].Header, // height should be 12
-			blocks[13].Header, // height should be 13
-			blocks[14].Header, // height should be 14
+			blocks[8].Header,  // height 8 = commonAncestorHeight (7) + 1
+			blocks[9].Header,  // height 9
+			blocks[10].Header, // height 10 - checkpoint!
+			blocks[11].Header, // height 11
+			blocks[12].Header, // height 12
+			blocks[13].Header, // height 13
+			blocks[14].Header, // height 14
 		},
 		forkDepth: 0, // no fork
-		headersFetchResult: &catchup.Result{
-			Headers: originalPeerHeaders, // Original headers before filtering
-		},
 	}
 
-	// Test the checkpoint verification - with the fix, this should now PASS
+	// Test the checkpoint verification
 	err := suite.Server.verifyCheckpointsInHeaderChain(catchupCtx)
 
-	// With the fix, checkpoint validation should work correctly even with suboptimal common ancestor
-	if err != nil {
-		t.Logf("Checkpoint validation failed (this was the old bug): %v", err)
-		t.Error("With the fix, checkpoint validation should now pass even with suboptimal common ancestor")
-	} else {
-		t.Logf("SUCCESS: Checkpoint validation passed with suboptimal common ancestor - fix is working!")
-	}
+	// Checkpoint at height 2 should be skipped (below common ancestor at height 7)
+	// Checkpoint at height 10 should be verified and pass (matches blocks[10])
+	assert.NoError(t, err, "Checkpoint validation should succeed - checkpoint at height 2 should be skipped, checkpoint at height 10 should match")
 }
 
 // TestExtractHeadersAfterAncestorIssue tests the header extraction logic
@@ -3650,5 +3611,133 @@ func TestSuboptimalCommonAncestorCausesHeightCalculationIssue(t *testing.T) {
 		t.Logf("With the fix, checkpoint validation should work correctly")
 	} else {
 		t.Logf("Checkpoint validation passed - the fix works!")
+	}
+}
+
+// TestCatchup_MemoryLimitAfterDuplicateRemoval tests that the memory limit check
+// happens AFTER duplicate removal, not before. This prevents premature termination
+// when the raw header count exceeds the limit but the actual headers to append
+// (after removing duplicates) would fit within the limit.
+//
+// Bug scenario:
+// - allCatchupHeaders has 10,000 headers (from iteration 1)
+// - maxAccumulatedHeaders is 10,001
+// - Iteration 2 returns [header9999, header10000] (2 headers, first is duplicate)
+// - BUGGY: 10,000 + 2 = 10,002 > 10,001 → truncates to 1, appends DUPLICATE header9999
+// - FIXED: After duplicate removal, only header10000 is new → 10,000 + 1 = 10,001 → appends correctly
+func TestCatchup_MemoryLimitAfterDuplicateRemoval(t *testing.T) {
+	ctx := context.Background()
+
+	// Create test server
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	// Set memory limit to 10,001 - just enough for 10,000 + 1 new header after duplicate removal
+	// But with the bug, 10,000 + 2 = 10,002 > 10,001 triggers premature truncation
+	const maxHeaders = 10_001
+	server.settings.BlockValidation.CatchupMaxAccumulatedHeaders = maxHeaders
+
+	// Build a chain of 10,002 headers (indices 0-10001)
+	// Iteration 1: returns 10,000 headers (0-9999)
+	// Iteration 2: returns 2 headers (9999 duplicate, 10000 new)
+	numHeaders := 10_002
+	allHeaders := testhelpers.CreateTestHeaders(t, numHeaders)
+
+	// Create target block (last header in chain)
+	targetBlock := &model.Block{
+		Header: allHeaders[numHeaders-1],
+		Height: uint32(numHeaders),
+	}
+
+	// Create "best block" - the starting point for catchup
+	bestBlock := &model.Block{
+		Header: allHeaders[0],
+		Height: 1,
+	}
+
+	// Mock blockchain client calls
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, targetBlock.Header.Hash()).Return(false, nil)
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
+		bestBlock.Header,
+		&model.BlockHeaderMeta{Height: bestBlock.Height, ID: 1},
+		nil,
+	)
+
+	locatorHashes := []*chainhash.Hash{bestBlock.Header.Hash()}
+	mockBlockchainClient.On("GetBlockLocator", mock.Anything, mock.Anything, mock.Anything).Return(locatorHashes, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, errors.NewServiceError("not found")).Maybe()
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	// Track which iteration we're on
+	callCount := 0
+
+	httpmock.RegisterResponder(
+		"GET",
+		`=~^http://test-peer/headers_from_common_ancestor/.*`,
+		func(req *http.Request) (*http.Response, error) {
+			callCount++
+
+			var headers []*model.BlockHeader
+
+			if callCount == 1 {
+				// First iteration: return exactly 10,000 headers (0-9999)
+				// This is maxBlockHeadersPerRequest, so it will continue to iteration 2
+				headers = allHeaders[0:10_000]
+			} else {
+				// Second iteration: return headers 9999-10000 (2 headers)
+				// First header (9999) is a duplicate of last from iteration 1
+				// Header 10000 is new
+				// With bug: 10,000 + 2 = 10,002 > 10,001 → truncates to 1, appends duplicate
+				// With fix: After removing duplicate, 10,000 + 1 = 10,001 ≤ 10,001 → appends new header
+				headers = allHeaders[9999:10001]
+			}
+
+			headerBytes := testhelpers.HeadersToBytes(headers)
+			return httpmock.NewBytesResponse(200, headerBytes), nil
+		},
+	)
+
+	// Execute catchup
+	result, _, err := server.catchupGetBlockHeaders(ctx, targetBlock, "peer-test-001", "http://test-peer")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	t.Logf("Result: %d headers, stop reason: %s, iterations: %d", len(result.Headers), result.StopReason, callCount)
+
+	// Check for duplicates in the result - this is the key bug indicator
+	seenHashes := make(map[chainhash.Hash]int)
+	for i, h := range result.Headers {
+		hash := *h.Hash()
+		if prevIdx, exists := seenHashes[hash]; exists {
+			t.Errorf("BUG DETECTED: Duplicate header at indices %d and %d (hash: %s)",
+				prevIdx, i, hash.String())
+		}
+		seenHashes[hash] = i
+	}
+
+	// Verify we have the expected number of headers
+	assert.Equal(t, maxHeaders, len(result.Headers),
+		"Should have exactly %d headers after memory limit enforcement", maxHeaders)
+
+	// Verify headers are sequential (no gaps, no duplicates)
+	for i := 0; i < len(result.Headers) && i < len(allHeaders); i++ {
+		expectedHash := allHeaders[i].Hash()
+		actualHash := result.Headers[i].Hash()
+		assert.True(t, expectedHash.IsEqual(actualHash),
+			"Header at index %d should be allHeaders[%d], got different hash", i, i)
+	}
+
+	// The last header should be header 10000 (index 10000), not header 9999 repeated
+	if len(result.Headers) > 0 {
+		lastHeader := result.Headers[len(result.Headers)-1]
+		expectedLastHeader := allHeaders[10000] // With fix, should be header 10000
+
+		assert.True(t, lastHeader.Hash().IsEqual(expectedLastHeader.Hash()),
+			"Last header should be header 10000 (unique), not a duplicate of header 9999")
 	}
 }
