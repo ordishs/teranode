@@ -37,6 +37,7 @@ type Settings struct {
 	LogLevel                     string
 	PrettyLogs                   bool
 	JSONLogging                  bool
+	Debug                        DebugSettings
 	ProfilerAddr                 string
 	StatsPrefix                  string
 	PrometheusEndpoint           string
@@ -77,6 +78,14 @@ type Settings struct {
 	Dashboard                    DashboardSettings
 	Pruner                       PrunerSettings
 	GlobalBlockHeightRetention   uint32
+}
+
+// DebugSettings configures subsystem-specific debug toggles.
+type DebugSettings struct {
+	All       bool
+	File      bool
+	Blobstore bool
+	UTXOStore bool
 }
 
 // GetUtxoStoreBlockHeightRetention calculates the effective block height retention for UTXO store
@@ -327,6 +336,7 @@ type BlockValidationSettings struct {
 	PreviousBlockHeaderCount                  uint64
 	MaxBlocksBehindBlockAssembly              int
 	PeriodicProcessingInterval                time.Duration // Interval for periodic processing of blocks with mined_set=false (default: 1 minute)
+	RecentBlockIDsLimit                       uint64        // Maximum number of recent block IDs to load for double-spend checking (default: 50000)
 	// Catchup configuration
 	CatchupMaxRetries            int // Maximum number of retries for catchup operations
 	CatchupIterationTimeout      int // Timeout in seconds for each catchup iteration
@@ -493,6 +503,9 @@ type P2PSettings struct {
 
 	// This is the time we trigger a periodic evaluation in the sync coordinator
 	SyncCoordinatorPeriodicEvaluationInterval time.Duration
+
+	// On-demand HTTP health checking for peer availability
+	HealthCheckEnabled bool // Enable HTTP availability checking during peer selection (uses 2s timeout)
 }
 
 type CoinbaseSettings struct {

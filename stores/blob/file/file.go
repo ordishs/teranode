@@ -44,7 +44,9 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/debugflags"
 	"github.com/ordishs/go-utils"
+	"github.com/ordishs/gocore"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -80,6 +82,26 @@ type File struct {
 	persistSubDir string
 	// longtermClient is an optional secondary storage backend for hybrid storage models
 	longtermClient longtermStore
+}
+
+func (s *File) debugEnabled() bool {
+	if !debugflags.FileEnabled() || s == nil || s.logger == nil {
+		return false
+	}
+
+	return s.logger.LogLevel() <= int(gocore.DEBUG)
+}
+
+func (s *File) debugf(format string, args ...interface{}) {
+	if !s.debugEnabled() {
+		return
+	}
+
+	s.logger.Debugf(format, args...)
+}
+
+func formatKeyHex(key []byte) string {
+	return utils.ReverseAndHexEncodeSlice(key)
 }
 
 // longtermStore defines the interface for a secondary storage backend that can be used
@@ -525,6 +547,168 @@ func (s *File) writeDAHToFile(dahFilename string, dah uint32) error {
 	return s.writeDAHToFile_internal(dahFilename, dah)
 }
 
+func (s *File) dahCleaner(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.cleanupCh:
+			s.cleanupExpiredFiles()
+		}
+	}
+}
+
+func (s *File) cleanupExpiredFiles() {
+	s.debugf("[File] Cleaning file DAHs")
+
+	filesToRemove := s.getExpiredFiles()
+	for _, fileName := range filesToRemove {
+		s.cleanupExpiredFile(fileName)
+	}
+}
+
+func (s *File) getExpiredFiles() []string {
+	s.fileDAHsMu.Lock()
+	filesToRemove := make([]string, 0, len(s.fileDAHs))
+
+	currentBlockHeight := s.currentBlockHeight.Load()
+
+	s.debugf("[File] current block height is %d", currentBlockHeight)
+
+	for fileName, dah := range s.fileDAHs {
+		if dah <= currentBlockHeight {
+			filesToRemove = append(filesToRemove, fileName)
+			s.debugf("[File] removing expired file: %s", fileName)
+		}
+	}
+	s.fileDAHsMu.Unlock()
+
+	return filesToRemove
+}
+
+func (s *File) cleanupExpiredFile(fileName string) {
+	// check if the DAH file still exists, even if the map says it has expired, another process might have updated it
+	dah, err := s.readDAHFromFile(fileName + ".dah")
+	if err != nil {
+		// If it's a processing error (invalid DAH value or corrupt file), clean it up
+		if errors.Is(err, errors.ErrProcessing) {
+			s.logger.Warnf("[File] invalid DAH file detected during cleanup: %s, error: %v", fileName+".dah", err)
+			s.removeDAHFromMap(fileName)
+
+			// Remove the invalid DAH file, but keep the blob files
+			// Protect file removal operation
+			ctx := context.Background()
+			if err := acquireWritePermit(ctx); err != nil {
+				s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
+				return
+			}
+			defer releaseWritePermit()
+
+			removeErr := os.Remove(fileName + ".dah")
+
+			if removeErr != nil && !os.IsNotExist(removeErr) {
+				s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName+".dah")
+			}
+		} else if errors.Is(err, errors.ErrNotFound) {
+			s.removeDAHFromMap(fileName)
+			s.debugf("[File] DAH file not found during cleanup, removing from map: %s", fileName+".dah")
+		} else {
+			s.debugf("[File] failed to read DAH from file: %s, error: %v", fileName+".dah", err)
+		}
+		return
+	}
+
+	// This should not happen anymore with the validation in readDAHFromFile
+	if dah == 0 {
+		s.removeDAHFromMap(fileName)
+		s.logger.Warnf("[File] unexpected DAH value 0, removing: %s", fileName+".dah")
+
+		// Remove the invalid DAH file, but keep the blob files
+		// Protect file removal operation
+		ctx := context.Background()
+		if err := acquireWritePermit(ctx); err != nil {
+			s.logger.Warnf("[File] failed to acquire write permit for removal: %v", err)
+			return
+		}
+		defer releaseWritePermit()
+
+		err := os.Remove(fileName + ".dah")
+		if err != nil && !os.IsNotExist(err) {
+			s.logger.Warnf("[File] failed to remove invalid DAH file: %s", fileName+".dah")
+		}
+
+		return
+	}
+
+	if !s.shouldRemoveFile(fileName, dah) {
+		return
+	}
+
+	s.debugf("[File] removing expired file: %s", fileName)
+	s.removeFiles(fileName)
+	s.removeDAHFromMap(fileName)
+}
+
+func (s *File) shouldRemoveFile(fileName string, fileDAH uint32) bool {
+	currentBlockHeight := s.currentBlockHeight.Load()
+
+	if fileDAH > currentBlockHeight {
+		// Update the DAH in our map
+		s.fileDAHsMu.Lock()
+		mapDAH := s.fileDAHs[fileName]
+		s.fileDAHs[fileName] = fileDAH
+		s.fileDAHsMu.Unlock()
+
+		s.debugf("[File] DAH file %s has DAH of %d, but map has %d",
+			fileName+".dah",
+			fileDAH,
+			mapDAH)
+
+		return false
+	}
+
+	return true
+}
+
+// removeFiles_internal removes files WITHOUT semaphore protection.
+// Caller must hold appropriate semaphore.
+func (s *File) removeFiles_internal(fileName string) {
+	// Use the Del method to allow logger.go to log the removal to help with troubleshooting
+	// FileTypeUnknown is "", which will remove the file, checksum and dah files
+	// err := s.Del(context.Background(), []byte(fileName), fileformat.FileTypeUnknown)
+
+	if err := os.Remove(fileName); err != nil && !os.IsNotExist(err) {
+		s.logger.Warnf("[File] failed to remove file: %s", fileName)
+	}
+
+	if err := os.Remove(fileName + ".dah"); err != nil && !os.IsNotExist(err) {
+		s.logger.Warnf("[File] failed to remove DAH file: %s", fileName+".dah")
+	}
+
+	if err := os.Remove(fileName + checksumExtension); err != nil && !os.IsNotExist(err) {
+		s.logger.Warnf("[File] failed to remove checksum file: %s", fileName+checksumExtension)
+	}
+}
+
+// removeFiles removes files WITH semaphore protection.
+// Use this when caller doesn't already hold a semaphore.
+func (s *File) removeFiles(fileName string) {
+	ctx := context.Background()
+	if err := acquireWritePermit(ctx); err != nil {
+		s.logger.Warnf("[File] failed to acquire write permit for file removal: %v", err)
+		return
+	}
+	defer releaseWritePermit()
+
+	s.removeFiles_internal(fileName)
+}
+
+func (s *File) removeDAHFromMap(fileName string) {
+	s.fileDAHsMu.Lock()
+	delete(s.fileDAHs, fileName)
+	s.fileDAHsMu.Unlock()
+}
+
 // Health checks the health status of the file-based blob store.
 // It verifies that the storage directory exists and is accessible by attempting to
 // create a temporary file. This ensures that the store can perform basic read/write
@@ -539,6 +723,8 @@ func (s *File) writeDAHToFile(dahFilename string, dah uint32) error {
 //   - string: Description of the health status ("OK" or an error message)
 //   - error: Any error that occurred during the health check
 func (s *File) Health(ctx context.Context, _ bool) (int, string, error) {
+	s.debugf("[File] Health check start path=%s", s.path)
+
 	if err := acquireWritePermit(ctx); err != nil {
 		return http.StatusServiceUnavailable, "File Store: Write concurrency limit reached", err
 	}
@@ -586,6 +772,7 @@ func (s *File) Health(ctx context.Context, _ bool) (int, string, error) {
 		return http.StatusInternalServerError, "File Store: Unable to delete file", err
 	}
 
+	s.debugf("[File] Health check succeeded path=%s", s.path)
 	return http.StatusOK, "File Store: Healthy", nil
 }
 
@@ -642,6 +829,9 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 		return errors.NewStorageError("[File][SetFromReader] failed to acquire write permit", err)
 	}
 	defer releaseWritePermit()
+
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] SetFromReader start key=%s type=%s", keyHex, fileType)
 
 	filename, err := s.constructFilename(key, fileType, opts)
 	if err != nil {
@@ -725,6 +915,7 @@ func (s *File) SetFromReader(ctx context.Context, key []byte, fileType fileforma
 		return errors.NewStorageError("[File][SetFromReader] failed to write hash file", err)
 	}
 
+	s.debugf("[File] SetFromReader completed key=%s type=%s filename=%s", keyHex, fileType, filename)
 	return nil
 }
 
@@ -777,9 +968,17 @@ func (s *File) writeHashFile(hasher hash.Hash, filename string) error {
 // Returns:
 //   - error: Any error that occurred during the operation
 func (s *File) Set(ctx context.Context, key []byte, fileType fileformat.FileType, value []byte, opts ...options.FileOption) error {
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] Set start key=%s type=%s size=%d", keyHex, fileType, len(value))
+
 	reader := io.NopCloser(bytes.NewReader(value))
 
-	return s.SetFromReader(ctx, key, fileType, reader, opts...)
+	err := s.SetFromReader(ctx, key, fileType, reader, opts...)
+	if err == nil {
+		s.debugf("[File] Set completed key=%s type=%s size=%d", keyHex, fileType, len(value))
+	}
+
+	return err
 }
 
 func (s *File) constructFilename(key []byte, fileType fileformat.FileType, opts []options.FileOption) (string, error) {
@@ -854,6 +1053,9 @@ func (s *File) SetDAH(ctx context.Context, key []byte, fileType fileformat.FileT
 	}
 	defer releaseWritePermit()
 
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] SetDAH start key=%s type=%s newDAH=%d", keyHex, fileType, newDAH)
+
 	merged := options.MergeOptions(s.options, opts)
 
 	fileName, err := merged.ConstructFilename(s.path, key, fileType)
@@ -894,6 +1096,9 @@ func (s *File) SetDAH(ctx context.Context, key []byte, fileType fileformat.FileT
 }
 
 func (s *File) GetDAH(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (uint32, error) {
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] GetDAH start key=%s type=%s", keyHex, fileType)
+
 	merged := options.MergeOptions(s.options, opts)
 
 	fileName, err := merged.ConstructFilename(s.path, key, fileType)
@@ -922,6 +1127,7 @@ func (s *File) GetDAH(ctx context.Context, key []byte, fileType fileformat.FileT
 		return 0, err
 	}
 
+	s.debugf("[File] GetDAH result key=%s type=%s dah=%d", keyHex, fileType, dah)
 	return dah, nil
 }
 
@@ -947,6 +1153,9 @@ func (s *File) GetDAH(ctx context.Context, key []byte, fileType fileformat.FileT
 //   - io.ReadCloser: Reader for streaming the blob data
 //   - error: Any error that occurred during the operation
 func (s *File) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error) {
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] GetIoReader start key=%s type=%s", keyHex, fileType)
+
 	merged := options.MergeOptions(s.options, opts)
 
 	fileName, err := merged.ConstructFilename(s.path, key, fileType)
@@ -966,6 +1175,7 @@ func (s *File) GetIoReader(ctx context.Context, key []byte, fileType fileformat.
 		return nil, err
 	}
 
+	s.debugf("[File] GetIoReader result key=%s type=%s filename=%s", keyHex, fileType, fileName)
 	return f, nil
 }
 
@@ -1057,6 +1267,9 @@ func (s *File) openFileWithFallback(ctx context.Context, merged *options.Options
 //   - []byte: The blob data
 //   - error: Any error that occurred during the operation
 func (s *File) Get(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) ([]byte, error) {
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] Get start key=%s type=%s", keyHex, fileType)
+
 	fileReader, err := s.GetIoReader(ctx, key, fileType, opts...)
 	if err != nil {
 		return nil, err
@@ -1071,7 +1284,10 @@ func (s *File) Get(ctx context.Context, key []byte, fileType fileformat.FileType
 		return nil, errors.NewStorageError("[File][Get] failed to read data from file reader", err)
 	}
 
-	return fileData.Bytes(), nil
+	data := fileData.Bytes()
+	s.debugf("[File] Get result key=%s type=%s bytes=%d", keyHex, fileType, len(data))
+
+	return data, nil
 }
 
 // Exists checks if a blob exists in the file store.
@@ -1094,6 +1310,9 @@ func (s *File) Exists(ctx context.Context, key []byte, fileType fileformat.FileT
 	}
 	defer releaseReadPermit()
 
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] Exists start key=%s type=%s", keyHex, fileType)
+
 	merged := options.MergeOptions(s.options, opts)
 
 	fileName, err := merged.ConstructFilename(s.path, key, fileType)
@@ -1104,6 +1323,7 @@ func (s *File) Exists(ctx context.Context, key []byte, fileType fileformat.FileT
 	// check whether the file exists
 	fileInfo, err := os.Stat(fileName)
 	if err == nil && fileInfo != nil {
+		s.debugf("[File] Exists result key=%s type=%s result=true (primary)", keyHex, fileType)
 		return true, nil
 	}
 
@@ -1116,14 +1336,21 @@ func (s *File) Exists(ctx context.Context, key []byte, fileType fileformat.FileT
 
 		fileInfo, err = os.Stat(persistedFilename)
 		if err == nil && fileInfo != nil {
+			s.debugf("[File] Exists result key=%s type=%s result=true (persist)", keyHex, fileType)
 			return true, nil
 		}
 	}
 
 	if s.longtermClient != nil {
-		return s.longtermClient.Exists(ctx, key, fileType, opts...)
+		exists, err := s.longtermClient.Exists(ctx, key, fileType, opts...)
+		if err == nil {
+			s.debugf("[File] Exists result key=%s type=%s result=%t (longterm)", keyHex, fileType, exists)
+		}
+
+		return exists, err
 	}
 
+	s.debugf("[File] Exists result key=%s type=%s result=false", keyHex, fileType)
 	return false, nil
 }
 
@@ -1146,7 +1373,8 @@ func (s *File) Del(ctx context.Context, key []byte, fileType fileformat.FileType
 	}
 	defer releaseWritePermit()
 
-	s.logger.Debugf("[File] Del: %s", utils.ReverseAndHexEncodeSlice(key))
+	keyHex := formatKeyHex(key)
+	s.debugf("[File] Del start key=%s type=%s", keyHex, fileType)
 
 	merged := options.MergeOptions(s.options, opts)
 
@@ -1164,12 +1392,14 @@ func (s *File) Del(ctx context.Context, key []byte, fileType fileformat.FileType
 	if err = os.Remove(fileName); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// If the file does not exist, consider it deleted
+			s.debugf("[File] Del skipped key=%s type=%s reason=file_missing", keyHex, fileType)
 			return nil
 		}
 
 		return errors.NewStorageError("[File][Del] [%s] failed to remove file", fileName, err)
 	}
 
+	s.debugf("[File] Del completed key=%s type=%s", keyHex, fileType)
 	return nil
 }
 
