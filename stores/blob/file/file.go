@@ -429,9 +429,10 @@ func newStore(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOpt
 	}
 
 	fileStore := &File{
-		path:    path,
-		logger:  logger,
-		options: options,
+		path:          path,
+		logger:        logger,
+		options:       options,
+		persistSubDir: options.PersistSubDir,
 	}
 
 	// Check if longterm storage options are provided

@@ -137,50 +137,7 @@ func TestFileNewWithInvalidDirectory(t *testing.T) {
 	})
 }
 
-func TestFileLoadDAHsCleanupTmpFiles(t *testing.T) {
-	t.Run("cleanup only old dah.tmp files", func(t *testing.T) {
-		// Get a temporary directory
-		tempDir, err := os.MkdirTemp("", "test-dah-tmp-cleanup")
-		require.NoError(t, err)
-		defer os.RemoveAll(tempDir)
-
-		// Create an old .dah.tmp file (>10 minutes old)
-		oldTmpFile := filepath.Join(tempDir, "old.tx.dah.tmp")
-		err = os.WriteFile(oldTmpFile, []byte("12345"), 0o600)
-		require.NoError(t, err)
-
-		// Modify the file's mod time to be 15 minutes ago
-		oldTime := time.Now().Add(-15 * time.Minute)
-		err = os.Chtimes(oldTmpFile, oldTime, oldTime)
-		require.NoError(t, err)
-
-		// Create a new .dah.tmp file (recent)
-		newTmpFile := filepath.Join(tempDir, "new.tx.dah.tmp")
-		err = os.WriteFile(newTmpFile, []byte("67890"), 0o600)
-		require.NoError(t, err)
-
-		// Create file store
-		u, err := url.Parse("file://" + tempDir)
-		require.NoError(t, err)
-
-		_, err = New(ulogger.TestLogger{}, u)
-		require.NoError(t, err)
-
-		// Wait a moment for the background loadDAHs to complete
-		time.Sleep(100 * time.Millisecond)
-
-		// Check that old tmp file was removed
-		_, err = os.Stat(oldTmpFile)
-		require.True(t, os.IsNotExist(err), "Old tmp file should have been removed")
-
-		// Check that new tmp file still exists
-		_, err = os.Stat(newTmpFile)
-		require.NoError(t, err, "New tmp file should still exist")
-
-		// Clean up the new tmp file
-		os.Remove(newTmpFile)
-	})
-}
+// TestFileLoadDAHsCleanupTmpFiles removed - loadDAHs() functionality moved to pruner service
 
 func TestFileConcurrentAccess(t *testing.T) {
 	t.Run("concurrent set and get", func(t *testing.T) {
