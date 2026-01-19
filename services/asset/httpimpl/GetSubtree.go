@@ -163,7 +163,7 @@ func (h *HTTP) GetSubtree(mode ReadMode) func(c echo.Context) error {
 					"Height":           subtree.Height,
 					"Fees":             subtree.Fees,
 					"SizeInBytes":      subtree.SizeInBytes,
-					"FeeHash":          subtree.FeeHash,
+					"FeeHash":          &subtree.FeeHash,
 					"Nodes":            paginatedNodes,
 					"ConflictingNodes": subtree.ConflictingNodes,
 				},

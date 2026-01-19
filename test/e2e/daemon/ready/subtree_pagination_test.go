@@ -295,7 +295,7 @@ func testSubtreeAPI(t *testing.T, baseURL, subtreeHash string, offset, limit int
 	url := fmt.Sprintf("%s/api/v1/subtree/%s/json?offset=%d&limit=%d", baseURL, subtreeHash, offset, limit)
 
 	// Use HTTP client to fetch
-	resp, err := http.Get(url)
+	resp, err := http.Get(url) //nolint:gosec // Test code with controlled URLs
 	require.NoError(t, err, "Failed to fetch subtree API")
 	defer resp.Body.Close()
 
