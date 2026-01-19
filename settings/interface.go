@@ -539,11 +539,11 @@ type PrunerSettings struct {
 	ConnectionPoolWarningThreshold float64       // Threshold (0.0-1.0) for connection pool utilization warnings and auto-adjustment (default: 0.7)
 	BlockTrigger                   string        // When to trigger pruning: "OnBlockPersisted" (default) or "OnBlockMined"
 	UTXODefensiveEnabled           bool          // Enable defensive checks before deleting UTXO transactions (verify children are mined > BlockHeightRetention blocks ago)
-	UTXODefensiveBatchReadSize      int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
-	UTXOChunkSize                   int           // Number of records to process in each chunk before batch flushing (default: 1000)
-	UTXOChunkGroupLimit             int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
-	UTXOProgressLogInterval         time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
-	UTXOPartitionQueries            int           // Number of parallel Aerospike partition queries for UTXO pruning (0 = auto-detect based on CPU cores and query-threads-limit)
+	UTXODefensiveBatchReadSize     int           // Batch size for reading child transactions during defensive UTXO pruning (default: 10000)
+	UTXOChunkSize                  int           // Number of records to process in each chunk before batch flushing (default: 1000)
+	UTXOChunkGroupLimit            int           // Maximum parallel chunk processing during UTXO pruning (default: 10)
+	UTXOProgressLogInterval        time.Duration // Interval for logging progress during UTXO pruning (default: 30s)
+	UTXOPartitionQueries           int           // Number of parallel Aerospike partition queries for UTXO pruning (0 = auto-detect based on CPU cores and query-threads-limit)
 }
 
 type SubtreeValidationSettings struct {
