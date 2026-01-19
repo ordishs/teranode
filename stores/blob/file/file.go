@@ -372,8 +372,6 @@ func New(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOption) 
 	return newStore(logger, storeURL, opts...)
 }
 
-var fileCleanerOnce sync.Map
-
 func newStore(logger ulogger.Logger, storeURL *url.URL, opts ...options.StoreOption) (*File, error) {
 	logger = logger.New("file")
 
@@ -1242,64 +1240,4 @@ func (s *File) Del(ctx context.Context, key []byte, fileType fileformat.FileType
 	return nil
 }
 
-// findFilesByExtension performs directory traversal to find files by extension.
-// NOTE: This is intentionally not semaphore-protected since it's a bulk scanning
-// operation that doesn't open many file descriptors simultaneously. It's called
-// infrequently (at startup and during background DAH loading).
-func findFilesByExtension(root, ext string) ([]string, error) {
-	var a []string
-
-	// Normalize extension: remove leading dot if present for 'find' command
-	// filepath.Ext returns extension with leading dot, but find pattern needs "*.<ext>"
-	extForFind := strings.TrimPrefix(ext, ".")
-
-	useFind := runtime.GOOS == "linux" || runtime.GOOS == "darwin"
-
-	// Check if 'find' is available
-	if useFind {
-		if _, err := exec.LookPath("find"); err == nil {
-			pattern := "*." + extForFind
-			cmd := exec.Command("find", root, "-type", "f", "-name", pattern)
-
-			var out bytes.Buffer
-
-			cmd.Stdout = &out
-			if err := cmd.Run(); err != nil {
-				return nil, err
-			}
-
-			for _, line := range strings.Split(out.String(), "\n") {
-				if line != "" {
-					a = append(a, line)
-				}
-			}
-
-			return a, nil
-		}
-	}
-
-	// Normalize extension: ensure it has a leading dot for filepath.Ext comparison
-	extForWalk := ext
-	if !strings.HasPrefix(extForWalk, ".") {
-		extForWalk = "." + extForWalk
-	}
-
-	err := filepath.Walk(root, func(s string, d os.FileInfo, e error) error {
-		if e != nil {
-			return e
-		}
-
-		// Use HasSuffix instead of filepath.Ext to support multi-dot extensions
-		// filepath.Ext("file.dah.tmp") returns ".tmp", not ".dah.tmp"
-		if strings.HasSuffix(d.Name(), extForWalk) {
-			a = append(a, s)
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return a, nil
-}
+// findFilesByExtension removed - was only used by loadDAHs which has been removed
