@@ -467,7 +467,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GRPCListenAddress:               getString("pruner_grpcListenAddress", ":8096", alternativeContext...),
 			BlockAssemblyWaitTimeout:        getDuration("pruner_blockAssemblyWaitTimeout", 10*time.Minute, alternativeContext...), // Wait up to 10 minutes for BA to be ready
 			ConnectionPoolWarningThreshold:  getFloat64("pruner_connectionPoolWarningThreshold", 0.7, alternativeContext...),       // Warn/adjust when exceeding 70% of connection pool
-			ForceIgnoreBlockPersisterHeight: getBool("pruner_force_ignore_block_persister_height", false, alternativeContext...),   // Force ignore block persister (default: false)
+			BlockTrigger:                    getString("pruner_block_trigger", PrunerBlockTriggerOnBlockPersisted, alternativeContext...),
 			UTXODefensiveEnabled:            getBool("pruner_utxoDefensiveEnabled", false, alternativeContext...),                  // Defensive mode off by default (production)
 			UTXODefensiveBatchReadSize:      getInt("pruner_utxoDefensiveBatchReadSize", 10000, alternativeContext...),             // Batch size for child verification
 			UTXOChunkSize:                   getInt("pruner_utxoChunkSize", 1000, alternativeContext...),                           // Chunk size for batch operations

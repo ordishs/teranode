@@ -2163,6 +2163,6 @@ func (o *testPrunerObserver) waitForPrune(timeout time.Duration) (uint32, int64,
 	case event := <-o.pruneCompleted:
 		return event.height, event.recordsProcessed, nil
 	case <-time.After(timeout):
-		return 0, 0, fmt.Errorf("timeout waiting for prune completion")
+		return 0, 0, errors.NewProcessingError("timeout waiting for prune completion")
 	}
 }

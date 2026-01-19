@@ -39,7 +39,8 @@ func TestCatchup(t *testing.T) {
 	t.Log("This test verifies that a node can sync from another node after transactions have been pruned")
 
 	enableBlockPersister := true
-	enablePruner := false
+	enablePruner := true
+	runNode2 := true
 
 	// Phase 1: Setup node1 with pruner
 	// Note: Blockpersister is disabled due to listener allocation issues in test environment
@@ -129,61 +130,60 @@ func TestCatchup(t *testing.T) {
 	require.Equal(t, targetHeight, node1Meta.Height, "NODE1 should be at height %d", targetHeight)
 	t.Logf("NODE1 at height %d, best block: %s", node1Meta.Height, node1BestHeader.Hash().String())
 
-	// SLEEP FOR 10 SECONDS TO ALLOW PERSISTER TO FINISH
-	time.Sleep(10 * time.Second)
+	if runNode2 {
+		// Phase 7: Start node2
+		node2 := newNode(t, 2, enableBlockPersister, enablePruner)
+		defer node2.Stop(t)
 
-	// Phase 7: Start node2
-	node2 := newNode(t, 2, enableBlockPersister, enablePruner)
-	defer node2.Stop(t)
+		t.Logf("NODE2 created (ClientName: %s, GlobalBlockHeightRetention: %d, PeerID: %s)",
+			node2.Settings.ClientName, node2.Settings.GlobalBlockHeightRetention, node2.Settings.P2P.PeerID)
 
-	t.Logf("NODE2 created (ClientName: %s, GlobalBlockHeightRetention: %d, PeerID: %s)",
-		node2.Settings.ClientName, node2.Settings.GlobalBlockHeightRetention, node2.Settings.P2P.PeerID)
+		// Phase 8: Inject node1 into node2 to trigger sync
+		t.Log("Phase 8: Injecting node1 into node2 to trigger catchup/sync...")
+		node2.InjectPeer(t, node1)
+		t.Log("NODE1 injected into NODE2's peer registry")
 
-	// Phase 8: Inject node1 into node2 to trigger sync
-	t.Log("Phase 8: Injecting node1 into node2 to trigger catchup/sync...")
-	node2.InjectPeer(t, node1)
-	t.Log("NODE1 injected into NODE2's peer registry")
+		// Phase 9: Wait for node2 to sync to node1's block height
+		t.Log("Phase 9: Waiting for node2 to reach block 10...")
+		node2.WaitForBlockhash(t, node1BestHeader.Hash(), 60*time.Second)
 
-	// Phase 9: Wait for node2 to sync to node1's block height
-	t.Log("Phase 9: Waiting for node2 to reach block 10...")
-	node2.WaitForBlockhash(t, node1BestHeader.Hash(), 60*time.Second)
+		// Verify node2 reached the same height
+		node2BestHeader, node2Meta, err := node2.BlockchainClient.GetBestBlockHeader(node2.Ctx)
+		require.NoError(t, err)
+		require.Equal(t, node1Meta.Height, node2Meta.Height, "NODE2 should be at same height as node1")
+		require.Equal(t, node1BestHeader.Hash().String(), node2BestHeader.Hash().String(), "NODE2 should have same best block as node1")
+		t.Logf("✓ NODE2 synced to height %d, block: %s", node2Meta.Height, node2BestHeader.Hash().String())
 
-	// Verify node2 reached the same height
-	node2BestHeader, node2Meta, err := node2.BlockchainClient.GetBestBlockHeader(node2.Ctx)
-	require.NoError(t, err)
-	require.Equal(t, node1Meta.Height, node2Meta.Height, "NODE2 should be at same height as node1")
-	require.Equal(t, node1BestHeader.Hash().String(), node2BestHeader.Hash().String(), "NODE2 should have same best block as node1")
-	t.Logf("✓ NODE2 synced to height %d, block: %s", node2Meta.Height, node2BestHeader.Hash().String())
+		// Phase 10: Verify node2 has all transactions in its utxostore
+		t.Log("Phase 10: Verifying node2 has all transactions...")
+		// NODE2 should have received all the block data including all transactions
+		// Check that node2 has the last transaction
+		readTx2, err := node2.UtxoStore.Get(node2.Ctx, lastTx.TxIDChainHash(), fields.Conflicting, fields.UnminedSince)
+		require.NoError(t, err, "Failed to get last transaction from node2's utxostore")
+		require.NotNil(t, readTx2, "Last transaction should exist in node2's utxostore")
+		require.False(t, readTx2.Conflicting, "Last transaction should not be conflicting")
+		require.Equal(t, uint32(0), readTx2.UnminedSince, "Last transaction should be mined")
+		t.Logf("✓ NODE2's utxostore contains the last transaction: %s", lastTx.TxIDChainHash().String())
 
-	// Phase 10: Verify node2 has all transactions in its utxostore
-	t.Log("Phase 10: Verifying node2 has all transactions...")
-	// NODE2 should have received all the block data including all transactions
-	// Check that node2 has the last transaction
-	readTx2, err := node2.UtxoStore.Get(node2.Ctx, lastTx.TxIDChainHash(), fields.Conflicting, fields.UnminedSince)
-	require.NoError(t, err, "Failed to get last transaction from node2's utxostore")
-	require.NotNil(t, readTx2, "Last transaction should exist in node2's utxostore")
-	require.False(t, readTx2.Conflicting, "Last transaction should not be conflicting")
-	require.Equal(t, uint32(0), readTx2.UnminedSince, "Last transaction should be mined")
-	t.Logf("✓ NODE2's utxostore contains the last transaction: %s", lastTx.TxIDChainHash().String())
+		// NODE2 should also have the first transaction (since it synced the full chain and hasn't pruned)
+		readTxFirst, err := node2.UtxoStore.Get(node2.Ctx, firstTx.TxIDChainHash(), fields.Conflicting, fields.UnminedSince)
+		require.NoError(t, err, "Failed to get first transaction from node2's utxostore")
+		require.NotNil(t, readTxFirst, "First transaction should exist in node2's utxostore")
+		t.Logf("✓ NODE2's utxostore contains the first transaction: %s (which was pruned from node1)", firstTx.TxIDChainHash().String())
 
-	// NODE2 should also have the first transaction (since it synced the full chain and hasn't pruned)
-	readTxFirst, err := node2.UtxoStore.Get(node2.Ctx, firstTx.TxIDChainHash(), fields.Conflicting, fields.UnminedSince)
-	require.NoError(t, err, "Failed to get first transaction from node2's utxostore")
-	require.NotNil(t, readTxFirst, "First transaction should exist in node2's utxostore")
-	t.Logf("✓ NODE2's utxostore contains the first transaction: %s (which was pruned from node1)", firstTx.TxIDChainHash().String())
+		// Verify all transactions in the chain are present in node2
+		for i, tx := range txChain {
+			_, err := node2.UtxoStore.Get(node2.Ctx, tx.TxIDChainHash())
+			require.NoError(t, err, "Transaction %d (%s) should exist in node2's utxostore", i, tx.TxIDChainHash().String())
+		}
+		t.Logf("✓ All %d transactions are present in node2's utxostore", len(txChain))
 
-	// Verify all transactions in the chain are present in node2
-	for i, tx := range txChain {
-		_, err := node2.UtxoStore.Get(node2.Ctx, tx.TxIDChainHash())
-		require.NoError(t, err, "Transaction %d (%s) should exist in node2's utxostore", i, tx.TxIDChainHash().String())
+		t.Log("=== Test Passed: NODE2 successfully caught up after node1 pruned transactions ===")
+
+		node2Records := getAllAerospikeRecords(t, node2.UtxoStore, "node2")
+		printCoinbaseRecords(t, node2Records)
+		printTxRecords(t, node2Records)
 	}
-	t.Logf("✓ All %d transactions are present in node2's utxostore", len(txChain))
-
-	t.Log("=== Test Passed: NODE2 successfully caught up after node1 pruned transactions ===")
-
-	node2Records := getAllAerospikeRecords(t, node2.UtxoStore, "node2")
-	printCoinbaseRecords(t, node2Records)
-	printTxRecords(t, node2Records)
 }
 
 func newNode(t *testing.T, nodeNumber int, enableBlockPersister bool, enablePruner bool) *daemon.TestDaemon {
@@ -239,6 +239,7 @@ func newNode(t *testing.T, nodeNumber int, enableBlockPersister bool, enablePrun
 				s.ChainCfgParams.CoinbaseMaturity = 1
 				s.GlobalBlockHeightRetention = 1
 				s.P2P.SyncCoordinatorPeriodicEvaluationInterval = 1 * time.Second
+				s.Pruner.BlockTrigger = settings.PrunerBlockTriggerOnBlockPersisted
 			},
 		),
 		FSMState: blockchain.FSMStateRUNNING,
