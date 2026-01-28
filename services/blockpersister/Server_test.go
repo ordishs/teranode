@@ -837,6 +837,14 @@ func (m *MockBlockchainClient) ScheduleBlobDeletion(ctx context.Context, blobKey
 	return 0, false, nil
 }
 
+func (m *MockBlockchainClient) CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType) (bool, error) {
+	return false, nil
+}
+
+func (m *MockBlockchainClient) ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType blockchain_api.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error) {
+	return nil, 0, nil
+}
+
 func (m *MockBlockchainClient) GetPendingBlobDeletions(ctx context.Context, height uint32, limit int) ([]*blockchain_api.ScheduledDeletion, error) {
 	return nil, nil
 }

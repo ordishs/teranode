@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	utxofactory "github.com/bsv-blockchain/teranode/stores/utxo/factory"
@@ -29,6 +30,7 @@ type Stores struct {
 	mainBlockAssemblyClient     blockassembly.ClientI
 	mainP2PClient               p2p.ClientI
 	mainSubtreeStore            blob.Store
+	mainBlockchainStore         blockchainstore.Store
 	mainSubtreeValidationClient subtreevalidation.Interface
 	mainTempStore               blob.Store
 	mainTxStore                 blob.Store
@@ -319,6 +321,27 @@ func (d *Stores) GetSubtreeStore(ctx context.Context, logger ulogger.Logger, app
 	}
 
 	return d.mainSubtreeStore, nil
+}
+
+func (d *Stores) GetBlockchainStore(_ context.Context, logger ulogger.Logger, appSettings *settings.Settings) (blockchainstore.Store, error) {
+	if d.mainBlockchainStore != nil {
+		return d.mainBlockchainStore, nil
+	}
+
+	// Create the blockchain store url from the app settings
+	blockchainStoreURL := appSettings.BlockChain.StoreURL
+	if blockchainStoreURL == nil {
+		return nil, errors.NewStorageError("blockchain store url not found")
+	}
+
+	// Create the blockchain store
+	blockchainStore, err := blockchainstore.NewStore(logger, blockchainStoreURL, appSettings)
+	if err != nil {
+		return nil, err
+	}
+
+	d.mainBlockchainStore = blockchainStore
+	return blockchainStore, nil
 }
 
 // GetTempStore returns the main temporary store instance. If the store hasn't been initialized yet,

@@ -14,7 +14,6 @@ package pruner
 
 import (
 	"context"
-	"database/sql"
 	"encoding/binary"
 	"net/http"
 	"strconv"
@@ -67,7 +66,6 @@ type Server struct {
 	stats               *gocore.Stat
 
 	// Blob deletion
-	db                   *sql.DB
 	blobStores           map[blockchain_api.BlobStoreType]blob.Store
 	blobDeletionCh       chan uint32
 	blobDeletionObserver BlobDeletionObserver
@@ -83,8 +81,6 @@ func New(
 	utxoStore utxo.Store,
 	blockchainClient blockchain.ClientI,
 	blockAssemblyClient blockassembly.ClientI,
-	blobStores map[blockchain_api.BlobStoreType]blob.Store,
-	db *sql.DB,
 ) *Server {
 	return &Server{
 		ctx:                 ctx,
@@ -93,8 +89,7 @@ func New(
 		utxoStore:           utxoStore,
 		blockchainClient:    blockchainClient,
 		blockAssemblyClient: blockAssemblyClient,
-		db:                  db,
-		blobStores:          blobStores,
+		blobStores:          make(map[blockchain_api.BlobStoreType]blob.Store),
 		blobDeletionCh:      make(chan uint32, 1),
 		stats:               gocore.NewStat("pruner"),
 	}

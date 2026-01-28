@@ -544,6 +544,16 @@ func (c *LocalClient) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, 
 	return 0, false, errors.NewProcessingError("not implemented")
 }
 
+// CancelBlobDeletion cancels a previously scheduled blob deletion.
+func (c *LocalClient) CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType) (bool, error) {
+	return false, errors.NewProcessingError("not implemented")
+}
+
+// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
+func (c *LocalClient) ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType blockchain_api.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error) {
+	return nil, 0, errors.NewProcessingError("not implemented")
+}
+
 // GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.
 func (c *LocalClient) GetPendingBlobDeletions(ctx context.Context, height uint32, limit int) ([]*blockchain_api.ScheduledDeletion, error) {
 	return nil, errors.NewProcessingError("not implemented")

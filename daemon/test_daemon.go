@@ -44,6 +44,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -79,6 +80,7 @@ type TestDaemon struct {
 	PropagationClient     *propagation.Client
 	Settings              *settings.Settings
 	SubtreeStore          blob.Store
+	BlockchainStore       blockchainstore.Store
 	UtxoStore             utxo.Store
 	P2PClient             p2p.ClientI
 	composeDependencies   tc.ComposeStack
@@ -532,6 +534,9 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	subtreeStore, err := d.daemonStores.GetSubtreeStore(ctx, logger, appSettings)
 	require.NoError(t, err)
 
+	blockchainStore, err := d.daemonStores.GetBlockchainStore(ctx, logger, appSettings)
+	require.NoError(t, err)
+
 	var utxoStore utxo.Store
 
 	utxoStore, err = d.daemonStores.GetUtxoStore(ctx, logger, appSettings)
@@ -603,6 +608,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		PropagationClient:     propagationClient,
 		Settings:              appSettings,
 		SubtreeStore:          subtreeStore,
+		BlockchainStore:       blockchainStore,
 		UtxoStore:             utxoStore,
 		P2PClient:             p2pClient,
 		composeDependencies:   composeDependencies,

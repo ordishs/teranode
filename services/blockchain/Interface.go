@@ -1002,6 +1002,36 @@ type ClientI interface {
 	// - Error if scheduling fails
 	ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error)
 
+	// CancelBlobDeletion cancels a previously scheduled blob deletion.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - blobKey: The key of the blob
+	// - fileType: The file type of the blob
+	// - storeType: The type of blob store
+	//
+	// Returns:
+	// - cancelled: True if the deletion was found and cancelled
+	// - Error if cancellation fails
+	CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType) (bool, error)
+
+	// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
+	//
+	// Parameters:
+	// - ctx: Context for the operation with timeout and cancellation support
+	// - minHeight: Minimum delete-at height (0 = no minimum)
+	// - maxHeight: Maximum delete-at height (0 = no maximum)
+	// - storeType: Filter by store type (only applied if filterByStore is true)
+	// - filterByStore: Whether to filter by store type
+	// - limit: Maximum number of results (0 = default)
+	// - offset: Number of results to skip
+	//
+	// Returns:
+	// - Array of scheduled deletions
+	// - Total count of matching deletions
+	// - Error if query fails
+	ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType blockchain_api.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error)
+
 	// GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.
 	//
 	// This method is used by the pruner service to query for blobs that are ready to be deleted.
