@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/daemon"
-	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/test"
 	"github.com/bsv-blockchain/teranode/util/usql"
 	"github.com/stretchr/testify/require"
@@ -57,25 +57,25 @@ func TestBlobDeletionScheduling(t *testing.T) {
 	testBlobs := []struct {
 		key            []byte
 		fileType       string
-		storeType      blockchain_api.BlobStoreType
+		storeType      storetypes.BlobStoreType
 		deleteAtHeight uint32
 	}{
 		{
 			key:            make([]byte, 32),
 			fileType:       "test",
-			storeType:      blockchain_api.BlobStoreType_TXSTORE,
+			storeType:      storetypes.TXSTORE,
 			deleteAtHeight: currentHeight + 1,
 		},
 		{
 			key:            make([]byte, 32),
 			fileType:       "test",
-			storeType:      blockchain_api.BlobStoreType_TXSTORE,
+			storeType:      storetypes.TXSTORE,
 			deleteAtHeight: currentHeight + 2,
 		},
 		{
 			key:            make([]byte, 32),
 			fileType:       "test",
-			storeType:      blockchain_api.BlobStoreType_TXSTORE,
+			storeType:      storetypes.TXSTORE,
 			deleteAtHeight: currentHeight + 1,
 		},
 	}
@@ -100,17 +100,17 @@ func TestBlobDeletionScheduling(t *testing.T) {
 	t.Log("Verified 3 deletions in database")
 
 	// Now check with the API
-	deletions, _, err := node.BlockchainClient.ListScheduledDeletions(ctx, 0, 0, blockchain_api.BlobStoreType_TXSTORE, false, 100, 0)
+	deletions, _, err := node.BlockchainClient.ListScheduledDeletions(ctx, 0, 0, storetypes.TXSTORE, false, 100, 0)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(deletions), 3, "Should have at least 3 scheduled deletions")
 	t.Logf("ListScheduledDeletions returned %d deletions", len(deletions))
 
-	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, 0, currentHeight+1, blockchain_api.BlobStoreType_TXSTORE, false, 100, 0)
+	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, 0, currentHeight+1, storetypes.TXSTORE, false, 100, 0)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(deletions), "Should have 2 deletions for DAH <= %d", currentHeight+1)
 	t.Log("Height range filtering works")
 
-	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, currentHeight+2, 0, blockchain_api.BlobStoreType_TXSTORE, false, 100, 0)
+	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, currentHeight+2, 0, storetypes.TXSTORE, false, 100, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(deletions), "Should have 1 deletion for DAH >= %d", currentHeight+2)
 	t.Log("Future deletions queried correctly")
@@ -122,7 +122,7 @@ func TestBlobDeletionScheduling(t *testing.T) {
 	require.True(t, cancelled, "Cancellation should succeed")
 	t.Log("Cancellation works")
 
-	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, 0, 0, blockchain_api.BlobStoreType_TXSTORE, false, 100, 0)
+	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, 0, 0, storetypes.TXSTORE, false, 100, 0)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(deletions), "Should have 2 deletions after cancelling 1")
 	t.Log("Queue updated after cancellation")
@@ -153,7 +153,7 @@ func TestBlobDeletionScheduling(t *testing.T) {
 
 	t.Logf("Pruner executed deletions for height %d", currentHeight+1)
 
-	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, 0, 0, blockchain_api.BlobStoreType_TXSTORE, false, 100, 0)
+	deletions, _, err = node.BlockchainClient.ListScheduledDeletions(ctx, 0, 0, storetypes.TXSTORE, false, 100, 0)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(deletions), "Should have 1 deletion remaining (DAH=%d)", currentHeight+2)
 	t.Log("E2E blob deletion scheduling and execution validated successfully")

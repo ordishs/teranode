@@ -33,6 +33,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	blockchain_sql "github.com/bsv-blockchain/teranode/stores/blockchain/sql"
@@ -2964,7 +2965,7 @@ func (b *Blockchain) ScheduleBlobDeletion(ctx context.Context, req *blockchain_a
 	}
 
 	b.logger.Infof("Scheduled blob deletion: id=%d, key=%x, store=%s, height=%d",
-		id, req.BlobKey, req.StoreType.String(), req.DeleteAtHeight)
+		id, req.BlobKey, storetypes.BlobStoreType(req.StoreType).String(), req.DeleteAtHeight)
 
 	return &blockchain_api.ScheduleBlobDeletionResponse{
 		DeletionId: id,
@@ -3001,7 +3002,7 @@ func (b *Blockchain) CancelBlobDeletion(ctx context.Context, req *blockchain_api
 	}
 
 	b.logger.Infof("Cancelled blob deletion: key=%x, store=%s, reason=%s",
-		req.BlobKey, req.StoreType.String(), req.CancelReason)
+		req.BlobKey, storetypes.BlobStoreType(req.StoreType).String(), req.CancelReason)
 
 	return &blockchain_api.CancelBlobDeletionResponse{
 		Cancelled: true,
@@ -3043,7 +3044,7 @@ func (b *Blockchain) ListScheduledDeletions(ctx context.Context, req *blockchain
 			Id:             d.ID,
 			BlobKey:        d.BlobKey,
 			FileType:       d.FileType,
-			StoreType:      blockchain_api.BlobStoreType(d.StoreType),
+			StoreType:      d.StoreType,
 			DeleteAtHeight: d.DeleteAtHeight,
 			RetryCount:     uint32(d.RetryCount),
 		}
@@ -3080,7 +3081,7 @@ func (b *Blockchain) GetPendingBlobDeletions(ctx context.Context, req *blockchai
 			Id:             d.ID,
 			BlobKey:        d.BlobKey,
 			FileType:       d.FileType,
-			StoreType:      blockchain_api.BlobStoreType(d.StoreType),
+			StoreType:      d.StoreType,
 			DeleteAtHeight: d.DeleteAtHeight,
 			RetryCount:     uint32(d.RetryCount),
 		}
@@ -3202,7 +3203,7 @@ func (b *Blockchain) AcquireBlobDeletionBatch(ctx context.Context, req *blockcha
 			Id:             d.ID,
 			BlobKey:        d.BlobKey,
 			FileType:       d.FileType,
-			StoreType:      blockchain_api.BlobStoreType(d.StoreType),
+			StoreType:      d.StoreType,
 			DeleteAtHeight: d.DeleteAtHeight,
 			RetryCount:     uint32(d.RetryCount),
 		}

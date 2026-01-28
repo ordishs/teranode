@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 )
 
@@ -1000,7 +1001,7 @@ type ClientI interface {
 	// Returns:
 	// - Deletion ID and success status
 	// - Error if scheduling fails
-	ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error)
+	ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error)
 
 	// CancelBlobDeletion cancels a previously scheduled blob deletion.
 	//
@@ -1013,7 +1014,7 @@ type ClientI interface {
 	// Returns:
 	// - cancelled: True if the deletion was found and cancelled
 	// - Error if cancellation fails
-	CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType) (bool, error)
+	CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType) (bool, error)
 
 	// ListScheduledDeletions lists scheduled blob deletions with optional filtering.
 	//
@@ -1030,7 +1031,7 @@ type ClientI interface {
 	// - Array of scheduled deletions
 	// - Total count of matching deletions
 	// - Error if query fails
-	ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType blockchain_api.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error)
+	ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType storetypes.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error)
 
 	// GetPendingBlobDeletions retrieves blob deletions ready for processing at a specific height.
 	//

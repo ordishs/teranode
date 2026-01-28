@@ -8,6 +8,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/stretchr/testify/mock"
@@ -1309,19 +1310,19 @@ func (m *mockBlockClient) GetBestHeightAndTime(ctx context.Context, req *emptypb
 }
 
 // ScheduleBlobDeletion mocks the ScheduleBlobDeletion method
-func (m *Mock) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
+func (m *Mock) ScheduleBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType, deleteAtHeight uint32) (int64, bool, error) {
 	args := m.Called(ctx, blobKey, fileType, storeType, deleteAtHeight)
 	return args.Get(0).(int64), args.Bool(1), args.Error(2)
 }
 
 // CancelBlobDeletion mocks the CancelBlobDeletion method
-func (m *Mock) CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType blockchain_api.BlobStoreType) (bool, error) {
+func (m *Mock) CancelBlobDeletion(ctx context.Context, blobKey []byte, fileType string, storeType storetypes.BlobStoreType) (bool, error) {
 	args := m.Called(ctx, blobKey, fileType, storeType)
 	return args.Bool(0), args.Error(1)
 }
 
 // ListScheduledDeletions mocks the ListScheduledDeletions method
-func (m *Mock) ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType blockchain_api.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error) {
+func (m *Mock) ListScheduledDeletions(ctx context.Context, minHeight, maxHeight uint32, storeType storetypes.BlobStoreType, filterByStore bool, limit, offset int) ([]*blockchain_api.ScheduledDeletion, int, error) {
 	args := m.Called(ctx, minHeight, maxHeight, storeType, filterByStore, limit, offset)
 	if args.Error(2) != nil {
 		return nil, 0, args.Error(2)
