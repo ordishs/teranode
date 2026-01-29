@@ -46,6 +46,8 @@ import (
 	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -959,6 +961,13 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 	}
 
 	if !ba.settings.BlockAssembly.Disabled {
+		if !ba.blockAssembler.subtreeProcessor.CanAcceptTransactions(1) {
+			return nil, status.Errorf(codes.ResourceExhausted,
+				"capacity limit reached: current=%d, max=%d",
+				ba.blockAssembler.subtreeProcessor.CurrentTransactionCount(),
+				ba.blockAssembler.subtreeProcessor.GetMaxUnminedTransactions())
+		}
+
 		ba.blockAssembler.AddTxBatch(
 			[]subtreepkg.Node{{Hash: chainhash.Hash(req.Txid), Fee: req.Fee, SizeInBytes: req.Size}},
 			[]*subtreepkg.TxInpoints{&txInpoints},
@@ -1077,6 +1086,13 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 
 	// Add entire batch in one call
 	if !ba.settings.BlockAssembly.Disabled {
+		if !ba.blockAssembler.subtreeProcessor.CanAcceptTransactions(len(nodes)) {
+			return nil, status.Errorf(codes.ResourceExhausted,
+				"capacity limit reached: current=%d, max=%d",
+				ba.blockAssembler.subtreeProcessor.CurrentTransactionCount(),
+				ba.blockAssembler.subtreeProcessor.GetMaxUnminedTransactions())
+		}
+
 		ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
 	}
 
@@ -1255,7 +1271,17 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 
 	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
 
-	ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
+	// Add entire batch in one call
+	if !ba.settings.BlockAssembly.Disabled {
+		if !ba.blockAssembler.subtreeProcessor.CanAcceptTransactions(len(nodes)) {
+			return nil, status.Errorf(codes.ResourceExhausted,
+				"capacity limit reached: current=%d, max=%d",
+				ba.blockAssembler.subtreeProcessor.CurrentTransactionCount(),
+				ba.blockAssembler.subtreeProcessor.GetMaxUnminedTransactions())
+		}
+
+		ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
+	}
 
 	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 }

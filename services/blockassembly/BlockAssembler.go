@@ -920,6 +920,10 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewProcessingError("[BlockAssembler] failed to initialize state: %v", err)
 	}
 
+	if err = b.initializeCapacityLimit(); err != nil {
+		return errors.NewProcessingError("[BlockAssembler] failed to initialize capacity limit: %v", err)
+	}
+
 	// Wait for any pending blocks to be processed before loading unmined transactions
 	if !b.skipWaitForPendingBlocks {
 		if err = b.subtreeProcessor.WaitForPendingBlocks(ctx); err != nil {
@@ -1275,6 +1279,41 @@ func (b *BlockAssembler) initState(ctx context.Context) error {
 	if err = b.SetState(ctx); err != nil {
 		b.logger.Errorf("[BlockAssembler] error setting state: %v", err)
 	}
+
+	return nil
+}
+
+// initializeCapacityLimit calculates and sets the maximum unmined transaction limit.
+// If MaxUnminedTransactions is configured to 0, it auto-calculates based on system memory.
+func (b *BlockAssembler) initializeCapacityLimit() error {
+	maxTx := b.settings.BlockAssembly.MaxUnminedTransactions
+
+	if maxTx == 0 {
+		bytesPerTx := b.settings.BlockAssembly.BytesPerTransaction
+		if bytesPerTx <= 0 {
+			bytesPerTx = 300
+		}
+
+		memoryPercent := b.settings.BlockAssembly.MemoryLimitPercent
+		if memoryPercent <= 0 || memoryPercent > 100 {
+			memoryPercent = 80
+		}
+
+		calculated, err := CalculateMaxTransactions(bytesPerTx, memoryPercent)
+		if err != nil {
+			b.logger.Warnf("[BlockAssembler] Failed to detect system memory, using default limit of 100 million: %v", err)
+			maxTx = 100_000_000
+		} else {
+			maxTx = calculated
+
+			totalMem, _ := GetTotalSystemMemory()
+			b.logger.Infof("[BlockAssembler] Auto-calculated max unmined transactions: %d (system memory: %d GB, using %d%%, %d bytes/tx)", maxTx, totalMem/(1024*1024*1024), memoryPercent, bytesPerTx)
+		}
+	} else {
+		b.logger.Infof("[BlockAssembler] Using configured max unmined transactions limit: %d", maxTx)
+	}
+
+	b.subtreeProcessor.SetMaxUnminedTransactions(maxTx)
 
 	return nil
 }
