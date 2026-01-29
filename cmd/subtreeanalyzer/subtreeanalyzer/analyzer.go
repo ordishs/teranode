@@ -11,6 +11,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -51,7 +52,7 @@ type blockWithDeletions struct {
 func Analyze(ctx context.Context, logger ulogger.Logger, settings *settings.Settings) error {
 	store, err := blockchainstore.NewStore(logger, settings.BlockChain.StoreURL, settings)
 	if err != nil {
-		return fmt.Errorf("failed to create blockchain store: %w", err)
+		return errors.NewServiceError("failed to create blockchain store", err)
 	}
 
 	db := store.GetDB()
@@ -59,7 +60,7 @@ func Analyze(ctx context.Context, logger ulogger.Logger, settings *settings.Sett
 	logger.Infof("Querying scheduled blob deletions...")
 	deletions, err := getScheduledDeletions(ctx, db)
 	if err != nil {
-		return fmt.Errorf("failed to get scheduled deletions: %w", err)
+		return errors.NewServiceError("failed to get scheduled deletions", err)
 	}
 
 	logger.Infof("Found %d scheduled deletions", len(deletions))
@@ -75,7 +76,7 @@ func Analyze(ctx context.Context, logger ulogger.Logger, settings *settings.Sett
 	logger.Infof("Finding blocks containing scheduled subtrees...")
 	blocksWithDeletions, err := findBlocksWithScheduledDeletions(ctx, db, subtreeDeletionMap)
 	if err != nil {
-		return fmt.Errorf("failed to find blocks with deletions: %w", err)
+		return errors.NewServiceError("failed to find blocks with deletions", err)
 	}
 
 	if len(blocksWithDeletions) == 0 {
@@ -229,7 +230,7 @@ func parseSubtrees(subtreesBytes []byte) ([][]byte, error) {
 
 	subTreeCount, err := wire.ReadVarInt(buf, 0)
 	if err != nil {
-		return nil, fmt.Errorf("error reading subtree count: %w", err)
+		return nil, errors.NewProcessingError("error reading subtree count", err)
 	}
 
 	subtrees := make([][]byte, 0, subTreeCount)
@@ -238,7 +239,7 @@ func parseSubtrees(subtreesBytes []byte) ([][]byte, error) {
 	for i := uint64(0); i < subTreeCount; i++ {
 		_, err = io.ReadFull(buf, subtreeBytes[:])
 		if err != nil {
-			return nil, fmt.Errorf("error reading subtree hash %d: %w", i, err)
+			return nil, errors.NewProcessingError("error reading subtree hash %d", i, err)
 		}
 
 		subtreeCopy := make([]byte, chainhash.HashSize)
