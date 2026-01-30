@@ -1283,34 +1283,15 @@ func (b *BlockAssembler) initState(ctx context.Context) error {
 	return nil
 }
 
-// initializeCapacityLimit calculates and sets the maximum unmined transaction limit.
-// If MaxUnminedTransactions is configured to 0, it auto-calculates based on system memory.
+// initializeCapacityLimit sets the maximum unmined transaction limit.
+// If MaxUnminedTransactions is 0, no limit is enforced (unlimited).
 func (b *BlockAssembler) initializeCapacityLimit() error {
 	maxTx := b.settings.BlockAssembly.MaxUnminedTransactions
 
-	if maxTx == 0 {
-		bytesPerTx := b.settings.BlockAssembly.BytesPerTransaction
-		if bytesPerTx <= 0 {
-			bytesPerTx = 300
-		}
-
-		memoryPercent := b.settings.BlockAssembly.MemoryLimitPercent
-		if memoryPercent <= 0 || memoryPercent > 100 {
-			memoryPercent = 80
-		}
-
-		calculated, err := CalculateMaxTransactions(bytesPerTx, memoryPercent)
-		if err != nil {
-			b.logger.Warnf("[BlockAssembler] Failed to detect system memory, using default limit of 100 million: %v", err)
-			maxTx = 100_000_000
-		} else {
-			maxTx = calculated
-
-			totalMem, _ := GetTotalSystemMemory()
-			b.logger.Infof("[BlockAssembler] Auto-calculated max unmined transactions: %d (system memory: %d GB, using %d%%, %d bytes/tx)", maxTx, totalMem/(1024*1024*1024), memoryPercent, bytesPerTx)
-		}
+	if maxTx > 0 {
+		b.logger.Infof("[BlockAssembler] Setting max unmined transactions limit to %d", maxTx)
 	} else {
-		b.logger.Infof("[BlockAssembler] Using configured max unmined transactions limit: %d", maxTx)
+		b.logger.Infof("[BlockAssembler] No limit on unmined transactions (MaxUnminedTransactions=0)")
 	}
 
 	b.subtreeProcessor.SetMaxUnminedTransactions(maxTx)
