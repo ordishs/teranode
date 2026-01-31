@@ -2408,3 +2408,33 @@ func (ba *BlockAssembly) SetSkipWaitForPendingBlocks(skip bool) {
 		ba.blockAssembler.SetSkipWaitForPendingBlocks(skip)
 	}
 }
+
+// CanAcceptTransaction checks if block assembly can accept more transactions.
+// This method is used by the validator to fail fast before spending UTXOs
+// if the capacity limit has been reached.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - req: Request containing the number of transactions to check
+//
+// Returns:
+//   - Response with capacity information
+//   - error: Any error encountered
+func (ba *BlockAssembly) CanAcceptTransaction(ctx context.Context, req *blockassembly_api.CanAcceptTransactionRequest) (*blockassembly_api.CanAcceptTransactionResponse, error) {
+	count := req.Count
+	if count == 0 {
+		count = 1
+	}
+
+	canAccept := ba.blockAssembler.subtreeProcessor.CanAcceptTransactions(int(count))
+	currentCount := ba.blockAssembler.subtreeProcessor.CurrentTransactionCount()
+	maxLimit := ba.blockAssembler.subtreeProcessor.GetMaxUnminedTransactions()
+	remainingCapacity := ba.blockAssembler.subtreeProcessor.RemainingCapacity()
+
+	return &blockassembly_api.CanAcceptTransactionResponse{
+		CanAccept:         canAccept,
+		CurrentCount:      currentCount,
+		MaxLimit:          maxLimit,
+		RemainingCapacity: remainingCapacity,
+	}, nil
+}
