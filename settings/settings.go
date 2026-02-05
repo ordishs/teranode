@@ -558,6 +558,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Propagation: PropagationSettings{
 			IPv6Addresses:        getString("ipv6_addresses", "", alternativeContext...),
 			IPv6Interface:        getString("ipv6_interface", "", alternativeContext...),
+			IPv6AllowedSources:   getMultiString("propagation_ipv6_allowed_sources", "|", []string{}, alternativeContext...),
 			GRPCMaxConnectionAge: getDuration("propagation_grpcMaxConnectionAge", 90*time.Second, alternativeContext...),
 			HTTPListenAddress:    getString("propagation_httpListenAddress", "", alternativeContext...),
 			HTTPAddresses:        getMultiString("propagation_httpAddresses", "|", []string{}, alternativeContext...),

@@ -389,6 +389,11 @@ func (h *AuthHandler) PostAuthMiddleware(next echo.HandlerFunc) echo.HandlerFunc
 // RequireAuthMiddleware is a middleware that requires authentication for all requests
 func (h *AuthHandler) RequireAuthMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		// Skip authentication for OPTIONS requests (CORS preflight)
+		if c.Request().Method == http.MethodOptions {
+			return next(c)
+		}
+
 		if !h.CheckAuth(c.Request()) {
 			return c.JSON(http.StatusUnauthorized, map[string]interface{}{
 				"success": false,

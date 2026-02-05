@@ -55,11 +55,15 @@ import (
 const (
 	banActionAdd = "add" // Action constant for adding a ban
 
-	// Default values for peer map cleanup
-	defaultPeerMapMaxSize         = 100000           // Maximum entries in peer maps
-	defaultPeerMapTTL             = 30 * time.Minute // Time-to-live for peer map entries
-	defaultPeerMapCleanupInterval = 5 * time.Minute  // Cleanup interval
+	// Default values for peer map cleanup (reduced to prevent memory exhaustion)
+	defaultPeerMapMaxSize         = 10000            // Maximum entries in peer maps (reduced from 100k)
+	defaultPeerMapTTL             = 10 * time.Minute // Time-to-live for peer map entries (reduced from 30min)
+	defaultPeerMapCleanupInterval = 1 * time.Minute  // Cleanup interval (reduced from 5min)
 	protocolIDVersion             = "1.0.0"          // Protocol version identifier
+
+	// maxP2PMessageSize limits P2P message sizes to prevent memory exhaustion attacks.
+	// Messages exceeding this limit are rejected before parsing.
+	maxP2PMessageSize = 10 * 1024 * 1024 // 10MB
 )
 
 // peerMapEntry stores peer information with timestamp for TTL tracking

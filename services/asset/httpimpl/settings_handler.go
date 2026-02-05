@@ -10,6 +10,18 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// sensitiveKeyPatterns contains substrings that indicate a setting value should be redacted.
+var sensitiveKeyPatterns = []string{
+	"private_key",
+	"password",
+	"pwd",
+	"secret",
+	"token",
+	"auth_key",
+	"credential",
+	"api_key",
+}
+
 // SettingsHandler handles settings-related HTTP requests.
 type SettingsHandler struct {
 	settings *settings.Settings
@@ -114,7 +126,7 @@ func (h *SettingsHandler) GetSettings(c echo.Context) error {
 	})
 
 	response := SettingsResponse{
-		Settings:   filtered,
+		Settings:   redactSensitiveSettings(filtered),
 		Categories: registry.Categories,
 		Total:      len(registry.Settings),
 		Filtered:   len(filtered),
@@ -135,4 +147,27 @@ func (h *SettingsHandler) GetSettingsCategories(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"categories": categories,
 	})
+}
+
+// isSensitiveKey checks if a setting key contains sensitive data that should be redacted.
+func isSensitiveKey(key string) bool {
+	lowerKey := strings.ToLower(key)
+	for _, pattern := range sensitiveKeyPatterns {
+		if strings.Contains(lowerKey, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactSensitiveSettings returns a copy of settings with sensitive values redacted.
+func redactSensitiveSettings(original []settings.SettingMetadata) []settings.SettingMetadata {
+	result := make([]settings.SettingMetadata, len(original))
+	for i, s := range original {
+		result[i] = s
+		if isSensitiveKey(s.Key) && s.CurrentValue != "" {
+			result[i].CurrentValue = "[REDACTED]"
+		}
+	}
+	return result
 }

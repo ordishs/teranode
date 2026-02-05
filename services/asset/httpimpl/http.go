@@ -137,6 +137,8 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	e.Use(middleware.Gzip())
 
+	e.Use(securityHeadersMiddleware())
+
 	if e.Debug {
 		e.Use(customLoggerMiddleware(logger))
 	}
@@ -344,9 +346,17 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// Create and register block handler for block operations
 	blockHandler := NewBlockHandler(repo.BlockchainClient, repo.BlockvalidationClient, logger)
 
-	// Register block invalidation/revalidation endpoints
-	apiGroup.POST("/block/invalidate", blockHandler.InvalidateBlock)
-	apiGroup.POST("/block/revalidate", blockHandler.RevalidateBlock)
+	// Create auth handler for protecting admin endpoints
+	authHandler := dashboard.NewAuthHandler(logger, tSettings)
+
+	// Register block invalidation/revalidation endpoints under authenticated group
+	// These are admin operations that could disrupt the blockchain state
+	apiBlockAdminGroup := e.Group(apiPrefix + "/block")
+	apiBlockAdminGroup.Use(authHandler.RequireAuthMiddleware)
+	apiBlockAdminGroup.POST("/invalidate", blockHandler.InvalidateBlock)
+	apiBlockAdminGroup.POST("/revalidate", blockHandler.RevalidateBlock)
+
+	// Read-only endpoint for invalid blocks doesn't require auth
 	apiGroup.GET("/blocks/invalid", blockHandler.GetLastNInvalidBlocks)
 
 	// Register catchup status endpoint
@@ -360,17 +370,16 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	// Register settings handler for settings portal (always requires authentication)
 	settingsHandler := NewSettingsHandler(tSettings, logger)
-	authHandler := dashboard.NewAuthHandler(logger, tSettings)
 	apiSettingsGroup := e.Group(apiPrefix + "/settings")
 	apiSettingsGroup.Use(authHandler.RequireAuthMiddleware)
 	apiSettingsGroup.GET("", settingsHandler.GetSettings)
 	apiSettingsGroup.GET("/categories", settingsHandler.GetSettingsCategories)
 
-	// Add OPTIONS handlers for block operations
-	apiGroup.OPTIONS("/block/invalidate", func(c echo.Context) error {
+	// Add OPTIONS handlers for block operations (CORS preflight doesn't require auth)
+	apiBlockAdminGroup.OPTIONS("/invalidate", func(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	})
-	apiGroup.OPTIONS("/block/revalidate", func(c echo.Context) error {
+	apiBlockAdminGroup.OPTIONS("/revalidate", func(c echo.Context) error {
 		return c.NoContent(http.StatusOK)
 	})
 	apiGroup.OPTIONS("/blocks/invalid", func(c echo.Context) error {
@@ -527,6 +536,18 @@ func customLoggerMiddleware(logger ulogger.Logger) echo.MiddlewareFunc {
 			logger.Infof("http request: Method=%s, URI=%s, RemoteAddr=%s Status=%d, Duration=%v, err=%v", c.Request().Method, c.Request().RequestURI, c.Request().RemoteAddr, status, duration, err)
 
 			return err
+		}
+	}
+}
+
+// securityHeadersMiddleware adds security headers to all HTTP responses.
+func securityHeadersMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Response().Header().Set("X-Content-Type-Options", "nosniff")
+			c.Response().Header().Set("X-Frame-Options", "DENY")
+			c.Response().Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			return next(c)
 		}
 	}
 }

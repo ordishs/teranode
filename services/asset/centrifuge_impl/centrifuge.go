@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/centrifugal/centrifuge"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -560,8 +561,10 @@ func (c *Centrifuge) authMiddleware(h http.Handler) http.Handler {
 		}
 
 		ctx := r.Context()
+		// Generate unique UserID per connection to prevent session confusion
+		userID := uuid.New().String()
 		newCtx := centrifuge.SetCredentials(ctx, &centrifuge.Credentials{
-			UserID: "42",
+			UserID: userID,
 		})
 		r = r.WithContext(newCtx)
 
