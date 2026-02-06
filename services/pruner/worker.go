@@ -171,27 +171,20 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				continue
 			}
 
-			// Track total items processed in this pruner cycle
-			var totalItemsProcessed int64
+			prunerActive.Set(1)
 
 			// Phase 1: Preserve parents of old unmined transactions
 			// This must run before Phase 2 to protect parents from deletion
 			if s.utxoStore != nil {
 				s.logger.Debugf("Phase 1: Preserving parents at height %d", latestHeight)
-				startTimePhase1 := time.Now()
 				if count, err := utxo.PreserveParentsOfOldUnminedTransactions(
 					ctx, s.utxoStore, latestHeight, s.settings, s.logger,
 				); err != nil {
 					s.logger.Warnf("Phase 1: Failed to preserve parents at height %d: %v", latestHeight, err)
 					prunerErrors.WithLabelValues("parent_preservation").Inc()
 					// Continue to Phase 2 - best effort, don't block pruning
-				} else {
-					prunerDuration.WithLabelValues("preserve_parents").Observe(time.Since(startTimePhase1).Seconds())
-					if count > 0 {
-						s.logger.Infof("Phase 1: Preserved parents for %d unmined transactions at height %d", count, latestHeight)
-						prunerUpdatingParents.Add(float64(count))
-						totalItemsProcessed += int64(count)
-					}
+				} else if count > 0 {
+					s.logger.Infof("Phase 1: Preserved parents for %d unmined transactions at height %d", count, latestHeight)
 				}
 			}
 
@@ -209,14 +202,10 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					s.logger.Infof("Phase 2: Pruned %d records at height %d", recordsProcessed, latestHeight)
 					prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
 					prunerProcessed.Inc()
-					prunerDeletingChildren.Add(float64(recordsProcessed))
-					totalItemsProcessed += recordsProcessed
 				}
 			}
 
-			// Update metrics for this pruner cycle
-			prunerItemCount.Set(float64(totalItemsProcessed))
-			prunerCurrentHeight.Set(float64(latestHeight))
+			prunerActive.Set(0)
 
 			// Update last processed height atomically
 			s.lastProcessedHeight.Store(latestHeight)
