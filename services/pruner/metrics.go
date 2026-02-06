@@ -8,15 +8,14 @@ import (
 )
 
 var (
-	prunerDuration  *prometheus.HistogramVec
-	prunerSkipped   *prometheus.CounterVec
-	prunerProcessed prometheus.Counter
-	prunerErrors    *prometheus.CounterVec
+	prunerDuration *prometheus.HistogramVec
+	prunerSkipped  *prometheus.CounterVec
+	prunerErrors   *prometheus.CounterVec
 
 	// Pruner operation metrics
 	prunerUpdatingParents  prometheus.Counter
 	prunerDeletingChildren prometheus.Counter
-	prunerCurrentHeight prometheus.Gauge
+	prunerCurrentHeight    prometheus.Gauge
 	prunerActive           prometheus.Gauge
 
 	// Blob deletion metrics
@@ -59,13 +58,6 @@ func _initPrometheusMetrics() {
 			Help: "Number of pruner operations skipped",
 		},
 		[]string{"reason"}, // "not_running", "no_new_height", "already_in_progress"
-	)
-
-	prunerProcessed = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "pruner_processed_total",
-			Help: "Total number of successful pruner operations",
-		},
 	)
 
 	prunerErrors = promauto.NewCounterVec(

@@ -206,7 +206,6 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				} else {
 					s.logger.Infof("Phase 2: Pruned %d records at height %d", recordsProcessed, latestHeight)
 					prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
-					prunerProcessed.Inc()
 					prunerDeletingChildren.Add(float64(recordsProcessed))
 				}
 			}

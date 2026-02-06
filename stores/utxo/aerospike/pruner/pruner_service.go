@@ -29,6 +29,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 )
 
 // Ensure Store implements the Pruner Service interface
@@ -568,12 +570,16 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, n
 		tpsStr = fmt.Sprintf("%.2f records/sec", tps)
 	}
 
+	p := message.NewPrinter(language.English)
+	formattedTotal := p.Sprintf("%d", totalProcessed)
+	formattedSkipped := p.Sprintf("%d", totalSkipped)
+
 	if s.defensiveEnabled {
-		s.logger.Infof("Completed parallel pruning for block height %d in %v: pruned %d records, skipped %d records (%s, defensive logic)",
-			blockHeight, elapsed, totalProcessed, totalSkipped, tpsStr)
+		s.logger.Infof("Completed parallel pruning for block height %d in %v: pruned %s records, skipped %s records (%s, defensive logic)",
+			blockHeight, elapsed, formattedTotal, formattedSkipped, tpsStr)
 	} else {
-		s.logger.Infof("Completed parallel pruning for block height %d in %v: pruned %d records (%s)",
-			blockHeight, elapsed, totalProcessed, tpsStr)
+		s.logger.Infof("Completed parallel pruning for block height %d in %v: pruned %s records, skipped %s records (%s)",
+			blockHeight, elapsed, formattedTotal, formattedSkipped, tpsStr)
 	}
 
 	prometheusUtxoCleanupBatch.Observe(float64(elapsed.Microseconds()) / 1_000_000)
