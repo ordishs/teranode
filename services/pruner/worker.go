@@ -171,6 +171,8 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				continue
 			}
 
+			prunerActive.Set(1)
+
 			// Track total items processed in this pruner cycle
 			var totalItemsProcessed int64
 
@@ -217,6 +219,7 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			// Update metrics for this pruner cycle
 			prunerItemCount.Set(float64(totalItemsProcessed))
 			prunerCurrentHeight.Set(float64(latestHeight))
+			prunerActive.Set(0)
 
 			// Update last processed height atomically
 			s.lastProcessedHeight.Store(latestHeight)

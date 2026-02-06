@@ -18,6 +18,7 @@ var (
 	prunerDeletingChildren prometheus.Counter
 	prunerItemCount        prometheus.Gauge
 	prunerCurrentHeight    prometheus.Gauge
+	prunerActive           prometheus.Gauge
 
 	// Blob deletion metrics
 	blobDeletionScheduledTotal  *prometheus.CounterVec
@@ -101,6 +102,13 @@ func _initPrometheusMetrics() {
 		prometheus.GaugeOpts{
 			Name: "pruner_current_height",
 			Help: "Current block height reached by the pruner",
+		},
+	)
+
+	prunerActive = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "pruner_active",
+			Help: "Whether the pruner is currently active (1) or idle (0)",
 		},
 	)
 
