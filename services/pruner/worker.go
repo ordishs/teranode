@@ -173,9 +173,6 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 
 			prunerActive.Set(1)
 
-			// Track total items processed in this pruner cycle
-			var totalItemsProcessed int64
-
 			// Phase 1: Preserve parents of old unmined transactions
 			// This must run before Phase 2 to protect parents from deletion
 			if s.utxoStore != nil {
@@ -192,7 +189,6 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					if count > 0 {
 						s.logger.Infof("Phase 1: Preserved parents for %d unmined transactions at height %d", count, latestHeight)
 						prunerUpdatingParents.Add(float64(count))
-						totalItemsProcessed += int64(count)
 					}
 				}
 			}
@@ -212,12 +208,9 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 					prunerDuration.WithLabelValues("dah_pruner").Observe(time.Since(startTime).Seconds())
 					prunerProcessed.Inc()
 					prunerDeletingChildren.Add(float64(recordsProcessed))
-					totalItemsProcessed += recordsProcessed
 				}
 			}
 
-			// Update metrics for this pruner cycle
-			prunerItemCount.Set(float64(totalItemsProcessed))
 			prunerCurrentHeight.Set(float64(latestHeight))
 			prunerActive.Set(0)
 

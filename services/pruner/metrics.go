@@ -16,8 +16,7 @@ var (
 	// Pruner operation metrics
 	prunerUpdatingParents  prometheus.Counter
 	prunerDeletingChildren prometheus.Counter
-	prunerItemCount        prometheus.Gauge
-	prunerCurrentHeight    prometheus.Gauge
+	prunerCurrentHeight prometheus.Gauge
 	prunerActive           prometheus.Gauge
 
 	// Blob deletion metrics
@@ -88,13 +87,6 @@ func _initPrometheusMetrics() {
 		prometheus.CounterOpts{
 			Name: "pruner_deleting_children_total",
 			Help: "Total number of records deleted by the DAH pruner",
-		},
-	)
-
-	prunerItemCount = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "pruner_item_count",
-			Help: "Number of items processed in the last pruner operation",
 		},
 	)
 
