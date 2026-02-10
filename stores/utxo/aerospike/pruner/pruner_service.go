@@ -83,6 +83,7 @@ type Options struct {
 // are accessed millions of times (e.g., utxoBatchSize in per-record processing loops).
 type Service struct {
 	logger      ulogger.Logger
+	settings    *settings.Settings
 	client      *uaerospike.Client
 	external    blob.Store
 	namespace   string
@@ -132,7 +133,7 @@ type externalFileInfo struct {
 }
 
 // NewService creates a new cleanup service
-func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
+func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 	if opts.Logger == nil {
 		return nil, errors.NewProcessingError("logger is required")
 	}
@@ -175,18 +176,18 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	})
 
 	// Use the configured query policy from settings (configured via aerospike_queryPolicy URL)
-	queryPolicy := util.GetAerospikeQueryPolicy(tSettings)
+	queryPolicy := util.GetAerospikeQueryPolicy(settings)
 	queryPolicy.IncludeBinData = true // Need to include bin data for cleanup processing
 
 	// Use the configured write policy from settings
-	writePolicy := util.GetAerospikeWritePolicy(tSettings, 0)
+	writePolicy := util.GetAerospikeWritePolicy(settings, 0)
 
 	// Use the configured batch policies from settings
-	batchWritePolicy := util.GetAerospikeBatchWritePolicy(tSettings)
+	batchWritePolicy := util.GetAerospikeBatchWritePolicy(settings)
 	batchWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
 
 	// Use the configured batch policy from settings (configured via aerospike_batchPolicy URL)
-	batchPolicy := util.GetAerospikeBatchPolicy(tSettings)
+	batchPolicy := util.GetAerospikeBatchPolicy(settings)
 
 	notifier := NewPrunerEventNotifier()
 	for _, observer := range opts.Observers {
@@ -196,6 +197,7 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 	service := &Service{
 		logger:                         opts.Logger,
 		client:                         opts.Client,
+		settings:                       settings,
 		external:                       opts.ExternalStore,
 		namespace:                      opts.Namespace,
 		set:                            opts.Set,
@@ -207,16 +209,16 @@ func NewService(tSettings *settings.Settings, opts Options) (*Service, error) {
 		batchWritePolicy:               batchWritePolicy,
 		batchPolicy:                    batchPolicy,
 		getPersistedHeight:             opts.GetPersistedHeight,
-		utxoBatchSize:                  tSettings.UtxoStore.UtxoBatchSize,
-		blockHeightRetention:           tSettings.GetUtxoStoreBlockHeightRetention(),
-		defensiveEnabled:               tSettings.Pruner.UTXODefensiveEnabled,
-		defensiveBatchReadSize:         tSettings.Pruner.UTXODefensiveBatchReadSize,
-		chunkSize:                      tSettings.Pruner.UTXOChunkSize,
-		chunkGroupLimit:                tSettings.Pruner.UTXOChunkGroupLimit,
-		progressLogInterval:            tSettings.Pruner.UTXOProgressLogInterval,
-		partitionQueries:               tSettings.Pruner.UTXOPartitionQueries,
-		connectionPoolWarningThreshold: tSettings.Pruner.ConnectionPoolWarningThreshold,
-		utxoSetTTL:                     tSettings.Pruner.UTXOSetTTL,
+		utxoBatchSize:                  settings.UtxoStore.UtxoBatchSize,
+		blockHeightRetention:           settings.GetUtxoStoreBlockHeightRetention(),
+		defensiveEnabled:               settings.Pruner.UTXODefensiveEnabled,
+		defensiveBatchReadSize:         settings.Pruner.UTXODefensiveBatchReadSize,
+		chunkSize:                      settings.Pruner.UTXOChunkSize,
+		chunkGroupLimit:                settings.Pruner.UTXOChunkGroupLimit,
+		progressLogInterval:            settings.Pruner.UTXOProgressLogInterval,
+		partitionQueries:               settings.Pruner.UTXOPartitionQueries,
+		connectionPoolWarningThreshold: settings.Pruner.ConnectionPoolWarningThreshold,
+		utxoSetTTL:                     settings.Pruner.UTXOSetTTL,
 		fieldTxID:                      fields.TxID.String(),
 		fieldUtxos:                     fields.Utxos.String(),
 		fieldInputs:                    fields.Inputs.String(),
@@ -1211,11 +1213,12 @@ func (s *Service) getTxInputsFromBins(ctx context.Context, blockHeight uint32, b
 }
 
 // flushCleanupBatches flushes accumulated parent updates, external file deletions, and Aerospike deletions
-func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error {
-	// Execute parent updates first
-	if len(parentUpdates) > 0 {
-		if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
-			return err
+func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[string]*parentUpdateInfo, deletions []*aerospike.Key, externalFiles []*externalFileInfo) error { // Execute parent updates first
+	if !s.settings.Pruner.SkipParentUpdates {
+		if len(parentUpdates) > 0 {
+			if err := s.executeBatchParentUpdates(ctx, parentUpdates); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1226,10 +1229,12 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 		}
 	}
 
-	// Delete Aerospike records last
-	if len(deletions) > 0 {
-		if err := s.executeBatchDeletions(ctx, deletions); err != nil {
-			return err
+	if !s.settings.Pruner.SkipDeletions {
+		// Delete Aerospike records last
+		if len(deletions) > 0 {
+			if err := s.executeBatchDeletions(ctx, deletions); err != nil {
+				return err
+			}
 		}
 	}
 
