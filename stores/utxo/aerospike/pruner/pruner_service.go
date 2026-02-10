@@ -39,13 +39,16 @@ var _ pruner.Service = (*Service)(nil)
 var IndexName, _ = gocore.Config().Get("pruner_IndexName", "pruner_dah_index")
 
 var (
-	prometheusMetricsInitOnce          sync.Once
-	prometheusUtxoCleanupBatch         prometheus.Histogram
-	prometheusUtxoRecordErrors         prometheus.Counter
-	prometheusUtxoBatchQueryError      prometheus.Counter
-	prometheusUtxoRecordsDeleted       prometheus.Counter
-	prometheusUtxoParentsUpdated       prometheus.Counter
-	prometheusUtxoExternalFilesDeleted prometheus.Counter
+	prometheusMetricsInitOnce                 sync.Once
+	prometheusUtxoCleanupBatch                prometheus.Histogram
+	prometheusUtxoRecordErrors                prometheus.Counter
+	prometheusUtxoBatchQueryError             prometheus.Counter
+	prometheusUtxoRecordsDeleted              prometheus.Counter
+	prometheusUtxoRecordsDeletedSkipped       prometheus.Counter
+	prometheusUtxoParentsUpdated              prometheus.Counter
+	prometheusUtxoParentsUpdatedSkipped       prometheus.Counter
+	prometheusUtxoExternalFilesDeleted        prometheus.Counter
+	prometheusUtxoExternalFilesDeletedSkipped prometheus.Counter
 )
 
 // Options contains configuration options for the cleanup service
@@ -180,13 +183,25 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 			Name: "utxo_pruner_records_deleted_total",
 			Help: "Total number of UTXO records deleted during pruning (updated incrementally)",
 		})
+		prometheusUtxoRecordsDeletedSkipped = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_records_deleted_skipped_total",
+			Help: "Total number of UTXO records skipped during pruning (updated incrementally)",
+		})
 		prometheusUtxoParentsUpdated = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_parents_updated_total",
 			Help: "Total number of parent records updated during pruning (updated incrementally)",
 		})
+		prometheusUtxoParentsUpdatedSkipped = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_parents_updated_skipped_total",
+			Help: "Total number of parent records skipped during pruning (updated incrementally)",
+		})
 		prometheusUtxoExternalFilesDeleted = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_external_files_deleted_total",
 			Help: "Total number of external files deleted during pruning (updated incrementally)",
+		})
+		prometheusUtxoExternalFilesDeletedSkipped = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_external_files_deleted_skipped_total",
+			Help: "Total number of external files skipped during pruning (updated incrementally)",
 		})
 	})
 
@@ -476,6 +491,9 @@ func (s *Service) partitionWorker(
 				prometheusUtxoRecordsDeleted.Add(float64(processed))
 			}
 
+			if skipped > 0 {
+				prometheusUtxoRecordsDeletedSkipped.Add(float64(skipped))
+			}
 			return nil
 		})
 	}
@@ -1357,6 +1375,10 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 		prometheusUtxoParentsUpdated.Add(float64(successCount))
 	}
 
+	if notFoundCount > 0 {
+		prometheusUtxoParentsUpdatedSkipped.Add(float64(notFoundCount))
+	}
+
 	return nil
 }
 
@@ -1482,6 +1504,10 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, files [
 	// Update metric with successful deletions
 	if successCount > 0 {
 		prometheusUtxoExternalFilesDeleted.Add(float64(successCount))
+	}
+
+	if alreadyDeletedCount > 0 {
+		prometheusUtxoExternalFilesDeletedSkipped.Add(float64(alreadyDeletedCount))
 	}
 
 	// Return error if any deletions failed
