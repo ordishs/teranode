@@ -39,10 +39,16 @@ var _ pruner.Service = (*Service)(nil)
 var IndexName, _ = gocore.Config().Get("pruner_IndexName", "pruner_dah_index")
 
 var (
-	prometheusMetricsInitOnce     sync.Once
-	prometheusUtxoCleanupBatch    prometheus.Histogram
-	prometheusUtxoRecordErrors    prometheus.Counter
-	prometheusUtxoBatchQueryError prometheus.Counter
+	prometheusMetricsInitOnce                 sync.Once
+	prometheusUtxoCleanupBatch                prometheus.Histogram
+	prometheusUtxoRecordErrors                prometheus.Counter
+	prometheusUtxoBatchQueryError             prometheus.Counter
+	prometheusUtxoRecordsDeleted              prometheus.Counter
+	prometheusUtxoRecordsDeletedSkipped       prometheus.Counter
+	prometheusUtxoParentsUpdated              prometheus.Counter
+	prometheusUtxoParentsUpdatedSkipped       prometheus.Counter
+	prometheusUtxoExternalFilesDeleted        prometheus.Counter
+	prometheusUtxoExternalFilesDeletedSkipped prometheus.Counter
 )
 
 // Options contains configuration options for the cleanup service
@@ -172,6 +178,30 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		prometheusUtxoBatchQueryError = promauto.NewCounter(prometheus.CounterOpts{
 			Name: "utxo_pruner_batch_query_errors_total",
 			Help: "Total number of Aerospike batch query errors during child verification",
+		})
+		prometheusUtxoRecordsDeleted = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_records_deleted_total",
+			Help: "Total number of UTXO records deleted during pruning (updated incrementally)",
+		})
+		prometheusUtxoRecordsDeletedSkipped = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_records_deleted_skipped_total",
+			Help: "Total number of UTXO records skipped during pruning (updated incrementally)",
+		})
+		prometheusUtxoParentsUpdated = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_parents_updated_total",
+			Help: "Total number of parent records updated during pruning (updated incrementally)",
+		})
+		prometheusUtxoParentsUpdatedSkipped = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_parents_updated_skipped_total",
+			Help: "Total number of parent records skipped during pruning (updated incrementally)",
+		})
+		prometheusUtxoExternalFilesDeleted = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_external_files_deleted_total",
+			Help: "Total number of external files deleted during pruning (updated incrementally)",
+		})
+		prometheusUtxoExternalFilesDeletedSkipped = promauto.NewCounter(prometheus.CounterOpts{
+			Name: "utxo_pruner_external_files_deleted_skipped_total",
+			Help: "Total number of external files skipped during pruning (updated incrementally)",
 		})
 	})
 
@@ -455,6 +485,15 @@ func (s *Service) partitionWorker(
 			totalProcessed += int64(processed)
 			totalSkipped += int64(skipped)
 			mu.Unlock()
+
+			// Update Prometheus counter incrementally for real-time rate calculation
+			if processed > 0 {
+				prometheusUtxoRecordsDeleted.Add(float64(processed))
+			}
+
+			if skipped > 0 {
+				prometheusUtxoRecordsDeletedSkipped.Add(float64(skipped))
+			}
 			return nil
 		})
 	}
@@ -1307,7 +1346,7 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 
 	// Check for errors
 	successCount := 0
-	notFoundCount := 0
+	skipped := 0
 	errorCount := 0
 
 	for _, rec := range batchRecords {
@@ -1315,7 +1354,7 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 			if rec.BatchRec().Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
 				// Idempotent: Parent may have been deleted by concurrent pruning or LocalDAH cleanup
 				// This is a success condition - parent is already gone so we don't need to update it
-				notFoundCount++
+				skipped++
 				continue
 			}
 			// Log other errors
@@ -1329,6 +1368,15 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 	// Return error if any individual record operations failed
 	if errorCount > 0 {
 		return errors.NewStorageError("%d parent update operations failed", errorCount)
+	}
+
+	// Update metric with successful parent updates
+	if successCount > 0 {
+		prometheusUtxoParentsUpdated.Add(float64(successCount))
+	}
+
+	if skipped > 0 {
+		prometheusUtxoParentsUpdatedSkipped.Add(float64(skipped))
 	}
 
 	return nil
@@ -1381,7 +1429,7 @@ func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.K
 
 	// Check for errors and count successes
 	successCount := 0
-	alreadyDeletedCount := 0
+	skippedCount := 0
 	errorCount := 0
 
 	for _, rec := range batchRecords {
@@ -1389,7 +1437,7 @@ func (s *Service) executeBatchDeletions(ctx context.Context, keys []*aerospike.K
 			if rec.BatchRec().Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
 				// Idempotent: Record already deleted by concurrent pruning or previous run
 				// This operation is safely re-runnable - treat as success
-				alreadyDeletedCount++
+				skippedCount++
 			} else {
 				s.logger.Errorf("Deletion error for key %v: %v", rec.BatchRec().Key, rec.BatchRec().Err)
 				errorCount++
@@ -1422,7 +1470,7 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, files [
 	}
 
 	successCount := 0
-	alreadyDeletedCount := 0
+	skipped := 0
 	errorCount := 0
 
 	for _, fileInfo := range files {
@@ -1440,7 +1488,7 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, files [
 			if errors.Is(err, errors.ErrNotFound) {
 				// Idempotent: File already deleted by LocalDAH cleanup, concurrent pruning, or previous run
 				// This operation is safely re-runnable - treat as success
-				alreadyDeletedCount++
+				skipped++
 				s.logger.Debugf("External file for tx %s (type %d) already deleted", fileInfo.txHash.String(), fileInfo.fileType)
 			} else {
 				s.logger.Errorf("Failed to delete external file for tx %s (type %d): %v", fileInfo.txHash.String(), fileInfo.fileType, err)
@@ -1451,7 +1499,15 @@ func (s *Service) executeBatchExternalFileDeletions(ctx context.Context, files [
 		}
 	}
 
-	s.logger.Debugf("External file deletion batch - success: %d, already deleted: %d, errors: %d", successCount, alreadyDeletedCount, errorCount)
+	s.logger.Debugf("External file deletion batch - success: %d, already deleted: %d, errors: %d", successCount, skipped, errorCount)
+
+	if successCount > 0 {
+		prometheusUtxoExternalFilesDeleted.Add(float64(successCount))
+	}
+
+	if skipped > 0 {
+		prometheusUtxoExternalFilesDeletedSkipped.Add(float64(skipped))
+	}
 
 	// Return error if any deletions failed
 	if errorCount > 0 {
