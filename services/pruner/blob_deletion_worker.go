@@ -166,8 +166,8 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 		totalFail += failCount
 	}
 
-	// Log overall summary if we processed any batches
-	if batchNum > 1 {
+	// Log overall summary if we processed multiple batches
+	if batchNum > 2 {
 		totalDuration := time.Since(overallStartTime).Round(time.Second)
 		s.logger.Infof("[pruner][%s:%d] blob deletion: processed %d batches - %s total succeeded, %s total failed (took %s)",
 			hashStr, height, batchNum-1, humanize.Comma(totalSuccess), humanize.Comma(totalFail), totalDuration)
