@@ -80,79 +80,102 @@ func (s *Server) processBlobDeletionsAtHeight(height uint32, blockHash *chainhas
 		}
 	}
 
-	// Acquire batch with locking from blockchain service (uses SELECT...FOR UPDATE SKIP LOCKED)
 	batchSize := s.settings.Pruner.BlobDeletionBatchSize
 	lockTimeout := 300 // 5 minutes - should be plenty for processing
-
-	batchToken, deletions, err := s.blockchainClient.AcquireBlobDeletionBatch(ctx, safeHeight, int(batchSize), lockTimeout)
-	if err != nil {
-		s.logger.Errorf("Failed to acquire blob deletion batch: %v", err)
-		blobDeletionErrorsTotal.WithLabelValues("acquisition").Inc()
-		return
-	}
-
-	if batchToken == "" || len(deletions) == 0 {
-		s.logger.Debugf("[pruner][%s:%d] blob deletion: no blob deletions available", hashStr, height)
-		return
-	}
-
-	batchStartTime := time.Now()
-	s.logger.Infof("[pruner][%s:%d] blob deletion: acquired blob deletion batch with %s deletions", hashStr, height, humanize.Comma(int64(len(deletions))))
-
-	// Track completed and failed deletions
-	completedIDs := make([]int64, 0, len(deletions))
-	failedIDs := make([]int64, 0, len(deletions))
-
-	var successCount, failCount int64
 	maxRetries := s.settings.Pruner.BlobDeletionMaxRetries
 
-	// Process all deletions in the batch
-	for i, deletion := range deletions {
-		storeType := storetypes.BlobStoreType(deletion.StoreType)
+	// Track totals across all batches
+	var totalSuccess, totalFail int64
+	var batchNum int
+	overallStartTime := time.Now()
 
-		s.logger.Debugf("[pruner][%s:%d] blob deletion: processing deletion %s/%s (id=%d, key=%x)",
-			hashStr, height, humanize.Comma(int64(i+1)), humanize.Comma(int64(len(deletions))), deletion.Id, deletion.BlobKey)
+	// Loop through batches until no more deletions available
+	for {
+		batchNum++
 
-		if err := s.processOneDeletion(ctx, deletion, hashStr, height); err != nil {
-			s.logger.Warnf("[pruner][%s:%d] blob deletion: failed to delete blob %x from %s (attempt %d/%d): %v",
-				hashStr, height, deletion.BlobKey, storeType.String(),
-				int(deletion.RetryCount)+1, maxRetries, err)
-
-			failedIDs = append(failedIDs, deletion.Id)
-
-			// Check if this will be removed due to max retries
-			if int(deletion.RetryCount)+1 >= maxRetries {
-				s.logger.Errorf("[pruner][%s:%d] blob deletion: blob %x will be removed after %d failed attempts",
-					hashStr, height, deletion.BlobKey, maxRetries)
-				blobDeletionErrorsTotal.WithLabelValues(storeType.String()).Inc()
-				failCount++
-			}
-		} else {
-			completedIDs = append(completedIDs, deletion.Id)
-			successCount++
-			blobDeletionProcessedTotal.Inc()
+		// Acquire batch with locking from blockchain service (uses SELECT...FOR UPDATE SKIP LOCKED)
+		batchToken, deletions, err := s.blockchainClient.AcquireBlobDeletionBatch(ctx, safeHeight, int(batchSize), lockTimeout)
+		if err != nil {
+			s.logger.Errorf("[pruner][%s:%d] blob deletion: failed to acquire batch %d: %v", hashStr, height, batchNum, err)
+			blobDeletionErrorsTotal.WithLabelValues("acquisition").Inc()
+			break
 		}
+
+		if batchToken == "" || len(deletions) == 0 {
+			if batchNum == 1 {
+				s.logger.Debugf("[pruner][%s:%d] blob deletion: no blob deletions available", hashStr, height)
+			}
+			break
+		}
+
+		batchStartTime := time.Now()
+		s.logger.Infof("[pruner][%s:%d] blob deletion: acquired batch %d with %s deletions", hashStr, height, batchNum, humanize.Comma(int64(len(deletions))))
+
+		// Track completed and failed deletions for this batch
+		completedIDs := make([]int64, 0, len(deletions))
+		failedIDs := make([]int64, 0, len(deletions))
+
+		var successCount, failCount int64
+
+		// Process all deletions in the batch
+		for i, deletion := range deletions {
+			storeType := storetypes.BlobStoreType(deletion.StoreType)
+
+			s.logger.Debugf("[pruner][%s:%d] blob deletion: processing deletion %s/%s (id=%d, key=%x)",
+				hashStr, height, humanize.Comma(int64(i+1)), humanize.Comma(int64(len(deletions))), deletion.Id, deletion.BlobKey)
+
+			if err := s.processOneDeletion(ctx, deletion, hashStr, height); err != nil {
+				s.logger.Warnf("[pruner][%s:%d] blob deletion: failed to delete blob %x from %s (attempt %d/%d): %v",
+					hashStr, height, deletion.BlobKey, storeType.String(),
+					int(deletion.RetryCount)+1, maxRetries, err)
+
+				failedIDs = append(failedIDs, deletion.Id)
+
+				// Check if this will be removed due to max retries
+				if int(deletion.RetryCount)+1 >= maxRetries {
+					s.logger.Errorf("[pruner][%s:%d] blob deletion: blob %x will be removed after %d failed attempts",
+						hashStr, height, deletion.BlobKey, maxRetries)
+					blobDeletionErrorsTotal.WithLabelValues(storeType.String()).Inc()
+					failCount++
+				}
+			} else {
+				completedIDs = append(completedIDs, deletion.Id)
+				successCount++
+				blobDeletionProcessedTotal.Inc()
+			}
+		}
+
+		// Complete the batch in a single gRPC call
+		s.logger.Infof("[pruner][%s:%d] blob deletion: completing batch %d - %s succeeded, %s failed",
+			hashStr, height, batchNum, humanize.Comma(successCount), humanize.Comma(int64(len(failedIDs))))
+
+		err = s.blockchainClient.CompleteBlobDeletionBatch(ctx, batchToken, completedIDs, failedIDs, maxRetries)
+		if err != nil {
+			s.logger.Errorf("[pruner][%s:%d] blob deletion: failed to complete batch %d: %v", hashStr, height, batchNum, err)
+			blobDeletionErrorsTotal.WithLabelValues("completion").Inc()
+			// Batch will be released when token expires - deletions will be retried
+			break
+		}
+
+		duration := time.Since(batchStartTime).Round(time.Second)
+		s.logger.Infof("[pruner][%s:%d] blob deletion: batch %d complete - %s succeeded, %s failed (took %s)",
+			hashStr, height, batchNum, humanize.Comma(successCount), humanize.Comma(failCount), duration)
+
+		// Update totals
+		totalSuccess += successCount
+		totalFail += failCount
 	}
 
-	// Complete the entire batch in a single gRPC call
-	s.logger.Infof("[pruner][%s:%d] blob deletion: completing batch - %s succeeded, %s failed",
-		hashStr, height, humanize.Comma(successCount), humanize.Comma(int64(len(failedIDs))))
-
-	err = s.blockchainClient.CompleteBlobDeletionBatch(ctx, batchToken, completedIDs, failedIDs, maxRetries)
-	if err != nil {
-		s.logger.Errorf("[pruner][%s:%d] blob deletion: failed to complete batch: %v", hashStr, height, err)
-		blobDeletionErrorsTotal.WithLabelValues("completion").Inc()
-		// Batch will be released when token expires - deletions will be retried
-		return
+	// Log overall summary if we processed multiple batches
+	if batchNum > 2 {
+		totalDuration := time.Since(overallStartTime).Round(time.Second)
+		s.logger.Infof("[pruner][%s:%d] blob deletion: processed %d batches - %s total succeeded, %s total failed (took %s)",
+			hashStr, height, batchNum-1, humanize.Comma(totalSuccess), humanize.Comma(totalFail), totalDuration)
 	}
-
-	duration := time.Since(batchStartTime).Round(time.Second)
-	s.logger.Infof("[pruner][%s:%d] blob deletion: batch complete - %s succeeded, %s failed (took %s)",
-		hashStr, height, humanize.Comma(successCount), humanize.Comma(failCount), duration)
 
 	// Notify observer if registered (for testing)
 	if s.blobDeletionObserver != nil {
-		s.blobDeletionObserver.OnBlobDeletionComplete(height, successCount, failCount)
+		s.blobDeletionObserver.OnBlobDeletionComplete(height, totalSuccess, totalFail)
 	}
 }
 
