@@ -428,6 +428,12 @@ func (h *HTTP) Start(ctx context.Context, addr string) error {
 	// Set the listener on the Echo server
 	h.e.Listener = listener
 
+	// Defense-in-depth timeouts (reverse proxy also enforces limits)
+	h.e.Server.ReadTimeout = 30 * time.Second
+	h.e.Server.WriteTimeout = 120 * time.Second // generous for large block responses
+	h.e.Server.IdleTimeout = 120 * time.Second
+	h.e.Server.ReadHeaderTimeout = 10 * time.Second
+
 	if mode == "HTTP" {
 		servicemanager.AddListenerInfo(fmt.Sprintf("Asset HTTP listening on %s", address))
 		err = h.e.Start(address)

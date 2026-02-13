@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -14,6 +16,20 @@ import (
 )
 
 const cookieName = "auth"
+
+const (
+	maxLoginAttempts   = 5
+	loginWindowSeconds = 15 * 60 // 15 minutes
+)
+
+// loginAttempt tracks failed login attempts for rate limiting.
+type loginAttempt struct {
+	count   int
+	firstAt time.Time
+}
+
+// failedLogins tracks per-IP failed login attempts.
+var failedLogins sync.Map
 
 // AuthHandler handles authentication for the dashboard UI
 type AuthHandler struct {
@@ -107,22 +123,66 @@ func (h *AuthHandler) CheckAuth(r *http.Request) bool {
 	authsha := sha256.Sum256([]byte(authHeader))
 	isValid := authsha == h.authsha
 
-	// Add debug logging
 	if !isValid {
-		expectedAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", rpcUser, rpcPass)))
-		expectedHash := sha256.Sum256([]byte(expectedAuth))
-
-		h.logger.Debugf("Auth validation failed. Got: %x, Expected: %x", authsha, expectedHash)
-		h.logger.Debugf("Username comparison: '%s' vs '%s'", username, rpcUser)
-		h.logger.Debugf("Password comparison: '%s' vs '%s'", password, rpcPass)
+		h.logger.Debugf("Auth validation failed for user: %s", username)
 	}
 
 	return isValid
 }
 
+// isLoginRateLimited checks if the given IP has exceeded the login attempt limit.
+// Returns true if the IP should be rate limited.
+func isLoginRateLimited(ip string) bool {
+	now := time.Now()
+	val, ok := failedLogins.Load(ip)
+	if !ok {
+		return false
+	}
+	attempt := val.(*loginAttempt)
+	if now.Sub(attempt.firstAt) > time.Duration(loginWindowSeconds)*time.Second {
+		// Window expired, clean up stale entry
+		failedLogins.Delete(ip)
+		return false
+	}
+	return attempt.count >= maxLoginAttempts
+}
+
+// recordFailedLogin records a failed login attempt for the given IP.
+func recordFailedLogin(ip string) {
+	now := time.Now()
+	val, ok := failedLogins.Load(ip)
+	if !ok {
+		failedLogins.Store(ip, &loginAttempt{count: 1, firstAt: now})
+		return
+	}
+	attempt := val.(*loginAttempt)
+	if now.Sub(attempt.firstAt) > time.Duration(loginWindowSeconds)*time.Second {
+		// Window expired, reset
+		failedLogins.Store(ip, &loginAttempt{count: 1, firstAt: now})
+		return
+	}
+	attempt.count++
+}
+
+// clearFailedLogins resets the failed login counter for the given IP.
+func clearFailedLogins(ip string) {
+	failedLogins.Delete(ip)
+}
+
 // LoginHandler handles login requests
 func (h *AuthHandler) LoginHandler(c echo.Context) error {
 	h.logger.Infof("Login attempt received")
+
+	clientIP := c.RealIP()
+
+	// Check rate limit before processing
+	if isLoginRateLimited(clientIP) {
+		h.logger.Warnf("Login rate limit exceeded for IP: %s", clientIP)
+		return c.JSON(http.StatusTooManyRequests, map[string]interface{}{
+			"success": false,
+			"error":   "Too many failed login attempts. Please try again later.",
+		})
+	}
 
 	// Check if this is a form submission
 	username := c.FormValue("username")
@@ -148,14 +208,16 @@ func (h *AuthHandler) LoginHandler(c echo.Context) error {
 			cookie.MaxAge = 86400 // 24 hours
 			c.SetCookie(cookie)
 
-			h.logger.Infof("Form-based login successful, cookie set: %s", cookie.Name)
+			clearFailedLogins(clientIP)
+			h.logger.Infof("Form-based login successful for user: %s", username)
 
 			return c.JSON(http.StatusOK, map[string]interface{}{
 				"success": true,
 			})
 		}
 
-		h.logger.Infof("Form-based login failed")
+		recordFailedLogin(clientIP)
+		h.logger.Infof("Form-based login failed for user: %s", username)
 
 		return c.JSON(http.StatusUnauthorized, map[string]interface{}{
 			"success": false,
@@ -177,13 +239,15 @@ func (h *AuthHandler) LoginHandler(c echo.Context) error {
 		cookie.MaxAge = 86400 // 24 hours
 		c.SetCookie(cookie)
 
-		h.logger.Infof("Login successful, cookie set: %s", cookie.Name)
+		clearFailedLogins(clientIP)
+		h.logger.Infof("Login successful")
 
 		return c.JSON(http.StatusOK, map[string]interface{}{
 			"success": true,
 		})
 	}
 
+	recordFailedLogin(clientIP)
 	h.logger.Infof("Login failed")
 
 	return c.JSON(http.StatusUnauthorized, map[string]interface{}{
@@ -212,17 +276,9 @@ func (h *AuthHandler) LogoutHandler(c echo.Context) error {
 func (h *AuthHandler) CheckAuthHandler(c echo.Context) error {
 	h.logger.Debugf("Auth check request received")
 
-	// Log all cookies for debugging
-	for _, cookie := range c.Cookies() {
-		h.logger.Debugf("Cookie found: %s = %s", cookie.Name, cookie.Value)
-	}
-
-	// Log auth header if present
-	authHeader := c.Request().Header.Get("Authorization")
-	if authHeader != "" {
-		h.logger.Debugf("Auth header found: %s", authHeader[:10]+"...")
-	} else {
-		h.logger.Debugf("No auth header found")
+	// Log auth header presence (not value)
+	if c.Request().Header.Get("Authorization") != "" {
+		h.logger.Debugf("Auth header present")
 	}
 
 	if h.CheckAuth(c.Request()) {

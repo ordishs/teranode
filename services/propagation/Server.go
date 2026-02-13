@@ -724,6 +724,10 @@ func (ps *PropagationServer) startHTTPServer(ctx context.Context, httpAddresses 
 		ps.httpServer.Use(middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(rate.Limit(ps.settings.Propagation.HTTPRateLimit))))
 	}
 
+	if ps.settings.Propagation.HTTPBodyLimit != "" {
+		ps.httpServer.Use(middleware.BodyLimit(ps.settings.Propagation.HTTPBodyLimit))
+	}
+
 	ps.httpServer.Server.ReadTimeout = 30 * time.Second
 	ps.httpServer.Server.WriteTimeout = 30 * time.Second
 	ps.httpServer.Server.IdleTimeout = 120 * time.Second
