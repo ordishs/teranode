@@ -569,6 +569,7 @@ func TestStartHTTPServer(t *testing.T) {
 			Propagation: settings.PropagationSettings{
 				HTTPRateLimit: 20,
 			},
+			Policy: &settings.PolicySettings{},
 		},
 	}
 

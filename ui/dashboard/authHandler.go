@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/settings"
@@ -18,18 +19,22 @@ import (
 const cookieName = "auth"
 
 const (
-	maxLoginAttempts   = 5
-	loginWindowSeconds = 15 * 60 // 15 minutes
+	maxLoginAttempts      = 5
+	loginWindowSeconds    = 15 * 60 // 15 minutes
+	loginCleanupInterval  = 5 * time.Minute
+	maxFailedLoginEntries = 10000
 )
 
 // loginAttempt tracks failed login attempts for rate limiting.
 type loginAttempt struct {
-	count   int
+	count   int32
 	firstAt time.Time
 }
 
 // failedLogins tracks per-IP failed login attempts.
 var failedLogins sync.Map
+
+var loginCleanupOnce sync.Once
 
 // AuthHandler handles authentication for the dashboard UI
 type AuthHandler struct {
@@ -38,8 +43,44 @@ type AuthHandler struct {
 	authsha  [sha256.Size]byte
 }
 
+func startLoginCleanup() {
+	ticker := time.NewTicker(loginCleanupInterval)
+
+	go func() {
+		for range ticker.C {
+			now := time.Now()
+			windowDuration := time.Duration(loginWindowSeconds) * time.Second
+			remaining := 0
+
+			failedLogins.Range(func(key, value any) bool {
+				attempt := value.(*loginAttempt)
+				if now.Sub(attempt.firstAt) > windowDuration {
+					failedLogins.Delete(key)
+				} else {
+					remaining++
+				}
+				return true
+			})
+
+			if remaining > maxFailedLoginEntries {
+				excess := remaining - maxFailedLoginEntries
+				failedLogins.Range(func(key, _ any) bool {
+					if excess <= 0 {
+						return false
+					}
+					failedLogins.Delete(key)
+					excess--
+					return true
+				})
+			}
+		}
+	}()
+}
+
 // NewAuthHandler creates a new authentication handler
 func NewAuthHandler(logger ulogger.Logger, settings *settings.Settings) *AuthHandler {
+	loginCleanupOnce.Do(startLoginCleanup)
+
 	var authsha [sha256.Size]byte
 
 	rpcUser := settings.RPC.RPCUser
@@ -144,7 +185,7 @@ func isLoginRateLimited(ip string) bool {
 		failedLogins.Delete(ip)
 		return false
 	}
-	return attempt.count >= maxLoginAttempts
+	return atomic.LoadInt32(&attempt.count) >= int32(maxLoginAttempts)
 }
 
 // recordFailedLogin records a failed login attempt for the given IP.
@@ -161,7 +202,7 @@ func recordFailedLogin(ip string) {
 		failedLogins.Store(ip, &loginAttempt{count: 1, firstAt: now})
 		return
 	}
-	attempt.count++
+	atomic.AddInt32(&attempt.count, 1)
 }
 
 // clearFailedLogins resets the failed login counter for the given IP.
