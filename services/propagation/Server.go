@@ -934,12 +934,14 @@ func (ps *PropagationServer) processTransaction(ctx context.Context, req *propag
 	txSize := len(req.Tx)
 
 	// Check transaction size BEFORE parsing to avoid wasting CPU on oversized transactions
-	maxTxSize := ps.settings.Policy.GetMaxTxSizePolicy()
-	if maxTxSize > 0 && txSize > maxTxSize {
-		prometheusInvalidTransactions.Inc()
-		err := errors.NewTxInvalidError("[ProcessTransaction] transaction size %d exceeds maximum allowed size %d", txSize, maxTxSize)
-		span.RecordError(err)
-		return err
+	if ps.settings != nil && ps.settings.Policy != nil {
+		maxTxSize := ps.settings.Policy.GetMaxTxSizePolicy()
+		if maxTxSize > 0 && txSize > maxTxSize {
+			prometheusInvalidTransactions.Inc()
+			err := errors.NewTxInvalidError("[ProcessTransaction] transaction size %d exceeds maximum allowed size %d", txSize, maxTxSize)
+			span.RecordError(err)
+			return err
+		}
 	}
 
 	var btTx *bt.Tx

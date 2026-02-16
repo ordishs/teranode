@@ -48,14 +48,18 @@ func (s *Server) handleBlockTopic(_ context.Context, m []byte, fromID string) {
 	// Check that fromID matches the block peer ID
 	if fromID != blockMessage.PeerID {
 		s.logger.Errorf("[handleBlockTopic] peer ID spoofing detected: from=%s claimed=%s", fromID, blockMessage.PeerID)
-		s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		if s.banManager != nil {
+			s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		}
 		return
 	}
 
 	// Validate DataHubURL to prevent SSRF attacks
 	if err = s.validateDataHubURL(blockMessage.DataHubURL); err != nil {
 		s.logger.Errorf("[handleBlockTopic] invalid DataHubURL from peer %s: %v", fromID, err)
-		s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		if s.banManager != nil {
+			s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		}
 		return
 	}
 
@@ -163,14 +167,18 @@ func (s *Server) handleSubtreeTopic(_ context.Context, m []byte, fromID string) 
 	// Check that fromID matches the subtree peer ID
 	if fromID != subtreeMessage.PeerID {
 		s.logger.Errorf("[handleSubtreeTopic] peer ID spoofing detected: from=%s claimed=%s", fromID, subtreeMessage.PeerID)
-		s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		if s.banManager != nil {
+			s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		}
 		return
 	}
 
 	// Validate DataHubURL to prevent SSRF attacks
 	if err = s.validateDataHubURL(subtreeMessage.DataHubURL); err != nil {
 		s.logger.Errorf("[handleSubtreeTopic] invalid DataHubURL from peer %s: %v", fromID, err)
-		s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		if s.banManager != nil {
+			s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		}
 		return
 	}
 
@@ -379,7 +387,9 @@ func (s *Server) handleRejectedTxTopic(_ context.Context, m []byte, fromID strin
 	// Check that fromID matches the rejected tx peer ID
 	if fromID != rejectedTxMessage.PeerID {
 		s.logger.Errorf("[handleRejectedTxTopic] peer ID spoofing detected: from=%s claimed=%s", fromID, rejectedTxMessage.PeerID)
-		s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		if s.banManager != nil {
+			s.banManager.AddScore(fromID, ReasonProtocolViolation)
+		}
 		return
 	}
 

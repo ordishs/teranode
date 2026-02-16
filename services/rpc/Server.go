@@ -1095,7 +1095,7 @@ func (s *RPCServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 		r.Body = http.MaxBytesReader(w, r.Body, s.rpcMaxRequestSize)
 	}
 
-  // Use context-aware logger for trace correlation
+	// Use context-aware logger for trace correlation
 	ctx := r.Context()
 	ctxLogger := s.logger.WithTraceContext(ctx)
 
