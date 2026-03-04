@@ -13,30 +13,6 @@ import (
 )
 
 // TestForkDeleteAtHeightPruningDoubleSpend tests a scenario where:
-// 1. A fork contains a double-spend transaction (txB)
-// 2. txB's outputs are spent on the losing fork
-// 3. UTXO pruning occurs via DeleteAtHeight (not manual deletion)
-// 4. Additional blocks are mined to trigger UTXO cleanup
-// 5. The fork becomes the longest chain, triggering a reorg
-// 6. Verify that the system handles this correctly without skipping processed_at
-//
-// PRODUCTION BUG REPRODUCTION - DeleteAtHeight PRUNING VARIANT:
-// This test reproduces the production bug using DeleteAtHeight UTXO pruning instead of manual deletion.
-// The bug occurred when:
-// - A fork with conflicted transactions had those UTXOs pruned (reached DeleteAtHeight)
-// - The pruning happened because the UTXOs were spent and retention period elapsed
-// - The fork then became the longest chain, triggering a reorg
-// - During moveForward, the blockchain FSM failed because pruned UTXOs couldn't be found
-// - This caused a reset, but the reset logic failed to set processed_at properly
-// - Result: Several blocks ended up with NULL processed_at timestamps
-//
-// Test scenario:
-//
-//	/ 4a [txA] -> 5a [txAChild] -> 6a -> ... -> 10a (initially longest)
-//
-// 0 -> 1 -> 2 -> 3 [parentTx]
-//
-//	\ 4b [txB] -> 5b [txBChild] (txB spent, will be pruned)
 //
 // Steps:
 // 1. Mine to maturity (creates blocks 0, 1, 2)

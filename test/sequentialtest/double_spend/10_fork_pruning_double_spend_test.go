@@ -12,22 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestForkPruningDoubleSpend tests a complex scenario where:
-// 1. A fork contains a double-spend transaction
-// 2. The double-spend transaction's UTXOs are pruned/deleted from UTXO store
-// 3. The fork becomes the longest chain, triggering a reorg
-// 4. Verify that the system handles this correctly without skipping processed_at
-//
-// PRODUCTION BUG REPRODUCTION:
-// This test reproduces the production bug: "Failure during moveForward, causing a reset,
-// failing and then skipping processed_at for a few blocks"
-//
-// The bug occurred when:
-// - A fork with conflicted transactions had those UTXOs pruned (reached DeleteAtHeight)
-// - The fork then became the longest chain, triggering a reorg
-// - During moveForward, the blockchain FSM failed because pruned UTXOs couldn't be found
-// - This caused a reset, but the reset logic failed to set processed_at properly
-// - Result: Several blocks ended up with NULL processed_at timestamps
+// TestForkPruningDoubleSpend tests a scenario where:
 //
 // Test scenario:
 //
