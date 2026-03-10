@@ -715,7 +715,7 @@ func (s *Service) PruneWithPartitions(ctx context.Context, blockHeight uint32, b
 
 		prometheusUtxoCleanupBatch.Observe(float64(elapsed.Microseconds()) / 1_000_000)
 
-		s.notifier.NotifyPruneComplete(blockHeight, totalProcessed)
+		s.notifier.NotifyPruneComplete(blockHeight, totalProcessed, s.settings.ClientName)
 
 		return totalProcessed, nil
 	}

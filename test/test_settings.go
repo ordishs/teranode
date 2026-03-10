@@ -15,6 +15,7 @@ var (
 	Node1PeerID     = "12D3KooWAFXWuxgdJoRsaA4J4RRRr8yu6WCrAPf8FaS7UfZg3ceG"
 	Node1PrivateKey = "c8a1b91ae120878d91a04c904e0d565aa44b2575c1bb30a729bd3e36e2a1d5e6067216fa92b1a1a7e30d0aaabe288e25f1efc0830f309152638b61d84be6b71d"
 
+
 	// Node 2 P2P identity
 	Node2PeerID     = "12D3KooWG6aCkDmi5tqx4G4AvVDTQdSVvTSzzQvk1vh9CtSR8KEW"
 	Node2PrivateKey = "89a2d8acf5b2e60fd969914c326c63cde50675a47897c0eaacc02eb6ff8665585d4d059f977910472bcb75040617632019cc0749443fdc66d331b61c8cfb4b0f"
@@ -57,9 +58,6 @@ func SystemTestSettings() func(*settings.Settings) {
 
 		// Quorum path
 		s.SubtreeValidation.QuorumPath = filepath.Join(s.DataFolder, "subtree_quorum")
-
-		// UTXO store (SQLite, relative to DataFolder)
-		s.UtxoStore.UtxoStore = mustParseURL("sqlite:///utxo")
 	}
 }
 
@@ -184,14 +182,10 @@ func MultiNodeSettings(nodeNumber int) func(*settings.Settings) {
 		s.P2P.PeerID = peerIDs[nodeNumber-1]
 		s.P2P.PrivateKey = privateKeys[nodeNumber-1]
 
-		// No static peers by default - use ConnectToPeer/InjectPeer instead
-		s.P2P.StaticPeers = []string{}
-
 		// === Stores (separate per node) ===
 		// Uses nested paths like teranode1/blockchain1.db to isolate node data
 		// SQLite URLs are resolved relative to DataFolder by util.InitSQLiteDB
 		s.BlockChain.StoreURL = mustParseURL(fmt.Sprintf("sqlite:///teranode%d/blockchain%d", nodeNumber, nodeNumber))
-		s.UtxoStore.UtxoStore = mustParseURL(fmt.Sprintf("sqlite:///teranode%d/utxo%d", nodeNumber, nodeNumber))
 
 		// Block stores - file-based, separate per node
 		// File URLs use file://./relative/path format for relative paths (Host="." triggers relative path handling)

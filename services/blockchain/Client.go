@@ -82,7 +82,6 @@ const (
 	FSMEventCATCHUPBLOCKS = blockchain_api.FSMEventType_CATCHUPBLOCKS
 	FSMEventLEGACYSYNC    = blockchain_api.FSMEventType_LEGACYSYNC
 )
-
 // NewClient creates a new blockchain client with default address settings.
 func NewClient(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, source string) (ClientI, error) {
 	logger = logger.New("blkcC")
@@ -91,7 +90,6 @@ func NewClient(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	if blockchainGrpcAddress == "" {
 		return nil, errors.NewConfigurationError("no blockchain_grpcAddress setting found")
 	}
-
 	return NewClientWithAddress(ctx, logger, tSettings, blockchainGrpcAddress, source)
 }
 
