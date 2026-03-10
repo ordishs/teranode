@@ -778,7 +778,7 @@ func (b *Block) validateSubtree(ctx context.Context, logger ulogger.Logger, deps
 
 	// a subtreeMetaSlice is required for further block validation, so if we cannot get it, we return an error
 	if err != nil {
-		return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice: %v", b.String(), subtreeHash.String(), sIdx, err)
+		return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d] error getting subtree meta slice", b.String(), subtreeHash.String(), sIdx, err)
 	}
 
 	for snIdx := 0; snIdx < len(subtree.Nodes); snIdx++ {

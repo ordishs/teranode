@@ -39,7 +39,10 @@ func TestSubtreePagination(t *testing.T) {
 		t.Skip("Skipping interactive test. Set INTERACTIVE=true to run this test for manual UI testing.")
 	}
 
-	ctx := context.Background()
+	tempDataDir := t.TempDir()
+	require.NoError(t, os.Setenv("DATADIR", tempDataDir))
+
+	ctx := t.Context()
 
 	// Configure test daemon with small subtree size for easier testing
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
