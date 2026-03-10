@@ -35,5 +35,6 @@ type Observer interface {
 	// OnPruneComplete is called when a pruning cycle completes.
 	// height is the block height that was pruned up to.
 	// recordsProcessed is the number of records that were pruned.
-	OnPruneComplete(height uint32, recordsProcessed int64)
+	// clientName is the name of the client that performed the pruning.
+	OnPruneComplete(height uint32, recordsProcessed int64, clientName string)
 }

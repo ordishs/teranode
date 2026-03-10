@@ -331,7 +331,7 @@ func (u *Server) readSubtree(ctx context.Context, subtreeHash chainhash.Hash) (*
 	if err != nil {
 		subtreeReader, err = u.subtreeStore.GetIoReader(ctx, subtreeHash.CloneBytes(), fileformat.FileTypeSubtreeToCheck)
 		if err != nil {
-			return nil, errors.NewStorageError("[BlockPersister] failed to get subtree from store", err)
+			return nil, errors.NewStorageError("[BlockPersister] failed to get subtree %s from store", subtreeHash.String(), err)
 		}
 	}
 

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"net/url"
 	"strconv"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -30,7 +31,7 @@ type Stores struct {
 	mainBlockAssemblyClient     blockassembly.ClientI
 	mainP2PClient               p2p.ClientI
 	mainSubtreeStore            blob.Store
-	mainBlockchainStore         blockchainstore.Store
+	mainBlockchainStoreCache         map[url.URL]blockchainstore.Store
 	mainSubtreeValidationClient subtreevalidation.Interface
 	mainTempStore               blob.Store
 	mainTxStore                 blob.Store
@@ -332,14 +333,17 @@ func (d *Stores) GetSubtreeStore(ctx context.Context, logger ulogger.Logger, app
 }
 
 func (d *Stores) GetBlockchainStore(_ context.Context, logger ulogger.Logger, appSettings *settings.Settings) (blockchainstore.Store, error) {
-	if d.mainBlockchainStore != nil {
-		return d.mainBlockchainStore, nil
-	}
-
-	// Create the blockchain store url from the app settings
 	blockchainStoreURL := appSettings.BlockChain.StoreURL
 	if blockchainStoreURL == nil {
-		return nil, errors.NewStorageError("blockchain store url not found")
+		return nil, errors.NewStorageError("blockchain storeURL must be set")
+	}
+
+	if d.mainBlockchainStoreCache == nil {
+		d.mainBlockchainStoreCache = make(map[url.URL]blockchainstore.Store)
+	}
+	
+	if store, found := d.mainBlockchainStoreCache[*blockchainStoreURL]; found {
+		return store, nil
 	}
 
 	// Create the blockchain store
@@ -348,7 +352,7 @@ func (d *Stores) GetBlockchainStore(_ context.Context, logger ulogger.Logger, ap
 		return nil, err
 	}
 
-	d.mainBlockchainStore = blockchainStore
+	d.mainBlockchainStoreCache[*blockchainStoreURL] = blockchainStore
 	return blockchainStore, nil
 }
 

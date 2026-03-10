@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,6 +129,7 @@ type TestOptions struct {
 	// Log format: [TestName:serviceName] LEVEL: message
 	// This provides consistent formatting and ensures all logs are captured by go test.
 	UseUnifiedLogger bool
+	SettingsContext  string
 }
 
 // JSONError represents a JSON error response from the RPC server.
@@ -155,13 +155,18 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		appSettings         *settings.Settings
 	)
 
-	appSettings = settings.NewSettings() // This reads gocore.Config and applies sensible defaults
+	if opts.SettingsContext != "" {
+		appSettings = settings.NewSettings(opts.SettingsContext) // This reads gocore.Config and applies sensible defaults
+	} else {
+		appSettings = settings.NewSettings() // This reads gocore.Config and applies sensible defaults
+	}
 
+	
 	// Generate a unique context for this TestDaemon to ensure util.GetListener
 	// creates unique listeners instead of returning cached ones from another TestDaemon.
 	// The counter ensures uniqueness even when tests run in quick succession.
-	uniqueID := atomic.AddUint64(&testDaemonCounter, 1)
-	appSettings.Context = fmt.Sprintf("%s-testdaemon-%d", appSettings.Context, uniqueID)
+	// uniqueID := atomic.AddUint64(&testDaemonCounter, 1)
+	// appSettings.Context = fmt.Sprintf("%s-testdaemon-%d", appSettings.Context, uniqueID)
 
 	var (
 		listenAddr string
@@ -246,18 +251,19 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	appSettings.Validator.HTTPAddress, _ = url.Parse(clientAddr)
 
 	// P2P - allocate port for libp2p (doesn't support pre-created listeners)
-	p2pPort, err := getFreePort()
-	require.NoError(t, err)
-	appSettings.P2P.StaticPeers = nil
-	appSettings.P2P.ListenAddresses = []string{"0.0.0.0"}
-	appSettings.P2P.Port = p2pPort
-
+	
 	// P2P gRPC
+	// Just set the port from the settings override function
 	if opts.EnableP2P {
+		var tmpSettings settings.Settings
+		opts.SettingsOverrideFunc(&tmpSettings)
+		// P2P gRPC uses a random port — the specified port is for libp2p
 		_, listenAddr, clientAddr, err = util.GetListener(appSettings.Context, "p2p", "", ":0")
 		require.NoError(t, err)
 		appSettings.P2P.GRPCListenAddress = listenAddr
 		appSettings.P2P.GRPCAddress = clientAddr
+		appSettings.P2P.Port = tmpSettings.P2P.Port
+		appSettings.P2P.ListenAddresses = []string{"0.0.0.0"}
 	}
 
 	if opts.EnableBlockPersister {
@@ -309,7 +315,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	// Create a unique data directory per test
 	// Use test name to ensure each test has its own isolated directory
 	testName := strings.ReplaceAll(t.Name(), "/", "_")
-	appSettings.ClientName = testName
+	// appSettings.ClientName = testName
 
 	// Determine the data directory path
 	var path string
@@ -388,6 +394,8 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	if opts.SettingsOverrideFunc != nil {
 		opts.SettingsOverrideFunc(appSettings)
 	}
+
+	
 
 	// Initialize container manager for UTXO store if UTXOStoreType is specified
 	var containerManager *containers.ContainerManager
@@ -789,8 +797,8 @@ func removeZeros(ports []int) []int {
 	return result
 }
 
-// getFreePort asks the kernel for a free open port that is ready to use.
-func getFreePort() (int, error) {
+// GetFreePort asks the kernel for a free open port that is ready to use.
+func GetFreePort() (int, error) {
 	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
 	if err != nil {
 		return 0, err
@@ -1115,9 +1123,9 @@ func (td *TestDaemon) WaitForPruner(t *testing.T, timeout time.Duration) {
 	// With GlobalBlockHeightRetention=1, transactions older than 1 block should be pruned.
 	// Current height is 10, so we wait for the pruner to complete its cycle.
 	t.Logf("Waiting for pruner to complete pruning cycle...")
-	prunedHeight, recordsProcessed, err := td.prunerObserver.waitForPrune(timeout)
+	prunedHeight, recordsProcessed, clientName, err := td.prunerObserver.waitForPrune(timeout)
 	require.NoError(t, err, "Timeout waiting for pruner to complete")
-	t.Logf("✓ Pruner completed pruning up to height %d, processed %d records", prunedHeight, recordsProcessed)
+	t.Logf("✓ Pruner completed pruning up to height %d, processed %d records, client: %s", prunedHeight, recordsProcessed, clientName)
 }
 
 // WaitForBlobDeletion waits for the blob deletion worker to complete processing.
@@ -2240,6 +2248,7 @@ func (td *TestDaemon) WaitForBlockAssemblyToProcessTx(t *testing.T, txHashStr st
 type pruneEvent struct {
 	height           uint32
 	recordsProcessed int64
+	clientName       string
 }
 
 type testPrunerObserver struct {
@@ -2254,21 +2263,21 @@ func newTestPrunerObserver(t *testing.T) *testPrunerObserver {
 	}
 }
 
-func (o *testPrunerObserver) OnPruneComplete(height uint32, recordsProcessed int64) {
-	o.t.Logf("✓ Pruner callback invoked for height %d with %d records processed", height, recordsProcessed)
+func (o *testPrunerObserver) OnPruneComplete(height uint32, recordsProcessed int64, clientName string) {
+	o.t.Logf("✓ Pruner callback invoked for height %d with %d records processed, client: %s", height, recordsProcessed, clientName)
 	select {
-	case o.pruneCompleted <- pruneEvent{height: height, recordsProcessed: recordsProcessed}:
+	case o.pruneCompleted <- pruneEvent{height: height, recordsProcessed: recordsProcessed, clientName: clientName}:
 	default:
 		o.t.Logf("Warning: pruneCompleted channel is full, dropping event for height %d", height)
 	}
 }
 
-func (o *testPrunerObserver) waitForPrune(timeout time.Duration) (uint32, int64, error) {
+func (o *testPrunerObserver) waitForPrune(timeout time.Duration) (uint32, int64, string, error) {
 	select {
 	case event := <-o.pruneCompleted:
-		return event.height, event.recordsProcessed, nil
+		return event.height, event.recordsProcessed, event.clientName, nil
 	case <-time.After(timeout):
-		return 0, 0, errors.NewProcessingError("timeout waiting for prune completion")
+		return 0, 0, "", errors.NewProcessingError("timeout waiting for prune completion")
 	}
 }
 

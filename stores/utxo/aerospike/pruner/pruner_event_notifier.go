@@ -23,11 +23,11 @@ func (n *PrunerEventNotifier) AddObserver(observer pruner.Observer) {
 	n.observers = append(n.observers, observer)
 }
 
-func (n *PrunerEventNotifier) NotifyPruneComplete(height uint32, recordsProcessed int64) {
+func (n *PrunerEventNotifier) NotifyPruneComplete(height uint32, recordsProcessed int64, clientName string) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
 	for _, observer := range n.observers {
-		observer.OnPruneComplete(height, recordsProcessed)
+		observer.OnPruneComplete(height, recordsProcessed, clientName)
 	}
 }
