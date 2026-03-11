@@ -31,7 +31,7 @@ type Stores struct {
 	mainBlockAssemblyClient     blockassembly.ClientI
 	mainP2PClient               p2p.ClientI
 	mainSubtreeStore            blob.Store
-	mainBlockchainStoreCache         map[url.URL]blockchainstore.Store
+	mainBlockchainStoreCache    map[url.URL]blockchainstore.Store
 	mainSubtreeValidationClient subtreevalidation.Interface
 	mainTempStore               blob.Store
 	mainTxStore                 blob.Store
@@ -341,7 +341,7 @@ func (d *Stores) GetBlockchainStore(_ context.Context, logger ulogger.Logger, ap
 	if d.mainBlockchainStoreCache == nil {
 		d.mainBlockchainStoreCache = make(map[url.URL]blockchainstore.Store)
 	}
-	
+
 	if store, found := d.mainBlockchainStoreCache[*blockchainStoreURL]; found {
 		return store, nil
 	}

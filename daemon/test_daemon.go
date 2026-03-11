@@ -161,7 +161,6 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		appSettings = settings.NewSettings() // This reads gocore.Config and applies sensible defaults
 	}
 
-	
 	// Generate a unique context for this TestDaemon to ensure util.GetListener
 	// creates unique listeners instead of returning cached ones from another TestDaemon.
 	// The counter ensures uniqueness even when tests run in quick succession.
@@ -251,7 +250,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	appSettings.Validator.HTTPAddress, _ = url.Parse(clientAddr)
 
 	// P2P - allocate port for libp2p (doesn't support pre-created listeners)
-	
+
 	// P2P gRPC
 	// Just set the port from the settings override function
 	if opts.EnableP2P {
@@ -394,8 +393,6 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 	if opts.SettingsOverrideFunc != nil {
 		opts.SettingsOverrideFunc(appSettings)
 	}
-
-	
 
 	// Initialize container manager for UTXO store if UTXOStoreType is specified
 	var containerManager *containers.ContainerManager

@@ -147,7 +147,6 @@ func testForkDeleteAtHeightPruningDoubleSpend(t *testing.T, utxoStore string) {
 	// require.NoError(t, td.WaitForTransactionInBlockAssembly(txAChild, blockWait))
 	// td.MineAndWait(t, 1)
 
-
 	_, block5a := td.CreateTestBlock(t, block4a, 20601, txAChild)
 	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block5a, block5a.Height, "", "legacy"))
 
@@ -264,7 +263,7 @@ func testForkDeleteAtHeightPruningDoubleSpend__(t *testing.T, utxoStore string) 
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
 		UTXOStoreType:      utxoStore,
 		EnableErrorLogging: true,
-		EnablePruner: true,
+		EnablePruner:       true,
 		SettingsOverrideFunc: test.ComposeSettings(
 			externalTxSettingsFunc(),
 			func(s *settings.Settings) {
@@ -384,7 +383,6 @@ func testForkDeleteAtHeightPruningDoubleSpend__(t *testing.T, utxoStore string) 
 	// require.NoError(t, td.PropagationClient.ProcessTransaction(td.Ctx, txAChild))
 	// require.NoError(t, td.WaitForTransactionInBlockAssembly(txAChild, blockWait))
 	// td.MineAndWait(t, 1)
-
 
 	_, block5a := td.CreateTestBlock(t, block4a, 20601, txAChild)
 	require.NoError(t, td.BlockValidationClient.ProcessBlock(td.Ctx, block5a, block5a.Height, "", "legacy"))

@@ -47,7 +47,7 @@ func testForkPruningDoubleSpend(t *testing.T, utxoStore string) {
 
 	// Create test daemon with short retention periods to allow pruning
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
-		UTXOStoreType:      utxoStore,
+		UTXOStoreType: utxoStore,
 		// EnableErrorLogging: true,
 		SettingsOverrideFunc: test.ComposeSettings(
 			externalTxSettingsFunc(),
@@ -247,7 +247,7 @@ func testForkPruningDoubleSpendLosingChain(t *testing.T, utxoStore string) {
 	const blockWait = 10 * time.Second
 
 	td := daemon.NewTestDaemon(t, daemon.TestOptions{
-		UTXOStoreType:      utxoStore,
+		UTXOStoreType: utxoStore,
 		// EnableErrorLogging: true,
 		SettingsOverrideFunc: test.ComposeSettings(
 			externalTxSettingsFunc(),
@@ -354,7 +354,6 @@ func testForkPruningDoubleSpendLosingChain(t *testing.T, utxoStore string) {
 
 	// Verify txA is still valid (on winning chain)
 	td.VerifyConflictingInUtxoStore(t, false, txA)
-
 
 	// now extend the losing chain further to make it longer
 	// use a loop to go from 4b to 9b
