@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../img/bsvblockchain_blue_logo.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.3">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
@@ -7036,7 +7036,7 @@
 <li>Go programming language</li>
 <li>gRPC for service communication</li>
 <li>Kafka for message queuing (optional)</li>
-<li>BSV libraries for transaction validation</li>
+<li>BSV Blockchain libraries for transaction validation</li>
 </ul>
 <p>You can read more about this service in the <a href="../../services/validator/">Validator Service documentation</a>.</p>
 <h3 id="24-subtree-validation-service">2.4 Subtree Validation Service</h3>
@@ -7199,7 +7199,7 @@
 <ul>
 <li>Go programming language</li>
 <li>Blob store for file storage</li>
-<li>Bitcoin SV libraries for blockchain operations</li>
+<li>BSV Blockchain libraries for blockchain operations</li>
 </ul>
 <p>You can read more about this service in the <a href="../../services/utxoPersister/">UTXO Persister Service documentation</a>.</p>
 <h3 id="33-p2p-service">3.3 P2P Service</h3>
@@ -7223,7 +7223,7 @@
 </ul>
 <p>You can read more about this service in the <a href="../../services/p2p/">P2P Service documentation</a>.</p>
 <h3 id="34-legacy-service">3.4 Legacy Service</h3>
-<p>The Legacy Service facilitates communication between Teranode and traditional Bitcoin SV nodes.</p>
+<p>The Legacy Service facilitates communication between Teranode and traditional BSV Blockchain nodes.</p>
 <p><img alt="P2P_Legacy_Container_Diagram.png" src="../../services/img/Legacy_Container_Diagram.png" /></p>
 <p><strong>Key Responsibilities:</strong></p>
 <ul>
@@ -7250,7 +7250,7 @@
 </ul>
 <p><strong>Supported RPC Commands:</strong></p>
 <ul>
-<li>createrawtransaction, generate, getbestblockhash, getblock, sendrawtransaction, stop, version, getminingcandidate, submitminingsolution, getblockchaininfo, getinfo, getpeerinfo</li>
+<li>clearbanned, createrawtransaction, generate, generatetoaddress, getbestblockhash, getblock, getblockbyheight, getblockchaininfo, getblockhash, getblockheader, getchaintips, getdifficulty, getinfo, getminingcandidate, getmininginfo, getpeerinfo, getrawmempool, getrawtransaction, help, invalidateblock, isbanned, listbanned, reconsiderblock, sendrawtransaction, setban, stop, submitminingsolution, version</li>
 </ul>
 <p><strong>Key Processes:</strong></p>
 <ul>
@@ -7278,13 +7278,11 @@
 </ul>
 <p><strong>Supported Storage Backends:</strong></p>
 <ul>
-<li>File System</li>
-<li>Google Cloud Storage (GCS)</li>
-<li>Amazon S3</li>
-<li>MinIO</li>
-<li>SeaweedFS</li>
-<li>SQL (PostgreSQL)</li>
-<li>In-memory storage</li>
+<li>File System (<code>file://</code>)</li>
+<li>Amazon S3 and S3-compatible services such as MinIO and SeaweedFS (<code>s3://</code>)</li>
+<li>HTTP (<code>http://</code>)</li>
+<li>In-memory storage (<code>memory://</code>)</li>
+<li>Null/no-op (<code>null://</code>)</li>
 </ul>
 <p><strong>Key Interactions:</strong></p>
 <ul>
@@ -7341,7 +7339,6 @@
 <p><strong>Key Topics and Use Cases:</strong></p>
 <ul>
 <li><code>kafka_validatortxsConfig</code>: Used for transmitting new transaction notifications from Propagation to Validator</li>
-<li><code>kafka_txsConfig</code>: Used for forwarding valid transactions from Validator to Block Assembly</li>
 <li><code>kafka_txmetaConfig</code>: Used for sending new UTXO metadata from Validator to Subtree Validation</li>
 <li><code>kafka_rejectedTxConfig</code>: Used for notifying P2P about rejected transactions</li>
 <li><code>kafka_blocksConfig</code>: Used for propagating new blocks from P2P to Block Validation</li>
