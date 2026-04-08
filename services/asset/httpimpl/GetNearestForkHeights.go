@@ -125,21 +125,17 @@ func (h *HTTP) GetNearestForkHeights(c echo.Context) error {
 		CurrentHeight: currentHeight,
 	}
 
-	// Prev: search from currentHeight downward
-	if currentHeight > 0 {
-		for height := currentHeight; height >= startHeight; height-- {
-			if forkHeights[height] {
-				resp.PrevFork = &nearestForkInfo{
-					Height:     height,
-					ParentHash: forkParentHash[height].String(),
-				}
-
-				break
+	// Prev: search from currentHeight downward.
+	// Use height+1 as loop variable to avoid uint32 underflow when height==0.
+	for h := currentHeight + 1; h > startHeight; h-- {
+		height := h - 1
+		if forkHeights[height] {
+			resp.PrevFork = &nearestForkInfo{
+				Height:     height,
+				ParentHash: forkParentHash[height].String(),
 			}
 
-			if height == 0 {
-				break
-			}
+			break
 		}
 	}
 
