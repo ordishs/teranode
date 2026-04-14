@@ -423,7 +423,7 @@ RETURNING id
 		return 0, 0, nil, false, errors.NewStorageError("failed to get subtree bytes", err)
 	}
 
-	var coinbaseBytes []byte
+	coinbaseBytes := []byte{}
 	if block.CoinbaseTx != nil {
 		coinbaseBytes = block.CoinbaseTx.Bytes()
 	}
