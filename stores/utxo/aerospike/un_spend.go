@@ -161,22 +161,14 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 
 	offset := s.calculateOffsetForOutput(spend.Vout)
 
-	// Caller-ownership check: pass the SpendingData the caller expects to be
-	// currently stored. The Lua script verifies it matches before clearing.
-	// Passing the explicit Aerospike NullValue skips the check (legacy escape
-	// hatch). We must use NullValue rather than a typed nil []byte because the
-	// aerospike client wraps a typed nil slice as BytesValue(nil), which Lua
-	// sees as a non-nil bytes object — defeating the `expectedSpendingData == nil`
-	// branch in the Lua script.
-	var expectedSpendingDataValue aerospike.Value = aerospike.NewNullValue()
-	if spend.SpendingData != nil {
-		expectedSpendingDataValue = aerospike.NewValue(spend.SpendingData.Bytes())
+	if spend.SpendingData == nil {
+		return errors.NewProcessingError("[Unspend] SpendingData is required for %s:%d", spend.TxID, spend.Vout)
 	}
 
 	ret, aErr := s.client.Execute(policy, key, LuaPackage, "unspend",
-		aerospike.NewIntegerValue(int(offset)), // vout adjusted for utxoBatchSize
-		aerospike.NewValue(spend.UTXOHash[:]),  // utxo hash
-		expectedSpendingDataValue,              // expected stored spending data (NullValue = skip check)
+		aerospike.NewIntegerValue(int(offset)),         // vout adjusted for utxoBatchSize
+		aerospike.NewValue(spend.UTXOHash[:]),          // utxo hash
+		aerospike.NewValue(spend.SpendingData.Bytes()), // expected stored spending data (mandatory ownership check)
 		aerospike.NewIntegerValue(int(s.blockHeight.Load())),
 		aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
 	)

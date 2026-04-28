@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	utxo2 "github.com/bsv-blockchain/teranode/test/longtest/stores/utxo"
@@ -70,6 +71,7 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 
 	err = store.Unspend(ctx, mismatched)
 	require.Error(t, err, "Unspend with mismatched SpendingData must error")
+	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
 
 	// The UTXO must still be spent — attempting to Spend with a NEW spender should fail with ErrSpent.
 	spendTxRetry := utxo2.GetSpendingTx(tx, 0)
@@ -80,9 +82,11 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 		"the original spender's TxID must still be the recorded conflicting TxID")
 }
 
-// TestUnspendOwnership_NilEscapeHatch verifies the backward-compat escape hatch:
-// Unspend with SpendingData == nil skips the ownership check (today's behaviour).
-func TestUnspendOwnership_NilEscapeHatch(t *testing.T) {
+// TestUnspendOwnership_NilSpendingDataRejected verifies that Unspend rejects
+// callers that pass a nil SpendingData. The escape hatch was removed because
+// every production caller derives spends from Spend()/SetConflicting()/GetSpends(),
+// all of which populate SpendingData.
+func TestUnspendOwnership_NilSpendingDataRejected(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
 
@@ -99,7 +103,6 @@ func TestUnspendOwnership_NilEscapeHatch(t *testing.T) {
 	utxoHash, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
 	require.NoError(t, err)
 
-	// Build an Unspend without SpendingData — escape hatch allows clearing the spend.
 	noSpendingData := []*utxo.Spend{{
 		TxID:         tx.TxIDChainHash(),
 		Vout:         0,
@@ -108,5 +111,14 @@ func TestUnspendOwnership_NilEscapeHatch(t *testing.T) {
 	}}
 
 	err = store.Unspend(ctx, noSpendingData)
-	require.NoError(t, err, "Unspend with nil SpendingData should succeed (backward-compat escape hatch)")
+	require.Error(t, err, "Unspend with nil SpendingData must error")
+	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
+
+	// The UTXO must still be spent — attempting to Spend with a NEW spender should still fail.
+	spendTxRetry := utxo2.GetSpendingTx(tx, 0)
+	spendsRet, err := store.Spend(ctx, spendTxRetry, store.GetBlockHeight()+1)
+	require.Error(t, err, "UTXO should still be spent after rejected nil-SpendingData Unspend")
+	require.Len(t, spendsRet, 1)
+	require.Equal(t, localSpendTx.TxIDChainHash().String(), spendsRet[0].ConflictingTxID.String(),
+		"the original spender's TxID must still be the recorded conflicting TxID")
 }

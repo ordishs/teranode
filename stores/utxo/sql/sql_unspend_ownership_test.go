@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	utxo2 "github.com/bsv-blockchain/teranode/test/longtest/stores/utxo"
@@ -79,6 +80,7 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 
 	err = store.Unspend(ctx, []*utxo.Spend{mismatchedSpend})
 	require.Error(t, err, "expected error when Unspend caller's SpendingData does not match the stored spend")
+	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
 
 	// The legitimate spending_data must still be intact — bitwise compare against expected bytes.
 	expected := spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 0).Bytes()
@@ -97,9 +99,10 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 		"stored spending_data must be unchanged after a mismatched Unspend attempt")
 }
 
-// TestUnspendOwnership_AlreadyUnspent verifies that Unspend on a never-spent UTXO
-// returns an error (NotFound), preserving the existing pre-fix behaviour.
-func TestUnspendOwnership_AlreadyUnspent(t *testing.T) {
+// TestUnspendOwnership_MismatchOnUnspent verifies that Unspend with a non-nil
+// SpendingData against a never-spent UTXO is rejected with the ownership-mismatch
+// processing error (the row's spending_data IS NULL, so no ownership match is possible).
+func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -121,4 +124,53 @@ func TestUnspendOwnership_AlreadyUnspent(t *testing.T) {
 
 	err = store.Unspend(ctx, []*utxo.Spend{spend})
 	require.Error(t, err, "expected error when unspending a UTXO that was never spent")
+	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
+}
+
+// TestUnspendOwnership_NilSpendingDataRejected verifies that Unspend rejects
+// callers that pass a nil SpendingData. The escape hatch was removed because
+// every production caller derives spends from Spend()/SetConflicting()/GetSpends(),
+// all of which populate SpendingData.
+func TestUnspendOwnership_NilSpendingDataRejected(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, tx := setup(ctx, t)
+
+	_, err := store.Create(ctx, tx, 0)
+	require.NoError(t, err)
+
+	spendTx := utxo2.GetSpendingTx(tx, 0)
+	_, err = store.Spend(ctx, spendTx, store.GetBlockHeight()+1)
+	require.NoError(t, err)
+
+	utxoHash, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
+	require.NoError(t, err)
+
+	noSpendingData := []*utxo.Spend{{
+		TxID:         tx.TxIDChainHash(),
+		Vout:         0,
+		UTXOHash:     utxoHash,
+		SpendingData: nil,
+	}}
+
+	err = store.Unspend(ctx, noSpendingData)
+	require.Error(t, err, "Unspend with nil SpendingData must error")
+	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
+
+	// The legitimate spend must still be intact.
+	expected := spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 0).Bytes()
+
+	probe := &utxo.Spend{
+		TxID:     tx.TxIDChainHash(),
+		Vout:     0,
+		UTXOHash: utxoHash,
+	}
+	resp, err := store.GetSpend(ctx, probe)
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_SPENT), resp.Status,
+		"UTXO must still be SPENT after a rejected Unspend attempt")
+	require.NotNil(t, resp.SpendingData, "spending_data must still be populated after a rejected Unspend attempt")
+	require.Equal(t, expected, resp.SpendingData.Bytes(),
+		"stored spending_data must be unchanged after a rejected Unspend attempt")
 }

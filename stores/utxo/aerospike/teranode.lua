@@ -471,10 +471,10 @@ end
 -- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
 -- offset number - the offset in the utxos list (vout % utxoBatchSize)
 -- utxoHash []byte - 32 byte little-endian hash of the UTXO
--- expectedSpendingData []byte|nil - 36 byte spending data the caller expects to be currently stored.
---                                   When non-nil this is checked against the stored value to prove
---                                   the caller owns the spend it's clearing. Pass nil to skip the
---                                   check (legacy escape hatch — should NOT be used in new code).
+-- expectedSpendingData []byte - 36 byte spending data the caller expects to be currently stored.
+--                               This is mandatory — the Go caller guards nil before invoking
+--                               the UDF — and is checked against the stored value to prove the
+--                               caller owns the spend it's clearing.
 -- currentBlockHeight number - the current block height
 -- blockHeightRetention number - the retention period for the UTXO record
 --           ____                       _
@@ -513,25 +513,23 @@ function unspend(rec, offset, utxoHash, expectedSpendingData, currentBlockHeight
         return response
     end
 
-    -- Defense-in-depth: verify caller-supplied spending data matches the stored value.
-    -- A nil expectedSpendingData is the backwards-compat escape hatch (legacy callers
-    -- that don't track SpendingData) and skips the check.
-    if expectedSpendingData ~= nil then
-        if existingSpendingData == nil then
-            response[FIELD_STATUS] = STATUS_ERROR
-            response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
-            response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_UNSPENT
+    -- Verify caller-supplied spending data matches the stored value (mandatory ownership check).
+    -- Two arms: stored data missing means the UTXO is unspent (caller can't own a non-existent spend);
+    -- stored data present but different means the caller owns a different spend.
+    if existingSpendingData == nil then
+        response[FIELD_STATUS] = STATUS_ERROR
+        response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
+        response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_UNSPENT
 
-            return response
-        end
+        return response
+    end
 
-        if not bytes_equal(existingSpendingData, expectedSpendingData) then
-            response[FIELD_STATUS] = STATUS_ERROR
-            response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
-            response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_MISMATCH
+    if not bytes_equal(existingSpendingData, expectedSpendingData) then
+        response[FIELD_STATUS] = STATUS_ERROR
+        response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
+        response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_MISMATCH
 
-            return response
-        end
+        return response
     end
 
     -- Only unspend if the UTXO is spent and not frozen
