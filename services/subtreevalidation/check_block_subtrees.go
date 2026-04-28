@@ -211,7 +211,11 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					// get the subtree from the peer
 					url := fmt.Sprintf("%s/subtree/%s", request.BaseUrl, subtreeHash.String())
 
-					subtreeNodeBytes, err := util.DoHTTPRequest(gCtx, url)
+					// Bound the body at the policy cap (MaximumMerkleItemsPerSubtree * HashSize) so
+					// a malicious peer can't OOM us by streaming oversized responses.
+					maxSubtreeBytes := int64(u.settings.BlockAssembly.MaximumMerkleItemsPerSubtree) * int64(chainhash.HashSize)
+
+					subtreeNodeBytes, err := util.DoHTTPRequestBounded(gCtx, url, maxSubtreeBytes)
 					if err != nil {
 						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree from %s", subtreeHash.String(), url, err)
 					}
