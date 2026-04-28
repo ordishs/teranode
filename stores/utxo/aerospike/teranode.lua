@@ -47,6 +47,7 @@ local ERROR_CODE_UTXO_INVALID_SIZE = "UTXO_INVALID_SIZE"
 local ERROR_CODE_UTXO_HASH_MISMATCH = "UTXO_HASH_MISMATCH"
 local ERROR_CODE_UTXO_NOT_FROZEN = "UTXO_NOT_FROZEN"
 local ERROR_CODE_INVALID_PARAMETER = "INVALID_PARAMETER"
+local ERROR_CODE_SPEND_OWNERSHIP_MISMATCH = "SPEND_OWNERSHIP_MISMATCH"
 
 -- Message constants
 local MSG_CONFLICTING = "TX is conflicting"
@@ -76,6 +77,8 @@ local ERR_UTXO_IS_FROZEN = "UTXO is frozen"
 local ERR_SPENT_EXTRA_RECS_NEGATIVE = "spentExtraRecs cannot be negative"
 local ERR_SPENT_EXTRA_RECS_EXCEED = "spentExtraRecs cannot be greater than totalExtraRecs"
 local ERR_TOTAL_EXTRA_RECS = "totalExtraRecs not found in record. Possible non-master record?"
+local ERR_SPEND_OWNERSHIP_MISMATCH = "spending data mismatch — caller does not own this spend"
+local ERR_SPEND_OWNERSHIP_UNSPENT = "expected spending data but UTXO is unspent"
 
 -- Response field name constants
 local FIELD_STATUS = "status"
@@ -466,8 +469,14 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 end
 
 -- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
--- blockID number - the block ID
+-- offset number - the offset in the utxos list (vout % utxoBatchSize)
+-- utxoHash []byte - 32 byte little-endian hash of the UTXO
+-- expectedSpendingData []byte|nil - 36 byte spending data the caller expects to be currently stored.
+--                                   When non-nil this is checked against the stored value to prove
+--                                   the caller owns the spend it's clearing. Pass nil to skip the
+--                                   check (legacy escape hatch — should NOT be used in new code).
 -- currentBlockHeight number - the current block height
+-- blockHeightRetention number - the retention period for the UTXO record
 --           ____                       _
 --  _   _ _ __ / ___| _ __   ___ _ __   __| |
 -- | | | | '_ \\___ \| '_ \ / _ \ '_ \ / _` |
@@ -475,7 +484,7 @@ end
 --  \__,_|_| |_|____/| .__/ \___|_| |_|\__,_|
 --                   |_|
 --
-function unspend(rec, offset, utxoHash, currentBlockHeight, blockHeightRetention)
+function unspend(rec, offset, utxoHash, expectedSpendingData, currentBlockHeight, blockHeightRetention)
     local response = map()
 
     if not aerospike:exists(rec) then
@@ -502,6 +511,27 @@ function unspend(rec, offset, utxoHash, currentBlockHeight, blockHeightRetention
         response[FIELD_MESSAGE] = errorInfo.message
 
         return response
+    end
+
+    -- Defense-in-depth: verify caller-supplied spending data matches the stored value.
+    -- A nil expectedSpendingData is the backwards-compat escape hatch (legacy callers
+    -- that don't track SpendingData) and skips the check.
+    if expectedSpendingData ~= nil then
+        if existingSpendingData == nil then
+            response[FIELD_STATUS] = STATUS_ERROR
+            response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
+            response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_UNSPENT
+
+            return response
+        end
+
+        if not bytes_equal(existingSpendingData, expectedSpendingData) then
+            response[FIELD_STATUS] = STATUS_ERROR
+            response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
+            response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_MISMATCH
+
+            return response
+        end
     end
 
     -- Only unspend if the UTXO is spent and not frozen

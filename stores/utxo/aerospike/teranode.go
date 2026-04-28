@@ -254,6 +254,10 @@ const (
 	LuaErrorCodeUtxoHashMismatch LuaErrorCode = "UTXO_HASH_MISMATCH"
 	LuaErrorCodeUtxoNotFrozen    LuaErrorCode = "UTXO_NOT_FROZEN"
 	LuaErrorCodeInvalidParameter LuaErrorCode = "INVALID_PARAMETER"
+	// LuaErrorCodeSpendOwnershipMismatch is returned by the unspend Lua function
+	// when the caller-supplied expected spending data doesn't match the stored
+	// value — the caller doesn't own the spend they're trying to clear.
+	LuaErrorCodeSpendOwnershipMismatch LuaErrorCode = "SPEND_OWNERSHIP_MISMATCH"
 )
 
 // LuaErrorInfo represents an individual error from Lua functions

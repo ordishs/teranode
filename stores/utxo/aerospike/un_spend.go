@@ -161,9 +161,22 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 
 	offset := s.calculateOffsetForOutput(spend.Vout)
 
+	// Caller-ownership check: pass the SpendingData the caller expects to be
+	// currently stored. The Lua script verifies it matches before clearing.
+	// Passing the explicit Aerospike NullValue skips the check (legacy escape
+	// hatch). We must use NullValue rather than a typed nil []byte because the
+	// aerospike client wraps a typed nil slice as BytesValue(nil), which Lua
+	// sees as a non-nil bytes object — defeating the `expectedSpendingData == nil`
+	// branch in the Lua script.
+	var expectedSpendingDataValue aerospike.Value = aerospike.NewNullValue()
+	if spend.SpendingData != nil {
+		expectedSpendingDataValue = aerospike.NewValue(spend.SpendingData.Bytes())
+	}
+
 	ret, aErr := s.client.Execute(policy, key, LuaPackage, "unspend",
 		aerospike.NewIntegerValue(int(offset)), // vout adjusted for utxoBatchSize
 		aerospike.NewValue(spend.UTXOHash[:]),  // utxo hash
+		expectedSpendingDataValue,              // expected stored spending data (NullValue = skip check)
 		aerospike.NewIntegerValue(int(s.blockHeight.Load())),
 		aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
 	)
@@ -194,6 +207,11 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 		}
 	} else if res.Status == LuaStatusError {
 		prometheusUtxoMapErrors.WithLabelValues("Reset", "error response").Inc()
+
+		if res.ErrorCode == LuaErrorCodeSpendOwnershipMismatch {
+			return errors.NewProcessingError("[Unspend] ownership mismatch for %s:%d (caller's SpendingData does not match stored spend): %s", spend.TxID, spend.Vout, res.Message)
+		}
+
 		return errors.NewStorageError("error in aerospike unspend record: %s", res.Message)
 	}
 

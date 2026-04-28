@@ -2712,7 +2712,25 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		_ = txn.Rollback()
 	}()
 
+	// Match-on-spending_data guards against clearing a stale or wrong spend.
+	// If $3 is NULL the predicate `spending_data = $3` is unknown → no rows
+	// match, so callers MUST pass non-nil SpendingData. The escape hatch for
+	// a caller without SpendingData is the second query below.
 	q1 := `
+		UPDATE outputs
+		SET spending_data = NULL
+		WHERE transaction_id IN (
+			SELECT id FROM transactions WHERE hash = $1
+		)
+		AND idx = $2
+		AND spending_data = $3
+		RETURNING transaction_id
+	`
+
+	// Backwards-compat: callers that genuinely don't track SpendingData
+	// (legacy paths) skip the ownership check by passing SpendingData == nil.
+	// Mirrors the Lua expectedSpendingData == nil escape hatch.
+	q1NoOwnership := `
 		UPDATE outputs
 		SET spending_data = NULL
 		WHERE transaction_id IN (
@@ -2746,9 +2764,17 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 
 			var transactionID int
 
-			err = txn.QueryRowContext(ctx, q1, spend.TxID[:], spend.Vout).Scan(&transactionID)
+			if spend.SpendingData != nil {
+				err = txn.QueryRowContext(ctx, q1, spend.TxID[:], spend.Vout, spend.SpendingData.Bytes()).Scan(&transactionID)
+			} else {
+				err = txn.QueryRowContext(ctx, q1NoOwnership, spend.TxID[:], spend.Vout).Scan(&transactionID)
+			}
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
+					if spend.SpendingData != nil {
+						return errors.NewProcessingError("[Unspend] ownership mismatch for %s:%d (caller's SpendingData does not match stored spend)", spend.TxID, spend.Vout)
+					}
+
 					return errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 				}
 
