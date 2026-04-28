@@ -712,7 +712,7 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 		sm.logger.Debugf("Error getting FSM current state: %v", err)
 	}
 
-	if *state == teranodeblockchain.FSMStateLEGACYSYNCING && sm.currentFeeFilter.Load() != bsvutil.SatoshiPerBitcoin {
+	if state != nil && *state == teranodeblockchain.FSMStateLEGACYSYNCING && sm.currentFeeFilter.Load() != bsvutil.SatoshiPerBitcoin {
 		// Set fee filter to inform peers that we don't want to be notified of transactions while we're syncing
 		feeFilter := wire.NewMsgFeeFilter(bsvutil.SatoshiPerBitcoin)
 
