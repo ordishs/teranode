@@ -86,7 +86,6 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 		affectedParentSpends  []*Spend
 		markedAsNotSpendable  []chainhash.Hash
 		step3SuccessfulSpends []*Spend
-		losingTxHashes        []chainhash.Hash
 		allMarkedHashes       []chainhash.Hash
 	)
 
@@ -102,7 +101,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 			return
 		}
 
-		rollbackErr := rollbackProcessConflicting(ctx, s, conflictingTxHashes, losingTxHashes,
+		rollbackErr := rollbackProcessConflicting(ctx, s, conflictingTxHashes,
 			allMarkedHashes, markedAsNotSpendable, step3SuccessfulSpends, blockHeight,
 			step2Committed, step4Committed)
 		if rollbackErr != nil {
@@ -175,7 +174,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 		}
 	}
 
-	losingTxHashes = losingTxHashesMap.Keys()
+	losingTxHashes := losingTxHashesMap.Keys()
 
 	// - 1: mark all losingTxHashesPerConflictingTx as conflicting + all its spending transactions recursively.
 	//   allMarkedConflicting is the BFS expansion: every hash now flagged Conflicting=true. Forwarded to callers so
@@ -261,7 +260,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 // the UTXO store may be in an inconsistent state — see ProcessConflicting deferred
 // block which tags this as MANUAL INTERVENTION REQUIRED.
 func rollbackProcessConflicting(ctx context.Context, s Store, conflictingTxHashes,
-	losingTxHashes, allMarkedHashes, markedAsNotSpendable []chainhash.Hash,
+	allMarkedHashes, markedAsNotSpendable []chainhash.Hash,
 	step3SuccessfulSpends []*Spend, blockHeight uint32, step2Committed, step4Committed bool) error {
 	var rollbackErr error
 
@@ -274,36 +273,45 @@ func rollbackProcessConflicting(ctx context.Context, s Store, conflictingTxHashe
 		}
 	}
 
-	// 2. Undo step 3 partial spends. Pass flagAsLocked=false because parents were already
-	// unlocked when we entered step 3 (the lock was applied at step 2, which we will undo
-	// further down — keeping them locked here would leak state past the rollback).
+	// 2. Undo step 3 partial spends. Pass flagAsLocked=false: step 3 used IgnoreLocked, so
+	// re-locking here is meaningless — the parents are still locked from step 2 and that
+	// lock will be cleared together at step 5 of the rollback (SetLocked false below).
 	if len(step3SuccessfulSpends) > 0 {
 		if e := s.Unspend(ctx, step3SuccessfulSpends, false); e != nil {
 			rollbackErr = errors.Join(rollbackErr, errors.NewProcessingError("rollback step 3 (unspend partial winning spends) failed", e))
 		}
 	}
 
-	// 3. Undo step 2: re-spend the losing txs to restore the original spending_data on
-	// affectedParentSpends. Parents are still locked at this point, so we MUST set
-	// IgnoreLocked. The losing txs are also marked conflicting at this point — same
-	// reason for IgnoreConflicting.
+	// 3. Undo step 2: re-spend every tx the cascade marked conflicting so the original
+	// spending_data is restored on affectedParentSpends. We iterate allMarkedHashes — not
+	// just losingTxHashes — because MarkConflictingRecursively does a BFS that reaches
+	// spending descendants of the counter-conflicting set, and step 2's Unspend covered
+	// the parents of that whole cascade. Skipping descendants would leave their parent
+	// UTXOs unspent and the store in a torn state. Parents are still locked here, so we
+	// MUST set IgnoreLocked; the cascade is still flagged conflicting, so IgnoreConflicting.
+	// A descendant's body may be unfetchable (pruned, frozen placeholder, or missing) —
+	// log via rollbackErr and continue rather than abort the rest of the unwind.
 	if step2Committed {
-		for _, h := range losingTxHashes {
+		for _, h := range allMarkedHashes {
 			h := h
+
+			if h.Equal(subtree.CoinbasePlaceholderHashValue) {
+				continue
+			}
 
 			txMeta, e := s.Get(ctx, &h, fields.Tx)
 			if e != nil {
-				rollbackErr = errors.Join(rollbackErr, errors.NewProcessingError("rollback step 2 (fetch losing tx) failed", e))
+				rollbackErr = errors.Join(rollbackErr, errors.NewProcessingError("rollback step 2 (fetch tx %s) failed", h.String(), e))
 				continue
 			}
 
 			if txMeta == nil || txMeta.Tx == nil {
-				rollbackErr = errors.Join(rollbackErr, errors.NewProcessingError("rollback step 2 (losing tx %s has no body)", h.String()))
+				rollbackErr = errors.Join(rollbackErr, errors.NewProcessingError("rollback step 2 (tx %s has no body)", h.String()))
 				continue
 			}
 
 			if _, e := s.Spend(ctx, txMeta.Tx, blockHeight, IgnoreFlags{IgnoreConflicting: true, IgnoreLocked: true}); e != nil {
-				rollbackErr = errors.Join(rollbackErr, errors.NewProcessingError("rollback step 2 (re-spend losing tx %s) failed", h.String(), e))
+				rollbackErr = errors.Join(rollbackErr, errors.NewProcessingError("rollback step 2 (re-spend tx %s) failed", h.String(), e))
 			}
 		}
 	}
