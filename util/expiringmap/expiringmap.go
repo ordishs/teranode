@@ -6,8 +6,9 @@ import (
 )
 
 type itemWrapper[V any] struct {
-	item   V
-	expiry int64
+	item    V
+	expiry  int64
+	addedAt int64
 }
 
 // ExpiringMap is a map that expires items after a given duration.
@@ -21,6 +22,7 @@ type ExpiringMap[K comparable, V any] struct {
 	evictionCh chan []V
 	evictionFn func(K, V) bool
 	stopCh     chan struct{}
+	maxSize    int
 }
 
 // New creates a new ExpiringMap with the given expiry duration.
@@ -75,14 +77,65 @@ func (m *ExpiringMap[K, V]) WithEvictionFunction(f func(K, V) bool) *ExpiringMap
 	return m
 }
 
+// WithMaxSize bounds the map to at most n entries. Inserting a new key when
+// the map is at capacity evicts the oldest entry (by insertion time) before
+// the new entry is added. A value of 0 (the default) disables the cap and
+// preserves the original unbounded behaviour.
+func (m *ExpiringMap[K, V]) WithMaxSize(n int) *ExpiringMap[K, V] {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.maxSize = n
+	return m
+}
+
 // Set sets the value for the given key.
 func (m *ExpiringMap[K, V]) Set(key K, value V) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	now := time.Now()
+	if _, exists := m.items[key]; !exists && m.maxSize > 0 && len(m.items) >= m.maxSize {
+		m.evictOldestLocked()
+	}
+
 	m.items[key] = &itemWrapper[V]{
-		item:   value,
-		expiry: time.Now().Add(m.expiry).UnixNano(),
+		item:    value,
+		expiry:  now.Add(m.expiry).UnixNano(),
+		addedAt: now.UnixNano(),
+	}
+}
+
+// evictOldestLocked removes the entry with the smallest addedAt timestamp.
+// The caller must hold m.mu for writing. The configured eviction function
+// and channel (if any) fire for the removed entry, mirroring TTL eviction.
+func (m *ExpiringMap[K, V]) evictOldestLocked() {
+	var (
+		oldestKey  K
+		oldestItem *itemWrapper[V]
+		haveOldest bool
+	)
+
+	for key, item := range m.items {
+		if !haveOldest || item.addedAt < oldestItem.addedAt {
+			oldestKey = key
+			oldestItem = item
+			haveOldest = true
+		}
+	}
+
+	if !haveOldest {
+		return
+	}
+
+	if m.evictionFn != nil && !m.evictionFn(oldestKey, oldestItem.item) {
+		return
+	}
+
+	delete(m.items, oldestKey)
+
+	if m.evictionCh != nil {
+		m.evictionCh <- []V{oldestItem.item}
 	}
 }
 
