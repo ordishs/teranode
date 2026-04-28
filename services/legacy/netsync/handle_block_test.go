@@ -510,6 +510,56 @@ func TestSyncManager_ExtendTransaction(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestSyncManager_ExtendTransaction_OOB verifies that ExtendTransaction returns
+// a TxInvalidError (rather than panicking) when a child input references a
+// parent output index that exceeds the parent's number of outputs. Regression
+// test for issue #4564.
+func TestSyncManager_ExtendTransaction_OOB(t *testing.T) {
+	initPrometheusMetrics()
+
+	sm := &SyncManager{
+		settings: test.CreateBaseTestSettings(t),
+		logger:   ulogger.TestLogger{},
+	}
+
+	parentScript := &bscript.Script{}
+	parent := &bt.Tx{
+		Version: 1,
+		Inputs:  []*bt.Input{},
+		Outputs: []*bt.Output{
+			{Satoshis: 100, LockingScript: parentScript},
+			{Satoshis: 200, LockingScript: parentScript},
+		},
+	}
+	parent.SetExtended(true)
+	parentHash := parent.TxIDChainHash()
+
+	child := &bt.Tx{
+		Version: 1,
+		Inputs: []*bt.Input{
+			{
+				UnlockingScript:    &bscript.Script{},
+				PreviousTxOutIndex: 5,
+			},
+		},
+		Outputs: []*bt.Output{
+			{Satoshis: 50, LockingScript: &bscript.Script{}},
+		},
+	}
+	require.NoError(t, child.Inputs[0].PreviousTxIDAdd(parentHash))
+
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](2)
+	txMap.Set(*parentHash, &TxMapWrapper{Tx: parent})
+	txMap.Set(*child.TxIDChainHash(), &TxMapWrapper{Tx: child})
+
+	err := sm.ExtendTransaction(context.Background(), child, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxInvalid), "expected TxInvalid error, got %v", err)
+	require.Contains(t, err.Error(), "out-of-range output 5")
+	require.Contains(t, err.Error(), parentHash.String())
+	require.Contains(t, err.Error(), "has 2 outputs")
+}
+
 // countingValidator tracks how many times Validate is called and optionally fails
 // the first N calls. It checks context cancellation to detect cascade behavior.
 type countingValidator struct {

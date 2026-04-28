@@ -1268,6 +1268,11 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 					}
 				}
 
+				if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
+					return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
+						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+				}
+
 				// No lock needed - each goroutine writes to a unique index
 				tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
 				tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
