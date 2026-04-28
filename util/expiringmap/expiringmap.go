@@ -79,8 +79,14 @@ func (m *ExpiringMap[K, V]) WithEvictionFunction(f func(K, V) bool) *ExpiringMap
 
 // WithMaxSize bounds the map to at most n entries. Inserting a new key when
 // the map is at capacity evicts the oldest entry (by insertion time) before
-// the new entry is added. A value of 0 (the default) disables the cap and
+// the new entry is added. If an eviction function is configured and it vetoes
+// the eviction of the oldest entry, the new entry is dropped instead — the
+// cap is always honored. A value of 0 (the default) disables the cap and
 // preserves the original unbounded behaviour.
+//
+// Note: cap-eviction's eviction-channel send is non-blocking (the notification
+// is dropped if the channel is full), since cap-eviction runs synchronously
+// inside Set. The TTL clean() path's eviction-channel send remains blocking.
 func (m *ExpiringMap[K, V]) WithMaxSize(n int) *ExpiringMap[K, V] {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,7 +102,9 @@ func (m *ExpiringMap[K, V]) Set(key K, value V) {
 
 	now := time.Now()
 	if _, exists := m.items[key]; !exists && m.maxSize > 0 && len(m.items) >= m.maxSize {
-		m.evictOldestLocked()
+		if !m.evictOldestLocked() {
+			return
+		}
 	}
 
 	m.items[key] = &itemWrapper[V]{
@@ -109,7 +117,10 @@ func (m *ExpiringMap[K, V]) Set(key K, value V) {
 // evictOldestLocked removes the entry with the smallest addedAt timestamp.
 // The caller must hold m.mu for writing. The configured eviction function
 // and channel (if any) fire for the removed entry, mirroring TTL eviction.
-func (m *ExpiringMap[K, V]) evictOldestLocked() {
+// Returns true if an entry was evicted; false if the eviction function vetoed
+// the removal (in which case the caller must not insert a new entry, to
+// preserve the cap).
+func (m *ExpiringMap[K, V]) evictOldestLocked() bool {
 	var (
 		oldestKey  K
 		oldestItem *itemWrapper[V]
@@ -125,18 +136,23 @@ func (m *ExpiringMap[K, V]) evictOldestLocked() {
 	}
 
 	if !haveOldest {
-		return
+		return false
 	}
 
 	if m.evictionFn != nil && !m.evictionFn(oldestKey, oldestItem.item) {
-		return
+		return false
 	}
 
 	delete(m.items, oldestKey)
 
 	if m.evictionCh != nil {
-		m.evictionCh <- []V{oldestItem.item}
+		select {
+		case m.evictionCh <- []V{oldestItem.item}:
+		default:
+		}
 	}
+
+	return true
 }
 
 // Get returns the value for the given key.

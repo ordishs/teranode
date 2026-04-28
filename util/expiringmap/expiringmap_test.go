@@ -25,10 +25,12 @@ func TestExpiringMap_WithMaxSize_CapEnforced(t *testing.T) {
 
 	_, aExists := m.Get("a")
 	_, bExists := m.Get("b")
+	_, cExists := m.Get("c")
 	_, dExists := m.Get("d")
 	_, eExists := m.Get("e")
 	require.False(t, aExists, "oldest entry 'a' should have been evicted")
 	require.False(t, bExists, "second-oldest entry 'b' should have been evicted")
+	require.True(t, cExists, "middle entry 'c' should still be present")
 	require.True(t, dExists, "recent entry 'd' should still be present")
 	require.True(t, eExists, "newest entry 'e' should still be present")
 }
@@ -105,9 +107,10 @@ func TestExpiringMap_WithMaxSize_EvictionFunctionFires(t *testing.T) {
 }
 
 func TestExpiringMap_WithMaxSize_EvictionFunctionVeto(t *testing.T) {
+	vetoKey := "a"
 	m := New[string, int](time.Hour).
 		WithEvictionFunction(func(k string, v int) bool {
-			return k != "a"
+			return k != vetoKey
 		}).
 		WithMaxSize(2)
 	defer m.Stop()
@@ -120,6 +123,18 @@ func TestExpiringMap_WithMaxSize_EvictionFunctionVeto(t *testing.T) {
 
 	_, aExists := m.Get("a")
 	require.True(t, aExists, "vetoed entry should not be evicted")
+	require.LessOrEqual(t, m.Len(), 2, "cap must hold even when eviction is vetoed")
+
+	_, cExists := m.Get("c")
+	require.False(t, cExists, "new entry must be dropped when eviction is vetoed")
+
+	vetoKey = ""
+	time.Sleep(2 * time.Millisecond)
+	m.Set("d", 4)
+
+	require.LessOrEqual(t, m.Len(), 2, "cap must hold after veto-then-non-veto sequence")
+	_, dExists := m.Get("d")
+	require.True(t, dExists, "non-vetoed insert after a veto should succeed")
 }
 
 func TestExpiringMap_WithMaxSize_ZeroIsUnbounded(t *testing.T) {
