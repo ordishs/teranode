@@ -1176,8 +1176,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// Block exists - check if it's invalid
 				_, blockMeta, err := u.blockchainClient.GetBlockHeader(ctx, block.Header.Hash())
 				if err != nil {
-					ctxLogger.Warnf("[ValidateBlock][%s] failed to get block metadata for existing block: %v, assuming valid", block.Header.Hash().String(), err)
-					return nil
+					return errors.NewServiceError("[ValidateBlock][%s] failed to get block metadata for existing block", block.Header.Hash().String(), err)
 				}
 
 				if blockMeta != nil && blockMeta.Invalid {
