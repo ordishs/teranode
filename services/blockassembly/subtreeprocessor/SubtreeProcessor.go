@@ -985,13 +985,28 @@ func (stp *SubtreeProcessor) resetAnnouncementTicker() {
 // It creates a new subtree with the same configuration and copies all nodes (except coinbase placeholder)
 // from the current subtree.
 //
+// The new subtree is sized to match the source subtree's capacity, not the current
+// currentItemsPerFile setting. adjustSubtreeSize can shrink currentItemsPerFile
+// between blocks while the in-flight currentSubtree retains its larger original
+// capacity; sizing the copy off currentItemsPerFile in that window would overflow.
+//
 // Returns:
 //   - *subtreepkg.Subtree: The incomplete subtree copy, or nil if creation failed
 //   - error: Any error encountered during subtree creation or node copying
 func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree, error) {
-	itemsPerFile := int(stp.currentItemsPerFile.Load())
+	currentSt := stp.currentSubtree.Load()
+	if currentSt == nil {
+		return nil, errors.NewProcessingError("createIncompleteSubtreeCopy: no current subtree")
+	}
 
-	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(itemsPerFile)
+	capacity := currentSt.Size()
+	if capacity <= 0 {
+		// Fall back to the configured size if the current subtree somehow reports
+		// no capacity; NewTreeByLeafCount will reject zero/negative values.
+		capacity = int(stp.currentItemsPerFile.Load())
+	}
+
+	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(capacity)
 	if err != nil {
 		return nil, err
 	}
@@ -1002,7 +1017,6 @@ func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree,
 	}
 
 	// Copy all nodes from current subtree (skipping the coinbase placeholder at index 0)
-	currentSt := stp.currentSubtree.Load()
 	for _, node := range currentSt.Nodes[1:] {
 		if err = incompleteSubtree.AddSubtreeNodeWithoutLock(node); err != nil {
 			return nil, err
