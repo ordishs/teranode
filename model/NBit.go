@@ -54,14 +54,36 @@ func (b NBit) CloneBytes() []byte {
 	return b[:]
 }
 
-// CalculateTarget from nBits returns the target as a big.Int
+// CalculateTarget from nBits returns the target as a big.Int.
+// Returns big.NewInt(0) for malformed nBits (negative-encoded or overflowing
+// 256 bits), matching Bitcoin Core's arith_uint256::SetCompact rejection
+// criteria. A zero target makes any positive hash fail the PoW comparison
+// and contributes zero chainwork — the safe semantic for a malformed value.
 func (b NBit) CalculateTarget() *big.Int {
 	nb := binary.LittleEndian.Uint32(b[:])
 
 	exponent := nb >> 24
 	mantissa := nb & 0x007FFFFF
 
-	// Invalid nBits
+	// Reject malformed encodings. Bitcoin Core requires a non-zero mantissa
+	// for both negative and overflow flags — a zero mantissa just encodes
+	// the value zero, regardless of sign bit or exponent.
+	if mantissa != 0 {
+		// Negative-encoded: sign bit set in mantissa byte.
+		if nb&0x00800000 != 0 {
+			return big.NewInt(0)
+		}
+		// Overflow: target would exceed 2^256.
+		//   exponent > 34         → any non-zero mantissa overflows
+		//   mantissa > 0xff   + exponent > 33 → 9+ bits shifted by 240+
+		//   mantissa > 0xffff + exponent > 32 → 17+ bits shifted by 232+
+		if exponent > 34 ||
+			(mantissa > 0xff && exponent > 33) ||
+			(mantissa > 0xffff && exponent > 32) {
+			return big.NewInt(0)
+		}
+	}
+
 	if exponent <= 3 {
 		mantissa >>= 8 * (3 - exponent)
 		return big.NewInt(int64(mantissa))

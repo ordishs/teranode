@@ -749,9 +749,12 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					stp.setCurrentRunningState(StateRunning)
 
 				case <-stp.announcementTicker.C:
-					// Periodically announce the current subtree if it has transactions
-					if stp.currentSubtree.Load().Length() > 1 {
-						logger.Debugf("[SubtreeProcessor] periodic announcement of current subtree with %d transactions", stp.currentSubtree.Load().Length()-1)
+					// Periodically announce the current subtree if it has transactions.
+					// Skip if the subtree is nearly full: a complete subtree is imminent and
+					// a partial here would just duplicate the announcement that follows.
+					currentSt := stp.currentSubtree.Load()
+					if currentSt.Length() > 1 && !nearlyFullSubtree(currentSt) {
+						logger.Debugf("[SubtreeProcessor] periodic announcement of current subtree with %d transactions", currentSt.Length()-1)
 
 						incompleteSubtree, err := stp.createIncompleteSubtreeCopy()
 						if err != nil {
@@ -943,6 +946,26 @@ func (stp *SubtreeProcessor) setCurrentRunningState(state State) {
 	prometheusSubtreeProcessorCurrentState.Set(float64(state))
 }
 
+// nearlyFullSubtreeThresholdPct is the fill percentage at or above which the periodic
+// announcement skips emitting a partial subtree, because a complete subtree is imminent.
+const nearlyFullSubtreeThresholdPct = 90
+
+// nearlyFullSubtree reports whether the subtree is at or above the threshold fill ratio,
+// indicating that natural completion is imminent and a partial announcement would just
+// duplicate the full one that is about to follow.
+func nearlyFullSubtree(st *subtreepkg.Subtree) bool {
+	if st == nil {
+		return false
+	}
+
+	capacity := st.Size()
+	if capacity <= 0 {
+		return false
+	}
+
+	return st.Length()*100 >= capacity*nearlyFullSubtreeThresholdPct
+}
+
 // resetAnnouncementTicker safely resets the announcement ticker by draining any pending ticks
 // before resetting. This prevents an immediate tick if one was already queued.
 //
@@ -962,13 +985,28 @@ func (stp *SubtreeProcessor) resetAnnouncementTicker() {
 // It creates a new subtree with the same configuration and copies all nodes (except coinbase placeholder)
 // from the current subtree.
 //
+// The new subtree is sized to match the source subtree's capacity, not the current
+// currentItemsPerFile setting. adjustSubtreeSize can shrink currentItemsPerFile
+// between blocks while the in-flight currentSubtree retains its larger original
+// capacity; sizing the copy off currentItemsPerFile in that window would overflow.
+//
 // Returns:
 //   - *subtreepkg.Subtree: The incomplete subtree copy, or nil if creation failed
 //   - error: Any error encountered during subtree creation or node copying
 func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree, error) {
-	itemsPerFile := int(stp.currentItemsPerFile.Load())
+	currentSt := stp.currentSubtree.Load()
+	if currentSt == nil {
+		return nil, errors.NewProcessingError("createIncompleteSubtreeCopy: no current subtree")
+	}
 
-	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(itemsPerFile)
+	capacity := currentSt.Size()
+	if capacity <= 0 {
+		// Fall back to the configured size if the current subtree somehow reports
+		// no capacity; NewTreeByLeafCount will reject zero/negative values.
+		capacity = int(stp.currentItemsPerFile.Load())
+	}
+
+	incompleteSubtree, err := subtreepkg.NewTreeByLeafCount(capacity)
 	if err != nil {
 		return nil, err
 	}
@@ -979,7 +1017,6 @@ func (stp *SubtreeProcessor) createIncompleteSubtreeCopy() (*subtreepkg.Subtree,
 	}
 
 	// Copy all nodes from current subtree (skipping the coinbase placeholder at index 0)
-	currentSt := stp.currentSubtree.Load()
 	for _, node := range currentSt.Nodes[1:] {
 		if err = incompleteSubtree.AddSubtreeNodeWithoutLock(node); err != nil {
 			return nil, err
