@@ -4,27 +4,17 @@ go 1.26.0
 
 replace github.com/in-toto/in-toto-golang => github.com/in-toto/in-toto-golang v0.9.0
 
-// Use the BSV fork (adds TeranodeModifyOp / TeranodeReadOp wire opcodes
-// 200/201 — see github.com/bsv-blockchain/aerospike-server-private feat/
-// teranode-native-op).
-//
-// TODO: switch this to a remote pseudo-version / tagged release once the
-// fork is published with a major-version subpath compatible with Go's
-// module proxy (the fork's go.mod declares `.../v8` but the GitHub repo
-// is at github.com/bsv-blockchain/aerospike-client-go without the /v8
-// suffix, which Go's module proxy rejects for v8.x pseudo-versions).
-// Workarounds: (a) tag the fork as v8.x.y at github.com/bsv-blockchain/
-// aerospike-client-go/v8 (via a /v8 subdirectory or a separate repo);
-// (b) keep this filesystem replace for development.
-replace github.com/aerospike/aerospike-client-go/v8 => /Users/oskarsson/gitcheckout/aerospike/aerospike-client-go-v8-bsv
-
 require (
 	github.com/IBM/sarama v1.45.1
-	github.com/aerospike/aerospike-client-go/v8 v8.4.2
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.3
+	// BSV fork of aerospike-client-go-v8 (adds TeranodeModifyOp /
+	// TeranodeReadOp wire opcodes 200/201 — see
+	// github.com/bsv-blockchain/aerospike-server-private feat/
+	// teranode-native-op for the matching server-side dispatcher).
+	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv1
 	github.com/bsv-blockchain/go-bt/v2 v2.6.2
 	github.com/bsv-blockchain/go-chaincfg v1.5.5
 	github.com/bsv-blockchain/go-sdk v1.2.19
@@ -89,6 +79,7 @@ require (
 	filippo.io/keygen v0.0.0-20260114151900-8e2790ea4c5b // indirect
 	github.com/DefangLabs/secret-detector v0.0.0-20250403165618-22662109213e // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
+	github.com/aerospike/aerospike-client-go/v8 v8.4.2 // indirect
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.5 // indirect

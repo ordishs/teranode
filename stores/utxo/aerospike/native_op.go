@@ -27,8 +27,8 @@ import (
 	"fmt"
 	"time"
 
-	aerospike "github.com/aerospike/aerospike-client-go/v8"
-	"github.com/aerospike/aerospike-client-go/v8/types"
+	aerospike "github.com/bsv-blockchain/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/vmihailenco/msgpack/v5"
 )

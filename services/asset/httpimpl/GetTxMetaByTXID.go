@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	aero "github.com/aerospike/aerospike-client-go/v8"
+	aero "github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"

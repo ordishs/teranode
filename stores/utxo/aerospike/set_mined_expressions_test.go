@@ -3,7 +3,7 @@ package aerospike
 import (
 	"testing"
 
-	"github.com/aerospike/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/stretchr/testify/require"
 )
 
