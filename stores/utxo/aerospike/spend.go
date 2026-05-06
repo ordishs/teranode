@@ -120,10 +120,11 @@ func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment in
 			return errors.NewProcessingError("failed to init new aerospike key for txMeta", err)
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, key, LuaPackage, "incrementSpentExtraRecs",
-			aerospike.NewIntegerValue(increment),
-			aerospike.NewIntegerValue(int(currentBlockHeight)),
-			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, key, subOpIncrementSpentExtraRec, "incrementSpentExtraRecs",
+			increment,
+			int(currentBlockHeight),
+			s.settings.GetUtxoStoreBlockHeightRetention(),
 		))
 	}
 
@@ -599,12 +600,13 @@ func (s *Store) createBatchRecords(batchesByKey map[keyIgnoreLocked][]aerospike.
 			useLuaPackage = s.spendLuaPackages[batchKey.hash[0]%uint8(s.settings.Aerospike.SeparateSpendUDFModuleCount)]
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, batchKey.key, useLuaPackage, "spendMulti",
-			aerospike.NewValue(batchItems),
-			aerospike.NewValue(batchKey.ignoreConflicting),
-			aerospike.NewValue(batchKey.ignoreLocked),
-			aerospike.NewValue(batchKey.blockHeight),
-			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
+			batchUDFPolicy, useLuaPackage, batchKey.key, subOpSpendMulti, "spendMulti",
+			batchItems,
+			batchKey.ignoreConflicting,
+			batchKey.ignoreLocked,
+			batchKey.blockHeight,
+			s.settings.GetUtxoStoreBlockHeightRetention(),
 		))
 		batchRecordKeys = append(batchRecordKeys, batchKey)
 	}
@@ -1079,10 +1081,11 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 			continue
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, aeroKey, LuaPackage, "incrementSpentExtraRecs",
-			aerospike.NewIntegerValue(item.increment),
-			aerospike.NewIntegerValue(int(currentBlockHeight)),
-			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, aeroKey, subOpIncrementSpentExtraRec, "incrementSpentExtraRecs",
+			item.increment,
+			int(currentBlockHeight),
+			s.settings.GetUtxoStoreBlockHeightRetention(),
 		))
 	}
 

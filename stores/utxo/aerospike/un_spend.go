@@ -161,11 +161,11 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 
 	offset := s.calculateOffsetForOutput(spend.Vout)
 
-	ret, aErr := s.client.Execute(policy, key, LuaPackage, "unspend",
-		aerospike.NewIntegerValue(int(offset)), // vout adjusted for utxoBatchSize
-		aerospike.NewValue(spend.UTXOHash[:]),  // utxo hash
-		aerospike.NewIntegerValue(int(s.blockHeight.Load())),
-		aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+	ret, aErr := s.executeTeranodeOp(policy, key, subOpUnspend, "unspend",
+		int(offset),       // vout adjusted for utxoBatchSize
+		spend.UTXOHash[:], // utxo hash
+		int(s.blockHeight.Load()),
+		s.settings.GetUtxoStoreBlockHeightRetention(),
 	)
 	if aErr != nil {
 		if e, ok := aErr.(*aerospike.AerospikeError); ok {

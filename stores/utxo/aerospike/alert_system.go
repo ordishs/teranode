@@ -96,9 +96,10 @@ func (s *Store) FreezeUTXOs(_ context.Context, spends []*utxo.Spend, tSettings *
 			return aErr
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, aeroKey, LuaPackage, "freeze",
-			aerospike.NewValue(s.calculateOffsetForOutput(spend.Vout)),
-			aerospike.NewValue(spend.UTXOHash[:]),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, aeroKey, subOpFreeze, "freeze",
+			s.calculateOffsetForOutput(spend.Vout),
+			spend.UTXOHash[:],
 		))
 	}
 
@@ -172,9 +173,10 @@ func (s *Store) UnFreezeUTXOs(_ context.Context, spends []*utxo.Spend, tSettings
 			return aErr
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, aeroKey, LuaPackage, "unfreeze",
-			aerospike.NewValue(s.calculateOffsetForOutput(spend.Vout)),
-			aerospike.NewValue(spend.UTXOHash[:]),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, aeroKey, subOpUnfreeze, "unfreeze",
+			s.calculateOffsetForOutput(spend.Vout),
+			spend.UTXOHash[:],
 		))
 	}
 
@@ -241,12 +243,13 @@ func (s *Store) ReAssignUTXO(_ context.Context, oldUtxo *utxo.Spend, newUtxo *ut
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 
 	batchRecords := []aerospike.BatchRecordIfc{
-		aerospike.NewBatchUDF(batchUDFPolicy, aeroKey, LuaPackage, "reassign",
-			aerospike.NewValue(s.calculateOffsetForOutput(oldUtxo.Vout)),
-			aerospike.NewValue(oldUtxo.UTXOHash[:]),
-			aerospike.NewValue(newUtxo.UTXOHash[:]),
-			aerospike.NewIntegerValue(int(s.blockHeight.Load())),
-			aerospike.NewIntegerValue(utxo.ReAssignedUtxoSpendableAfterBlocks),
+		s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, aeroKey, subOpReassign, "reassign",
+			s.calculateOffsetForOutput(oldUtxo.Vout),
+			oldUtxo.UTXOHash[:],
+			newUtxo.UTXOHash[:],
+			int(s.blockHeight.Load()),
+			utxo.ReAssignedUtxoSpendableAfterBlocks,
 		),
 	}
 

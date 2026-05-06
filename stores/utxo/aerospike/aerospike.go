@@ -788,12 +788,9 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			continue
 		}
 
-		batchRecords[i] = aerospike.NewBatchUDF(
-			batchUDFPolicy,
-			key,
-			LuaPackage,
-			"preserveUntil",
-			aerospike.NewIntegerValue(int(preserveUntilHeight)),
+		batchRecords[i] = s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, key, subOpPreserveUntil, "preserveUntil",
+			int(preserveUntilHeight),
 		)
 	}
 

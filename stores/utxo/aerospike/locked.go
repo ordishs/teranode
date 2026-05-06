@@ -67,12 +67,9 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 
 		// Now we need to get totalRecords and do all the child records if necessary...
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(
-			batchUDFPolicy,
-			key,
-			LuaPackage,
-			"setLocked",
-			aerospike.NewValue(batchItem.setValue),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
+			batchUDFPolicy, LuaPackage, key, subOpSetLocked, "setLocked",
+			batchItem.setValue,
 		))
 	}
 
