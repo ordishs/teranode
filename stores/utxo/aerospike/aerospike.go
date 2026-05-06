@@ -140,6 +140,13 @@ type Store struct {
 	indexOnce           sync.Once     // Ensures index creation/wait is only done once per process
 	spendLuaPackages    []string      // Pre-initialized array of Lua package names for spend operations
 
+	// useNativeTeranodeOps caches whether the store should issue mod-teranode
+	// invocations through the native operate-path (TeranodeModifyOp, wire op
+	// type 200) rather than the legacy UDF path. Both the Aerospike setting
+	// and a server-capability probe (see detectNativeTeranodeOpSupport) must
+	// agree; otherwise calls fall back to UDF transparently. See native_op.go.
+	useNativeTeranodeOps bool
+
 	// batchOperateFn is a test-only override for s.client.BatchOperate; nil means use the real client.
 	batchOperateFn func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error
 }
@@ -228,6 +235,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 			s.spendLuaPackages[i] = LuaPackage + "_" + fmt.Sprintf("%d", i)
 		}
 	}
+
+	// Decide once whether to use the native operate-path for mod-teranode
+	// invocations. Falls back to UDF transparently if the setting is off
+	// or the cluster doesn't support the new opcode. See native_op.go.
+	s.initNativeTeranodeOps(ctx)
 
 	// Ensure index creation/wait is only done once per process
 	if pruner.IndexName != "" {

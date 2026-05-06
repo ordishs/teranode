@@ -4,7 +4,19 @@ go 1.26.0
 
 replace github.com/in-toto/in-toto-golang => github.com/in-toto/in-toto-golang v0.9.0
 
-replace github.com/aerospike/aerospike-client-go/v8 => github.com/aerospike/aerospike-client-go/v8 v8.2.0
+// Use the BSV fork (adds TeranodeModifyOp / TeranodeReadOp wire opcodes
+// 200/201 — see github.com/bsv-blockchain/aerospike-server-private feat/
+// teranode-native-op).
+//
+// TODO: switch this to a remote pseudo-version / tagged release once the
+// fork is published with a major-version subpath compatible with Go's
+// module proxy (the fork's go.mod declares `.../v8` but the GitHub repo
+// is at github.com/bsv-blockchain/aerospike-client-go without the /v8
+// suffix, which Go's module proxy rejects for v8.x pseudo-versions).
+// Workarounds: (a) tag the fork as v8.x.y at github.com/bsv-blockchain/
+// aerospike-client-go/v8 (via a /v8 subdirectory or a separate repo);
+// (b) keep this filesystem replace for development.
+replace github.com/aerospike/aerospike-client-go/v8 => /Users/oskarsson/gitcheckout/aerospike/aerospike-client-go-v8-bsv
 
 require (
 	github.com/IBM/sarama v1.45.1
@@ -162,6 +174,7 @@ require (
 	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/tonistiigi/dchapes-mode v0.0.0-20250318174251-73d941a28323 // indirect
 	github.com/tonistiigi/go-csvvalue v0.0.0-20240814133006-030d3b2625d0 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/wadey/gocovmerge v0.0.0-20160331181800-b5bfa59ec0ad // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
@@ -201,6 +214,7 @@ require (
 	github.com/twmb/franz-go/pkg/kadm v1.17.2
 	github.com/twmb/franz-go/pkg/kmsg v1.12.0
 	github.com/urfave/cli/v3 v3.8.0
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
 require (
@@ -463,5 +477,5 @@ require (
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/labstack/gommon v0.4.2
 	github.com/spf13/cobra v1.10.1 // indirect
-	github.com/yuin/gopher-lua v1.1.1 // indirect
+	github.com/yuin/gopher-lua v1.1.2 // indirect
 )

@@ -201,18 +201,15 @@ func (s *Store) prepareBatchRecordsForSetMined(batchRecords []aerospike.BatchRec
 			return errors.NewProcessingError("aerospike NewKey error", err)
 		}
 
-		batchRecords[idx] = aerospike.NewBatchUDF(
-			batchUDFPolicy,
-			key,
-			usePackage,
-			"setMined",
-			aerospike.NewValue(minedBlockInfo.BlockID),
-			aerospike.NewValue(minedBlockInfo.BlockHeight),
-			aerospike.NewValue(minedBlockInfo.SubtreeIdx),
-			aerospike.NewValue(thisBlockHeight),
-			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
-			aerospike.BoolValue(minedBlockInfo.OnLongestChain),
-			aerospike.BoolValue(minedBlockInfo.UnsetMined),
+		batchRecords[idx] = s.teranodeBatchRecord(
+			batchUDFPolicy, usePackage, key, subOpSetMined, "setMined",
+			minedBlockInfo.BlockID,
+			minedBlockInfo.BlockHeight,
+			minedBlockInfo.SubtreeIdx,
+			thisBlockHeight,
+			s.settings.GetUtxoStoreBlockHeightRetention(),
+			minedBlockInfo.OnLongestChain,
+			minedBlockInfo.UnsetMined,
 		)
 	}
 
