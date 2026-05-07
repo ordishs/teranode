@@ -72,7 +72,6 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
-	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -115,7 +114,7 @@ func TestUnmined(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 
-	container, err := aeroTest.RunContainer(ctx)
+	container, err := runAerospikeTestContainer(ctx)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -137,6 +136,9 @@ func TestUnmined(t *testing.T) {
 
 	store, err := New(ctx, logger, tSettings, aeroURL)
 	require.NoError(t, err)
+	if os.Getenv("AEROSPIKE_EXPECT_NATIVE_OPS") == "true" {
+		require.True(t, store.useNativeTeranodeOps)
+	}
 
 	t.Run("check_empty_store", func(t *testing.T) {
 		exists, err := store.indexExists("unminedSinceIndex")
@@ -339,7 +341,7 @@ func TestLargeTxStoresExternally(t *testing.T) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 
-	container, err := aeroTest.RunContainer(ctx)
+	container, err := runAerospikeTestContainer(ctx)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {

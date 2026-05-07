@@ -4,7 +4,7 @@
 // invoked through one of two paths:
 //
 //  1. UDF path (legacy):  aerospike.NewBatchUDF(..., "<fn>", args...)
-//  2. Native path:        aerospike.NewBatchWrite(..., TeranodeModifyOp("result", payload))
+//  2. Native path:        aerospike.NewBatchWrite(..., TeranodeModifyOp("SUCCESS", payload))
 //
 // The native path bypasses the UDF executor and runs under the same
 // lock as native ops like LIST_APPEND. It requires both:
@@ -30,6 +30,7 @@ import (
 	aerospike "github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -52,11 +53,10 @@ const (
 	subOpAddDeletedChildren     uint8 = 13
 )
 
-// nativeOpResultBin is the bin name used by the native-op result
-// message. The dispatcher writes the result map into this bin in the
-// response; the request bin name is echoed back unchanged so callers
-// can read result by name.
-const nativeOpResultBin = "result"
+// nativeOpResultBin is the bin name used by the native-op result message.
+// Keep this aligned with LuaSuccess so existing batch response parsing works
+// for both UDF and native paths.
+const nativeOpResultBin = string(LuaSuccess)
 
 // encodeNativeOpPayload serializes a sub-op invocation onto the wire
 // as MessagePack `[sub_op_id, [args...]]` matching the dispatcher's
@@ -173,11 +173,10 @@ func (s *Store) executeTeranodeUDF(
 
 // detectNativeTeranodeOpSupport probes the cluster to confirm it
 // understands AS_MSG_OP_TERANODE_MODIFY (wire op 200). Returns true
-// only when the probe got a response shape consistent with our
-// dispatcher (PARAMETER_ERROR for malformed payload, or OK for a
-// valid one). Anything else — connection error, timeout, an
-// unexpected result code — biases toward false-negative so the
-// fallback never runs against a server that doesn't support the op.
+// only when the server accepts a valid native sub-op, returns a parseable
+// response, and applies the expected record mutation. Anything else biases
+// toward false-negative so the fallback never runs against a server that
+// doesn't support the op.
 //
 // Called once during store construction; the result is cached in
 // s.useNativeTeranodeOps.
@@ -187,41 +186,82 @@ func (s *Store) detectNativeTeranodeOpSupport(ctx context.Context) bool {
 	}
 
 	// Probe key — chosen to never collide with real txid keys (always
-	// 32 bytes / chainhash). The bin we read back from the response
-	// also doesn't pollute the namespace because we never commit; the
-	// dispatcher fails fast on the malformed payload.
+	// 32 bytes / chainhash). Create a short-lived record and run setLocked:
+	// a patched server mutates the record and returns a structured response,
+	// while an unpatched server rejects the custom opcode with PARAMETER_ERROR.
 	probeKey, err := aerospike.NewKey(s.namespace, s.setName, "_teranode-native-op-probe")
 	if err != nil {
 		s.logger.Warnf("[teranode-native-op] probe key creation failed: %v; falling back to UDF path", err)
 		return false
 	}
 
-	// Intentionally malformed payload: msgpack `nil` (0xc0). The
-	// dispatcher's first step is as_unpack_list_header_element_count;
-	// nil isn't a list header, so we expect AS_ERR_PARAMETER (=4).
-	probeOp := aerospike.TeranodeModifyOp(nativeOpResultBin, []byte{0xc0})
+	payload, encErr := encodeNativeOpPayload(subOpSetLocked, []any{true})
+	if encErr != nil {
+		s.logger.Warnf("[teranode-native-op] probe payload encode failed: %v; falling back to UDF path", encErr)
+		return false
+	}
+
+	probeOp := aerospike.TeranodeModifyOp(nativeOpResultBin, payload)
 
 	policy := aerospike.NewWritePolicy(0, 0)
 	policy.TotalTimeout = 2 * time.Second
+	policy.Expiration = 60
 
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_ = probeCtx // reserved for future cancellation plumbing into the client
 
-	_, opErr := s.client.Operate(policy, probeKey, probeOp)
+	if putErr := s.client.PutBins(policy, probeKey, aerospike.NewBin("_nativeProbe", true)); putErr != nil {
+		s.logger.Warnf("[teranode-native-op] probe record setup failed: %v; falling back to UDF path", putErr)
+		return false
+	}
+	defer func() {
+		_, _ = s.client.Delete(policy, probeKey)
+	}()
+
+	rec, opErr := s.client.Operate(policy, probeKey, probeOp)
 	if opErr == nil {
-		// Unexpected — we sent garbage; getting OK means the dispatcher
-		// is even more permissive than we thought. Treat as supported.
+		if rec == nil || rec.Bins == nil || rec.Bins[nativeOpResultBin] == nil {
+			s.logger.Warnf("[teranode-native-op] probe returned no %q bin; falling back to UDF path", nativeOpResultBin)
+			return false
+		}
+
+		res, parseErr := s.ParseLuaMapResponse(rec.Bins[nativeOpResultBin])
+		if parseErr != nil {
+			s.logger.Warnf("[teranode-native-op] probe returned unparsable response (%v); falling back to UDF path", parseErr)
+			return false
+		}
+
+		if res.Status != LuaStatusOK {
+			s.logger.Warnf("[teranode-native-op] probe returned non-OK response (%+v); falling back to UDF path", res)
+			return false
+		}
+
+		readPolicy := aerospike.NewPolicy()
+		readPolicy.TotalTimeout = 2 * time.Second
+
+		probeRecord, readErr := s.client.Get(readPolicy, probeKey, fields.Locked.String())
+		if readErr != nil {
+			s.logger.Warnf("[teranode-native-op] probe verification failed: %v; falling back to UDF path", readErr)
+			return false
+		}
+		if probeRecord == nil || probeRecord.Bins == nil {
+			s.logger.Warnf("[teranode-native-op] probe verification returned no record; falling back to UDF path")
+			return false
+		}
+		if locked, ok := probeRecord.Bins[fields.Locked.String()].(bool); !ok || !locked {
+			s.logger.Warnf("[teranode-native-op] probe did not set %q=true; falling back to UDF path", fields.Locked.String())
+			return false
+		}
+
 		return true
 	}
 
-	// Aerospike Error wraps a result code; PARAMETER_ERROR (=4) is
-	// what our dispatcher returns for the malformed payload.
 	var aerr aerospike.Error
 	if errors.As(opErr, &aerr) {
-		switch aerr.Matches(types.PARAMETER_ERROR) {
-		case true:
-			return true
+		if aerr.Matches(types.PARAMETER_ERROR) {
+			s.logger.Infof("[teranode-native-op] server rejected native-op probe; falling back to UDF path")
+			return false
 		}
 		s.logger.Warnf("[teranode-native-op] probe got unexpected error code (%v); "+
 			"falling back to UDF path", aerr)
