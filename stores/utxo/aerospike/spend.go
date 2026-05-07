@@ -57,6 +57,8 @@ package aerospike
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -131,27 +133,47 @@ func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment in
 	if err := s.client.BatchOperate(batchPolicy, batchRecords); err != nil {
 		*batchRecordsPtr = batchRecords
 		putBatchRecordsSlice(batchRecordsPtr)
-		return errors.NewStorageError("[IncrementSpentRecordsMulti] error in aerospike batch", err)
+		return errors.NewStorageError("[IncrementSpentRecordsMulti] error in aerospike batch with %d records: %s", len(batchRecords), err.Error(), err)
 	}
 
 	// Inspect per-record errors
 	var aggErr error
 	for i := range batchRecords {
-		if recErr := batchRecords[i].BatchRec().Err; recErr != nil {
-			if aggErr == nil {
-				aggErr = recErr
-			} else {
-				aggErr = errors.Join(aggErr, recErr)
-			}
+		batchRecord := batchRecords[i]
+		if batchRecord == nil {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] missing batch record; %s", describeChainHashAt(txids, i), describeAerospikeBatchRecord(batchRecord)))
+			continue
 		}
 
-		response := batchRecords[i].BatchRec().Record
-		if response != nil && response.Bins != nil {
-			successMap := response.Bins[LuaSuccess.String()].(map[interface{}]interface{})
-			status, ok := successMap["status"].(string)
-			if !ok || status != "OK" {
-				aggErr = errors.Join(aggErr, errors.NewProcessingError(successMap["message"].(string)))
+		batchRec := batchRecord.BatchRec()
+		if batchRec == nil {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] missing batch record; %s", describeChainHashAt(txids, i), describeAerospikeBatchRecord(batchRecord)))
+			continue
+		}
+
+		if recErr := batchRec.Err; recErr != nil {
+			if s.logger != nil {
+				s.logger.Errorf("[IncrementSpentRecordsMulti][%s] batch record failed; %s: %s", describeChainHashAt(txids, i), describeAerospikeBatchRecord(batchRecord), recErr.Error())
 			}
+			aggErr = errors.Join(aggErr, recErr)
+			continue
+		}
+
+		response := batchRec.Record
+		if response == nil || response.Bins == nil || response.Bins[LuaSuccess.String()] == nil {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] missing expected response bin %q; %s", describeChainHashAt(txids, i), LuaSuccess.String(), describeAerospikeBatchRecord(batchRecord)))
+			continue
+		}
+
+		rawResponse := response.Bins[LuaSuccess.String()]
+		parsed, err := s.ParseLuaMapResponse(rawResponse)
+		if err != nil {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] failed to parse response bin %q (value %s); %s: %s", describeChainHashAt(txids, i), LuaSuccess.String(), describeAerospikeValue(rawResponse), describeAerospikeBatchRecord(batchRecord), err.Error(), err))
+			continue
+		}
+
+		if parsed.Status != LuaStatusOK {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] incrementSpentExtraRecs returned %s: %s", describeChainHashAt(txids, i), parsed.Status, parsed.Message))
 		}
 	}
 
@@ -202,17 +224,27 @@ func (s *Store) SetDAHForChildRecordsMulti(items []struct {
 	}
 
 	if err := s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords); err != nil {
-		return errors.NewStorageError("[SetDAHForChildRecordsMulti] failed to set DAH", err)
+		return errors.NewStorageError("[SetDAHForChildRecordsMulti] failed to set DAH for %d records: %s", len(batchRecords), err.Error(), err)
 	}
 
 	var aggErr error
 	for _, br := range batchRecords {
-		if recErr := br.BatchRec().Err; recErr != nil {
-			if aggErr == nil {
-				aggErr = recErr
-			} else {
-				aggErr = errors.Join(aggErr, recErr)
+		if br == nil {
+			aggErr = errors.Join(aggErr, errors.NewStorageError("[SetDAHForChildRecordsMulti] missing batch record; %s", describeAerospikeBatchRecord(br)))
+			continue
+		}
+
+		batchRec := br.BatchRec()
+		if batchRec == nil {
+			aggErr = errors.Join(aggErr, errors.NewStorageError("[SetDAHForChildRecordsMulti] missing batch record; %s", describeAerospikeBatchRecord(br)))
+			continue
+		}
+
+		if recErr := batchRec.Err; recErr != nil {
+			if s.logger != nil {
+				s.logger.Errorf("[SetDAHForChildRecordsMulti] batch record failed; %s: %s", describeAerospikeBatchRecord(br), recErr.Error())
 			}
+			aggErr = errors.Join(aggErr, recErr)
 		}
 	}
 
@@ -514,7 +546,7 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 // logSpendBatchStart logs the start of a spend batch if verbose debug is enabled
 func (s *Store) logSpendBatchStart(batchID uint64, batchSize int) {
 	if s.settings.UtxoStore.VerboseDebug {
-		s.logger.Debugf("[SPEND_BATCH_LUA] sending lua batch %d of %d spends", batchID, batchSize)
+		s.logger.Debugf("[spendMulti] sending batch %d of %d spends", batchID, batchSize)
 	}
 }
 
@@ -524,14 +556,14 @@ func (s *Store) prepareSpendBatches(batch []*batchSpend, batchID uint64) (map[ke
 	batchesByKey := make(map[keyIgnoreLocked][]aerospike.MapValue, len(batch))
 
 	for idx, bItem := range batch {
-		key, err := s.getOrCreateAerospikeKey(bItem, s.utxoBatchSize, aeroKeyMap)
-		if err != nil {
-			bItem.errCh <- err
+		if err := s.validateSpendItem(bItem); err != nil {
+			s.sendSpendBatchItemError(batch, idx, err)
 			continue
 		}
 
-		if err := s.validateSpendItem(bItem); err != nil {
-			bItem.errCh <- err
+		key, err := s.getOrCreateAerospikeKey(bItem, s.utxoBatchSize, aeroKeyMap)
+		if err != nil {
+			s.sendSpendBatchItemError(batch, idx, err)
 			continue
 		}
 
@@ -561,7 +593,7 @@ func (s *Store) getOrCreateAerospikeKey(bItem *batchSpend, utxoBatchSize int, ke
 
 	key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 	if err != nil {
-		return nil, errors.NewProcessingError("[SPEND_BATCH_LUA][%s] failed to init new aerospike key for spend", bItem.spend.TxID.String(), err)
+		return nil, errors.NewProcessingError("[spendMulti][%s] failed to init new aerospike key for spend", describeBatchSpend(bItem), err)
 	}
 
 	keyMap[keySourceStr] = key
@@ -570,8 +602,20 @@ func (s *Store) getOrCreateAerospikeKey(bItem *batchSpend, utxoBatchSize int, ke
 
 // validateSpendItem validates that the spend item has all required data
 func (s *Store) validateSpendItem(bItem *batchSpend) error {
+	if bItem == nil {
+		return errors.NewProcessingError("[spendMulti][<nil>] batch item is nil")
+	}
+	if bItem.spend == nil {
+		return errors.NewProcessingError("[spendMulti][%s] spend is nil", describeBatchSpend(bItem))
+	}
+	if bItem.spend.TxID == nil {
+		return errors.NewProcessingError("[spendMulti][%s] txid is nil", describeBatchSpend(bItem))
+	}
+	if bItem.spend.UTXOHash == nil {
+		return errors.NewProcessingError("[spendMulti][%s] utxo hash is nil", describeBatchSpend(bItem))
+	}
 	if bItem.spend.SpendingData == nil {
-		return errors.NewProcessingError("[SPEND_BATCH_LUA][%s] spending data is nil", bItem.spend.TxID.String())
+		return errors.NewProcessingError("[spendMulti][%s] spending data is nil", describeBatchSpend(bItem))
 	}
 	return nil
 }
@@ -620,7 +664,7 @@ func (s *Store) executeSpendBatch(batchRecords []aerospike.BatchRecordIfc, batch
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
 		for idx, bItem := range batch {
-			bItem.errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] failed to batch spend aerospike map utxo in batchId %d: %d - %w", bItem.spend.TxID.String(), batchID, idx, err)
+			s.sendSpendBatchItemError(batch, idx, errors.NewStorageError("[spendMulti][%s] BatchOperate failed for batchId %d itemIdx %d: %s", describeBatchSpend(bItem), batchID, idx, err.Error(), err))
 		}
 		return err
 	}
@@ -633,36 +677,47 @@ func (s *Store) processSpendBatchResults(ctx context.Context, batchRecords []aer
 		key := batchRecordKeys[batchIdx]
 		batchByKey, ok := batchesByKey[key]
 		if !ok {
-			s.logger.Errorf("[SPEND_BATCH_LUA] could not find batch key for batchIdx %d", batchIdx)
+			s.logger.Errorf("[spendMulti] could not find batch key for batchIdx %d", batchIdx)
 			continue
 		}
 
-		txID := batch[batchByKey[0]["idx"].(int)].spend.TxID
+		txID := spendBatchGroupTxID(batchByKey, batch)
 		s.processSingleBatchResult(ctx, batchRecord, batchByKey, batch, txID, key.blockHeight, batchID)
 	}
 
 	if s.settings.UtxoStore.VerboseDebug {
-		s.logger.Debugf("[SPEND_BATCH_LUA] sending lua batch %d of %d spends DONE", batchID, len(batch))
+		s.logger.Debugf("[spendMulti] sending batch %d of %d spends DONE", batchID, len(batch))
 	}
 }
 
 // processSingleBatchResult processes a single batch record result
 func (s *Store) processSingleBatchResult(ctx context.Context, batchRecord aerospike.BatchRecordIfc, batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash, thisBlockHeight uint32, batchID uint64) {
-	batchErr := batchRecord.BatchRec().Err
-	if batchErr != nil {
-		s.handleBatchError(batchByKey, batch, thisBlockHeight, batchID, batchErr)
+	if batchRecord == nil {
+		s.handleMissingResponse(batchRecord, batchByKey, batch, txID, thisBlockHeight, batchID)
 		return
 	}
 
-	response := batchRecord.BatchRec().Record
+	batchRec := batchRecord.BatchRec()
+	if batchRec == nil {
+		s.handleMissingResponse(batchRecord, batchByKey, batch, txID, thisBlockHeight, batchID)
+		return
+	}
+
+	batchErr := batchRec.Err
+	if batchErr != nil {
+		s.handleBatchError(batchRecord, batchByKey, batch, thisBlockHeight, batchID, batchErr)
+		return
+	}
+
+	response := batchRec.Record
 	if response == nil || response.Bins == nil || response.Bins[LuaSuccess.String()] == nil {
-		s.handleMissingResponse(batchByKey, batch, txID)
+		s.handleMissingResponse(batchRecord, batchByKey, batch, txID, thisBlockHeight, batchID)
 		return
 	}
 
 	res, parseErr := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
 	if parseErr != nil {
-		s.handleParseError(batchByKey, batch, txID, parseErr)
+		s.handleParseError(batchRecord, response.Bins[LuaSuccess.String()], batchByKey, batch, txID, thisBlockHeight, batchID, parseErr)
 		return
 	}
 
@@ -681,10 +736,15 @@ func (s *Store) processSingleBatchResult(ctx context.Context, batchRecord aerosp
 }
 
 // handleBatchError handles errors from batch operations
-func (s *Store) handleBatchError(batchByKey []aerospike.MapValue, batch []*batchSpend, thisBlockHeight uint32, batchID uint64, err error) {
+func (s *Store) handleBatchError(batchRecord aerospike.BatchRecordIfc, batchByKey []aerospike.MapValue, batch []*batchSpend, thisBlockHeight uint32, batchID uint64, err error) {
+	diagnostics := describeAerospikeBatchRecord(batchRecord)
+	group := describeSpendBatchGroup(batchByKey, batch)
 	for _, batchItem := range batchByKey {
-		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in aerospike spend batch record, blockHeight %d: %d", batch[idx].spend.TxID.String(), thisBlockHeight, batchID, err)
+		idx, ok := spendBatchItemIndex(batchItem)
+		if !ok {
+			continue
+		}
+		s.sendSpendBatchItemError(batch, idx, errors.NewStorageError("[spendMulti][%s] aerospike spend batch record failed, batchId %d blockHeight %d; %s; %s: %s", describeBatchSpendAt(batch, idx), batchID, thisBlockHeight, diagnostics, group, err.Error(), err))
 	}
 	// Record batch-level failure for circuit breaker
 	if s.spendCircuitBreaker != nil {
@@ -693,23 +753,139 @@ func (s *Store) handleBatchError(batchByKey []aerospike.MapValue, batch []*batch
 }
 
 // handleMissingResponse handles missing response from batch operation
-func (s *Store) handleMissingResponse(batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash) {
+func (s *Store) handleMissingResponse(batchRecord aerospike.BatchRecordIfc, batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash, thisBlockHeight uint32, batchID uint64) {
+	diagnostics := describeAerospikeBatchRecord(batchRecord)
+	group := describeSpendBatchGroup(batchByKey, batch)
 	for _, batchItem := range batchByKey {
-		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- errors.NewProcessingError("[SPEND_BATCH_LUA][%s] could not parse response", txID.String())
+		idx, ok := spendBatchItemIndex(batchItem)
+		if !ok {
+			continue
+		}
+		s.sendSpendBatchItemError(batch, idx, errors.NewProcessingError("[spendMulti][%s] missing expected response bin %q, batchId %d blockHeight %d; %s; %s", describeChainHash(txID), LuaSuccess.String(), batchID, thisBlockHeight, diagnostics, group))
 	}
 }
 
 // handleParseError handles parse errors from response
-func (s *Store) handleParseError(batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash, err error) {
+func (s *Store) handleParseError(batchRecord aerospike.BatchRecordIfc, rawResponse interface{}, batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash, thisBlockHeight uint32, batchID uint64, err error) {
+	diagnostics := describeAerospikeBatchRecord(batchRecord)
+	group := describeSpendBatchGroup(batchByKey, batch)
 	for _, batchItem := range batchByKey {
-		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- errors.NewProcessingError("[SPEND_BATCH_LUA][%s] could not parse response", txID.String(), err)
+		idx, ok := spendBatchItemIndex(batchItem)
+		if !ok {
+			continue
+		}
+		s.sendSpendBatchItemError(batch, idx, errors.NewProcessingError("[spendMulti][%s] failed to parse response bin %q (value %s), batchId %d blockHeight %d; %s; %s: %s", describeChainHash(txID), LuaSuccess.String(), describeAerospikeValue(rawResponse), batchID, thisBlockHeight, diagnostics, group, err.Error(), err))
 	}
+}
+
+func spendBatchItemIndex(batchItem aerospike.MapValue) (int, bool) {
+	if batchItem == nil {
+		return 0, false
+	}
+
+	idx, ok := batchItem["idx"].(int)
+	return idx, ok
+}
+
+func spendBatchGroupTxID(batchByKey []aerospike.MapValue, batch []*batchSpend) *chainhash.Hash {
+	for _, batchItem := range batchByKey {
+		idx, ok := spendBatchItemIndex(batchItem)
+		if !ok || idx < 0 || idx >= len(batch) {
+			continue
+		}
+		if batch[idx] == nil || batch[idx].spend == nil {
+			continue
+		}
+		return batch[idx].spend.TxID
+	}
+	return nil
+}
+
+func (s *Store) sendSpendBatchItemError(batch []*batchSpend, idx int, err error) {
+	if idx < 0 || idx >= len(batch) || batch[idx] == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[spendMulti] unable to send batch item result for idx=%d: %v", idx, err)
+		}
+		return
+	}
+	s.sendSpendBatchError(batch[idx], err)
+}
+
+func (s *Store) sendSpendBatchError(bItem *batchSpend, err error) {
+	if bItem == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[spendMulti] unable to send batch item result for nil item: %v", err)
+		}
+		return
+	}
+	if bItem.errCh == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[spendMulti][%s] unable to send batch item result because errCh is nil: %v", describeBatchSpend(bItem), err)
+		}
+		return
+	}
+
+	bItem.errCh <- err
+}
+
+func describeBatchSpendAt(batch []*batchSpend, idx int) string {
+	if idx < 0 || idx >= len(batch) {
+		return "<unknown>"
+	}
+	return describeBatchSpend(batch[idx])
+}
+
+func describeBatchSpend(bItem *batchSpend) string {
+	if bItem == nil {
+		return "<nil>"
+	}
+	if bItem.spend == nil {
+		return "spend=<nil>"
+	}
+	return describeUTXOSpend(bItem.spend)
+}
+
+func describeSpendBatchGroup(batchByKey []aerospike.MapValue, batch []*batchSpend) string {
+	if len(batchByKey) == 0 {
+		return "group=[]"
+	}
+
+	const maxItems = 6
+	parts := make([]string, 0, min(len(batchByKey), maxItems))
+	for itemIdx, batchItem := range batchByKey {
+		if itemIdx == maxItems {
+			parts = append(parts, fmt.Sprintf("...+%d more", len(batchByKey)-itemIdx))
+			break
+		}
+
+		idx, ok := spendBatchItemIndex(batchItem)
+		if !ok {
+			parts = append(parts, fmt.Sprintf("idx=<invalid> offset=%v", batchItem["offset"]))
+			continue
+		}
+
+		spendDesc := "<unknown>"
+		vout := batchItem["vOut"]
+		if idx >= 0 && idx < len(batch) && batch[idx] != nil {
+			spendDesc = describeBatchSpend(batch[idx])
+			if batch[idx].spend != nil {
+				vout = batch[idx].spend.Vout
+			}
+		}
+
+		parts = append(parts, fmt.Sprintf("idx=%d spend=%s vout=%v offset=%v", idx, spendDesc, vout, batchItem["offset"]))
+	}
+
+	return "group=[" + strings.Join(parts, "; ") + "]"
 }
 
 // handleSpendSignal handles signals from spend operations
 func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *chainhash.Hash, childCount int, thisBlockHeight uint32) {
+	if txID == nil {
+		s.logger.Errorf("[spendMulti] cannot handle signal %s with nil txid", signal)
+		return
+	}
+
 	switch signal {
 	case LuaSignalAllSpent:
 		if err := s.handleExtraRecords(ctx, txID, 1); err != nil {
@@ -739,8 +915,11 @@ func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *c
 // handleSuccessfulSpends handles successful spend operations
 func (s *Store) handleSuccessfulSpends(batchByKey []aerospike.MapValue, batch []*batchSpend) {
 	for _, batchItem := range batchByKey {
-		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- nil
+		idx, ok := spendBatchItemIndex(batchItem)
+		if !ok {
+			continue
+		}
+		s.sendSpendBatchItemError(batch, idx, nil)
 	}
 	// Record successful batch operation for circuit breaker
 	if s.spendCircuitBreaker != nil {
@@ -750,12 +929,26 @@ func (s *Store) handleSuccessfulSpends(batchByKey []aerospike.MapValue, batch []
 
 // handleErrorSpends handles error responses from spend operations
 func (s *Store) handleErrorSpends(res *LuaMapResponse, batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash, thisBlockHeight uint32, batchID uint64) {
+	if res == nil {
+		for _, batchItem := range batchByKey {
+			idx, ok := spendBatchItemIndex(batchItem)
+			if !ok {
+				continue
+			}
+			s.sendSpendBatchItemError(batch, idx, errors.NewStorageError("[spendMulti][%s] nil error response, blockHeight %d: %d", describeChainHash(txID), thisBlockHeight, batchID))
+		}
+		return
+	}
+
 	if res.Message != "" {
 		// General error for all spends
 		generalErr := s.createGeneralError(res.ErrorCode, txID, thisBlockHeight, batchID, res.Message)
 		for _, batchItem := range batchByKey {
-			idx := batchItem["idx"].(int)
-			batch[idx].errCh <- generalErr
+			idx, ok := spendBatchItemIndex(batchItem)
+			if !ok {
+				continue
+			}
+			s.sendSpendBatchItemError(batch, idx, generalErr)
 		}
 	} else if res.Errors != nil {
 		// Individual errors for specific spends
@@ -763,8 +956,11 @@ func (s *Store) handleErrorSpends(res *LuaMapResponse, batchByKey []aerospike.Ma
 	} else {
 		// ERROR status but no message or errors
 		for _, batchItem := range batchByKey {
-			idx := batchItem["idx"].(int)
-			batch[idx].errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in LUA spend batch record, blockHeight %d: %d - %v", txID.String(), thisBlockHeight, batchID, res)
+			idx, ok := spendBatchItemIndex(batchItem)
+			if !ok {
+				continue
+			}
+			s.sendSpendBatchItemError(batch, idx, errors.NewStorageError("[spendMulti][%s] error in spendMulti batch record, blockHeight %d: %d - %v", describeChainHash(txID), thisBlockHeight, batchID, res))
 		}
 	}
 }
@@ -773,70 +969,80 @@ func (s *Store) handleErrorSpends(res *LuaMapResponse, batchByKey []aerospike.Ma
 func (s *Store) createGeneralError(errorCode LuaErrorCode, txID *chainhash.Hash, thisBlockHeight uint32, batchID uint64, message string) error {
 	switch errorCode {
 	case LuaErrorCodeFrozen:
-		return errors.NewUtxoFrozenError("[SPEND_BATCH_LUA][%s] transaction is frozen, blockHeight %d: %d - %s", txID.String(), thisBlockHeight, batchID, message)
+		return errors.NewUtxoFrozenError("[spendMulti][%s] transaction is frozen, blockHeight %d: %d - %s", describeChainHash(txID), thisBlockHeight, batchID, message)
 	case LuaErrorCodeConflicting:
-		return errors.NewTxConflictingError("[SPEND_BATCH_LUA][%s] transaction is conflicting, blockHeight %d: %d - %s", txID.String(), thisBlockHeight, batchID, message)
+		return errors.NewTxConflictingError("[spendMulti][%s] transaction is conflicting, blockHeight %d: %d - %s", describeChainHash(txID), thisBlockHeight, batchID, message)
 	case LuaErrorCodeLocked:
-		return errors.NewTxLockedError("[SPEND_BATCH_LUA][%s] transaction is locked, blockHeight %d: %d - %s", txID.String(), thisBlockHeight, batchID, message)
+		return errors.NewTxLockedError("[spendMulti][%s] transaction is locked, blockHeight %d: %d - %s", describeChainHash(txID), thisBlockHeight, batchID, message)
 	case LuaErrorCodeCreating:
-		return errors.NewTxCreatingError("[SPEND_BATCH_LUA][%s] transaction is creating, blockHeight %d: %d - %s", txID.String(), thisBlockHeight, batchID, message)
+		return errors.NewTxCreatingError("[spendMulti][%s] transaction is creating, blockHeight %d: %d - %s", describeChainHash(txID), thisBlockHeight, batchID, message)
 	case LuaErrorCodeCoinbaseImmature:
-		return errors.NewTxCoinbaseImmatureError("[SPEND_BATCH_LUA][%s] coinbase is locked, blockHeight %d: %d - %s", txID.String(), thisBlockHeight, batchID, message)
+		return errors.NewTxCoinbaseImmatureError("[spendMulti][%s] coinbase is locked, blockHeight %d: %d - %s", describeChainHash(txID), thisBlockHeight, batchID, message)
 	case LuaErrorCodeTxNotFound:
-		return errors.NewTxNotFoundError("[SPEND_BATCH_LUA][%s] transaction not found, blockHeight %d: %d - %s", txID.String(), thisBlockHeight, batchID, message)
+		return errors.NewTxNotFoundError("[spendMulti][%s] transaction not found, blockHeight %d: %d - %s", describeChainHash(txID), thisBlockHeight, batchID, message)
 	default:
-		return errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in LUA spend batch record, blockHeight %d: %d - %s", txID.String(), thisBlockHeight, batchID, message)
+		return errors.NewStorageError("[spendMulti][%s] error in spendMulti batch record, blockHeight %d: %d - %s", describeChainHash(txID), thisBlockHeight, batchID, message)
 	}
 }
 
 // handleIndividualErrors handles individual errors for specific spends
 func (s *Store) handleIndividualErrors(errors map[int]LuaErrorInfo, batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash) {
 	for _, batchItem := range batchByKey {
-		idx := batchItem["idx"].(int)
+		idx, ok := spendBatchItemIndex(batchItem)
+		if !ok {
+			continue
+		}
 
 		if errMsg, hasError := errors[idx]; hasError {
-			batch[idx].errCh <- s.createSpendError(errMsg, batch[idx], txID)
+			s.sendSpendBatchItemError(batch, idx, s.createSpendError(errMsg, batch[idx], txID))
 		} else {
-			batch[idx].errCh <- nil
+			s.sendSpendBatchItemError(batch, idx, nil)
 		}
 	}
 }
 
 // createSpendError creates an error for a specific spend
 func (s *Store) createSpendError(errMsg LuaErrorInfo, batchItem *batchSpend, txID *chainhash.Hash) error {
+	if batchItem == nil || batchItem.spend == nil {
+		return errors.NewStorageError("[spendMulti][%s] cannot create spend error for nil batch item: %s", describeChainHash(txID), errMsg.Message)
+	}
+
 	switch errMsg.ErrorCode {
 	case LuaErrorCodeSpent:
 		if errMsg.SpendingData != "" {
 			spendingData, parseErr := spendpkg.NewSpendingDataFromString(errMsg.SpendingData)
 			if parseErr != nil {
-				return errors.NewStorageError("[SPEND_BATCH_LUA][%s] invalid spending data in error: %s", txID.String(), errMsg.SpendingData)
+				return errors.NewStorageError("[spendMulti][%s] invalid spending data in error: %s", describeChainHash(txID), errMsg.SpendingData)
 			}
 
+			if batchItem.spend.TxID == nil || batchItem.spend.UTXOHash == nil {
+				return errors.NewStorageError("[spendMulti][%s] cannot create spent error with nil txid or utxo hash for %s", describeChainHash(txID), describeBatchSpend(batchItem))
+			}
 			return errors.NewUtxoSpentError(*batchItem.spend.TxID, batchItem.spend.Vout, *batchItem.spend.UTXOHash, spendingData)
 		}
 
-		return errors.NewStorageError("[SPEND_BATCH_LUA][%s] UTXO already spent but no spending data provided", txID.String())
+		return errors.NewStorageError("[spendMulti][%s] UTXO already spent but no spending data provided", describeChainHash(txID))
 
 	case LuaErrorCodeInvalidSpend:
-		return errors.NewUtxoError("[SPEND_BATCH_LUA][%s] invalid spend for vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+		return errors.NewUtxoError("[spendMulti][%s] invalid spend for vout %d: %s", describeChainHash(txID), batchItem.spend.Vout, errMsg.Message)
 
 	case LuaErrorCodeFrozen:
-		return errors.NewUtxoFrozenError("[SPEND_BATCH_LUA][%s] UTXO is frozen, vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+		return errors.NewUtxoFrozenError("[spendMulti][%s] UTXO is frozen, vout %d: %s", describeChainHash(txID), batchItem.spend.Vout, errMsg.Message)
 
 	case LuaErrorCodeFrozenUntil:
-		return errors.NewUtxoFrozenError("[SPEND_BATCH_LUA][%s] UTXO frozen until block, vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+		return errors.NewUtxoFrozenError("[spendMulti][%s] UTXO frozen until block, vout %d: %s", describeChainHash(txID), batchItem.spend.Vout, errMsg.Message)
 
 	case LuaErrorCodeUtxoNotFound:
-		return errors.NewTxNotFoundError("[SPEND_BATCH_LUA][%s] UTXO not found for vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+		return errors.NewTxNotFoundError("[spendMulti][%s] UTXO not found for vout %d: %s", describeChainHash(txID), batchItem.spend.Vout, errMsg.Message)
 
 	case LuaErrorCodeUtxoHashMismatch:
-		return errors.NewUtxoHashMismatchError("[SPEND_BATCH_LUA][%s] UTXO hash mismatch for vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+		return errors.NewUtxoHashMismatchError("[spendMulti][%s] UTXO hash mismatch for vout %d: %s", describeChainHash(txID), batchItem.spend.Vout, errMsg.Message)
 
 	case LuaErrorCodeUtxoInvalidSize:
-		return errors.NewUtxoInvalidSize("[SPEND_BATCH_LUA][%s] UTXO invalid size for vout %d: %s", txID.String(), batchItem.spend.Vout, errMsg.Message)
+		return errors.NewUtxoInvalidSize("[spendMulti][%s] UTXO invalid size for vout %d: %s", describeChainHash(txID), batchItem.spend.Vout, errMsg.Message)
 
 	default:
-		return errors.NewStorageError("[SPEND_BATCH_LUA][%s] error for vout %d (code: %s): %s", txID.String(), batchItem.spend.Vout, errMsg.ErrorCode, errMsg.Message)
+		return errors.NewStorageError("[spendMulti][%s] error for vout %d (code: %s): %s", describeChainHash(txID), batchItem.spend.Vout, errMsg.ErrorCode, errMsg.Message)
 	}
 }
 
@@ -858,7 +1064,7 @@ func (s *Store) SetDAHForChildRecords(txID *chainhash.Hash, childCount int, dah 
 
 		errs[i] = <-errCh
 		if errs[i] != nil {
-			s.logger.Errorf("[setDAHForChildRecords][%s] failed to set DAH for child record %d: %v", txID.String(), i, errs[i])
+			s.logger.Errorf("[setDAHForChildRecords][%s] failed to set DAH for child record %d: %v", describeChainHash(txID), i, errs[i])
 		}
 	}
 
@@ -872,7 +1078,7 @@ func (s *Store) SetDAHForChildRecords(txID *chainhash.Hash, childCount int, dah 
 	}
 
 	if errorsFound {
-		return errors.NewStorageError("[setDAHForChildRecords][%s] failed to set DAH for one or more child records", txID.String())
+		return errors.NewStorageError("[setDAHForChildRecords][%s] failed to set DAH for one or more child records", describeChainHash(txID))
 	}
 
 	return nil
@@ -898,8 +1104,9 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 	// Parse the map response
 	ret, err := s.ParseLuaMapResponse(res)
 	if err != nil {
-		s.logger.Errorf("[SPEND_BATCH_LUA][%s] failed to parse LUA return value: %v", txID.String(), err)
-		return err
+		wrappedErr := errors.NewProcessingError("[spendMulti][%s] failed to parse IncrementSpentRecords response (value %s): %s", describeChainHash(txID), describeAerospikeValue(res), err.Error(), err)
+		s.logger.Errorf("%v", wrappedErr)
+		return wrappedErr
 	}
 
 	if ret.Status == LuaStatusOK {
@@ -915,11 +1122,11 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 					if ret.ChildCount > 0 {
 						allSpent, verifyErr := s.verifyAllChildrenSpent(ctx, txID, ret.ChildCount)
 						if verifyErr != nil {
-							s.logger.Errorf("[handleExtraRecords][%s] failed to verify children: %v", txID.String(), verifyErr)
+							s.logger.Errorf("[handleExtraRecords][%s] failed to verify children: %v", describeChainHash(txID), verifyErr)
 							return verifyErr
 						}
 						if !allSpent {
-							s.logger.Warnf("[handleExtraRecords][%s] spentExtraRecs triggered DAH but not all children are spent — counter drift detected, clearing master DAH", txID.String())
+							s.logger.Warnf("[handleExtraRecords][%s] spentExtraRecs triggered DAH but not all children are spent — counter drift detected, clearing master DAH", describeChainHash(txID))
 							// Lua already set DAH on the master record inline.
 							// Clear it since children aren't actually all-spent.
 							errCh := make(chan error, 1)
@@ -930,7 +1137,7 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 								errCh:          errCh,
 							})
 							if dahErr := <-errCh; dahErr != nil {
-								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), dahErr)
+								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", describeChainHash(txID), dahErr)
 							}
 							return nil
 						}
@@ -953,7 +1160,7 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 			}
 		}
 	} else if ret.Status == LuaStatusError {
-		return errors.NewStorageError("[SPEND_BATCH_LUA][%s] failed to handleExtraRecords: %v", txID.String(), ret.Message)
+		return errors.NewStorageError("[spendMulti][%s] failed to handleExtraRecords: %v", describeChainHash(txID), ret.Message)
 	}
 
 	return nil
@@ -964,6 +1171,9 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 // DAH — the spentExtraRecs counter can drift during interrupted rollbacks,
 // so we verify the actual child state before trusting it.
 func (s *Store) verifyAllChildrenSpent(ctx context.Context, txID *chainhash.Hash, childCount int) (bool, error) {
+	if txID == nil {
+		return false, errors.NewProcessingError("[verifyAllChildrenSpent][<nil>] txid is nil")
+	}
 	if childCount == 0 {
 		return true, nil
 	}
@@ -981,7 +1191,7 @@ func (s *Store) verifyAllChildrenSpent(ctx context.Context, txID *chainhash.Hash
 		keySource := uaerospike.CalculateKeySourceInternal(txID, i)
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
-			return false, errors.NewProcessingError("[verifyAllChildrenSpent][%s] failed to create key for child %d", txID.String(), i, err)
+			return false, errors.NewProcessingError("[verifyAllChildrenSpent][%s] failed to create key for child %d", describeChainHash(txID), i, err)
 		}
 
 		batchRecords = append(batchRecords, aerospike.NewBatchRead(
@@ -992,13 +1202,19 @@ func (s *Store) verifyAllChildrenSpent(ctx context.Context, txID *chainhash.Hash
 	}
 
 	if err := s.client.BatchOperate(batchPolicy, batchRecords); err != nil {
-		return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] batch read failed", txID.String(), err)
+		return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] batch read failed", describeChainHash(txID), err)
 	}
 
 	for i, br := range batchRecords {
+		if br == nil {
+			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] child %d read returned nil batch record", describeChainHash(txID), i+1)
+		}
 		rec := br.BatchRec()
+		if rec == nil {
+			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] child %d read returned nil batch rec; %s", describeChainHash(txID), i+1, describeAerospikeBatchRecord(br))
+		}
 		if rec.Err != nil {
-			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] child %d read failed", txID.String(), i+1, rec.Err)
+			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] child %d read failed", describeChainHash(txID), i+1, rec.Err)
 		}
 		if rec.Record == nil || rec.Record.Bins == nil {
 			return false, nil
@@ -1006,11 +1222,11 @@ func (s *Store) verifyAllChildrenSpent(ctx context.Context, txID *chainhash.Hash
 
 		spentUtxos, ok := rec.Record.Bins[fields.SpentUtxos.String()].(int)
 		if !ok {
-			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] invalid type for spentUtxos in child %d", txID.String(), i+1)
+			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] invalid type for spentUtxos in child %d", describeChainHash(txID), i+1)
 		}
 		recordUtxos, ok := rec.Record.Bins[fields.RecordUtxos.String()].(int)
 		if !ok {
-			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] invalid type for recordUtxos in child %d", txID.String(), i+1)
+			return false, errors.NewStorageError("[verifyAllChildrenSpent][%s] invalid type for recordUtxos in child %d", describeChainHash(txID), i+1)
 		}
 
 		if spentUtxos != recordUtxos {
@@ -1054,7 +1270,7 @@ func (s *Store) IncrementSpentRecords(txid *chainhash.Hash, increment int) (inte
 		if prometheusUtxoMapErrors != nil {
 			prometheusUtxoMapErrors.WithLabelValues("IncrementSpentRecords", "BatchTimeout").Inc()
 		}
-		return nil, errors.NewServiceUnavailableError("[IncrementSpentRecords][%s] batch operation timed out after %s", txid.String(), spendTimeout)
+		return nil, errors.NewServiceUnavailableError("[IncrementSpentRecords][%s] batch operation timed out after %s", describeChainHash(txid), spendTimeout)
 	}
 }
 
@@ -1066,18 +1282,26 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 
 	// Create a batch of records to read, with a max size of the batch
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(batch))
+	batchItems := make([]*batchIncrement, 0, len(batch))
 
 	currentBlockHeight := s.blockHeight.Load()
 
 	// Create a batch of records to read from the txHashes
 	for _, item := range batch {
+		if item == nil {
+			if s.logger != nil {
+				s.logger.Errorf("[IncrementSpentRecords] nil batch item")
+			}
+			continue
+		}
+		if item.txID == nil {
+			s.sendIncrementBatchResult(item, nil, errors.NewProcessingError("failed to init new aerospike key for txMeta: txid is nil"))
+			continue
+		}
+
 		aeroKey, err := aerospike.NewKey(s.namespace, s.setName, item.txID[:])
 		if err != nil {
-			item.res <- incrementSpentRecordsRes{
-				res: nil,
-				err: errors.NewProcessingError("failed to init new aerospike key for txMeta", err),
-			}
-
+			s.sendIncrementBatchResult(item, nil, errors.NewProcessingError("failed to init new aerospike key for txMeta", err))
 			continue
 		}
 
@@ -1087,16 +1311,14 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 			int(currentBlockHeight),
 			s.settings.GetUtxoStoreBlockHeightRetention(),
 		))
+		batchItems = append(batchItems, item)
 	}
 
 	// send the batch to aerospike
 	err = s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
 		for _, item := range batch {
-			item.res <- incrementSpentRecordsRes{
-				res: nil,
-				err: errors.NewStorageError("error in aerospike send outpoint batch records", err),
-			}
+			s.sendIncrementBatchResult(item, nil, errors.NewStorageError("[IncrementSpentRecords][%s] BatchOperate failed: %s", describeBatchIncrement(item), err.Error(), err))
 		}
 
 		return
@@ -1104,32 +1326,69 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 
 	// Process the batch records
 	for idx, batchRecordIfc := range batchRecords {
-		batchRecord := batchRecordIfc.BatchRec()
-		if batchRecord.Err != nil {
-			batch[idx].res <- incrementSpentRecordsRes{
-				res: nil,
-				err: errors.NewStorageError("error in aerospike send outpoint batch records", err),
-			}
+		item := batchIncrementAt(batchItems, idx)
+		if batchRecordIfc == nil {
+			s.sendIncrementBatchResult(item, nil, errors.NewStorageError("[IncrementSpentRecords][%s] missing batch record; %s", describeBatchIncrement(item), describeAerospikeBatchRecord(batchRecordIfc)))
+			continue
+		}
 
+		batchRecord := batchRecordIfc.BatchRec()
+		if batchRecord == nil {
+			s.sendIncrementBatchResult(item, nil, errors.NewStorageError("[IncrementSpentRecords][%s] missing batch record; %s", describeBatchIncrement(item), describeAerospikeBatchRecord(batchRecordIfc)))
+			continue
+		}
+
+		if batchRecord.Err != nil {
+			s.sendIncrementBatchResult(item, nil, errors.NewStorageError("[IncrementSpentRecords][%s] batch record failed; %s: %s", describeBatchIncrement(item), describeAerospikeBatchRecord(batchRecordIfc), batchRecord.Err.Error(), batchRecord.Err))
 			continue
 		}
 
 		// Get the raw response from Lua
+		if batchRecord.Record == nil || batchRecord.Record.Bins == nil {
+			s.sendIncrementBatchResult(item, nil, errors.NewProcessingError("[IncrementSpentRecords][%s] missing expected response bin %q; %s", describeBatchIncrement(item), LuaSuccess.String(), describeAerospikeBatchRecord(batchRecordIfc)))
+			continue
+		}
+
 		rawResponse := batchRecord.Record.Bins[LuaSuccess.String()]
 		if rawResponse == nil {
-			batch[idx].res <- incrementSpentRecordsRes{
-				res: nil,
-				err: errors.NewProcessingError("no response from Lua"),
-			}
+			s.sendIncrementBatchResult(item, nil, errors.NewProcessingError("[IncrementSpentRecords][%s] missing expected response bin %q; %s", describeBatchIncrement(item), LuaSuccess.String(), describeAerospikeBatchRecord(batchRecordIfc)))
 			continue
 		}
 
 		// Pass through the raw response - let the caller handle parsing
-		batch[idx].res <- incrementSpentRecordsRes{
-			res: rawResponse,
-			err: nil,
-		}
+		s.sendIncrementBatchResult(item, rawResponse, nil)
 	}
+}
+
+func batchIncrementAt(batch []*batchIncrement, idx int) *batchIncrement {
+	if idx < 0 || idx >= len(batch) {
+		return nil
+	}
+	return batch[idx]
+}
+
+func describeBatchIncrement(item *batchIncrement) string {
+	if item == nil {
+		return "<nil>"
+	}
+	return describeChainHash(item.txID)
+}
+
+func (s *Store) sendIncrementBatchResult(item *batchIncrement, res interface{}, err error) {
+	if item == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[IncrementSpentRecords] unable to send batch result for nil item: %v", err)
+		}
+		return
+	}
+	if item.res == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[IncrementSpentRecords][%s] unable to send batch result because result channel is nil: %v", describeBatchIncrement(item), err)
+		}
+		return
+	}
+
+	item.res <- incrementSpentRecordsRes{res: res, err: err}
 }
 
 func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
@@ -1142,11 +1401,23 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 	unsetOp := aerospike.PutOp(aerospike.NewBin(dahBinName, nil))
 
 	for i, b := range batch {
+		if b == nil {
+			if s.logger != nil {
+				s.logger.Errorf("[SetDAHBatch] nil batch item at idx=%d", i)
+			}
+			continue
+		}
+		if b.txID == nil {
+			s.sendDAHBatchError(batch, i, errors.NewProcessingError("[SetDAHBatch][%s] failed to create key for pagination record %d: txid is nil", describeBatchDAH(b), b.childIdx))
+			continue
+		}
+
 		keySource := uaerospike.CalculateKeySourceInternal(b.txID, b.childIdx)
 
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
 			s.logger.Errorf("[SetDAHBatch][%s] failed to create key for pagination record %d: %v", b.txID.String(), b.childIdx, err)
+			s.sendDAHBatchError(batch, i, errors.NewProcessingError("[SetDAHBatch][%s] failed to create key for pagination record %d", describeBatchDAH(b), b.childIdx, err))
 			continue
 		}
 
@@ -1160,8 +1431,8 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 	// Execute batch operation
 	err = s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords)
 	if err != nil {
-		for _, bItem := range batch {
-			bItem.errCh <- errors.NewStorageError("[SetDAHBatch][%s] failed to set DAH", err)
+		for idx, bItem := range batch {
+			s.sendDAHBatchError(batch, idx, errors.NewStorageError("[SetDAHBatch][%s] failed to set DAH: %s", describeBatchDAH(bItem), err.Error(), err))
 		}
 
 		return
@@ -1169,13 +1440,59 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 
 	// batchOperate may have no errors, but some of the records may have failed
 	for batchIdx, batchRecord := range batchRecords {
-		err = batchRecord.BatchRec().Err
-
-		if err != nil {
-			batch[batchIdx].errCh <- err
+		bItem := batchDAHAt(batch, batchIdx)
+		if batchRecord == nil {
+			s.sendDAHBatchError(batch, batchIdx, errors.NewStorageError("[SetDAHBatch][%s] missing batch record; %s", describeBatchDAH(bItem), describeAerospikeBatchRecord(batchRecord)))
 			continue
 		}
 
-		batch[batchIdx].errCh <- nil
+		batchRec := batchRecord.BatchRec()
+		if batchRec == nil {
+			s.sendDAHBatchError(batch, batchIdx, errors.NewStorageError("[SetDAHBatch][%s] missing batch record; %s", describeBatchDAH(bItem), describeAerospikeBatchRecord(batchRecord)))
+			continue
+		}
+
+		err = batchRec.Err
+
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Errorf("[SetDAHBatch][%s] batch record failed; %s: %s", describeBatchDAH(bItem), describeAerospikeBatchRecord(batchRecord), err.Error())
+			}
+			s.sendDAHBatchError(batch, batchIdx, err)
+			continue
+		}
+
+		s.sendDAHBatchError(batch, batchIdx, nil)
 	}
+}
+
+func batchDAHAt(batch []*batchDAH, idx int) *batchDAH {
+	if idx < 0 || idx >= len(batch) {
+		return nil
+	}
+	return batch[idx]
+}
+
+func describeBatchDAH(bItem *batchDAH) string {
+	if bItem == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%s:%d", describeChainHash(bItem.txID), bItem.childIdx)
+}
+
+func (s *Store) sendDAHBatchError(batch []*batchDAH, idx int, err error) {
+	bItem := batchDAHAt(batch, idx)
+	if bItem == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[SetDAHBatch] unable to send batch item result for idx=%d: %v", idx, err)
+		}
+		return
+	}
+	if bItem.errCh == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[SetDAHBatch][%s] unable to send batch item result because errCh is nil: %v", describeBatchDAH(bItem), err)
+		}
+		return
+	}
+	bItem.errCh <- err
 }

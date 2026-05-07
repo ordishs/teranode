@@ -74,8 +74,8 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 	}
 
 	if err := s.client.BatchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords); err != nil {
-		for _, batchItem := range batch {
-			batchItem.errCh <- errors.NewProcessingError("could not batch write locked flag", err)
+		for idx, batchItem := range batch {
+			s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][%s] BatchOperate failed while setting locked=%t: %s", describeLockedBatchItem(batchItem), lockedBatchSetValue(batchItem), err.Error(), err))
 		}
 
 		return
@@ -83,55 +83,114 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 
 	// Now we need to get totalRecords and do all the child records if necessary...
 	for idx, batchRecord := range batchRecords {
-		if batchRecord.BatchRec().Err != nil {
-			batch[idx].errCh <- errors.NewProcessingError("could not batch write locked flag", batchRecord.BatchRec().Err)
+		batchItem := lockedBatchItemAt(batch, idx)
+		if batchItem == nil {
+			s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][<nil>] missing locked batch item for idx=%d", idx))
 			continue
 		}
 
-		response := batchRecord.BatchRec().Record
-		if response != nil && response.Bins != nil && response.Bins[LuaSuccess.String()] != nil {
-			res, err := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
-			if err != nil {
-				batch[idx].errCh <- errors.NewProcessingError("could not parse response", err)
-				continue
-			}
-
-			if res.Status != LuaStatusOK {
-				if res.ErrorCode == LuaErrorCodeTxNotFound {
-					batch[idx].errCh <- errors.NewTxNotFoundError("transaction not found: %s", batch[idx].txHash.String())
-				} else {
-					batch[idx].errCh <- errors.NewProcessingError("error from setLocked: %s", res.Message)
-				}
-				continue
-			}
-
-			extraRecords := res.ChildCount
-			if extraRecords == 0 {
-				batch[idx].errCh <- nil
-				continue
-			}
-
-			// We need to do the child records...
-			g, _ := errgroup.WithContext(batch[idx].ctx)
-
-			for i := 1; i <= extraRecords; i++ {
-				i := i
-
-				g.Go(func() error {
-					errCh := make(chan error, 1)
-
-					s.lockedBatcher.PutCtx(batch[idx].ctx, &batchLocked{
-						txHash:     batch[idx].txHash,
-						childIndex: uint32(i), // nolint:gosec
-						setValue:   batch[idx].setValue,
-						errCh:      errCh,
-					})
-
-					return <-errCh
-				})
-			}
-
-			batch[idx].errCh <- g.Wait()
+		if batchRecord == nil {
+			s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][%s] missing batch record while setting locked=%t; %s", describeLockedBatchItem(batchItem), lockedBatchSetValue(batchItem), describeAerospikeBatchRecord(batchRecord)))
+			continue
 		}
+
+		batchRec := batchRecord.BatchRec()
+		if batchRec == nil {
+			s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][%s] missing batch record while setting locked=%t; %s", describeLockedBatchItem(batchItem), lockedBatchSetValue(batchItem), describeAerospikeBatchRecord(batchRecord)))
+			continue
+		}
+
+		if batchRec.Err != nil {
+			s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][%s] batch record failed while setting locked=%t; %s: %s", describeLockedBatchItem(batchItem), lockedBatchSetValue(batchItem), describeAerospikeBatchRecord(batchRecord), batchRec.Err.Error(), batchRec.Err))
+			continue
+		}
+
+		response := batchRec.Record
+		if response == nil || response.Bins == nil || response.Bins[LuaSuccess.String()] == nil {
+			s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][%s] missing expected response bin %q while setting locked=%t; %s", describeLockedBatchItem(batchItem), LuaSuccess.String(), lockedBatchSetValue(batchItem), describeAerospikeBatchRecord(batchRecord)))
+			continue
+		}
+
+		rawResponse := response.Bins[LuaSuccess.String()]
+		res, err := s.ParseLuaMapResponse(rawResponse)
+		if err != nil {
+			s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][%s] failed to parse response bin %q (value %s) while setting locked=%t; %s: %s", describeLockedBatchItem(batchItem), LuaSuccess.String(), describeAerospikeValue(rawResponse), lockedBatchSetValue(batchItem), describeAerospikeBatchRecord(batchRecord), err.Error(), err))
+			continue
+		}
+
+		if res.Status != LuaStatusOK {
+			if res.ErrorCode == LuaErrorCodeTxNotFound {
+				s.sendLockedBatchItemError(batch, idx, errors.NewTxNotFoundError("transaction not found: %s", describeLockedBatchItem(batchItem)))
+			} else {
+				s.sendLockedBatchItemError(batch, idx, errors.NewProcessingError("[setLocked][%s] error from setLocked while setting locked=%t: %s", describeLockedBatchItem(batchItem), lockedBatchSetValue(batchItem), res.Message))
+			}
+			continue
+		}
+
+		extraRecords := res.ChildCount
+		if extraRecords == 0 {
+			s.sendLockedBatchItemError(batch, idx, nil)
+			continue
+		}
+
+		// We need to do the child records...
+		g, _ := errgroup.WithContext(batchItem.ctx)
+
+		for i := 1; i <= extraRecords; i++ {
+			i := i
+
+			g.Go(func() error {
+				errCh := make(chan error, 1)
+
+				s.lockedBatcher.PutCtx(batchItem.ctx, &batchLocked{
+					txHash:     batchItem.txHash,
+					childIndex: uint32(i), // nolint:gosec
+					setValue:   batchItem.setValue,
+					errCh:      errCh,
+				})
+
+				return <-errCh
+			})
+		}
+
+		s.sendLockedBatchItemError(batch, idx, g.Wait())
 	}
+}
+
+func lockedBatchItemAt(batch []*batchLocked, idx int) *batchLocked {
+	if idx < 0 || idx >= len(batch) {
+		return nil
+	}
+	return batch[idx]
+}
+
+func describeLockedBatchItem(batchItem *batchLocked) string {
+	if batchItem == nil {
+		return "<nil>"
+	}
+	return batchItem.txHash.String()
+}
+
+func lockedBatchSetValue(batchItem *batchLocked) bool {
+	if batchItem == nil {
+		return false
+	}
+	return batchItem.setValue
+}
+
+func (s *Store) sendLockedBatchItemError(batch []*batchLocked, idx int, err error) {
+	batchItem := lockedBatchItemAt(batch, idx)
+	if batchItem == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[setLocked] unable to send batch item result for idx=%d: %v", idx, err)
+		}
+		return
+	}
+	if batchItem.errCh == nil {
+		if s.logger != nil {
+			s.logger.Errorf("[setLocked][%s] unable to send batch item result because errCh is nil: %v", describeLockedBatchItem(batchItem), err)
+		}
+		return
+	}
+	batchItem.errCh <- err
 }

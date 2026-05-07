@@ -801,7 +801,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	// Execute batch operation
 	err := s.client.BatchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		return errors.NewStorageError("failed to preserve transactions", err)
+		return errors.NewStorageError("failed to preserve %d transactions: %s", len(txIDs), err.Error(), err)
 	}
 
 	// Check results and handle external transactions
@@ -809,17 +809,31 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	var parseErrors, luaErrors, noResponseErrors int
 
 	for i, record := range batchRecords {
+		if record == nil {
+			noResponseErrors++
+			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", txIDs[i].String(), describeAerospikeBatchRecord(record))
+			continue
+		}
+
 		batchRecord := record.BatchRec()
+		if batchRecord == nil {
+			noResponseErrors++
+			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", txIDs[i].String(), describeAerospikeBatchRecord(record))
+			continue
+		}
+
 		if batchRecord.Err != nil {
-			s.logger.Warnf("[PreserveTransactions] Failed to preserve tx %s: %v", txIDs[i].String(), batchRecord.Err)
+			s.logger.Warnf("[PreserveTransactions][%s] failed to preserve tx; %s: %v", txIDs[i].String(), describeAerospikeBatchRecord(record), batchRecord.Err)
 			continue
 		}
 
 		response := batchRecord.Record
 		if response != nil && response.Bins != nil && response.Bins[LuaSuccess.String()] != nil {
-			res, err := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
+			rawResponse := response.Bins[LuaSuccess.String()]
+			res, err := s.ParseLuaMapResponse(rawResponse)
 			if err != nil {
 				parseErrors++
+				s.logger.Warnf("[PreserveTransactions][%s] failed to parse response bin %q (value %s); %s: %v", txIDs[i].String(), LuaSuccess.String(), describeAerospikeValue(rawResponse), describeAerospikeBatchRecord(record), err)
 				continue
 			}
 
@@ -829,10 +843,12 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			case LuaStatusError:
 				if res.ErrorCode != LuaErrorCodeTxNotFound {
 					luaErrors++
+					s.logger.Warnf("[PreserveTransactions][%s] preserveUntil returned error: %s", txIDs[i].String(), res.Message)
 				}
 			}
 		} else {
 			noResponseErrors++
+			s.logger.Warnf("[PreserveTransactions][%s] missing expected response bin %q; %s", txIDs[i].String(), LuaSuccess.String(), describeAerospikeBatchRecord(record))
 		}
 	}
 

@@ -150,7 +150,7 @@ func (s *Store) executeTeranodeOp(
 		if opErr != nil {
 			return nil, opErr
 		}
-		if rec == nil {
+		if rec == nil || rec.Bins == nil {
 			return nil, nil
 		}
 		return rec.Bins[nativeOpResultBin], nil
@@ -222,13 +222,14 @@ func (s *Store) detectNativeTeranodeOpSupport(ctx context.Context) bool {
 	rec, opErr := s.client.Operate(policy, probeKey, probeOp)
 	if opErr == nil {
 		if rec == nil || rec.Bins == nil || rec.Bins[nativeOpResultBin] == nil {
-			s.logger.Warnf("[teranode-native-op] probe returned no %q bin; falling back to UDF path", nativeOpResultBin)
+			s.logger.Warnf("[teranode-native-op] probe returned no %q bin; %s; falling back to UDF path", nativeOpResultBin, describeAerospikeRecord(rec))
 			return false
 		}
 
-		res, parseErr := s.ParseLuaMapResponse(rec.Bins[nativeOpResultBin])
+		rawResponse := rec.Bins[nativeOpResultBin]
+		res, parseErr := s.ParseLuaMapResponse(rawResponse)
 		if parseErr != nil {
-			s.logger.Warnf("[teranode-native-op] probe returned unparsable response (%v); falling back to UDF path", parseErr)
+			s.logger.Warnf("[teranode-native-op] probe returned unparsable response bin %q (value %s); %s: %v; falling back to UDF path", nativeOpResultBin, describeAerospikeValue(rawResponse), describeAerospikeRecord(rec), parseErr)
 			return false
 		}
 

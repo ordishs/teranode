@@ -57,6 +57,8 @@ package aerospike
 
 import (
 	_ "embed"
+	"math"
+	"reflect"
 	"time"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
@@ -279,7 +281,7 @@ type LuaMapResponse struct {
 // This handles the new structured response format where Lua returns a map.
 func (s *Store) ParseLuaMapResponse(response interface{}) (*LuaMapResponse, error) {
 	// Handle the expected map response
-	respMap, ok := response.(map[interface{}]interface{})
+	respMap, ok := luaResponseMap(response)
 	if !ok {
 		return nil, errors.NewProcessingError("expected map response but got %T", response)
 	}
@@ -312,38 +314,30 @@ func (s *Store) ParseLuaMapResponse(response interface{}) (*LuaMapResponse, erro
 		result.Signal = LuaSignal(signal)
 	}
 
-	// Parse blockIDs (can be list or []interface{})
+	// Parse blockIDs from Lua/native response slices.
 	if blockIDs, ok := respMap["blockIDs"]; ok {
-		switch v := blockIDs.(type) {
-		case []interface{}:
-			result.BlockIDs = make([]int, len(v))
-			for i, id := range v {
-				if idInt, ok := id.(int); ok {
-					result.BlockIDs[i] = idInt
-				} else {
-					return nil, errors.NewProcessingError("invalid blockID at index %d", i)
-				}
-			}
-		default:
-			return nil, errors.NewProcessingError("invalid blockIDs type: %T", blockIDs)
+		ids, err := luaResponseIntSlice(blockIDs)
+		if err != nil {
+			return nil, err
 		}
+		result.BlockIDs = ids
 	}
 
 	// Parse errors map for spendMulti
 	if errorsField, ok := respMap["errors"]; ok {
-		errMap, ok := errorsField.(map[interface{}]interface{})
+		errMap, ok := luaResponseMap(errorsField)
 		if !ok {
 			return nil, errors.NewProcessingError("invalid errors type: %T", errorsField)
 		}
 
 		result.Errors = make(map[int]LuaErrorInfo)
 		for k, v := range errMap {
-			offset, ok := k.(int)
+			offset, ok := luaResponseInt(k)
 			if !ok {
 				return nil, errors.NewProcessingError("invalid error offset type: %T", k)
 			}
 
-			errorObj, ok := v.(map[interface{}]interface{})
+			errorObj, ok := luaResponseMap(v)
 			if !ok {
 				return nil, errors.NewProcessingError("invalid error object type: %T", v)
 			}
@@ -374,10 +368,91 @@ func (s *Store) ParseLuaMapResponse(response interface{}) (*LuaMapResponse, erro
 
 	// Parse childCount
 	if childCount, ok := respMap["childCount"]; ok {
-		if count, ok := childCount.(int); ok {
+		if count, ok := luaResponseInt(childCount); ok {
 			result.ChildCount = count
 		}
 	}
 
 	return result, nil
+}
+
+func luaResponseMap(v interface{}) (map[interface{}]interface{}, bool) {
+	switch m := v.(type) {
+	case map[interface{}]interface{}:
+		return m, true
+	case map[string]interface{}:
+		result := make(map[interface{}]interface{}, len(m))
+		for k, v := range m {
+			result[k] = v
+		}
+		return result, true
+	default:
+		rv := reflect.ValueOf(v)
+		if !rv.IsValid() || rv.Kind() != reflect.Map {
+			return nil, false
+		}
+
+		result := make(map[interface{}]interface{}, rv.Len())
+		for _, key := range rv.MapKeys() {
+			result[key.Interface()] = rv.MapIndex(key).Interface()
+		}
+		return result, true
+	}
+}
+
+func luaResponseIntSlice(v interface{}) ([]int, error) {
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() || (rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array) {
+		return nil, errors.NewProcessingError("invalid blockIDs type: %T", v)
+	}
+
+	result := make([]int, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		idInt, ok := luaResponseInt(rv.Index(i).Interface())
+		if !ok {
+			return nil, errors.NewProcessingError("invalid blockID at index %d", i)
+		}
+		result[i] = idInt
+	}
+
+	return result, nil
+}
+
+func luaResponseInt(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int8:
+		return int(n), true
+	case int16:
+		return int(n), true
+	case int32:
+		return int(n), true
+	case int64:
+		if n < math.MinInt || n > math.MaxInt {
+			return 0, false
+		}
+		return int(n), true
+	case uint:
+		if uint64(n) > uint64(math.MaxInt) {
+			return 0, false
+		}
+		return int(n), true
+	case uint8:
+		return int(n), true
+	case uint16:
+		return int(n), true
+	case uint32:
+		if uint64(n) > uint64(math.MaxInt) {
+			return 0, false
+		}
+		return int(n), true
+	case uint64:
+		if n > uint64(math.MaxInt) {
+			return 0, false
+		}
+		return int(n), true
+	default:
+		return 0, false
+	}
 }

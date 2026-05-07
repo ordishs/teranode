@@ -277,15 +277,15 @@ func (s *Store) SpendMultiWithExpressions(ctx context.Context, batch []*batchSpe
 	aeroKeyMap := make(map[string]*aerospike.Key)
 	batchRecordIdx := 0
 
-	for _, bItem := range batch {
-		key, err := s.getOrCreateAerospikeKey(bItem, s.utxoBatchSize, aeroKeyMap)
-		if err != nil {
-			bItem.errCh <- err
+	for idx, bItem := range batch {
+		if err := s.validateSpendItem(bItem); err != nil {
+			s.sendSpendBatchItemError(batch, idx, err)
 			continue
 		}
 
-		if err := s.validateSpendItem(bItem); err != nil {
-			bItem.errCh <- err
+		key, err := s.getOrCreateAerospikeKey(bItem, s.utxoBatchSize, aeroKeyMap)
+		if err != nil {
+			s.sendSpendBatchItemError(batch, idx, err)
 			continue
 		}
 
@@ -330,8 +330,8 @@ func (s *Store) SpendMultiWithExpressions(ctx context.Context, batch []*batchSpe
 
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	if err := s.client.BatchOperate(batchPolicy, batchRecords); err != nil {
-		for _, bItem := range batch {
-			bItem.errCh <- errors.NewStorageError("[SPEND_BATCH_EXP] failed to batch spend: %w", err)
+		for idx, bItem := range batch {
+			s.sendSpendBatchItemError(batch, idx, errors.NewStorageError("[spendExpressions][%s] BatchOperate failed for batchId %d: %s", describeBatchSpend(bItem), batchID, err.Error(), err))
 		}
 		return
 	}
@@ -369,14 +369,36 @@ func (s *Store) processSpendBatchResultsExpressions(
 			continue
 		}
 
+		if bItem == nil {
+			s.logger.Errorf("[spendExpressions] missing batch spend item for result idx=%d batchId=%d", idx, batchID)
+			errCount++
+			continue
+		}
+		if bItem.spend == nil {
+			s.sendSpendBatchError(bItem, errors.NewStorageError("[spendExpressions][%s] missing spend for batchId %d", describeBatchSpend(bItem), batchID))
+			errCount++
+			continue
+		}
+
+		if batchRecord == nil {
+			s.sendSpendBatchError(bItem, errors.NewStorageError("[spendExpressions][%s] missing batch record for batchId %d; %s", describeBatchSpend(bItem), batchID, describeAerospikeBatchRecord(batchRecord)))
+			errCount++
+			continue
+		}
+
 		batchRec := batchRecord.BatchRec()
+		if batchRec == nil {
+			s.sendSpendBatchError(bItem, errors.NewStorageError("[spendExpressions][%s] missing batch record for batchId %d; %s", describeBatchSpend(bItem), batchID, describeAerospikeBatchRecord(batchRecord)))
+			errCount++
+			continue
+		}
 
 		// Handle errors
 		if batchRec.Err != nil {
 			var aErr *aerospike.AerospikeError
 			if errors.As(batchRec.Err, &aErr) {
 				if aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
-					bItem.errCh <- errors.NewTxNotFoundError("transaction not found: %s", bItem.spend.TxID.String())
+					s.sendSpendBatchError(bItem, errors.NewTxNotFoundError("transaction not found: %s", describeBatchSpend(bItem)))
 					errCount++
 					continue
 				}
@@ -384,27 +406,27 @@ func (s *Store) processSpendBatchResultsExpressions(
 				if aErr.ResultCode == types.FILTERED_OUT {
 					// Spend was filtered out - could be already spent, conflicting, locked, etc.
 					// Return a generic error since we can't distinguish the exact reason
-					bItem.errCh <- errors.NewUtxoError("spend validation failed for %s:%d", bItem.spend.TxID.String(), bItem.spend.Vout)
+					s.sendSpendBatchError(bItem, errors.NewUtxoError("spend validation failed for %s", describeBatchSpend(bItem)))
 					errCount++
 					continue
 				}
 			}
 
-			bItem.errCh <- errors.NewStorageError("spend error for %s:%d: %w", bItem.spend.TxID.String(), bItem.spend.Vout, batchRec.Err)
+			s.sendSpendBatchError(bItem, errors.NewStorageError("[spendExpressions][%s] spend error for batchId %d; %s: %s", describeBatchSpend(bItem), batchID, describeAerospikeBatchRecord(batchRecord), batchRec.Err.Error(), batchRec.Err))
 			errCount++
 			continue
 		}
 
 		// Parse successful result
 		if batchRec.Record == nil || batchRec.Record.Bins == nil {
-			bItem.errCh <- nil
+			s.sendSpendBatchError(bItem, nil)
 			okCount++
 			continue
 		}
 
 		state, err := s.parseSpendState(batchRec.Record.Bins)
 		if err != nil {
-			bItem.errCh <- errors.NewProcessingError("failed to parse spend state: %w", err)
+			s.sendSpendBatchError(bItem, errors.NewProcessingError("[spendExpressions][%s] failed to parse spend state for batchId %d; bins=%s: %s", describeBatchSpend(bItem), batchID, describeAerospikeBins(batchRec.Record.Bins), err.Error(), err))
 			errCount++
 			continue
 		}
@@ -484,11 +506,11 @@ func (s *Store) processSpendBatchResultsExpressions(
 	}
 
 	if postErr != nil {
-		s.logger.Errorf("[SPEND_BATCH_EXP] follow-up errors: %v", postErr)
+		s.logger.Errorf("[spendExpressions] follow-up errors: %v", postErr)
 	}
 
 	if s.settings.UtxoStore.VerboseDebug {
-		s.logger.Debugf("[SPEND_BATCH_EXP] batch %d of %d spends completed in %v (ok=%d, err=%d)",
+		s.logger.Debugf("[spendExpressions] batch %d of %d spends completed in %v (ok=%d, err=%d)",
 			batchID, len(spendIndex), time.Since(start), okCount, errCount)
 	}
 }

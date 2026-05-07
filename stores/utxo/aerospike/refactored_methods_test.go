@@ -29,7 +29,7 @@ func TestHandleBatchRecordError_Logic(t *testing.T) {
 			name:          "generic error",
 			err:           errors.NewError("some error"),
 			expectNilErr:  false,
-			errorContains: "aerospike batchRecord error",
+			errorContains: "aerospike setMined batchRecord error",
 		},
 	}
 
@@ -41,7 +41,7 @@ func TestHandleBatchRecordError_Logic(t *testing.T) {
 				return
 			}
 
-			err := s.handleBatchRecordError(tt.err, hash)
+			err := s.handleBatchRecordError(nil, tt.err, hash)
 			if tt.expectNilErr {
 				assert.Nil(t, err)
 			} else {

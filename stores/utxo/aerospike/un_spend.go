@@ -179,7 +179,7 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 	res, err := s.ParseLuaMapResponse(ret)
 	if err != nil {
 		prometheusUtxoMapErrors.WithLabelValues("Reset", "error parsing response").Inc()
-		return errors.NewProcessingError("error parsing response", err)
+		return errors.NewProcessingError("[unspend][%s] error parsing response (value %s): %s", describeUTXOSpend(spend), describeAerospikeValue(ret), err.Error(), err)
 	}
 
 	if res.Status == LuaStatusOK {

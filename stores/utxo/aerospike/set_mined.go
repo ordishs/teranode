@@ -221,7 +221,7 @@ func (s *Store) executeBatchOperation(batchRecords []aerospike.BatchRecordIfc) e
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 
 	if err := s.client.BatchOperate(batchPolicy, batchRecords); err != nil {
-		return errors.NewStorageError("aerospike BatchOperate error", err)
+		return errors.NewStorageError("aerospike BatchOperate error for setMined batch with %d records: %s", len(batchRecords), err.Error(), err)
 	}
 
 	prometheusTxMetaAerospikeMapSetMinedBatch.Inc()
@@ -291,7 +291,12 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 				blockIDsUint32[i] = bID32
 			}
 
-			blockIDs[*hashes[idx]] = blockIDsUint32
+			if hashes[idx] == nil {
+				errs = errors.Join(errs, errors.NewProcessingError("aerospike SetMinedMulti returned blockIDs for nil hash at index %d", idx))
+				nrErrors++
+			} else {
+				blockIDs[*hashes[idx]] = blockIDsUint32
+			}
 		}
 
 		// Aggregate signals for batched follow-up work
@@ -361,19 +366,29 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 // processSingleBatchRecord processes a single batch record result
 func (s *Store) processSingleBatchRecord(ctx context.Context, batchRecord aerospike.BatchRecordIfc, hash *chainhash.Hash,
 	thisBlockHeight uint32, minedBlockInfo utxo.MinedBlockInfo) (bool, *LuaMapResponse, error) {
-	batchErr := batchRecord.BatchRec().Err
+	if batchRecord == nil {
+		return false, nil, errors.NewError("missing setMined batch record for transaction %s; %s", describeChainHash(hash), describeAerospikeBatchRecord(batchRecord))
+	}
+
+	batchRec := batchRecord.BatchRec()
+	if batchRec == nil {
+		return false, nil, errors.NewError("missing setMined batch record for transaction %s; %s", describeChainHash(hash), describeAerospikeBatchRecord(batchRecord))
+	}
+
+	batchErr := batchRec.Err
 	if batchErr != nil {
-		return false, nil, s.handleBatchRecordError(batchErr, hash)
+		return false, nil, s.handleBatchRecordError(batchRecord, batchErr, hash)
 	}
 
-	response := batchRecord.BatchRec().Record
+	response := batchRec.Record
 	if response == nil || response.Bins == nil || response.Bins[LuaSuccess.String()] == nil {
-		return false, nil, errors.NewError("missing SUCCESS bin in aerospike response for transaction %s", hash.String())
+		return false, nil, errors.NewError("missing %q bin in aerospike setMined response for transaction %s; %s", LuaSuccess.String(), describeChainHash(hash), describeAerospikeBatchRecord(batchRecord))
 	}
 
-	res, parseErr := s.ParseLuaMapResponse(response.Bins[LuaSuccess.String()])
+	rawResponse := response.Bins[LuaSuccess.String()]
+	res, parseErr := s.ParseLuaMapResponse(rawResponse)
 	if parseErr != nil {
-		return false, nil, errors.NewError("aerospike batchRecord %s ParseLuaMapResponse error", hash.String(), parseErr)
+		return false, nil, errors.NewError("aerospike setMined batchRecord %s ParseLuaMapResponse error for bin %q (value %s); %s: %s", describeChainHash(hash), LuaSuccess.String(), describeAerospikeValue(rawResponse), describeAerospikeBatchRecord(batchRecord), parseErr.Error(), parseErr)
 	}
 
 	if res.Status != LuaStatusOK {
@@ -383,23 +398,23 @@ func (s *Store) processSingleBatchRecord(ctx context.Context, batchRecord aerosp
 				return true, res, nil
 			}
 
-			return false, res, errors.NewTxNotFoundError("transaction not found: %s", hash.String())
+			return false, res, errors.NewTxNotFoundError("transaction not found: %s", describeChainHash(hash))
 		}
 
-		return false, res, errors.NewError("aerospike batchRecord %s error: %s", hash.String(), res.Message)
+		return false, res, errors.NewError("aerospike batchRecord %s error: %s", describeChainHash(hash), res.Message)
 	}
 
 	return true, res, nil
 }
 
 // handleBatchRecordError handles errors from batch records
-func (s *Store) handleBatchRecordError(err error, hash *chainhash.Hash) error {
+func (s *Store) handleBatchRecordError(batchRecord aerospike.BatchRecordIfc, err error, hash *chainhash.Hash) error {
 	var aErr *aerospike.AerospikeError
 	if errors.As(err, &aErr) && aErr != nil && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
 		// the tx Meta does not exist anymore, so we do not have to set the mined status
 		return nil
 	}
-	return errors.NewStorageError("aerospike batchRecord error", hash.String(), err)
+	return errors.NewStorageError("aerospike setMined batchRecord error for transaction %s; %s: %s", describeChainHash(hash), describeAerospikeBatchRecord(batchRecord), err.Error(), err)
 }
 
 // handleSetMinedSignal handles signals from the setMined operation
