@@ -14,7 +14,7 @@ require (
 	// TeranodeReadOp wire opcodes 200/201 — see
 	// github.com/bsv-blockchain/aerospike-server-private feat/
 	// teranode-native-op for the matching server-side dispatcher).
-	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv2
+	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv2.0.20260508103936-b18e5d80a9e4
 	github.com/bsv-blockchain/go-bt/v2 v2.6.2
 	github.com/bsv-blockchain/go-chaincfg v1.5.5
 	github.com/bsv-blockchain/go-sdk v1.2.19
