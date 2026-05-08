@@ -381,6 +381,15 @@ func getAerospikeClient(logger ulogger.Logger, url *url.URL, tSettings *settings
 }
 
 func initStats(logger ulogger.Logger, client *uaerospike.Client, tSettings *settings.Settings) {
+	if !tSettings.Aerospike.EnableClientMetrics {
+		// Gated by aerospike_enable_client_metrics. When disabled we skip both
+		// client.EnableMetrics(nil) AND the stats-polling goroutine — the latter is
+		// pointless without the former, and the per-batch nodeStats updates that
+		// EnableMetrics implies are exactly the contention point we may be opting out of.
+		logger.Infof("[Aerospike] client metrics disabled (aerospike_enable_client_metrics=false)")
+		return
+	}
+
 	var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 	aerospikeStatsRefreshInterval := tSettings.Aerospike.StatsRefreshDuration

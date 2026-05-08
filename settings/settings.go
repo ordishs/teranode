@@ -171,6 +171,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
 			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
 			UseNativeTeranodeOps:            getBool("aerospike_use_native_teranode_ops", false, alternativeContext...),
+			EnableClientMetrics:             getBool("aerospike_enable_client_metrics", true, alternativeContext...),
 		},
 		Alert: AlertSettings{
 			GenesisKeys:   getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
