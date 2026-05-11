@@ -12,7 +12,14 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
-	github.com/bitcoin-sv/bdk/module/gobdk v1.2.3
+	// Pinned to a hot-fix on top of v1.2.3 (bitcoin-sv/bdk PR #40) that adds a
+	// per-CheckSig signature-cache to the script verifier. Without it the
+	// validator stalls for hours on consensus-valid scripts that perform the
+	// same ECDSA verification many times (e.g. testnet block 1,451,505).
+	//
+	// DO NOT bump to gobdk v1.2.4 (or later) until bitcoin-sv/bdk PR #41 has
+	// merged — that PR ports the same hot-fix forward to master / v1.2.4.
+	github.com/bitcoin-sv/bdk/module/gobdk v1.2.4-0.20260511121643-5ab3fd5b627d
 	github.com/bsv-blockchain/go-bt/v2 v2.6.2
 	github.com/bsv-blockchain/go-chaincfg v1.5.5
 	github.com/bsv-blockchain/go-sdk v1.2.19
@@ -181,13 +188,13 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.3
 	github.com/bsv-blockchain/go-alert-system v0.1.6
-	github.com/bsv-blockchain/go-batcher v1.2.10
+	github.com/bsv-blockchain/go-batcher/v2 v2.0.0
 	github.com/bsv-blockchain/go-bc v1.1.5
 	github.com/bsv-blockchain/go-bn v1.1.4
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
 	github.com/bsv-blockchain/go-safe-conversion v1.1.2
-	github.com/bsv-blockchain/go-tx-map v1.3.3
+	github.com/bsv-blockchain/go-tx-map v1.3.4
 	github.com/bsv-blockchain/go-wire v1.2.1
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
