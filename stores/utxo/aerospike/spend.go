@@ -57,6 +57,7 @@ package aerospike
 
 import (
 	"context"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -237,16 +238,21 @@ type batchDAH struct {
 // and propagates it as an error. Without this, a panic during Spend would be
 // logged but the caller would observe (nil, nil) — a silent failure that can
 // mask UTXO state corruption.
+//
+// Uses ERR_UNKNOWN rather than ERR_PROCESSING so the block-validation retry
+// classifier (services/blockvalidation/BlockValidation.go) does not treat a
+// recovered panic as a transient infrastructure error and retry indefinitely
+// against a broken path.
 func handleSpendPanic(recovered any, err *error, logger ulogger.Logger) {
 	if recovered == nil {
 		return
 	}
 
 	prometheusUtxoMapErrors.WithLabelValues("Spend", "Failed Spend Cleaning").Inc()
-	logger.Errorf("ERROR panic in aerospike Spend: %v", recovered)
+	logger.Errorf("ERROR panic in aerospike Spend: %v\n%s", recovered, debug.Stack())
 
 	if *err == nil {
-		*err = errors.NewProcessingError("panic in Spend: %v", recovered)
+		*err = errors.NewUnknownError("panic in Spend: %v", recovered)
 	}
 }
 
@@ -316,6 +322,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		spend := spend
 
 		g.Go(func() error {
+			// Per-worker panic recovery. The parent's defer only catches panics in the
+			// parent goroutine — errgroup propagates errors but does not recover panics
+			// inside g.Go bodies, so without this a worker panic would crash the process.
+			defer func() {
+				handleSpendPanic(recover(), &spends[idx].Err, s.logger)
+			}()
+
 			// Fast-fail check: if circuit breaker is already open, reject immediately
 			if s.spendCircuitBreaker != nil && !s.spendCircuitBreaker.Allow() {
 				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND] circuit breaker open, rejecting request")

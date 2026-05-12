@@ -1,9 +1,9 @@
 package aerospike
 
 import (
-	"fmt"
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -32,8 +32,10 @@ func TestHandleSpendPanic(t *testing.T) {
 	})
 
 	t.Run("existing err is preserved", func(t *testing.T) {
-		original := fmt.Errorf("original failure")
-		err := original
+		var (
+			original error = errors.NewUnknownError("original failure")
+			err            = original
+		)
 		handleSpendPanic("late panic", &err, logger)
 		require.Same(t, original, err)
 	})
