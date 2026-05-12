@@ -574,7 +574,7 @@ func (v *Server) ValidateTransactionBatch(ctx context.Context, req *validator_ap
 			metaData[idx] = validatorResponse.Metadata
 			errReasons[idx] = errors.Wrap(err)
 
-			// Never return an error because we don't the other transaction to stop.
+			// Never return an error because we don't want to cancel the context for other transactions in the batch.
 			return nil
 		})
 	}
