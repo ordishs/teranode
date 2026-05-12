@@ -2,7 +2,7 @@ package sql
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -47,7 +47,7 @@ func TestHandleSpendPanic(t *testing.T) {
 	})
 
 	t.Run("existing err is preserved", func(t *testing.T) {
-		original := errors.New("original failure")
+		original := fmt.Errorf("original failure")
 		err := original
 		handleSpendPanic("late panic", &err, logger)
 		require.Same(t, original, err)
