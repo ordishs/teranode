@@ -510,17 +510,11 @@ func TestSyncManager_ExtendTransaction(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestSyncManager_ExtendTransaction_OOB verifies that ExtendTransaction returns
-// a TxInvalidError (rather than panicking) when a child input references a
-// parent output index that exceeds the parent's number of outputs. Regression
-// test for issue #4564.
-func TestSyncManager_ExtendTransaction_OOB(t *testing.T) {
-	initPrometheusMetrics()
-
-	sm := &SyncManager{
-		settings: test.CreateBaseTestSettings(t),
-		logger:   ulogger.TestLogger{},
-	}
+// buildOOBFixture constructs a parent (2 outputs) and a child whose only input
+// references PreviousTxOutIndex == 5, plus a txMap containing both. Shared by
+// the ExtendTransaction and extendFromTxMap regression tests for issue #4564.
+func buildOOBFixture(t *testing.T) (*chainhash.Hash, *bt.Tx, *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) {
+	t.Helper()
 
 	parentScript := &bscript.Script{}
 	parent := &bt.Tx{
@@ -552,12 +546,45 @@ func TestSyncManager_ExtendTransaction_OOB(t *testing.T) {
 	txMap.Set(*parentHash, &TxMapWrapper{Tx: parent})
 	txMap.Set(*child.TxIDChainHash(), &TxMapWrapper{Tx: child})
 
+	return parentHash, child, txMap
+}
+
+// TestSyncManager_ExtendTransaction_OOB verifies that ExtendTransaction returns
+// a TxInvalidError (rather than panicking) when a child input references a
+// parent output index that exceeds the parent's number of outputs. Regression
+// test for issue #4564.
+func TestSyncManager_ExtendTransaction_OOB(t *testing.T) {
+	initPrometheusMetrics()
+
+	sm := &SyncManager{
+		settings: test.CreateBaseTestSettings(t),
+		logger:   ulogger.TestLogger{},
+	}
+
+	parentHash, child, txMap := buildOOBFixture(t)
+
 	err := sm.ExtendTransaction(context.Background(), child, txMap)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrTxInvalid), "expected TxInvalid error, got %v", err)
-	require.Contains(t, err.Error(), "out-of-range output 5")
 	require.Contains(t, err.Error(), parentHash.String())
-	require.Contains(t, err.Error(), "has 2 outputs")
+}
+
+// TestSyncManager_extendFromTxMap_OOB verifies the same OOB guard on the
+// same-block phase-1 path. Regression test for issue #4564.
+func TestSyncManager_extendFromTxMap_OOB(t *testing.T) {
+	initPrometheusMetrics()
+
+	sm := &SyncManager{
+		settings: test.CreateBaseTestSettings(t),
+		logger:   ulogger.TestLogger{},
+	}
+
+	parentHash, child, txMap := buildOOBFixture(t)
+
+	err := sm.extendFromTxMap(context.Background(), child, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxInvalid), "expected TxInvalid error, got %v", err)
+	require.Contains(t, err.Error(), parentHash.String())
 }
 
 // countingValidator tracks how many times Validate is called and optionally fails

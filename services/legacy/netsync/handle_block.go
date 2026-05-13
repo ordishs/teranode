@@ -1250,6 +1250,14 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 			g.Go(func() error {
 				txWrapper.SomeParentsInBlock = true
 
+				// Parent Outputs are populated at wire-parse time and never mutated afterwards,
+				// so the bounds check is safe to run before WaitForParent and lets us reject
+				// malformed peer blocks without burning up to 120s on the polling loop.
+				if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
+					return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
+						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+				}
+
 				// we do have a parent, but since everything is happening in parallel, we need to check if the parent has
 				// already been extended
 				timeOut := time.After(120 * time.Second)
@@ -1266,11 +1274,6 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 
 						time.Sleep(10 * time.Millisecond) // wait for the parent transaction to be extended
 					}
-				}
-
-				if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
-					return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
-						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
 				}
 
 				// No lock needed - each goroutine writes to a unique index
