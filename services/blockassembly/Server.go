@@ -1509,7 +1509,17 @@ func (ba *BlockAssembly) createMerkleTreeFromSubtrees(jobID string, subtreesInJo
 		return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to create topTree", jobID, err)
 	}
 
+	// Mirror model.Block.CheckMerkleRoot's CVE-2012-2459-style duplicate detection
+	// so assembly cannot silently emit a block the validator will reject.
+	seen := make(map[chainhash.Hash]struct{}, len(subtreeHashes))
+
 	for _, hash := range subtreeHashes {
+		if _, dup := seen[hash]; dup {
+			return nil, errors.NewProcessingError("[BlockAssembly][%s] duplicate subtree root hash in top-level merkle tree: %s", jobID, hash.String())
+		}
+
+		seen[hash] = struct{}{}
+
 		if err = topTree.AddNode(hash, 1, 0); err != nil {
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to add node to topTree", jobID, err)
 		}

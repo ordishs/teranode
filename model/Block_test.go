@@ -4677,6 +4677,49 @@ func TestCheckMerkleRoot_RejectsNonPowerOfTwoFinalSubtree(t *testing.T) {
 	require.Contains(t, err.Error(), "leaf count is not a power of two")
 }
 
+// TestCheckMerkleRoot_RejectsFirstSubtreeNotPowerOfTwo verifies that
+// CheckMerkleRoot rejects a block whose first subtree's leaf count is not a
+// power of two. The lift math depends on this invariant — without the guard a
+// peer can craft a non-power-of-two first subtree and produce a merkle root
+// that diverges from the canonical flat tree.
+func TestCheckMerkleRoot_RejectsFirstSubtreeNotPowerOfTwo(t *testing.T) {
+	block := buildBlockWithFirstSubtreeNonPowerOfTwo(t)
+
+	err := block.CheckMerkleRoot(context.Background())
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected BlockInvalidError, got %v", err)
+	require.Contains(t, err.Error(), "first subtree leaf count is not a power of two")
+}
+
+// buildBlockWithFirstSubtreeNonPowerOfTwo returns a Block whose first subtree
+// has 3 leaves (non-power-of-two) and second subtree is complete with 4 leaves.
+// Under the lift rules the first subtree's length is the canonical capacity, so
+// allowing a non-power-of-two value here would break the merkle-root math.
+func buildBlockWithFirstSubtreeNonPowerOfTwo(t *testing.T) *Block {
+	t.Helper()
+
+	first, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, first.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	second, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 10; i < 14; i++ {
+		require.NoError(t, second.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	return &Block{
+		Header:        newTestBlockHeader(t),
+		CoinbaseTx:    newTestCoinbaseTx(t),
+		Subtrees:      []*chainhash.Hash{first.RootHash(), second.RootHash()},
+		SubtreeSlices: []*subtreepkg.Subtree{first, second},
+	}
+}
+
 // newTestCoinbaseTx returns a fresh coinbase tx parsed from the shared
 // CoinbaseHex constant used elsewhere in this file.
 func newTestCoinbaseTx(t *testing.T) *bt.Tx {

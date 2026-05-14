@@ -126,3 +126,42 @@ func TestCreateMerkleTreeFromSubtrees_SingleSubtreeUnchanged(t *testing.T) {
 	require.Equal(t, originalHash, subtreeHashes[0], "single-subtree hash must not change")
 	require.Equal(t, originalHash.String(), merkleRoot.String(), "single-subtree merkle root equals the subtree root")
 }
+
+// TestCreateMerkleTreeFromSubtrees_RejectsDuplicateSubtreeRoots mirrors the
+// CVE-2012-2459-style hardening on the validator side (model.Block.CheckMerkleRoot
+// at the duplicate-detection block) and verifies the assembly path will not
+// silently emit a block the validator rejects.
+func TestCreateMerkleTreeFromSubtrees_RejectsDuplicateSubtreeRoots(t *testing.T) {
+	first, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 0; i < 4; i++ {
+		require.NoError(t, first.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	// Build a second subtree whose root collides with the first by populating
+	// it with the same leaves. Real assembly would never produce this, but a
+	// future bug in getIncompleteSubtreeMiningData re-emitting the same slice
+	// could — that's what the guard catches.
+	second, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for i := 0; i < 4; i++ {
+		require.NoError(t, second.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
+	}
+
+	require.Equal(t, first.RootHash().String(), second.RootHash().String(),
+		"test fixture: subtree roots must collide for this test to mean anything")
+
+	subtreesInJob := []*subtreepkg.Subtree{first, second}
+	subtreeHashes := []chainhash.Hash{*first.RootHash(), *second.RootHash()}
+
+	coinbaseHash := chainhash.HashH([]byte{0xAB})
+
+	ba := &BlockAssembly{}
+
+	merkleRoot, err := ba.createMerkleTreeFromSubtrees("test-job", subtreesInJob, subtreeHashes, &coinbaseHash)
+	require.Error(t, err)
+	require.Nil(t, merkleRoot)
+	require.Contains(t, err.Error(), "duplicate subtree root hash")
+}

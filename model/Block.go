@@ -1339,6 +1339,18 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 		targetLength := b.SubtreeSlices[0].Length()
 		targetHeight := b.SubtreeSlices[0].Height
 
+		// Lift correctness depends on the first subtree's leaf count being a power
+		// of two — that's what makes the partitioned top-tree composition match
+		// the canonical flat merkle root. Without this guard a peer can craft a
+		// non-power-of-two first subtree (e.g. lengths [3, 2]) and produce a
+		// merkle root that a canonical SV Node validator would not agree with.
+		if !subtreepkg.IsPowerOfTwo(targetLength) {
+			return errors.NewBlockInvalidError(
+				"[BLOCK][%s] first subtree leaf count is not a power of two: %d",
+				b.String(), targetLength,
+			)
+		}
+
 		for i, sub := range b.SubtreeSlices {
 			isLast := i == len(b.SubtreeSlices)-1
 
