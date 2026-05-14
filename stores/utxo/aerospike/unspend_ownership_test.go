@@ -82,6 +82,33 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 		"the original spender's TxID must still be the recorded conflicting TxID")
 }
 
+// TestUnspendOwnership_NotFound verifies that Unspend against a record the store
+// has never seen (Lua's ERROR_CODE_TX_NOT_FOUND branch) is surfaced as
+// NotFoundError — matches the SQL backend.
+func TestUnspendOwnership_NotFound(t *testing.T) {
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	_, store, ctx, deferFn := initAerospike(t, tSettings, logger)
+	t.Cleanup(deferFn)
+
+	// No store.Create — the record does not exist.
+	unknownTxHash := chainhash.HashH([]byte("never-created"))
+	utxoHash, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
+	require.NoError(t, err)
+
+	spend := []*utxo.Spend{{
+		TxID:         &unknownTxHash,
+		Vout:         0,
+		UTXOHash:     utxoHash,
+		SpendingData: spendpkg.NewSpendingData(&unknownTxHash, 0),
+	}}
+
+	err = store.Unspend(ctx, spend)
+	require.Error(t, err, "expected error when unspending an unknown transaction")
+	require.True(t, errors.Is(err, errors.ErrNotFound), "expected NotFoundError, got: %v", err)
+}
+
 // TestUnspendOwnership_NilSpendingDataRejected verifies that Unspend rejects
 // callers that pass a nil SpendingData. The escape hatch was removed because
 // every production caller derives spends from Spend()/SetConflicting()/GetSpends(),

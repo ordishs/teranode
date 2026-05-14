@@ -2726,6 +2726,19 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		RETURNING transaction_id
 	`
 
+	// qDiag runs after q1 returns 0 rows to distinguish:
+	//   - row missing            → NotFoundError
+	//   - row exists, NULL       → already-unspent (ProcessingError)
+	//   - row exists, different  → ownership mismatch (ProcessingError)
+	// Matches the three branches in stores/utxo/aerospike/teranode.lua::unspend.
+	qDiag := `
+		SELECT spending_data FROM outputs
+		WHERE transaction_id IN (
+			SELECT id FROM transactions WHERE hash = $1
+		)
+		AND idx = $2
+	`
+
 	locked := false
 	if len(flagAsLocked) > 0 {
 		locked = flagAsLocked[0]
@@ -2757,7 +2770,19 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 			err = txn.QueryRowContext(ctx, q1, spend.TxID[:], spend.Vout, spend.SpendingData.Bytes()).Scan(&transactionID)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
-					return errors.NewProcessingError("[Unspend] ownership mismatch for %s:%d (caller's SpendingData does not match stored spend)", spend.TxID, spend.Vout)
+					var existing []byte
+
+					diagErr := txn.QueryRowContext(ctx, qDiag, spend.TxID[:], spend.Vout).Scan(&existing)
+					switch {
+					case errors.Is(diagErr, sql.ErrNoRows):
+						return errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+					case diagErr != nil:
+						return diagErr
+					case existing == nil:
+						return errors.NewProcessingError("[Unspend] expected spending data but UTXO %s:%d is unspent", spend.TxID, spend.Vout)
+					default:
+						return errors.NewProcessingError("[Unspend] ownership mismatch for %s:%d (caller's SpendingData does not match stored spend)", spend.TxID, spend.Vout)
+					}
 				}
 
 				return err

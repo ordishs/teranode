@@ -99,9 +99,35 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 		"stored spending_data must be unchanged after a mismatched Unspend attempt")
 }
 
+// TestUnspendOwnership_NotFound verifies that Unspend against a transaction the
+// store has never seen returns NotFoundError. Mirrors the Aerospike Lua
+// ERROR_CODE_TX_NOT_FOUND branch and the pre-existing SQL behaviour for genuinely
+// unknown outputs.
+func TestUnspendOwnership_NotFound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, tx := setup(ctx, t)
+
+	utxoHash, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
+	require.NoError(t, err)
+
+	unknownTxHash := chainhash.HashH([]byte("never-created"))
+	spend := &utxo.Spend{
+		TxID:         &unknownTxHash,
+		Vout:         0,
+		UTXOHash:     utxoHash,
+		SpendingData: spendpkg.NewSpendingData(&unknownTxHash, 0),
+	}
+
+	err = store.Unspend(ctx, []*utxo.Spend{spend})
+	require.Error(t, err, "expected error when unspending an unknown transaction")
+	require.True(t, errors.Is(err, errors.ErrNotFound), "expected NotFoundError, got: %v", err)
+}
+
 // TestUnspendOwnership_MismatchOnUnspent verifies that Unspend with a non-nil
-// SpendingData against a never-spent UTXO is rejected with the ownership-mismatch
-// processing error (the row's spending_data IS NULL, so no ownership match is possible).
+// SpendingData against a never-spent UTXO is rejected with the "UTXO is unspent"
+// processing error (case 2 of the SQL 3-way dispatch — row exists, spending_data IS NULL).
 func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -125,6 +151,7 @@ func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	err = store.Unspend(ctx, []*utxo.Spend{spend})
 	require.Error(t, err, "expected error when unspending a UTXO that was never spent")
 	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
+	require.Contains(t, err.Error(), "is unspent", "expected case-2 'UTXO is unspent' message, got: %v", err)
 }
 
 // TestUnspendOwnership_NilSpendingDataRejected verifies that Unspend rejects

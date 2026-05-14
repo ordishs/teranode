@@ -1994,10 +1994,8 @@ func TestSpendAndUnspendEdgeCases(t *testing.T) {
 	}
 
 	err = store.Unspend(ctx, []*utxo.Spend{nonExistentSpend})
-	// This might not error, but we're testing the code path
-	if err != nil {
-		t.Logf("Unspend non-existent UTXO returned error (acceptable): %v", err)
-	}
+	require.Error(t, err, "Unspend against a non-existent output must error")
+	require.True(t, errors.Is(err, errors.ErrNotFound), "expected NotFoundError for non-existent output, got: %v", err)
 
 	// Test spending multiple outputs if transaction has them
 	if len(tx.Outputs) > 1 {
