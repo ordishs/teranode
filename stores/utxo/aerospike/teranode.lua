@@ -48,6 +48,7 @@ local ERROR_CODE_UTXO_HASH_MISMATCH = "UTXO_HASH_MISMATCH"
 local ERROR_CODE_UTXO_NOT_FROZEN = "UTXO_NOT_FROZEN"
 local ERROR_CODE_INVALID_PARAMETER = "INVALID_PARAMETER"
 local ERROR_CODE_SPEND_OWNERSHIP_MISMATCH = "SPEND_OWNERSHIP_MISMATCH"
+local ERROR_CODE_SPEND_OWNERSHIP_UNSPENT = "SPEND_OWNERSHIP_UNSPENT"
 
 -- Message constants
 local MSG_CONFLICTING = "TX is conflicting"
@@ -514,11 +515,12 @@ function unspend(rec, offset, utxoHash, expectedSpendingData, currentBlockHeight
     end
 
     -- Verify caller-supplied spending data matches the stored value (mandatory ownership check).
-    -- Two arms: stored data missing means the UTXO is unspent (caller can't own a non-existent spend);
-    -- stored data present but different means the caller owns a different spend.
+    -- Two arms with distinct error codes so the Go layer can map them to different typed errors:
+    --   'unspent' is idempotent (retry-safe) — the row is already what the caller wants;
+    --   'mismatch' indicates a real caller bug — they own a different spend.
     if existingSpendingData == nil then
         response[FIELD_STATUS] = STATUS_ERROR
-        response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
+        response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_UNSPENT
         response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_UNSPENT
 
         return response

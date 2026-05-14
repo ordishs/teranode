@@ -126,8 +126,10 @@ func TestUnspendOwnership_NotFound(t *testing.T) {
 }
 
 // TestUnspendOwnership_MismatchOnUnspent verifies that Unspend with a non-nil
-// SpendingData against a never-spent UTXO is rejected with the "UTXO is unspent"
-// processing error (case 2 of the SQL 3-way dispatch — row exists, spending_data IS NULL).
+// SpendingData against a never-spent UTXO is rejected with ErrUtxoUnspent
+// (case 2 of the SQL 3-way dispatch — row exists, spending_data IS NULL).
+// This is the idempotent-retry signal: retry-safe callers like validator
+// reverseSpends treat it as success.
 func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -150,7 +152,7 @@ func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 
 	err = store.Unspend(ctx, []*utxo.Spend{spend})
 	require.Error(t, err, "expected error when unspending a UTXO that was never spent")
-	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
+	require.True(t, errors.Is(err, errors.ErrUtxoUnspent), "expected ErrUtxoUnspent, got: %v", err)
 	require.Contains(t, err.Error(), "is unspent", "expected case-2 'UTXO is unspent' message, got: %v", err)
 }
 

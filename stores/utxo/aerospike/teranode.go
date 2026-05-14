@@ -256,8 +256,12 @@ const (
 	LuaErrorCodeInvalidParameter LuaErrorCode = "INVALID_PARAMETER"
 	// LuaErrorCodeSpendOwnershipMismatch is returned by the unspend Lua function
 	// when the caller-supplied expected spending data doesn't match the stored
-	// value — the caller doesn't own the spend they're trying to clear.
+	// value — the caller owns a different spend (a real bug, not retry-safe).
 	LuaErrorCodeSpendOwnershipMismatch LuaErrorCode = "SPEND_OWNERSHIP_MISMATCH"
+	// LuaErrorCodeSpendOwnershipUnspent is returned when the row exists but its
+	// spending_data is nil — the UTXO is already unspent. Idempotent on retry:
+	// callers like validator.reverseSpends can treat this as success.
+	LuaErrorCodeSpendOwnershipUnspent LuaErrorCode = "SPEND_OWNERSHIP_UNSPENT"
 )
 
 // LuaErrorInfo represents an individual error from Lua functions

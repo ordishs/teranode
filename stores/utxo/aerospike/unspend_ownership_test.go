@@ -109,6 +109,38 @@ func TestUnspendOwnership_NotFound(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrNotFound), "expected NotFoundError, got: %v", err)
 }
 
+// TestUnspendOwnership_MismatchOnUnspent verifies that Unspend with a non-nil
+// SpendingData against a never-spent UTXO returns ErrUtxoUnspent (Lua's
+// ERROR_CODE_SPEND_OWNERSHIP_UNSPENT branch — row exists, spending_data is nil).
+// Mirrors the SQL backend's case-2 dispatch and is the idempotent-retry signal:
+// retry-safe callers like validator reverseSpends treat it as success.
+func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	_, store, ctx, deferFn := initAerospike(t, tSettings, logger)
+	t.Cleanup(deferFn)
+
+	_, err := store.Create(ctx, tx, 101)
+	require.NoError(t, err)
+
+	utxoHash, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
+	require.NoError(t, err)
+
+	// Never call Spend — the row exists with spending_data nil.
+	someTxHash := chainhash.HashH([]byte("some-other-tx"))
+	spend := []*utxo.Spend{{
+		TxID:         tx.TxIDChainHash(),
+		Vout:         0,
+		UTXOHash:     utxoHash,
+		SpendingData: spendpkg.NewSpendingData(&someTxHash, 0),
+	}}
+
+	err = store.Unspend(ctx, spend)
+	require.Error(t, err, "expected error when unspending a UTXO that was never spent")
+	require.True(t, errors.Is(err, errors.ErrUtxoUnspent), "expected ErrUtxoUnspent, got: %v", err)
+}
+
 // TestUnspendOwnership_NilSpendingDataRejected verifies that Unspend rejects
 // callers that pass a nil SpendingData. The escape hatch was removed because
 // every production caller derives spends from Spend()/SetConflicting()/GetSpends(),

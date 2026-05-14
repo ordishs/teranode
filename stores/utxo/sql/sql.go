@@ -2728,9 +2728,14 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 
 	// qDiag runs after q1 returns 0 rows to distinguish:
 	//   - row missing            → NotFoundError
-	//   - row exists, NULL       → already-unspent (ProcessingError)
-	//   - row exists, different  → ownership mismatch (ProcessingError)
+	//   - row exists, NULL       → already-unspent (UtxoUnspentError — idempotent for retry-safe callers)
+	//   - row exists, different  → ownership mismatch (ProcessingError — real caller bug)
 	// Matches the three branches in stores/utxo/aerospike/teranode.lua::unspend.
+	//
+	// This SELECT is best-effort: between q1 and qDiag a concurrent transaction
+	// may change the row state, so the returned message could be slightly stale.
+	// The safety guarantee comes from q1's AND spending_data = $3 condition — by
+	// the time we get here, q1 has already declined to clear anything.
 	qDiag := `
 		SELECT spending_data FROM outputs
 		WHERE transaction_id IN (
@@ -2779,7 +2784,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 					case diagErr != nil:
 						return diagErr
 					case existing == nil:
-						return errors.NewProcessingError("[Unspend] expected spending data but UTXO %s:%d is unspent", spend.TxID, spend.Vout)
+						return errors.NewUtxoUnspentError("[Unspend] expected spending data but UTXO %s:%d is unspent", spend.TxID, spend.Vout)
 					default:
 						return errors.NewProcessingError("[Unspend] ownership mismatch for %s:%d (caller's SpendingData does not match stored spend)", spend.TxID, spend.Vout)
 					}
