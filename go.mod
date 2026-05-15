@@ -15,9 +15,9 @@ require (
 	// github.com/bsv-blockchain/aerospike-server-private feat/
 	// teranode-native-op for the matching server-side dispatcher).
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv2.0.20260508103936-b18e5d80a9e4
-	github.com/bsv-blockchain/go-bt/v2 v2.6.2
+	github.com/bsv-blockchain/go-bt/v2 v2.6.3
 	github.com/bsv-blockchain/go-chaincfg v1.5.5
-	github.com/bsv-blockchain/go-sdk v1.2.19
+	github.com/bsv-blockchain/go-sdk v1.2.23
 	github.com/bsv-blockchain/go-subtree v1.2.0
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.2
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
@@ -191,7 +191,13 @@ require (
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
 	github.com/bsv-blockchain/go-safe-conversion v1.1.2
-	github.com/bsv-blockchain/go-tx-map v1.3.4
+	// Pseudo-version pins the un-released feat(synced): add SetIfNotExistsMulti
+	// commit (bsv-blockchain/go-tx-map#114). PutMultiBucketTxInpoints in
+	// services/blockassembly/subtreeprocessor relies on this bulk method to
+	// take a single per-bucket lock instead of one Lock/Unlock pair per entry,
+	// which materially reduces moveForwardBlock CPU on the hot path. Replace
+	// with the next tagged release (>= v1.3.6) once go-tx-map#114 ships.
+	github.com/bsv-blockchain/go-tx-map v1.3.6-0.20260515143932-e509e98caded
 	github.com/bsv-blockchain/go-wire v1.2.1
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
