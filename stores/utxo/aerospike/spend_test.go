@@ -499,9 +499,9 @@ func TestStore_Unspend(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		// Unspend a never-spent UTXO returns ErrUtxoUnspent: the row exists but its
-		// spending_data is nil, so the ownership check rejects the request via the
-		// idempotent-retry branch (retry-safe callers treat this as success).
+		// Unspend a never-spent UTXO is an idempotent no-op: the row's spending_data
+		// is already nil, so the ownership check naturally short-circuits and the
+		// call succeeds without modifying anything.
 		someTxHash := chainhash.HashH([]byte("some-other-tx"))
 		err = store.Unspend(ctx, []*utxo.Spend{
 			{
@@ -511,8 +511,7 @@ func TestStore_Unspend(t *testing.T) {
 				SpendingData: spendpkg.NewSpendingData(&someTxHash, 0),
 			},
 		})
-		require.Error(t, err)
-		require.True(t, errors.Is(err, errors.ErrUtxoUnspent), "expected ErrUtxoUnspent, got: %v", err)
+		require.NoError(t, err)
 
 		// Verify we can still spend the UTXO normally.
 		spends, err := store.Spend(ctx, spendTx, store.GetBlockHeight()+1)

@@ -468,40 +468,6 @@ func TestValidator_ReverseSpends_WithRetriesAndFailure(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
-// TestValidator_ReverseSpends_UtxoUnspentIsIdempotent verifies that when the
-// underlying store reports the UTXO is already unspent (ErrUtxoUnspent),
-// reverseSpends treats it as success on the first attempt and does NOT retry.
-// This protects retry safety after a successful Unspend whose response was lost.
-func TestValidator_ReverseSpends_UtxoUnspentIsIdempotent(t *testing.T) {
-	ctx := context.Background()
-	logger := ulogger.TestLogger{}
-
-	mockStore := &utxo.MockUtxostore{}
-	settings := test.CreateBaseTestSettings(t)
-
-	validator, err := New(ctx, logger, settings, mockStore, nil, nil, nil, nil)
-	require.NoError(t, err)
-
-	v := validator.(*Validator)
-
-	testHash, _ := chainhash.NewHashFromStr("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-	spends := []*utxo.Spend{
-		{
-			TxID: testHash,
-			Vout: 0,
-		},
-	}
-
-	// Exactly one call: ErrUtxoUnspent is treated as idempotent success.
-	mockStore.On("Unspend", mock.Anything, spends, mock.Anything).
-		Return(errors.NewUtxoUnspentError("utxo is unspent")).Once()
-
-	err = v.reverseSpends(ctx, spends)
-	require.NoError(t, err)
-
-	mockStore.AssertExpectations(t)
-}
-
 func TestValidator_ReverseSpends_AllRetriesFail(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}

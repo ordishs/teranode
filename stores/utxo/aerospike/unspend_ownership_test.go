@@ -41,8 +41,10 @@ func TestUnspendOwnership_HappyPath(t *testing.T) {
 	require.NoError(t, err, "after successful Unspend the UTXO should be re-spendable")
 }
 
-// TestUnspendOwnership_Mismatch verifies that Unspend with a different SpendingData
-// (caller doesn't own the spend) returns an error and leaves the UTXO still spent.
+// TestUnspendOwnership_Mismatch verifies that Unspend is idempotent when the
+// caller's SpendingData doesn't match the stored value: the call succeeds and
+// the legitimate spend stays intact. The safety guarantee is "never wipe a
+// spend we don't own".
 func TestUnspendOwnership_Mismatch(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
@@ -70,13 +72,13 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 	}}
 
 	err = store.Unspend(ctx, mismatched)
-	require.Error(t, err, "Unspend with mismatched SpendingData must error")
-	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
+	require.NoError(t, err, "mismatched Unspend must be an idempotent no-op, not an error")
 
-	// The UTXO must still be spent — attempting to Spend with a NEW spender should fail with ErrSpent.
+	// The UTXO must still be spent — attempting to Spend with a NEW spender should fail with ErrSpent
+	// and report the ORIGINAL spender's TxID as the conflict source.
 	spendTxRetry := utxo2.GetSpendingTx(tx, 0)
 	spendsRet, err := store.Spend(ctx, spendTxRetry, store.GetBlockHeight()+1)
-	require.Error(t, err, "UTXO should still be spent after mismatched Unspend")
+	require.Error(t, err, "UTXO should still be spent after the no-op mismatched Unspend")
 	require.Len(t, spendsRet, 1)
 	require.Equal(t, localSpendTx.TxIDChainHash().String(), spendsRet[0].ConflictingTxID.String(),
 		"the original spender's TxID must still be the recorded conflicting TxID")
@@ -110,10 +112,9 @@ func TestUnspendOwnership_NotFound(t *testing.T) {
 }
 
 // TestUnspendOwnership_MismatchOnUnspent verifies that Unspend with a non-nil
-// SpendingData against a never-spent UTXO returns ErrUtxoUnspent (Lua's
-// ERROR_CODE_SPEND_OWNERSHIP_UNSPENT branch — row exists, spending_data is nil).
-// Mirrors the SQL backend's case-2 dispatch and is the idempotent-retry signal:
-// retry-safe callers like validator reverseSpends treat it as success.
+// SpendingData against a never-spent UTXO is an idempotent no-op (the row is
+// already in the desired state — nothing to clear). Mirrors the SQL backend's
+// case-2 behaviour.
 func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
@@ -137,8 +138,12 @@ func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	}}
 
 	err = store.Unspend(ctx, spend)
-	require.Error(t, err, "expected error when unspending a UTXO that was never spent")
-	require.True(t, errors.Is(err, errors.ErrUtxoUnspent), "expected ErrUtxoUnspent, got: %v", err)
+	require.NoError(t, err, "Unspend against an already-unspent UTXO must be a no-op success")
+
+	// The UTXO must still be spendable normally — confirm by spending it.
+	freshSpend := utxo2.GetSpendingTx(tx, 0)
+	_, err = store.Spend(ctx, freshSpend, store.GetBlockHeight()+1)
+	require.NoError(t, err, "UTXO should remain freshly spendable after the no-op Unspend")
 }
 
 // TestUnspendOwnership_NilSpendingDataRejected verifies that Unspend rejects

@@ -50,8 +50,10 @@ func TestUnspendOwnership_HappyPath(t *testing.T) {
 	require.Nil(t, resp.SpendingData, "expected spending_data to be cleared after matching Unspend")
 }
 
-// TestUnspendOwnership_Mismatch verifies that Unspend with a different SpendingData
-// (caller doesn't own the spend) returns an error and leaves spending_data UNCHANGED.
+// TestUnspendOwnership_Mismatch verifies that Unspend is idempotent when the
+// caller's SpendingData doesn't match the stored value: the call succeeds (no
+// error) and the legitimate spending_data is preserved bit-for-bit. The safety
+// guarantee is "never wipe a spend we don't own" — this test pins that.
 func TestUnspendOwnership_Mismatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -79,8 +81,7 @@ func TestUnspendOwnership_Mismatch(t *testing.T) {
 	}
 
 	err = store.Unspend(ctx, []*utxo.Spend{mismatchedSpend})
-	require.Error(t, err, "expected error when Unspend caller's SpendingData does not match the stored spend")
-	require.True(t, errors.Is(err, errors.ErrProcessing), "expected processing error, got: %v", err)
+	require.NoError(t, err, "mismatched Unspend must be an idempotent no-op, not an error")
 
 	// The legitimate spending_data must still be intact — bitwise compare against expected bytes.
 	expected := spendpkg.NewSpendingData(spendTx.TxIDChainHash(), 0).Bytes()
@@ -126,10 +127,9 @@ func TestUnspendOwnership_NotFound(t *testing.T) {
 }
 
 // TestUnspendOwnership_MismatchOnUnspent verifies that Unspend with a non-nil
-// SpendingData against a never-spent UTXO is rejected with ErrUtxoUnspent
-// (case 2 of the SQL 3-way dispatch — row exists, spending_data IS NULL).
-// This is the idempotent-retry signal: retry-safe callers like validator
-// reverseSpends treat it as success.
+// SpendingData against a never-spent UTXO is an idempotent no-op: the row's
+// spending_data stays NULL and no error is returned. The safety property holds
+// because we never touched the stored value.
 func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -151,9 +151,19 @@ func TestUnspendOwnership_MismatchOnUnspent(t *testing.T) {
 	}
 
 	err = store.Unspend(ctx, []*utxo.Spend{spend})
-	require.Error(t, err, "expected error when unspending a UTXO that was never spent")
-	require.True(t, errors.Is(err, errors.ErrUtxoUnspent), "expected ErrUtxoUnspent, got: %v", err)
-	require.Contains(t, err.Error(), "is unspent", "expected case-2 'UTXO is unspent' message, got: %v", err)
+	require.NoError(t, err, "Unspend against an already-unspent UTXO must be a no-op success")
+
+	// spending_data must still be NULL — we never owned a spend to clear.
+	probe := &utxo.Spend{
+		TxID:     tx.TxIDChainHash(),
+		Vout:     0,
+		UTXOHash: utxoHash,
+	}
+	resp, err := store.GetSpend(ctx, probe)
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_OK), resp.Status,
+		"UTXO must still be OK (unspent) after the no-op Unspend")
+	require.Nil(t, resp.SpendingData, "spending_data must remain NULL after the no-op Unspend")
 }
 
 // TestUnspendOwnership_NilSpendingDataRejected verifies that Unspend rejects

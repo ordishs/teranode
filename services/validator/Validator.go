@@ -1131,26 +1131,17 @@ func (v *Validator) reverseSpends(ctx context.Context, spentUtxos []*utxo.Spend)
 	defer deferFn()
 
 	for retries := uint(0); retries < 3; retries++ {
-		errReset := v.utxoStore.Unspend(ctx, spentUtxos)
-		if errReset == nil {
-			break
-		}
-
-		// Idempotent retry: a previous attempt may have succeeded but its
-		// response was lost (network blip, post-commit cancellation). On
-		// retry the UTXO is already unspent — the desired end state — so
-		// treat ErrUtxoUnspent as success.
-		if errors.Is(errReset, errors.ErrUtxoUnspent) {
-			break
-		}
-
-		if retries < 2 {
-			backoff := time.Duration(1<<retries) * time.Second
-			v.logger.Errorf("error resetting utxos, retrying in %s: %v", backoff.String(), errReset)
-			time.Sleep(backoff)
+		if errReset := v.utxoStore.Unspend(ctx, spentUtxos); errReset != nil {
+			if retries < 2 {
+				backoff := time.Duration(1<<retries) * time.Second
+				v.logger.Errorf("error resetting utxos, retrying in %s: %v", backoff.String(), errReset)
+				time.Sleep(backoff)
+			} else {
+				span.RecordError(errReset)
+				return errors.NewProcessingError("error resetting utxos", errReset)
+			}
 		} else {
-			span.RecordError(errReset)
-			return errors.NewProcessingError("error resetting utxos", errReset)
+			break
 		}
 	}
 

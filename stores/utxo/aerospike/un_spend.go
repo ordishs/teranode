@@ -200,12 +200,7 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 	} else if res.Status == LuaStatusError {
 		prometheusUtxoMapErrors.WithLabelValues("Reset", "error response").Inc()
 
-		switch res.ErrorCode {
-		case LuaErrorCodeSpendOwnershipMismatch:
-			return errors.NewProcessingError("[Unspend] ownership mismatch for %s:%d (caller's SpendingData does not match stored spend): %s", spend.TxID, spend.Vout, res.Message)
-		case LuaErrorCodeSpendOwnershipUnspent:
-			return errors.NewUtxoUnspentError("[Unspend] expected spending data but UTXO %s:%d is unspent", spend.TxID, spend.Vout)
-		case LuaErrorCodeTxNotFound:
+		if res.ErrorCode == LuaErrorCodeTxNotFound {
 			return errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
 		}
 

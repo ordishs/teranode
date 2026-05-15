@@ -47,8 +47,6 @@ local ERROR_CODE_UTXO_INVALID_SIZE = "UTXO_INVALID_SIZE"
 local ERROR_CODE_UTXO_HASH_MISMATCH = "UTXO_HASH_MISMATCH"
 local ERROR_CODE_UTXO_NOT_FROZEN = "UTXO_NOT_FROZEN"
 local ERROR_CODE_INVALID_PARAMETER = "INVALID_PARAMETER"
-local ERROR_CODE_SPEND_OWNERSHIP_MISMATCH = "SPEND_OWNERSHIP_MISMATCH"
-local ERROR_CODE_SPEND_OWNERSHIP_UNSPENT = "SPEND_OWNERSHIP_UNSPENT"
 
 -- Message constants
 local MSG_CONFLICTING = "TX is conflicting"
@@ -78,8 +76,6 @@ local ERR_UTXO_IS_FROZEN = "UTXO is frozen"
 local ERR_SPENT_EXTRA_RECS_NEGATIVE = "spentExtraRecs cannot be negative"
 local ERR_SPENT_EXTRA_RECS_EXCEED = "spentExtraRecs cannot be greater than totalExtraRecs"
 local ERR_TOTAL_EXTRA_RECS = "totalExtraRecs not found in record. Possible non-master record?"
-local ERR_SPEND_OWNERSHIP_MISMATCH = "spending data mismatch — caller does not own this spend"
-local ERR_SPEND_OWNERSHIP_UNSPENT = "expected spending data but UTXO is unspent"
 
 -- Response field name constants
 local FIELD_STATUS = "status"
@@ -514,28 +510,17 @@ function unspend(rec, offset, utxoHash, expectedSpendingData, currentBlockHeight
         return response
     end
 
-    -- Verify caller-supplied spending data matches the stored value (mandatory ownership check).
-    -- Two arms with distinct error codes so the Go layer can map them to different typed errors:
-    --   'unspent' is idempotent (retry-safe) — the row is already what the caller wants;
-    --   'mismatch' indicates a real caller bug — they own a different spend.
-    if existingSpendingData == nil then
-        response[FIELD_STATUS] = STATUS_ERROR
-        response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_UNSPENT
-        response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_UNSPENT
+    -- Ownership check: only clear spending_data when the caller owns the current spend.
+    -- Idempotent semantics: the safety guarantee is "never wipe a spend we don't own",
+    -- not "error on every no-op". Callers like ProcessConflicting build affectedParentSpends
+    -- from the loser's inputs, but the parent's stored spending_data may be nil (loser
+    -- never actually spent) or belong to the winner (in which case we MUST NOT clear).
+    -- In either no-op case we still fall through to setDeleteAtHeight + update so any
+    -- DAH housekeeping stays consistent with the actual record state.
+    local callerOwnsSpend = existingSpendingData ~= nil
+        and bytes_equal(existingSpendingData, expectedSpendingData)
 
-        return response
-    end
-
-    if not bytes_equal(existingSpendingData, expectedSpendingData) then
-        response[FIELD_STATUS] = STATUS_ERROR
-        response[FIELD_ERROR_CODE] = ERROR_CODE_SPEND_OWNERSHIP_MISMATCH
-        response[FIELD_MESSAGE] = ERR_SPEND_OWNERSHIP_MISMATCH
-
-        return response
-    end
-
-    -- Only unspend if the UTXO is spent and not frozen
-    if bytes.size(utxo) == FULL_UTXO_SIZE then
+    if callerOwnsSpend then
         if isFrozen(existingSpendingData) then
             response[FIELD_STATUS] = STATUS_ERROR
             response[FIELD_ERROR_CODE] = ERROR_CODE_FROZEN
