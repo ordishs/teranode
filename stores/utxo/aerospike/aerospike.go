@@ -778,24 +778,34 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 
-	batchRecords := make([]aerospike.BatchRecordIfc, len(txIDs))
+	// Build batchRecords via append so a failed NewKey doesn't leave a nil
+	// entry in the slice — client.BatchOperate can nil-deref on nil entries.
+	// recordTxIDs tracks the original txID for each surviving batch record so
+	// result-handling logs reference the right hash.
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(txIDs))
+	recordTxIDs := make([]chainhash.Hash, 0, len(txIDs))
 
 	var keyErrors int
-	for i, txID := range txIDs {
+	for _, txID := range txIDs {
 		key, err := aerospike.NewKey(s.namespace, s.setName, txID[:])
 		if err != nil {
 			keyErrors++
 			continue
 		}
 
-		batchRecords[i] = s.teranodeBatchRecord(
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(
 			batchUDFPolicy, LuaPackage, key, subOpPreserveUntil, "preserveUntil",
 			int(preserveUntilHeight),
-		)
+		))
+		recordTxIDs = append(recordTxIDs, txID)
 	}
 
 	if keyErrors > 0 {
 		s.logger.Errorf("[PreserveTransactions] Failed to create keys for %d/%d transactions", keyErrors, len(txIDs))
+	}
+
+	if len(batchRecords) == 0 {
+		return nil
 	}
 
 	// Execute batch operation
@@ -811,19 +821,19 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 	for i, record := range batchRecords {
 		if record == nil {
 			noResponseErrors++
-			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", txIDs[i].String(), describeAerospikeBatchRecord(record))
+			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", recordTxIDs[i].String(), describeAerospikeBatchRecord(record))
 			continue
 		}
 
 		batchRecord := record.BatchRec()
 		if batchRecord == nil {
 			noResponseErrors++
-			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", txIDs[i].String(), describeAerospikeBatchRecord(record))
+			s.logger.Warnf("[PreserveTransactions][%s] missing batch record; %s", recordTxIDs[i].String(), describeAerospikeBatchRecord(record))
 			continue
 		}
 
 		if batchRecord.Err != nil {
-			s.logger.Warnf("[PreserveTransactions][%s] failed to preserve tx; %s: %v", txIDs[i].String(), describeAerospikeBatchRecord(record), batchRecord.Err)
+			s.logger.Warnf("[PreserveTransactions][%s] failed to preserve tx; %s: %v", recordTxIDs[i].String(), describeAerospikeBatchRecord(record), batchRecord.Err)
 			continue
 		}
 
@@ -833,7 +843,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			res, err := s.ParseLuaMapResponse(rawResponse)
 			if err != nil {
 				parseErrors++
-				s.logger.Warnf("[PreserveTransactions][%s] failed to parse response bin %q (value %s); %s: %v", txIDs[i].String(), LuaSuccess.String(), describeAerospikeValue(rawResponse), describeAerospikeBatchRecord(record), err)
+				s.logger.Warnf("[PreserveTransactions][%s] failed to parse response bin %q (value %s); %s: %v", recordTxIDs[i].String(), LuaSuccess.String(), describeAerospikeValue(rawResponse), describeAerospikeBatchRecord(record), err)
 				continue
 			}
 
@@ -843,12 +853,12 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 			case LuaStatusError:
 				if res.ErrorCode != LuaErrorCodeTxNotFound {
 					luaErrors++
-					s.logger.Warnf("[PreserveTransactions][%s] preserveUntil returned error: %s", txIDs[i].String(), res.Message)
+					s.logger.Warnf("[PreserveTransactions][%s] preserveUntil returned error: %s", recordTxIDs[i].String(), res.Message)
 				}
 			}
 		} else {
 			noResponseErrors++
-			s.logger.Warnf("[PreserveTransactions][%s] missing expected response bin %q; %s", txIDs[i].String(), LuaSuccess.String(), describeAerospikeBatchRecord(record))
+			s.logger.Warnf("[PreserveTransactions][%s] missing expected response bin %q; %s", recordTxIDs[i].String(), LuaSuccess.String(), describeAerospikeBatchRecord(record))
 		}
 	}
 

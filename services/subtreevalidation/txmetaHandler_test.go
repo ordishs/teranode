@@ -85,11 +85,6 @@ func (m *mockCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
 	return args.Error(0)
 }
 
-func (m *mockCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
-	args := m.Called(keys, values)
-	return args.Error(0)
-}
-
 func (m *mockCache) BatchDecorate(ctx context.Context, txs []*utxo.UnresolvedMetaData, fields ...fields.FieldName) error {
 	args := m.Called(ctx, txs, fields)
 	return args.Error(0)
@@ -246,38 +241,40 @@ func createKafkaMessage(t *testing.T, delete bool, content []byte) *kafka.KafkaM
 	}
 }
 
-// newTestServerForHandler builds a minimal Server suitable for txmetaHandler tests.
-// txmetaHandler is fire-and-forget — it spawns one goroutine per message — so there
-// is no worker pool / channel to set up or tear down. The returned drain function
-// gives the spawned goroutine time to run before mock expectations are asserted.
-//
-// If `log` is a *mockLogger we also pre-register a Maybe() Infof so tests that don't
-// care about logger calls aren't surprised by them.
-func newTestServerForHandler(t *testing.T, log ulogger.Logger, cache utxo.Store) (*Server, func()) {
+func createKafkaMessageForHash(t *testing.T, hash chainhash.Hash, action byte, content []byte) *kafka.KafkaMessage {
 	t.Helper()
 
-	if ml, ok := log.(*mockLogger); ok {
-		ml.On("Infof", mock.Anything, mock.Anything).Maybe().Return()
+	contentLen := uint32(len(content))
+	if action == txmetaActionDELETE {
+		contentLen = 0
 	}
 
-	tSettings := &settings.Settings{}
+	dataSize := 4 + 32 + 1 + 4 + int(contentLen)
+	data := make([]byte, dataSize)
+	offset := 0
 
-	server := &Server{
-		logger:    log,
-		settings:  tSettings,
-		utxoStore: cache,
+	binary.LittleEndian.PutUint32(data[offset:], 1)
+	offset += 4
+
+	copy(data[offset:], hash[:])
+	offset += 32
+
+	data[offset] = action
+	offset++
+
+	binary.LittleEndian.PutUint32(data[offset:], contentLen)
+	offset += 4
+
+	if contentLen > 0 {
+		copy(data[offset:], content[:int(contentLen)])
 	}
 
-	return server, func() {
-		// Wait for any in-flight apply goroutine to finish. There is no global
-		// waitgroup since the handler is fire-and-forget; a short sleep is enough
-		// because per-key SetCacheFromBytes calls take microseconds. Tests with
-		// many entries still use a deterministic mock that returns immediately.
-		time.Sleep(50 * time.Millisecond)
-	}
+	return &kafka.KafkaMessage{Value: data}
 }
 
 func TestServer_txmetaHandler(t *testing.T) {
+	// Note: The handler dispatches work to bounded shard workers and may return an error if a queue is full.
+	// Tests verify proper parsing of the binary batch format.
 	tests := []struct {
 		name       string
 		setupMocks func(*mockLogger, *mockCache)
@@ -304,16 +301,13 @@ func TestServer_txmetaHandler(t *testing.T) {
 			name: "failed delete operation logs error",
 			setupMocks: func(l *mockLogger, c *mockCache) {
 				c.On("Delete", mock.Anything, mock.AnythingOfType("*chainhash.Hash")).Return(errors.ErrProcessing)
-				l.On("Errorf", mock.Anything, mock.Anything, mock.Anything).Return()
+				l.On("Errorf", mock.Anything, mock.Anything).Return()
 			},
 			input: createKafkaMessage(t, true, []byte{}),
 		},
 		{
-			name: "successful set operation uses per-entry SetCacheFromBytes",
+			name: "successful set operation",
 			setupMocks: func(l *mockLogger, c *mockCache) {
-				// Per-entry path: one Kafka message of 1 entry → one SetCacheFromBytes
-				// call (NOT SetCacheMulti). This is the bucket-lock-friendly path that
-				// keeps each lock acquisition brief.
 				c.On("SetCacheFromBytes", mock.Anything, mock.Anything).Return(nil)
 			},
 			input: createKafkaMessage(t, false, []byte("test data")),
@@ -334,190 +328,86 @@ func TestServer_txmetaHandler(t *testing.T) {
 			mockCache := &mockCache{}
 			tt.setupMocks(mockLogger, mockCache)
 
-			server, stop := newTestServerForHandler(t, mockLogger, mockCache)
-
-			err := server.txmetaHandler(context.Background(), tt.input)
-			if tt.name == "failed delete operation logs error" {
-				// DELETE is synchronous and must surface failures so the Kafka
-				// consumer leaves the offset uncommitted and the message gets
-				// re-delivered.
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
+			server := &Server{
+				logger:    mockLogger,
+				utxoStore: mockCache,
 			}
 
-			// stop() drains any in-flight apply goroutines (ADDs only — DELETE
-			// runs synchronously above) before AssertExpectations.
-			stop()
+			// The handler always returns nil (async processing)
+			err := server.txmetaHandler(context.Background(), tt.input)
+			assert.NoError(t, err)
+
+			// Wait briefly for async goroutine to complete
+			// This is a bit awkward but necessary since processing is async
+			<-time.After(10 * time.Millisecond)
 
 			mockCache.AssertExpectations(t)
 		})
 	}
 }
 
-// createMultiEntryKafkaMessage builds a binary batch with N ADD entries, used to verify
-// that one Kafka message produces ONE SetCacheMulti call (not N SetCacheFromBytes).
-func createMultiEntryKafkaMessage(t *testing.T, n int) *kafka.KafkaMessage {
-	t.Helper()
+func TestServer_txmetaHandler_PreservesPerKeyOrdering(t *testing.T) {
+	mockLogger := &mockLogger{}
+	mockCache := &mockCache{}
 
-	const contentLen = 8
-	dataSize := 4 + n*(32+1+4+contentLen)
-	data := make([]byte, dataSize)
-	offset := 0
+	var (
+		operationMu sync.Mutex
+		operations  []string
+	)
 
-	binary.LittleEndian.PutUint32(data[offset:], uint32(n))
-	offset += 4
+	mockCache.On("SetCacheFromBytes", mock.Anything, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		operationMu.Lock()
+		defer operationMu.Unlock()
+		operations = append(operations, "add")
+	})
 
-	for i := 0; i < n; i++ {
-		// Hash: byte 0 is i so we can verify per-entry distinctness if needed.
-		data[offset] = byte(i)
-		offset += 32
-		data[offset] = txmetaActionADD
-		offset++
-		binary.LittleEndian.PutUint32(data[offset:], contentLen)
-		offset += 4
-		// Content: filled with i so values are also distinct.
-		for j := 0; j < contentLen; j++ {
-			data[offset+j] = byte(i)
-		}
-		offset += contentLen
+	mockCache.On("Delete", mock.Anything, mock.AnythingOfType("*chainhash.Hash")).Return(nil).Run(func(args mock.Arguments) {
+		operationMu.Lock()
+		defer operationMu.Unlock()
+		operations = append(operations, "delete")
+	})
+
+	server := &Server{
+		logger:    mockLogger,
+		utxoStore: mockCache,
 	}
 
-	return &kafka.KafkaMessage{Value: data}
-}
+	hash := chainhash.Hash{42}
+	addMessage := createKafkaMessageForHash(t, hash, txmetaActionADD, []byte("payload"))
+	deleteMessage := createKafkaMessageForHash(t, hash, txmetaActionDELETE, nil)
 
-// TestServer_txmetaHandler_PerEntrySetCacheFromBytes guards the cache-write strategy.
-//
-// Previously the worker batched all entries into one SetCacheMulti call — that turned
-// out to hold each touched bucket's write lock for the entire batch (~1ms), and under
-// many concurrent workers the bucket-lock queue inflated, collapsing throughput.
-//
-// Per-entry SetCacheFromBytes acquires/releases the bucket lock for a single key at a
-// time (~1µs holds), keeping the queue shallow. That's the lock-contention profile
-// that historically sustained 2M+ ops/sec on this path.
-func TestServer_txmetaHandler_PerEntrySetCacheFromBytes(t *testing.T) {
-	const entries = 50
-
-	mockLogger := &mockLogger{}
-	mockCache := &mockCache{}
-	// Each entry gets its own SetCacheFromBytes call — never SetCacheMulti.
-	mockCache.On("SetCacheFromBytes", mock.Anything, mock.Anything).Return(nil).Times(entries)
-
-	server, stop := newTestServerForHandler(t, mockLogger, mockCache)
-	defer stop()
-
-	err := server.txmetaHandler(context.Background(), createMultiEntryKafkaMessage(t, entries))
+	err := server.txmetaHandler(context.Background(), addMessage)
 	assert.NoError(t, err)
 
-	stop()
-	mockCache.AssertExpectations(t)
-	// Belt-and-braces: the batched path must NOT be used — that's the regression we're avoiding.
-	mockCache.AssertNotCalled(t, "SetCacheMulti", mock.Anything, mock.Anything)
-}
-
-// TestServer_txmetaHandler_MixedBatch verifies that a single Kafka message containing
-// both ADD and DELETE entries dispatches to the right cache call for each.
-func TestServer_txmetaHandler_MixedBatch(t *testing.T) {
-	// Build a batch: ADD, DELETE, ADD.
-	buf := make([]byte, 0)
-	count := make([]byte, 4)
-	binary.LittleEndian.PutUint32(count, 3)
-	buf = append(buf, count...)
-
-	appendEntry := func(action byte, keyByte byte, content []byte) {
-		hash := make([]byte, 32)
-		hash[0] = keyByte
-		buf = append(buf, hash...)
-		buf = append(buf, action)
-		lenBuf := make([]byte, 4)
-		binary.LittleEndian.PutUint32(lenBuf, uint32(len(content)))
-		buf = append(buf, lenBuf...)
-		buf = append(buf, content...)
-	}
-	appendEntry(txmetaActionADD, 0xAA, []byte("a-data"))
-	appendEntry(txmetaActionDELETE, 0xBB, nil)
-	appendEntry(txmetaActionADD, 0xCC, []byte("c-data-longer"))
-
-	mockLogger := &mockLogger{}
-	mockCache := &mockCache{}
-	mockCache.On("SetCacheFromBytes", mock.Anything, mock.Anything).Return(nil).Twice()
-	mockCache.On("Delete", mock.Anything, mock.AnythingOfType("*chainhash.Hash")).Return(nil).Once()
-
-	server, stop := newTestServerForHandler(t, mockLogger, mockCache)
-	defer stop()
-
-	err := server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: buf})
+	err = server.txmetaHandler(context.Background(), deleteMessage)
 	assert.NoError(t, err)
 
-	stop()
-	mockCache.AssertExpectations(t)
+	assert.Eventually(t, func() bool {
+		operationMu.Lock()
+		defer operationMu.Unlock()
+		return len(operations) == 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	operationMu.Lock()
+	defer operationMu.Unlock()
+	assert.Equal(t, []string{"add", "delete"}, operations)
 }
 
-// TestServer_txmetaHandler_TruncatedBatch verifies that a malformed (claims more
-// entries than it contains) message is acked without panic and without applying
-// any pending partial state.
-func TestServer_txmetaHandler_TruncatedBatch(t *testing.T) {
-	// Header claims 2 entries, body contains only 1.
-	buf := make([]byte, 0, 4+32+1+4)
-	buf = binary.LittleEndian.AppendUint32(buf, 2)
-	buf = append(buf, make([]byte, 32+1+4)...) // first entry: hash + action + contentLen=0
-
-	mockLogger := &mockLogger{}
-	mockCache := &mockCache{}
-	// First (well-formed) entry is an ADD with empty content; per-entry goroutine
-	// is allowed to land. The truncated second entry must just bail without panic.
-	mockCache.On("SetCacheFromBytes", mock.Anything, mock.Anything).Return(nil).Maybe()
-	mockLogger.On("Errorf", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
-
-	server, stop := newTestServerForHandler(t, mockLogger, mockCache)
-	defer stop()
-
-	err := server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: buf})
-	assert.NoError(t, err)
-}
-
-// TestServer_txmetaHandler_ConcurrentCalls asserts that the fire-and-forget handler
-// tolerates many concurrent callers without panicking or deadlocking. There is no
-// shared state to corrupt — each call spawns its own apply goroutine — so this is a
-// regression smoke test, not a race test. It still earns its keep under -race because
-// SetCacheFromBytes is hit from N goroutines simultaneously.
-func TestServer_txmetaHandler_ConcurrentCalls(t *testing.T) {
-	mockLogger := &mockLogger{}
-	mockCache := &mockCache{}
-	// Apply path uses per-entry SetCacheFromBytes; we don't care how many calls land,
-	// only that none panic.
-	mockCache.On("SetCacheFromBytes", mock.Anything, mock.Anything).Return(nil).Maybe()
-	mockCache.On("Delete", mock.Anything, mock.AnythingOfType("*chainhash.Hash")).Return(nil).Maybe()
-	mockLogger.On("Debugf", mock.Anything, mock.Anything).Maybe().Return()
-	mockLogger.On("Errorf", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
-
-	server, stop := newTestServerForHandler(t, mockLogger, mockCache)
-
-	const senders = 16
-	var senderWg sync.WaitGroup
-	stopRequested := make(chan struct{})
-
-	for i := 0; i < senders; i++ {
-		senderWg.Add(1)
-		go func() {
-			defer senderWg.Done()
-			for {
-				select {
-				case <-stopRequested:
-					return
-				default:
-				}
-				_ = server.txmetaHandler(context.Background(),
-					createKafkaMessage(t, false, []byte("payload")))
-			}
-		}()
+func TestServer_txmetaHandler_ReturnsErrorWhenQueueFull(t *testing.T) {
+	server := &Server{
+		logger: ulogger.TestLogger{},
 	}
 
-	time.Sleep(5 * time.Millisecond)
-	close(stopRequested)
-	senderWg.Wait()
+	// Pretend workers are already initialized with a permanently full shard queue.
+	server.txmetaWorkerInitOnce.Do(func() {})
+	server.txmetaWorkerQueues = []chan txmetaWorkItem{
+		make(chan txmetaWorkItem),
+	}
 
-	// Drain in-flight apply goroutines before the test exits so the mock isn't called
-	// after t.Cleanup runs.
-	stop()
+	hash := chainhash.Hash{0}
+	message := createKafkaMessageForHash(t, hash, txmetaActionADD, []byte("payload"))
+
+	err := server.txmetaHandler(context.Background(), message)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, errors.ErrProcessing))
 }

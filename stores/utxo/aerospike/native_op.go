@@ -145,7 +145,14 @@ func (s *Store) executeTeranodeOp(
 				subOp, err)
 			return s.executeTeranodeUDF(udfPolicy, key, udfFnName, args)
 		}
-		writePolicy := aerospike.NewWritePolicy(0, 0)
+		// Reuse the caller's WritePolicy so timeouts/retries/commit-level/TTL stay
+		// consistent with the UDF path. Only synthesise a default when the caller
+		// passed nil (the UDF path's client.Execute tolerates a nil policy, but
+		// client.Operate does not).
+		writePolicy := udfPolicy
+		if writePolicy == nil {
+			writePolicy = aerospike.NewWritePolicy(0, 0)
+		}
 		rec, opErr := s.client.Operate(writePolicy, key, aerospike.TeranodeModifyOp(nativeOpResultBin, payload))
 		if opErr != nil {
 			return nil, opErr
@@ -186,9 +193,10 @@ func (s *Store) detectNativeTeranodeOpSupport(ctx context.Context) bool {
 	}
 
 	// Probe key — chosen to never collide with real txid keys (always
-	// 32 bytes / chainhash). Create a short-lived record and run setLocked:
-	// a patched server mutates the record and returns a structured response,
-	// while an unpatched server rejects the custom opcode with PARAMETER_ERROR.
+	// 32 bytes / chainhash). Create a short-lived record and run a valid
+	// setLocked sub-op via TeranodeModifyOp: a patched server recognises wire
+	// op 200, executes the sub-op, and returns a structured response; an
+	// unpatched server rejects the unknown opcode with PARAMETER_ERROR.
 	probeKey, err := aerospike.NewKey(s.namespace, s.setName, "_teranode-native-op-probe")
 	if err != nil {
 		s.logger.Warnf("[teranode-native-op] probe key creation failed: %v; falling back to UDF path", err)
