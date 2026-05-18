@@ -1327,7 +1327,6 @@ func (s *File) syncParentDirBestEffort(filename string) {
 		return
 	}
 
-
 	rel, err := s.storeRelPath(filename)
 	if err != nil {
 		s.debugf("[File][%s] failed to calculate parent directory for sync: %v", filename, err)
