@@ -73,7 +73,7 @@ require (
 	modernc.org/sqlite v1.47.0
 )
 
-require github.com/aerospike/aerospike-client-go/v8 v8.4.2 // indirect
+require github.com/aerospike/aerospike-client-go/v8 v8.4.2
 
 require (
 	bitbucket.org/simon_ordish/cryptolib v1.0.48 // indirect
