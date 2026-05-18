@@ -80,6 +80,29 @@ type Block struct {
 	subtreeSlicesMu sync.RWMutex
 	txMap           txmap.TxMap
 	medianTimestamp uint32
+	// nodeAllocator, if non-nil, supplies pooled backing slices for the
+	// per-subtree Node arrays during GetAndValidateSubtrees. Only the
+	// blockvalidation service sets this (via SetNodeAllocator); model-internal
+	// callers leave it nil and behaviour matches legacy make() allocation.
+	nodeAllocator subtreepkg.NodeAllocator
+}
+
+// SetNodeAllocator installs a caller-supplied allocator that
+// GetAndValidateSubtrees will pass to subtree.DeserializeFromReaderWithAllocator
+// for each fetched subtree. The blockvalidation service uses this to pool the
+// large per-subtree []Node arrays across blocks. Passing nil restores default
+// (make-backed) allocation. Safe to call before any goroutine reads the block.
+func (b *Block) SetNodeAllocator(alloc subtreepkg.NodeAllocator) {
+	b.subtreeSlicesMu.Lock()
+	b.nodeAllocator = alloc
+	b.subtreeSlicesMu.Unlock()
+}
+
+// NodeAllocator returns the currently-installed NodeAllocator (or nil).
+func (b *Block) NodeAllocator() subtreepkg.NodeAllocator {
+	b.subtreeSlicesMu.RLock()
+	defer b.subtreeSlicesMu.RUnlock()
+	return b.nodeAllocator
 }
 
 func NewBlock(header *BlockHeader, coinbase *bt.Tx, subtrees []*chainhash.Hash, transactionCount uint64, sizeInBytes uint64, blockHeight uint32, id uint32) (*Block, error) {
@@ -552,6 +575,13 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		ReportTxMapStats(diskMap.Stats())
 		_ = diskMap.Close()
 		ClearTxMapStats()
+	} else if poolable, ok := b.txMap.(*txmap.SplitSwissMapUint64); ok {
+		// Return the pooled in-memory map for reuse on the next block.
+		// transactionCountUint32 was computed at Get time; recompute the
+		// same way so the map lands in the matching size-class pool.
+		if n, err := safeconversion.Uint64ToUint32(b.TransactionCount); err == nil {
+			PutTxMap(poolable, n)
+		}
 	} else if closer, ok := b.txMap.(io.Closer); ok {
 		_ = closer.Close()
 	}
@@ -638,7 +668,10 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 		}
 		b.txMap = diskMap
 	} else {
-		b.txMap = txmap.NewSplitSwissMapUint64(transactionCountUint32)
+		// Draw the txMap from a size-class pool so the (potentially multi-GB)
+		// backing storage is reused across blocks. PutTxMap is called at
+		// release time below, keyed by the same transactionCountUint32.
+		b.txMap = GetTxMap(transactionCountUint32)
 	}
 	for subIdx := 0; subIdx < len(b.SubtreeSlices); subIdx++ {
 		subIdx := subIdx
@@ -741,7 +774,12 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 			ClearParentSpendsMapStats()
 		}()
 	} else {
-		psMap = NewSplitSyncedParentMap(4096, b.TransactionCount*3)
+		// Draw the parent-spends map from a size-class pool. Released via
+		// defer below, keyed by the same expectedInpoints value.
+		expectedInpoints := b.TransactionCount * 3
+		pooled := GetParentSpendsMap(expectedInpoints)
+		psMap = pooled
+		defer PutParentSpendsMap(pooled, expectedInpoints)
 	}
 
 	validationCtx := &validationContext{
@@ -1118,6 +1156,11 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 
 	b.SubtreeSlices = make([]*subtreepkg.Subtree, len(b.Subtrees))
 
+	// Snapshot the node allocator under the lock we already hold so deserialize
+	// goroutines can read it without further synchronisation. nodeAlloc may be
+	// nil, in which case DeserializeFromReaderWithAllocator falls back to make.
+	nodeAlloc := b.nodeAllocator
+
 	var (
 		sizeInBytes atomic.Uint64
 		txCount     atomic.Uint64
@@ -1188,9 +1231,9 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 					bufioReaderPool.Put(bufferedReader)
 				}()
 
-				if err = subtree.DeserializeFromReader(bufferedReader); err != nil {
+				if err = subtree.DeserializeFromReaderWithAllocator(bufferedReader, nodeAlloc); err != nil {
 					_, err = retry.Retry(gCtx, logger, func() (struct{}, error) {
-						return struct{}{}, subtree.DeserializeFromReader(bufferedReader)
+						return struct{}{}, subtree.DeserializeFromReaderWithAllocator(bufferedReader, nodeAlloc)
 					}, retry.WithMessage(fmt.Sprintf("[BLOCK][%s][ID %d] failed to deserialize subtree %s", blockHash, blockID, subtreeHash)))
 
 					if err != nil {

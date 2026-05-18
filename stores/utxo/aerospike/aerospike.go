@@ -147,6 +147,11 @@ type Store struct {
 	// agree; otherwise calls fall back to UDF transparently. See native_op.go.
 	useNativeTeranodeOps bool
 
+	// batchKeysPool is a per-Store sync.Pool of *[]*aerospike.Key slices reused
+	// across SetMinedMulti calls. Per-Store scoping ensures the Key's intrinsic
+	// namespace/setName never crosses Store instances.
+	batchKeysPool sync.Pool
+
 	// batchOperateFn is a test-only override for s.client.BatchOperate; nil means use the real client.
 	batchOperateFn func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error
 }

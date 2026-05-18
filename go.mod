@@ -18,7 +18,7 @@ require (
 	github.com/bsv-blockchain/go-bt/v2 v2.6.3
 	github.com/bsv-blockchain/go-chaincfg v1.5.8
 	github.com/bsv-blockchain/go-sdk v1.2.23
-	github.com/bsv-blockchain/go-subtree v1.2.0
+	github.com/bsv-blockchain/go-subtree v1.3.3-0.20260518124750-54b24848c926
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.2
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
@@ -142,6 +142,8 @@ require (
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/nxadm/tail v1.4.11 // indirect
+	github.com/onsi/ginkgo/v2 v2.27.5 // indirect
+	github.com/onsi/gomega v1.39.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect
@@ -191,14 +193,12 @@ require (
 	github.com/bsv-blockchain/go-bn v1.1.4
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
-	github.com/bsv-blockchain/go-safe-conversion v1.1.2
-	// Pseudo-version pins the un-released feat(synced): add SetIfNotExistsMulti
-	// commit (bsv-blockchain/go-tx-map#114). PutMultiBucketTxInpoints in
-	// services/blockassembly/subtreeprocessor relies on this bulk method to
-	// take a single per-bucket lock instead of one Lock/Unlock pair per entry,
-	// which materially reduces moveForwardBlock CPU on the hot path. Replace
-	// with the next tagged release (>= v1.3.6) once go-tx-map#114 ships.
-	github.com/bsv-blockchain/go-tx-map v1.3.6-0.20260515143932-e509e98caded
+	github.com/bsv-blockchain/go-safe-conversion v1.2.0
+	// Pseudo-version pins go-tx-map feat/presize-headroom (bsv-blockchain/go-tx-map#115),
+	// which includes both PutMultiBucketTxInpoints from #114 and the 1.2x-headroom
+	// + Clear() additions this branch needs. Replace with the next tagged release
+	// once #115 ships.
+	github.com/bsv-blockchain/go-tx-map v1.3.7-0.20260518142155-122571ef45fe
 	github.com/bsv-blockchain/go-wire v1.2.3
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
