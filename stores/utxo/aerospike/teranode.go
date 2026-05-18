@@ -279,16 +279,28 @@ type LuaMapResponse struct {
 }
 
 // Reset clears all fields of LuaMapResponse so it can be reused via a sync.Pool.
+//
+// BlockIDs MUST be nil-ed (not truncated to [:0]) because the public contract
+// observed by processBatchResultsForSetMined is "BlockIDs != nil iff the Lua
+// response actually contained a blockIDs field". parseLuaMapResponseInto only
+// writes BlockIDs when the response includes that key — error responses (e.g.
+// TX_NOT_FOUND) leave BlockIDs untouched. Truncating to [:0] across pool
+// iterations would carry forward a non-nil empty slice from a successful
+// previous record and cause the caller to insert the failed record's hash
+// into the returned map with an empty value. (See test
+// TestAerospike/aerospike_setmined_multi_partial_failure.)
+//
 // The Errors map is cleared (entries deleted) rather than nil-ed so its backing
-// buckets can be reused when the response is repopulated.
+// buckets can be reused. parseLuaMapResponseInto explicitly checks the
+// respMap["errors"] key existence before writing, so the same nil/empty
+// contract concern does not apply — the loop body checks res.Signal and other
+// scalar fields rather than relying on r.Errors == nil semantics.
 func (r *LuaMapResponse) Reset() {
 	r.Status = ""
 	r.ErrorCode = ""
 	r.Message = ""
 	r.Signal = ""
-	if r.BlockIDs != nil {
-		r.BlockIDs = r.BlockIDs[:0]
-	}
+	r.BlockIDs = nil
 	if r.Errors != nil {
 		for k := range r.Errors {
 			delete(r.Errors, k)
