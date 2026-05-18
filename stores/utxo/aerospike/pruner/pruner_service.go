@@ -99,6 +99,21 @@ type Options struct {
 	// LuaPackage is the name of the registered Lua UDF module
 	LuaPackage string
 
+	// BuildAddDeletedChildrenRecord, when non-nil, takes ownership of building
+	// the per-parent BatchRecord for the parent-update phase. The parent Store
+	// supplies this so the pruner routes through the native-op wrapper
+	// (subOpAddDeletedChildren) when the cluster supports it, with transparent
+	// fallback to the legacy NewBatchUDF call otherwise.
+	//
+	// The policy argument is honoured only by the UDF branch; the native-op
+	// branch synthesises its own write policy. Pass childHashes as the same
+	// []interface{} payload the legacy path would have wrapped in
+	// aerospike.NewValue (one Lua argument: a list of hex hash strings).
+	//
+	// When nil, the pruner builds NewBatchUDF directly using LuaPackage
+	// (existing pre-PR-828 behaviour).
+	BuildAddDeletedChildrenRecord func(policy *aerospike.BatchUDFPolicy, key *aerospike.Key, childHashes []interface{}) aerospike.BatchRecordIfc
+
 	// Observers is a list of observers to notify when pruning completes
 	Observers []pruner.Observer
 }
@@ -135,6 +150,10 @@ type Service struct {
 
 	// Lua UDF module name
 	luaPackage string
+
+	// Optional native-op-aware builder for the addDeletedChildren batch record.
+	// See Options.BuildAddDeletedChildrenRecord for the contract.
+	buildAddDeletedChildrenRecord func(*aerospike.BatchUDFPolicy, *aerospike.Key, []interface{}) aerospike.BatchRecordIfc
 
 	// Cached field names (avoid repeated String() allocations in hot paths)
 	fieldTxID, fieldUtxos, fieldInputs, fieldDeletedChildren, fieldExternal        string
@@ -263,6 +282,7 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		indexWaiter:                    opts.IndexWaiter,
 		notifier:                       notifier,
 		luaPackage:                     opts.LuaPackage,
+		buildAddDeletedChildrenRecord:  opts.BuildAddDeletedChildrenRecord,
 		queryPolicy:                    queryPolicy,
 		writePolicy:                    writePolicy,
 		batchPolicy:                    batchPolicy,
@@ -1489,15 +1509,18 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 		return nil
 	}
 
-	if s.luaPackage != "" {
+	if s.buildAddDeletedChildrenRecord != nil || s.luaPackage != "" {
 		return s.executeBatchParentUpdatesUDF(ctx, updates)
 	}
 
 	return s.executeBatchParentUpdatesBatchWrite(ctx, updates)
 }
 
-// executeBatchParentUpdatesUDF uses a Lua UDF (addDeletedChildren) so that missing parent
-// records are handled server-side without generating KEY_NOT_FOUND errors in Aerospike client metrics.
+// executeBatchParentUpdatesUDF builds the addDeletedChildren parent-update batch
+// using either the native-op wrapper (when Options.BuildAddDeletedChildrenRecord
+// was supplied) or a direct NewBatchUDF fallback. In both cases missing parent
+// records are handled server-side, avoiding KEY_NOT_FOUND noise in Aerospike
+// client metrics.
 func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[string]*parentUpdateInfo) error {
 	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates))
@@ -1508,13 +1531,20 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 			childHashList = append(childHashList, childHash.String())
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(
-			batchUDFPolicy,
-			info.key,
-			s.luaPackage,
-			"addDeletedChildren",
-			aerospike.NewValue(childHashList),
-		))
+		var record aerospike.BatchRecordIfc
+		if s.buildAddDeletedChildrenRecord != nil {
+			record = s.buildAddDeletedChildrenRecord(batchUDFPolicy, info.key, childHashList)
+		} else {
+			record = aerospike.NewBatchUDF(
+				batchUDFPolicy,
+				info.key,
+				s.luaPackage,
+				"addDeletedChildren",
+				aerospike.NewValue(childHashList),
+			)
+		}
+
+		batchRecords = append(batchRecords, record)
 	}
 
 	select {
@@ -1543,7 +1573,12 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 
 		if batchRec.Record != nil && batchRec.Record.Bins != nil {
 			if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
-				if respMap, ok := resp.(map[interface{}]interface{}); ok {
+				// The UDF path returns map[interface{}]interface{}; the native-op
+				// dispatcher decodes the same Lua-style response as
+				// map[string]interface{}. Normalise to the former so the rest of
+				// the handler reads as before.
+				respMap, ok := normaliseAddDeletedChildrenResponse(resp)
+				if ok {
 					if status, ok := respMap["status"].(string); ok {
 						switch status {
 						case "OK":
@@ -1578,6 +1613,24 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 	}
 
 	return nil
+}
+
+// normaliseAddDeletedChildrenResponse converts both response shapes the
+// addDeletedChildren mod-teranode op may return (legacy UDF path:
+// map[interface{}]interface{}; native-op path: map[string]interface{}) into
+// a single interface-keyed map. Returns false if the value isn't either.
+func normaliseAddDeletedChildrenResponse(v interface{}) (map[interface{}]interface{}, bool) {
+	switch m := v.(type) {
+	case map[interface{}]interface{}:
+		return m, true
+	case map[string]interface{}:
+		out := make(map[interface{}]interface{}, len(m))
+		for k, val := range m {
+			out[k] = val
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // executeBatchParentUpdatesBatchWrite is the fallback when Lua UDF is not configured.
