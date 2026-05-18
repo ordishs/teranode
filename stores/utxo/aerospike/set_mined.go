@@ -109,6 +109,15 @@ func putBatchRecordsSlice(s *[]aerospike.BatchRecordIfc) {
 // different (ns, set) — Key only exposes SetValue, which recomputes digest from
 // the existing setName.
 //
+// Workload assumption: SetMinedMulti batch sizes are relatively uniform within
+// a single Store's lifetime (Store lifetime == application lifetime, ~one Store
+// per deployment). Under that assumption the pool's per-Store scoping is the
+// right trade-off: a large batch seeds the pool with a large backing array
+// that subsequent batches reuse, amortizing allocation. sync.Pool's per-GC
+// drainage ages out the slice if the workload permanently shifts to small
+// batches. If multi-tenant or highly variable batch sizes become common,
+// switch to size-class bucketing analogous to model.GetTxMap.
+//
 // On return, the slice length equals `capacity`. Entries from a freshly allocated
 // slice are nil; the caller must initialize each via aerospike.NewKey before use.
 // Entries retained from a prior batch are non-nil and must be reset via SetValue.

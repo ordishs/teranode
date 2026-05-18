@@ -537,6 +537,15 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// CVE-2012-2459 guard — runs unconditionally so future callers passing nil subtreeStore
 	// don't silently skip dedup. checkDuplicateTransactions iterates SubtreeSlices in memory
 	// and does not need the subtree store directly.
+	//
+	// b.txMap is allocated inside checkDuplicateTransactions (possibly mid-execution
+	// when a worker fails). The deferred releaseTxMap below ensures the pooled
+	// in-memory variant is returned to the pool on *every* exit path — including
+	// errors from checkDuplicateTransactions, the flush below, and
+	// validOrderAndBlessed. releaseTxMap is nil-safe, idempotent, and handles
+	// all three b.txMap variants (disk-backed, pooled in-memory, generic Closer).
+	defer b.releaseTxMap()
+
 	err = b.checkDuplicateTransactions(ctx, logger, settings.Block.CheckDuplicateTransactionsConcurrency, settings.Block.DiskMapDirs)
 	if err != nil {
 		return false, err
@@ -570,24 +579,36 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		}
 	}
 
-	// close and release the txMap
+	return true, nil
+}
+
+// releaseTxMap returns b.txMap to the pool (in-memory variant) or closes the
+// disk-backed map, then nils b.txMap. Idempotent and nil-safe: safe to call
+// multiple times or before b.txMap is ever assigned. Invoked via defer from
+// Block.Valid so the pooled map is reclaimed on every exit path, including
+// errors during checkDuplicateTransactions or validOrderAndBlessed.
+func (b *Block) releaseTxMap() {
+	if b.txMap == nil {
+		return
+	}
+
 	if diskMap, ok := b.txMap.(*DiskTxMapUint64); ok {
 		ReportTxMapStats(diskMap.Stats())
 		_ = diskMap.Close()
 		ClearTxMapStats()
 	} else if poolable, ok := b.txMap.(*txmap.SplitSwissMapUint64); ok {
 		// Return the pooled in-memory map for reuse on the next block.
-		// transactionCountUint32 was computed at Get time; recompute the
-		// same way so the map lands in the matching size-class pool.
+		// b.TransactionCount was set in GetAndValidateSubtrees before
+		// checkDuplicateTransactions ran, so it matches the value used at
+		// GetTxMap time and the map lands in the correct size-class pool.
 		if n, err := safeconversion.Uint64ToUint32(b.TransactionCount); err == nil {
 			PutTxMap(poolable, n)
 		}
 	} else if closer, ok := b.txMap.(io.Closer); ok {
 		_ = closer.Close()
 	}
-	b.txMap = nil
 
-	return true, nil
+	b.txMap = nil
 }
 
 // https://en.bitcoin.it/wiki/BIP_0034
