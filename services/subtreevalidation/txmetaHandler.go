@@ -52,29 +52,40 @@ func (u *Server) txmetaMessageHandler(ctx context.Context) func(msg *kafka.Kafka
 //	[4 bytes]  - content length (uint32, little-endian) - 0 for DELETE
 //	[N bytes]  - content (metaBytes) - only for ADD
 //
-// All entries are applied SYNCHRONOUSLY in the calling goroutine (the Kafka
-// consumer's per-partition goroutine). Earlier we spawned one goroutine per
-// ADD entry to maximise parallelism, but at ~1.1M entries/sec on the scaling
-// cluster this overwhelmed the Go scheduler — the per-entry goroutine queue
-// reached ~89K depth and average enqueue→complete latency ballooned to ~80 ms
-// (p50). Cache writes themselves take microseconds; spawn + queue cost
-// dominated. Walking the batch serially within the partition goroutine costs
-// ~5 ms for 1024 entries, but parallelism still comes from 256 partition
-// goroutines running in parallel — exactly the bucket-shard concurrency we
-// wanted, with two orders of magnitude fewer goroutines.
+// Entries are sharded by the first byte of the tx hash across
+// txmetaWorkerShardCount (256) worker goroutines, each draining its own
+// bounded channel (txmetaWorkerQueueSize). Sharding by hash byte preserves
+// per-key ordering: every operation for the same hash lands in the same
+// shard and is therefore applied in arrival order. Per-shard parallelism
+// gives us 256-way concurrency without the per-entry-goroutine cost that
+// an earlier design suffered (89K goroutine queue depth at ~1.1M
+// entries/sec, p50 enqueue→complete ~80 ms; spawn+queue dominated the
+// microsecond-scale cache writes).
 //
-// DELETEs return their error so the Kafka offset stays uncommitted on
-// failure; on restart the message is re-delivered and the delete retried.
-// ADD failures are logged at Debug — the cache fill is best-effort, a missed
-// write falls through to the UTXO store on the next BatchDecorate.
+// On full shard queues:
 //
-// Memory: keys and values are SUBSLICES of msg.Value (no per-entry copies).
-// franz-go's Record.Value is stable for the lifetime of the record. The only
-// per-entry copy is the 32-byte chainhash.Hash for DELETEs (forced by the
-// [32]byte array type, value copy, no allocation).
+//   - During startup (before u.txmetaCaughtUp latches) the enqueue blocks,
+//     propagating backpressure into the Kafka poll loop so the cold cache
+//     is rebuilt without dropping entries.
 //
-// Processing errors on malformed messages are logged and the message is acked
-// (return nil) to avoid infinite retry loops on corrupt input.
+//   - Once caught up (any partition reaches its tail) the enqueue is
+//     drop-on-full and the remainder of the current Kafka batch is
+//     abandoned. The cache will be repopulated from Kafka on the next
+//     restart; live ADDs that are dropped fall through to the UTXO store
+//     on the next BatchDecorate. enqueueTxmetaWorkItem logs a Warn.
+//
+// Memory: ADD content is COPIED out of msg.Value because the worker may
+// run after the puller has advanced past this Kafka record. DELETE entries
+// store only the 32-byte chainhash.Hash by value (no allocation).
+//
+// Errors:
+//
+//   - Truncated message: logged and acked (return nil) to avoid infinite
+//     retry loops on corrupt input.
+//
+//   - Enqueue error (shard channel send fails for a reason other than
+//     full): returned, so the Kafka offset stays uncommitted and the
+//     message is re-delivered on restart.
 func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) error {
 	if msg == nil || len(msg.Value) < 4 {
 		return nil

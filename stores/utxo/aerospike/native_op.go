@@ -24,7 +24,6 @@ package aerospike
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	aerospike "github.com/bsv-blockchain/aerospike-client-go/v8"
@@ -218,10 +217,6 @@ func (s *Store) detectNativeTeranodeOpSupport(ctx context.Context) bool {
 	policy.TotalTimeout = 2 * time.Second
 	policy.Expiration = 60
 
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	_ = probeCtx // reserved for future cancellation plumbing into the client
-
 	if putErr := s.client.PutBins(policy, probeKey, aerospike.NewBin("_nativeProbe", true)); putErr != nil {
 		s.logger.Warnf("[teranode-native-op] probe record setup failed: %v; falling back to UDF path", putErr)
 		return false
@@ -303,12 +298,5 @@ func (s *Store) initNativeTeranodeOps(ctx context.Context) {
 			"capability probe rejected; using UDF path")
 	} else if supported {
 		s.logger.Infof("[teranode-native-op] enabled (op type 200, sub_op_id wire format)")
-	}
-
-	// Sanity: if a future caller introduces a sub_op id higher than
-	// the table can hold, panic at startup rather than at first use.
-	if subOpAddDeletedChildren > 13 {
-		panic(fmt.Sprintf("sub_op_id %d exceeds 13; SUBOP_TABLE on the server "+
-			"only has 14 entries (0..13)", subOpAddDeletedChildren))
 	}
 }

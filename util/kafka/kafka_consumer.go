@@ -478,9 +478,20 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 			uncommittedRecords := make([]*kgo.Record, 0)
 			var uncommittedMu sync.Mutex
 
+			// partitionWg tracks the per-partition goroutines spawned below.
+			// We deliberately do NOT wait on it between fetches (that was the
+			// barrier #868bdbb06 removed for steady-state throughput). It is
+			// waited on EXACTLY ONCE at shutdown so the final commitRecords
+			// captures everything that finished processing — without it, a
+			// goroutine mid-consumerFn appends to uncommittedRecords AFTER the
+			// final commit has run, leaving its records uncommitted on disk
+			// even though they were successfully processed.
+			var partitionWg sync.WaitGroup
+
 			for {
 				select {
 				case <-internalCtx.Done():
+					partitionWg.Wait()
 					uncommittedMu.Lock()
 					k.commitRecords(uncommittedRecords)
 					uncommittedMu.Unlock()
@@ -511,7 +522,9 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					// and the goroutine below outlives it.
 					hwm := p.HighWatermark
 
+					partitionWg.Add(1)
 					go func(records []*kgo.Record, hwm int64) {
+						defer partitionWg.Done()
 						for _, record := range records {
 							select {
 							case <-internalCtx.Done():
