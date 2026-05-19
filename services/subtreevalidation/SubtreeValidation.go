@@ -617,7 +617,9 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	txMetaSlice := make([]metaSliceItem, len(txHashes))
 
 	for attempt := 1; attempt <= maxRetries+1; attempt++ {
-		prometheusSubtreeValidationValidateSubtreeRetry.Inc()
+		if attempt > 1 {
+			prometheusSubtreeValidationValidateSubtreeRetry.Inc()
+		}
 
 		var logMsg string
 
@@ -641,16 +643,8 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		if err != nil {
 			if errors.Is(err, errors.ErrThresholdExceeded) {
 				u.logger.Warnf("[ValidateSubtreeInternal][%s] [attempt #%d] too many missing txmeta entries in cache (fail fast check only, will retry)", v.SubtreeHash.String(), attempt)
-				select {
-				case <-ctx.Done():
-					break
-				case <-time.After(retrySleepDuration):
-					break
-				case <-time.After(10 * time.Millisecond):
-					if u.isPrioritySubtreeCheckActive(v.SubtreeHash.String()) {
-						// break early - this is now a priority request. what the hell are we doing waiting around?
-						break
-					}
+				if waitErr := u.waitForRetryOrPriority(ctx, v.SubtreeHash.String(), retrySleepDuration); waitErr != nil {
+					return nil, waitErr
 				}
 
 				continue
@@ -790,6 +784,31 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	return subtree, nil
 }
 
+func (u *Server) waitForRetryOrPriority(ctx context.Context, subtreeHash string, retrySleepDuration time.Duration) error {
+	if retrySleepDuration <= 0 || u.isPrioritySubtreeCheckActive(subtreeHash) {
+		return nil
+	}
+
+	timer := time.NewTimer(retrySleepDuration)
+	defer timer.Stop()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.NewContextCanceledError("[ValidateSubtreeInternal][%s] context canceled while waiting to retry: %v", subtreeHash, ctx.Err())
+		case <-timer.C:
+			return nil
+		case <-ticker.C:
+			if u.isPrioritySubtreeCheckActive(subtreeHash) {
+				return nil
+			}
+		}
+	}
+}
+
 func (u *Server) storeSubtreeFiles(ctx context.Context, stat *gocore.Stat, subtreeHash *chainhash.Hash, subtree *subtreepkg.Subtree, subtreeMeta *subtreepkg.Meta) error {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "storeSubtreeFiles",
 		tracing.WithParentStat(stat),
@@ -906,9 +925,13 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	url := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
 	u.logger.Debugf("[getSubtreeTxHashes][%s] getting subtree from %s", subtreeHash.String(), url)
 
+	// Bound the body at the policy cap (MaximumMerkleItemsPerSubtree * HashSize). A peer that
+	// streams more than this is malicious — fail fast rather than ReadAll into memory.
+	maxSubtreeBytes := int64(u.settings.BlockAssembly.MaximumMerkleItemsPerSubtree) * int64(chainhash.HashSize)
+
 	// TODO add the metric for how long this takes
 	// body, err := util.DoHTTPRequestBodyReader(spanCtx, url)
-	subtreeBytes, err := util.DoHTTPRequest(spanCtx, url)
+	subtreeBytes, err := util.DoHTTPRequestBounded(spanCtx, url, maxSubtreeBytes)
 	if err != nil {
 		// check whether this is a 404 error
 		if errors.Is(err, errors.ErrNotFound) {
@@ -1214,7 +1237,9 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 			// get the whole subtree from the other peer
 			url := fmt.Sprintf("%s/subtree_data/%s", baseURL, subtreeHash.String())
 
-			body, subtreeDataErr := util.DoHTTPRequestBodyReader(ctx, url)
+			// Retry on 503 — peer's asset service may be admission-rejecting under load
+			// (asset_concurrency_subtree_data_create cap). Other errors fail through immediately.
+			body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
 			if subtreeDataErr != nil {
 				// Peer cannot provide subtree data - report as invalid subtree
 				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "peer_cannot_provide_subtree_data")
