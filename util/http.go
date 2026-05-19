@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -341,18 +342,21 @@ func buildHTTPError(resp *http.Response, rawURL string) error {
 }
 
 // parseRetryAfter parses an HTTP Retry-After header value into a duration.
-// Per RFC 7231 the value is either delta-seconds or an HTTP-date; we accept the seconds form
-// (the asset server emits it that way) and ignore HTTP-date for simplicity.
-// Returns 0 if the header is absent, invalid, or non-positive.
+// Per RFC 7231 the value is either delta-seconds (a non-negative integer) or an
+// HTTP-date; we only accept the delta-seconds form (the asset server emits it that
+// way) and treat HTTP-date as "no retry hint". Explicit integer parsing avoids
+// time.ParseDuration's quirky acceptance of fractional/signed/unit-suffixed inputs
+// like "-5s", "0.5s" or "1m".
+// Returns 0 if the header is absent, non-numeric, or non-positive.
 func parseRetryAfter(h string) time.Duration {
 	if h == "" {
 		return 0
 	}
-	secs, err := time.ParseDuration(h + "s")
+	secs, err := strconv.Atoi(h)
 	if err != nil || secs <= 0 {
 		return 0
 	}
-	return secs
+	return time.Duration(secs) * time.Second
 }
 
 // retryConfig parameterizes DoHTTPRequestBodyReaderWithRetry. Exposed at package level so

@@ -1043,6 +1043,12 @@ func TestParseRetryAfter(t *testing.T) {
 		{"1", time.Second},
 		{"30", 30 * time.Second},
 		{"not-a-number", 0},
+		// HTTP-date format must be treated as "no retry hint", not silently
+		// reinterpreted. Same for any non-integer the server might emit.
+		{"Wed, 21 Oct 2015 07:28:00 GMT", 0},
+		{"1.5", 0}, // time.ParseDuration would have accepted "1.5s"
+		{"1m", 0},  // and "1ms", "1h" etc — none are valid delta-seconds
+		{" 5", 0},  // surrounding whitespace
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {

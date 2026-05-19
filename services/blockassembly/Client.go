@@ -466,6 +466,7 @@ func (s *Client) sendBatchColumnar(ctx context.Context, batch []*batchItem) {
 		// independently. Costs one wasted RPC per batch against a
 		// persistently-old server; acceptable for the simpler code path.
 		if status.Code(err) == codes.Unimplemented {
+			s.logger.Debugf("[blockassembly] columnar AddTxBatch unimplemented on peer; falling back to row-oriented batch (rolling deploy?): %v", err)
 			s.sendBatchRowOriented(ctx, batch)
 			return
 		}
