@@ -697,3 +697,36 @@ func TestBroadcast_BoundedPool(t *testing.T) {
 	t.Logf("Broadcast of %d unresponsive channels with pool=%d completed in %v (expected %v..%v)",
 		numChannels, maxConcurrentBroadcasts, elapsed, expectedMin, expectedMax)
 }
+
+// TestBroadcast_NonPositivePoolSizeDoesNotDeadlock verifies that a misconfigured
+// (zero or negative) maxConcurrentBroadcasts is clamped to a usable value rather
+// than deadlocking the broadcast loop. With cap=0, sem <- struct{}{} on an
+// unbuffered channel would block forever because the receiver runs only after
+// the send returns.
+func TestBroadcast_NonPositivePoolSizeDoesNotDeadlock(t *testing.T) {
+	originalPoolSize := maxConcurrentBroadcasts
+	defer func() { maxConcurrentBroadcasts = originalPoolSize }()
+	maxConcurrentBroadcasts = 0
+
+	cm := newClientChannelMap()
+
+	const numChannels = 3
+	for i := 0; i < numChannels; i++ {
+		cm.add(make(chan []byte, 1)) // buffered so sends succeed immediately
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		cm.broadcast([]byte("test"), &ulogger.TestLogger{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("broadcast deadlocked with maxConcurrentBroadcasts <= 0")
+	}
+
+	require.Equal(t, numChannels, cm.count(), "responsive channels should still be registered")
+}

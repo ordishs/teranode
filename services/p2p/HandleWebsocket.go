@@ -118,8 +118,12 @@ func (cm *clientChannelMap) broadcast(data []byte, logger ulogger.Logger) {
 	}
 
 	// Send to all channels in parallel without holding the lock
-	// This prevents O(N) delay accumulation from blocking clients
-	sem := make(chan struct{}, maxConcurrentBroadcasts)
+	// This prevents O(N) delay accumulation from blocking clients.
+	// Clamp poolSize to at least 1 so a misconfigured/test-overridden cap can't
+	// deadlock the loop: with capacity 0, sem <- struct{}{} would block forever
+	// because the receiving goroutine is launched only after the send returns.
+	poolSize := max(maxConcurrentBroadcasts, 1)
+	sem := make(chan struct{}, poolSize)
 
 	var wg sync.WaitGroup
 	for _, ch := range channels {
