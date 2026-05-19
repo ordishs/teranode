@@ -24,6 +24,8 @@ package aerospike
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	aerospike "github.com/bsv-blockchain/aerospike-client-go/v8"
@@ -199,7 +201,15 @@ func (s *Store) detectNativeTeranodeOpSupport(ctx context.Context) bool {
 	// setLocked sub-op via TeranodeModifyOp: a patched server recognises wire
 	// op 200, executes the sub-op, and returns a structured response; an
 	// unpatched server rejects the unknown opcode with PARAMETER_ERROR.
-	probeKey, err := aerospike.NewKey(s.namespace, s.setName, "_teranode-native-op-probe")
+	// Per-process probe key. Two teranode instances booting concurrently against
+	// the same cluster would otherwise share the same key — their PutBins /
+	// Operate / Get sequences can interleave so one instance observes a record
+	// whose Locked bin was overwritten by the other and returns a false-negative.
+	// PID + nanosecond starttime is unique across simultaneous processes on any
+	// host, and the probe record's 60s TTL bounds the namespace residency in the
+	// rare case Delete fails.
+	probeKeyName := fmt.Sprintf("_teranode-native-op-probe-%d-%d", os.Getpid(), time.Now().UnixNano())
+	probeKey, err := aerospike.NewKey(s.namespace, s.setName, probeKeyName)
 	if err != nil {
 		s.logger.Warnf("[teranode-native-op] probe key creation failed: %v; falling back to UDF path", err)
 		return false
