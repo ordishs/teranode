@@ -1393,7 +1393,65 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 	case len(hashes) == 1:
 		calculatedMerkleRootHash = &hashes[0]
 	case len(hashes) > 0:
-		// Create a new subtree with the hashes of the subtrees
+		// The first subtree must be complete (production invariant under Strategy A).
+		// Its Length() therefore equals its serialized leaf count both in-memory and
+		// after a disk round-trip, making it a stable signal for the block's
+		// intended subtree capacity. Subtree.Height is correct for the lift step
+		// because for a complete subtree Height = Ceil(Log2(Length)) and that
+		// relationship is preserved by deserialization (which re-derives Height
+		// from numLeaves).
+		targetLength := b.SubtreeSlices[0].Length()
+		targetHeight := b.SubtreeSlices[0].Height
+
+		// Lift correctness depends on the first subtree's leaf count being a power
+		// of two — that's what makes the partitioned top-tree composition match
+		// the canonical flat merkle root. Without this guard a peer can craft a
+		// non-power-of-two first subtree (e.g. lengths [3, 2]) and produce a
+		// merkle root that a canonical SV Node validator would not agree with.
+		if !subtreepkg.IsPowerOfTwo(targetLength) {
+			return errors.NewBlockInvalidError(
+				"[BLOCK][%s] first subtree leaf count is not a power of two: %d",
+				b.String(), targetLength,
+			)
+		}
+
+		for i, sub := range b.SubtreeSlices {
+			isLast := i == len(b.SubtreeSlices)-1
+
+			if !isLast && sub.Length() != targetLength {
+				return errors.NewBlockInvalidError(
+					"[BLOCK][%s] only the final subtree may be incomplete (index %d, length %d, targetLength %d)",
+					b.String(), i, sub.Length(), targetLength,
+				)
+			}
+
+			if isLast && sub.Length() > targetLength {
+				return errors.NewBlockInvalidError(
+					"[BLOCK][%s] final subtree exceeds first subtree size (length %d, targetLength %d)",
+					b.String(), sub.Length(), targetLength,
+				)
+			}
+
+			if isLast && sub.Length() < targetLength && !subtreepkg.IsPowerOfTwo(sub.Length()) {
+				return errors.NewBlockInvalidError(
+					"[BLOCK][%s] final subtree leaf count is not a power of two: %d",
+					b.String(), sub.Length(),
+				)
+			}
+		}
+
+		// If the final subtree is shorter than the target length, lift its root
+		// to the target height so it occupies the slot of a same-capacity subtree
+		// in the top-level merkle tree.
+		if last := b.SubtreeSlices[len(b.SubtreeSlices)-1]; last.Length() < targetLength {
+			liftedRoot, err := last.RootHashPadded(targetHeight)
+			if err != nil {
+				return errors.NewProcessingError("[BLOCK][%s] failed lifting final subtree", b.String(), err)
+			}
+
+			hashes[len(hashes)-1] = *liftedRoot
+		}
+
 		st, err := subtreepkg.NewIncompleteTreeByLeafCount(len(b.Subtrees))
 		if err != nil {
 			return errors.NewProcessingError("[BLOCK][%s] error creating new root tree", b.String(), err)

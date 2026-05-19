@@ -63,7 +63,7 @@ func Test_NewDataFromBytes(t *testing.T) {
 		data := &Data{
 			Fee:         100,
 			SizeInBytes: 200,
-			TxInpoints:  testInpointsHash3Hash4,
+			TxInpoints: testInpointsHash3Hash4,
 			BlockIDs: []uint32{
 				123,
 				321,
@@ -99,7 +99,7 @@ func Test_NewDataFromBytes(t *testing.T) {
 		data := &Data{
 			Fee:         100,
 			SizeInBytes: 200,
-			TxInpoints:  testInpointsHash3Hash4,
+			TxInpoints: testInpointsHash3Hash4,
 			BlockIDs: []uint32{
 				123,
 				321,
@@ -131,7 +131,7 @@ func Test_NewDataFromBytes(t *testing.T) {
 		data := &Data{
 			Fee:         100,
 			SizeInBytes: 200,
-			TxInpoints:  testInpointsHash3Hash4,
+			TxInpoints: testInpointsHash3Hash4,
 			BlockIDs: []uint32{
 				123,
 				321,
@@ -170,7 +170,7 @@ func Benchmark_NewMetaDataFromBytes(b *testing.B) {
 	data := &Data{
 		Fee:         100,
 		SizeInBytes: 200,
-		TxInpoints:  testInpointsHash3Hash4,
+		TxInpoints: testInpointsHash3Hash4,
 		BlockIDs: []uint32{
 			5,
 			6,
@@ -192,7 +192,7 @@ func Benchmark_Bytes(b *testing.B) {
 	data := &Data{
 		Fee:         100,
 		SizeInBytes: 200,
-		TxInpoints:  testInpointsHash3Hash4,
+		TxInpoints: testInpointsHash3Hash4,
 		BlockIDs: []uint32{
 			5,
 			6,
@@ -212,7 +212,7 @@ func Benchmark_MetaBytes(b *testing.B) {
 	data := &Data{
 		Fee:         100,
 		SizeInBytes: 200,
-		TxInpoints:  testInpointsHash3Hash4,
+		TxInpoints: testInpointsHash3Hash4,
 	}
 
 	b.ReportAllocs()

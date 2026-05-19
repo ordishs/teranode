@@ -30,6 +30,10 @@ type KafkaMessage struct {
 	Partition int32
 	Offset    int64
 	Timestamp time.Time
+	// HighWaterMark is the partition's high water mark (the next offset that will be
+	// produced) at the time this fetch response was returned. Consumers can compare
+	// Offset+1 against HighWaterMark to detect "caught up to the live tail".
+	HighWaterMark int64
 }
 
 // KafkaConsumerGroupI defines the interface for Kafka consumer group operations.
@@ -502,7 +506,12 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 						return
 					}
 
-					go func(records []*kgo.Record) {
+					// Capture HighWatermark in the outer scope: the kgo.FetchTopicPartition
+					// value `p` is only valid for the duration of this synchronous callback,
+					// and the goroutine below outlives it.
+					hwm := p.HighWatermark
+
+					go func(records []*kgo.Record, hwm int64) {
 						for _, record := range records {
 							select {
 							case <-internalCtx.Done():
@@ -511,12 +520,13 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 							}
 
 							kafkaMsg := &KafkaMessage{
-								Key:       record.Key,
-								Value:     record.Value,
-								Topic:     record.Topic,
-								Partition: record.Partition,
-								Offset:    record.Offset,
-								Timestamp: record.Timestamp,
+								Key:           record.Key,
+								Value:         record.Value,
+								Topic:         record.Topic,
+								Partition:     record.Partition,
+								Offset:        record.Offset,
+								Timestamp:     record.Timestamp,
+								HighWaterMark: hwm,
 							}
 
 							if err := consumerFn(kafkaMsg); err != nil {
@@ -539,7 +549,7 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 								uncommittedMu.Unlock()
 							}
 						}
-					}(p.Records)
+					}(p.Records, hwm)
 				})
 
 				select {
@@ -742,12 +752,13 @@ func (h *inMemoryConsumerHandler) Cleanup(_ inmemorykafka.ConsumerGroupSession) 
 func (h *inMemoryConsumerHandler) ConsumeClaim(session inmemorykafka.ConsumerGroupSession, claim inmemorykafka.ConsumerGroupClaim) error {
 	for message := range claim.Messages() {
 		kafkaMsg := &KafkaMessage{
-			Key:       message.Key,
-			Value:     message.Value,
-			Topic:     message.Topic,
-			Partition: message.Partition,
-			Offset:    message.Offset,
-			Timestamp: message.Timestamp,
+			Key:           message.Key,
+			Value:         message.Value,
+			Topic:         message.Topic,
+			Partition:     message.Partition,
+			Offset:        message.Offset,
+			Timestamp:     message.Timestamp,
+			HighWaterMark: claim.HighWaterMarkOffset(),
 		}
 
 		var err error
