@@ -2,6 +2,8 @@ package util
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	mathbits "math/bits"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -82,4 +84,123 @@ func TestSubtreeMerkleRootEquivalence(t *testing.T) {
 
 	require.NotEqual(t, referenceRoot.String(), naiveTop.RootHash().String(),
 		"without phantom-step lifting, the composed root would not match")
+}
+
+// TestSubtreeMerkleRootEquivalence_NonPowerOfTwoFinal proves that the
+// partitioned merkle root matches the canonical flat merkle root when the
+// final subtree contains a non-power-of-two number of leaves. This is the
+// invariant that issue #901's fix relies on: the legacy-block partitioner can
+// stay at subtreeSize=maxItems even for adversarial transaction counts, with
+// the awkward remainder going into a single final subtree of whatever size.
+//
+// The test exercises a range of remainder sizes (3, 5, 6, 7, 11, ..., 15,943)
+// to cover the duplicate-when-odd cascade at multiple internal levels of the
+// final subtree.
+func TestSubtreeMerkleRootEquivalence_NonPowerOfTwoFinal(t *testing.T) {
+	const subtreeSize = 32
+
+	// rValues covers a variety of binary patterns to exercise the
+	// duplicate-when-odd cascade at every level of a capacity-32 final subtree.
+	rValues := []int{1, 2, 3, 5, 6, 7, 9, 11, 13, 15, 17, 21, 23, 27, 31}
+
+	for _, r := range rValues {
+		t.Run(formatLeafCount(r), func(t *testing.T) {
+			totalTxs := subtreeSize + r
+
+			txHashes := make([]chainhash.Hash, totalTxs)
+			for i := range txHashes {
+				_, err := rand.Read(txHashes[i][:])
+				require.NoError(t, err)
+			}
+
+			// Reference: single big tree padded to next power of two with the
+			// duplicate-when-odd rule (handled by NewTreeByLeafCount + AddNode).
+			referenceCapacity := subtree.CeilPowerOfTwo(totalTxs)
+			bigTree, err := subtree.NewTreeByLeafCount(referenceCapacity)
+			require.NoError(t, err)
+
+			for _, h := range txHashes {
+				require.NoError(t, bigTree.AddNode(h, 0, 0))
+			}
+
+			referenceRoot := bigTree.RootHash()
+			require.NotNil(t, referenceRoot)
+
+			// Composite: first subtreeSize leaves in a complete subtree, last r
+			// leaves in a subtree of capacity ceil(log2(r)).
+			left, err := subtree.NewTreeByLeafCount(subtreeSize)
+			require.NoError(t, err)
+
+			for i := 0; i < subtreeSize; i++ {
+				require.NoError(t, left.AddNode(txHashes[i], 0, 0))
+			}
+
+			right, err := subtree.NewIncompleteTreeByLeafCount(r)
+			require.NoError(t, err)
+
+			for i := subtreeSize; i < totalTxs; i++ {
+				require.NoError(t, right.AddNode(txHashes[i], 0, 0))
+			}
+
+			require.Equal(t, r, right.Length())
+
+			// Lift the right subtree's root to the left subtree's height. The
+			// right subtree's RootHash() naturally lives at height ceil(log2(r))
+			// because BuildMerkleTreeStoreFromBytes applies duplicate-when-odd
+			// internally — we just need to self-hash up the phantom levels.
+			rightLifted := liftRootForTest(right.RootHash(), right.Length(), left.Height)
+
+			topTree, err := subtree.NewTreeByLeafCount(2)
+			require.NoError(t, err)
+			require.NoError(t, topTree.AddNode(*left.RootHash(), 0, 0))
+			require.NoError(t, topTree.AddNode(*rightLifted, 0, 0))
+
+			require.Equal(t, referenceRoot.String(), topTree.RootHash().String(),
+				"composed root must equal reference root for r=%d (final subtree has %d leaves)", r, r)
+		})
+	}
+}
+
+// liftRootForTest mirrors the inline lift in model.Block.CheckMerkleRoot,
+// duplicated here to keep this test in package util (which cannot import
+// package model without creating a cycle). For any leaf count, the
+// duplicate-when-odd rule applied internally during merkle-tree construction
+// makes the natural root live at height ceil(log2(length)); the phantom-step
+// lift then self-hashes up to targetHeight.
+func liftRootForTest(root *chainhash.Hash, length, targetHeight int) *chainhash.Hash {
+	actualHeight := mathbits.Len(uint(length - 1))
+	out := *root
+
+	var buf [64]byte
+
+	for i := 0; i < targetHeight-actualHeight; i++ {
+		copy(buf[0:32], out[:])
+		copy(buf[32:64], out[:])
+		first := sha256.Sum256(buf[:])
+		out = chainhash.Hash(sha256.Sum256(first[:]))
+	}
+
+	return &out
+}
+
+func formatLeafCount(r int) string {
+	return "final_subtree_has_" + intToASCII(r) + "_leaves"
+}
+
+func intToASCII(n int) string {
+	if n == 0 {
+		return "0"
+	}
+
+	var buf [20]byte
+
+	i := len(buf)
+
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+
+	return string(buf[i:])
 }

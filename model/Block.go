@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
+	mathbits "math/bits"
 	"runtime"
 	"sort"
 	"strings"
@@ -1351,6 +1353,46 @@ func (b *Block) getSubtreeMetaSlice(ctx context.Context, subtreeStore SubtreeSto
 	return subtreeMetaSlice, nil
 }
 
+// liftSubtreeRootToTargetHeight returns the merkle root of the subtree as it
+// would appear in a slot of height targetHeight, computed by self-hashing the
+// natural root up the phantom levels (H(prev, prev) per level). This is the
+// generalisation of subtreepkg.RootHashPadded that also accepts non-power-of-two
+// leaf counts: BuildMerkleTreeStoreFromBytes already applies the
+// duplicate-when-odd rule at each internal level, so the subtree's RootHash()
+// naturally lives at height ceil(log2(Length)) and is the correct starting
+// point for the phantom-step lift regardless of whether Length is a power of
+// two. See [[partition-legacy-block-issue-901]] for why the non-power-of-two
+// case matters in practice.
+func liftSubtreeRootToTargetHeight(st *subtreepkg.Subtree, targetHeight int) (*chainhash.Hash, error) {
+	length := st.Length()
+	if length == 0 {
+		return nil, errors.NewProcessingError("cannot lift empty subtree")
+	}
+
+	actualHeight := mathbits.Len(uint(length - 1))
+	if targetHeight < actualHeight {
+		return nil, errors.NewProcessingError("targetHeight %d less than subtree height %d", targetHeight, actualHeight)
+	}
+
+	rootHash := st.RootHash()
+	if rootHash == nil {
+		return nil, errors.NewProcessingError("subtree returned nil root")
+	}
+
+	root := *rootHash
+
+	var buf [64]byte
+
+	for i := 0; i < targetHeight-actualHeight; i++ {
+		copy(buf[0:32], root[:])
+		copy(buf[32:64], root[:])
+		first := sha256.Sum256(buf[:])
+		root = chainhash.Hash(sha256.Sum256(first[:]))
+	}
+
+	return &root, nil
+}
+
 func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 	if len(b.Subtrees) != len(b.SubtreeSlices) {
 		return errors.NewStorageError("[BLOCK][%s] number of subtrees does not match number of subtree slices, have you called block.GetAndValidateSubtrees()?", b.String())
@@ -1431,20 +1473,20 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 					b.String(), sub.Length(), targetLength,
 				)
 			}
-
-			if isLast && sub.Length() < targetLength && !subtreepkg.IsPowerOfTwo(sub.Length()) {
-				return errors.NewBlockInvalidError(
-					"[BLOCK][%s] final subtree leaf count is not a power of two: %d",
-					b.String(), sub.Length(),
-				)
-			}
 		}
 
 		// If the final subtree is shorter than the target length, lift its root
 		// to the target height so it occupies the slot of a same-capacity subtree
-		// in the top-level merkle tree.
+		// in the top-level merkle tree. The final subtree's leaf count does NOT
+		// need to be a power of two: BuildMerkleTreeStoreFromBytes already applies
+		// the duplicate-when-odd rule at every internal level, so the subtree's
+		// own RootHash() naturally lives at height ceil(log2(Length)) and matches
+		// what the canonical flat tree produces for that segment. Allowing
+		// non-power-of-two final subtrees is what lets the legacy-block
+		// partitioner stay at maxItems instead of degenerating to tiny subtrees
+		// for adversarial transaction counts — see issue #901.
 		if last := b.SubtreeSlices[len(b.SubtreeSlices)-1]; last.Length() < targetLength {
-			liftedRoot, err := last.RootHashPadded(targetHeight)
+			liftedRoot, err := liftSubtreeRootToTargetHeight(last, targetHeight)
 			if err != nil {
 				return errors.NewProcessingError("[BLOCK][%s] failed lifting final subtree", b.String(), err)
 			}
