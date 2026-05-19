@@ -147,6 +147,15 @@ type Store struct {
 	// agree; otherwise calls fall back to UDF transparently. See native_op.go.
 	useNativeTeranodeOps bool
 
+	// nativeOpBatchWritePolicy is the shared BatchWritePolicy used by every
+	// NewBatchWrite the native-op path constructs in teranodeBatchRecord.
+	// Allocated once in initNativeTeranodeOps; the Aerospike client only
+	// reads from it during BatchOperate, so concurrent reads from many
+	// goroutines are safe. Sharing one policy instead of allocating a
+	// fresh one per batch record reverses the per-record alloc the
+	// original PR-828 implementation introduced.
+	nativeOpBatchWritePolicy *aerospike.BatchWritePolicy
+
 	// batchKeysPool is a per-Store sync.Pool of *[]*aerospike.Key slices reused
 	// across SetMinedMulti calls. Per-Store scoping ensures the Key's intrinsic
 	// namespace/setName never crosses Store instances.

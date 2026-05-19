@@ -93,8 +93,11 @@ func (s *Store) teranodeBatchRecord(
 				subOp, err)
 			return s.teranodeBatchUDFRecord(udfPolicy, udfPackage, key, udfFnName, args)
 		}
+		// Reuse the Store's shared BatchWritePolicy (allocated once in
+		// initNativeTeranodeOps). The Aerospike client only reads from the
+		// policy during BatchOperate, and no caller mutates it after init.
 		return aerospike.NewBatchWrite(
-			aerospike.NewBatchWritePolicy(),
+			s.nativeOpBatchWritePolicy,
 			key,
 			aerospike.TeranodeModifyOp(nativeOpResultBin, payload),
 		)
@@ -282,11 +285,18 @@ func (s *Store) detectNativeTeranodeOpSupport(ctx context.Context) bool {
 	return false
 }
 
-// initNativeTeranodeOps caches the native-op decision on the store.
-// Idempotent; safe to call from store construction.
+// initNativeTeranodeOps caches the native-op decision on the store and
+// allocates the shared BatchWritePolicy used by every record the native-op
+// path emits. Idempotent; safe to call from store construction.
+//
+// nativeOpBatchWritePolicy is shared across every NewBatchWrite the native
+// path constructs (one allocation per Store, not per record). The Aerospike
+// client only reads from this policy during BatchOperate, so concurrent reads
+// from many goroutines are safe. Do NOT mutate the policy after this call.
 func (s *Store) initNativeTeranodeOps(ctx context.Context) {
 	supported := s.detectNativeTeranodeOpSupport(ctx)
 	s.useNativeTeranodeOps = supported
+	s.nativeOpBatchWritePolicy = aerospike.NewBatchWritePolicy()
 
 	if s.settings.Aerospike.UseNativeTeranodeOps && !supported {
 		s.logger.Infof("[teranode-native-op] setting requested native ops but server " +

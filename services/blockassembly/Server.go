@@ -1088,6 +1088,19 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 			len(req.VoutIdxsTxOffsets), txCount+1))
 	}
 
+	// Validate offset tables before any slicing. Without these the per-tx
+	// slice expressions below panic with index-out-of-range on crafted input
+	// (non-monotonic offsets, out-of-bounds tail, etc.). Bad input must
+	// produce a structured error, not a goroutine crash on the block-assembly
+	// process — this path is reachable from any peer that can issue gRPC.
+	totalParents := len(req.ParentTxHashesPacked) / 32
+	if err := validatePackedOffsets(req.ParentTxOffsets, totalParents); err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("parent_tx_offsets: %s", err.Error(), err))
+	}
+	if err := validatePackedOffsets(req.VoutIdxsTxOffsets, len(req.VoutIdxsPacked)); err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("vout_idxs_tx_offsets: %s", err.Error(), err))
+	}
+
 	if ba.settings.BlockAssembly.Disabled {
 		return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 	}
@@ -1101,7 +1114,6 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 	// for the whole batch. chainhash.Hash is [32]byte with byte alignment, so
 	// a []byte backing is byte-aligned and safe to reinterpret. Each per-tx
 	// slice of `parents` below is just a slice header — zero allocation.
-	totalParents := len(req.ParentTxHashesPacked) / 32
 
 	var parents []chainhash.Hash
 	if totalParents > 0 {
@@ -1130,6 +1142,14 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 			// AddTxBatch (gRPC keeps them reachable).
 			parentSlice := parents[req.ParentTxOffsets[i]:req.ParentTxOffsets[i+1]]
 			voutSlice := req.VoutIdxsPacked[req.VoutIdxsTxOffsets[i]:req.VoutIdxsTxOffsets[i+1]]
+			// NewTxInpointsFromPacked aliases voutSlice with zero validation;
+			// a malformed count-prefixed layout panics later inside
+			// GetParentVoutsAtIndex during subtree-meta serialisation. Walk
+			// the slice once here — O(numParents) per tx, cheap — so a
+			// crafted batch is rejected up front.
+			if err := validatePackedVouts(voutSlice, len(parentSlice)); err != nil {
+				return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("vout_idxs_packed for tx %d: %s", i, err.Error(), err))
+			}
 			txInpointsArr[i] = subtreepkg.NewTxInpointsFromPacked(parentSlice, voutSlice)
 		}
 		// else: txInpointsArr[i] is the zero-value TxInpoints, which is the
@@ -1143,6 +1163,66 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 	ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
 
 	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
+}
+
+// validatePackedOffsets checks that a columnar request's offset table is
+// well-formed before it is used to slice the corresponding packed buffer.
+// Requires:
+//   - len(offsets) >= 2 (caller has already enforced len == txCount+1 >= 2),
+//   - offsets[0] == 0,
+//   - offsets[len-1] == bufferLen,
+//   - monotonically non-decreasing.
+//
+// Returns a structured error (not a panic) so block-assembly survives a
+// hostile or buggy peer.
+func validatePackedOffsets(offsets []uint32, bufferLen int) error {
+	if len(offsets) < 2 {
+		return errors.NewProcessingError("must have at least 2 entries, got %d", len(offsets))
+	}
+	if offsets[0] != 0 {
+		return errors.NewProcessingError("first offset must be 0, got %d", offsets[0])
+	}
+	last := offsets[len(offsets)-1]
+	if int64(last) != int64(bufferLen) {
+		return errors.NewProcessingError("last offset %d does not match buffer length %d", last, bufferLen)
+	}
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i] < offsets[i-1] {
+			return errors.NewProcessingError("offsets not monotonically non-decreasing at index %d (%d < %d)", i, offsets[i], offsets[i-1])
+		}
+	}
+	return nil
+}
+
+// validatePackedVouts verifies that a per-tx voutIdxs slice has the
+// count-prefixed shape [count_0, val_0..val_count_0-1, count_1, ...] for
+// exactly numParents groups, with the sum-of-counts plus numParents-of-count
+// words exactly consuming voutSlice. Returns an error describing the first
+// inconsistency it finds; nil if well-formed.
+//
+// subtree.NewTxInpointsFromPacked stores the slice without validating, and
+// later accessors (GetParentVoutsAtIndex, used during subtree-meta
+// serialisation) panic with index-out-of-range on malformed input. This
+// O(numParents) walk runs once per tx at receive time and rejects bad input
+// before it crosses the AddTxBatch boundary into the queue.
+func validatePackedVouts(voutSlice []uint32, numParents int) error {
+	pos := 0
+	for p := 0; p < numParents; p++ {
+		if pos >= len(voutSlice) {
+			return errors.NewProcessingError("ran out of bytes reading count for parent %d (pos=%d, len=%d)", p, pos, len(voutSlice))
+		}
+		count := int64(voutSlice[pos])
+		pos++
+		remaining := int64(len(voutSlice) - pos)
+		if count > remaining {
+			return errors.NewProcessingError("parent %d declares count=%d but only %d entries remain", p, count, remaining)
+		}
+		pos += int(count)
+	}
+	if pos != len(voutSlice) {
+		return errors.NewProcessingError("trailing bytes after %d parents: pos=%d, len=%d", numParents, pos, len(voutSlice))
+	}
+	return nil
 }
 
 // TxCount returns the total number of transactions processed.
