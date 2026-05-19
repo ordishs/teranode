@@ -488,13 +488,34 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 			// even though they were successfully processed.
 			var partitionWg sync.WaitGroup
 
+			// partitionLocks serialises processing within a single partition
+			// across consecutive fetches. PollFetches returns immediately and
+			// can hand us a second batch from partition P before the goroutine
+			// processing the first batch has finished. Without a per-partition
+			// lock, batch B could mark/append a later offset while batch A is
+			// mid-way; a subsequent commitRecords would then advance the
+			// partition past records A had not yet processed, and if A later
+			// fails on an earlier offset the broker never re-delivers them.
+			// One mutex per partition is allocated lazily on first use; the
+			// number of partitions is bounded by the topic config.
+			var partitionLocks sync.Map // map[int32]*sync.Mutex
+
+			// shutdownDrain captures everything in flight on every exit path.
+			// Must run for context cancellation AND for fetch errors that
+			// indicate the client is closing (ErrClientClosed / ctx.Canceled),
+			// otherwise records processed after the last ticker commit are
+			// lost despite successful processing.
+			shutdownDrain := func() {
+				partitionWg.Wait()
+				uncommittedMu.Lock()
+				k.commitRecords(uncommittedRecords)
+				uncommittedMu.Unlock()
+			}
+
 			for {
 				select {
 				case <-internalCtx.Done():
-					partitionWg.Wait()
-					uncommittedMu.Lock()
-					k.commitRecords(uncommittedRecords)
-					uncommittedMu.Unlock()
+					shutdownDrain()
 					return
 				default:
 				}
@@ -505,6 +526,7 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					for _, err := range errs {
 						if errors.Is(err.Err, context.Canceled) || errors.Is(err.Err, kgo.ErrClientClosed) {
 							k.Config.Logger.Debugf("Kafka consumer shutdown: %v", err.Err)
+							shutdownDrain()
 							return
 						}
 						k.Config.Logger.Errorf("Kafka consumer error on topic %s partition %d: %v", err.Topic, err.Partition, err.Err)
@@ -522,9 +544,17 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 					// and the goroutine below outlives it.
 					hwm := p.HighWatermark
 
+					muIface, _ := partitionLocks.LoadOrStore(p.Partition, &sync.Mutex{})
+					mu := muIface.(*sync.Mutex)
+
 					partitionWg.Add(1)
-					go func(records []*kgo.Record, hwm int64) {
+					go func(records []*kgo.Record, hwm int64, mu *sync.Mutex) {
 						defer partitionWg.Done()
+						// Serialise processing within this partition. Different
+						// partitions remain parallel; cross-partition ordering is
+						// not preserved (and was never claimed).
+						mu.Lock()
+						defer mu.Unlock()
 						for _, record := range records {
 							select {
 							case <-internalCtx.Done():
@@ -562,7 +592,7 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 								uncommittedMu.Unlock()
 							}
 						}
-					}(p.Records, hwm)
+					}(p.Records, hwm, mu)
 				})
 
 				select {

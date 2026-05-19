@@ -170,9 +170,15 @@ func (u *Server) SetTxMetaCacheFromBytes(_ context.Context, key, txMetaBytes []b
 }
 
 // SetTxMetaCacheMulti stores multiple transaction metadata entries in the cache in a single call.
-// Used by the Kafka txmeta handler to batch all ADD entries from one Kafka message into a single
-// cache call, allowing the cache's per-bucket locks to be acquired once per touched bucket
-// (rather than once per entry, sequentially, as the previous one-at-a-time path did).
+//
+// Reserved for a future batched fan-out optimisation of the Kafka txmeta handler: the
+// intent is that a single Kafka message containing N ADD entries can be applied as one
+// SetCacheMulti call, letting the underlying cache acquire each touched per-bucket lock
+// once per call instead of once per entry. The current txmetaHandler is sharded across
+// 256 hash-byte worker goroutines and applies entries one at a time via
+// SetTxMetaCacheFromBytes — it does NOT call this method yet. Kept on the interface so
+// alternative cache implementations can implement the fan-out today and the handler can
+// be migrated later without an interface change.
 func (u *Server) SetTxMetaCacheMulti(_ context.Context, keys [][]byte, values [][]byte) error {
 	if len(keys) == 0 {
 		return nil
