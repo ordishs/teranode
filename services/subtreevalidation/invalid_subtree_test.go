@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -338,6 +339,42 @@ func TestInvalidSubtreeReporting_ReadTxFromReaderPanic(t *testing.T) {
 	assert.Nil(t, tx)
 }
 
+// TestGetSubtreeTxHashes_OversizedBody verifies that getSubtreeTxHashes refuses to allocate
+// a peer-supplied response body larger than MaximumMerkleItemsPerSubtree * HashSize.
+// Pre-fix this would have allocated unbounded memory; post-fix it returns ErrExternal.
+func TestGetSubtreeTxHashes_OversizedBody(t *testing.T) {
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	// Lower the cap so the test response is cheap to produce.
+	tSettings.BlockAssembly.MaximumMerkleItemsPerSubtree = 4 // 4 * 32 = 128 byte cap
+
+	subtreeHash := chainhash.HashH([]byte("test-oversized-subtree"))
+	baseURL := testPeerURL
+
+	server := &Server{
+		logger:                       ulogger.TestLogger{},
+		settings:                     tSettings,
+		subtreeStore:                 memory.New(),
+		invalidSubtreeKafkaProducer:  &mockKafkaProducer{},
+		invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute * 1),
+	}
+	defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+	// Register a peer that returns a body larger than the cap.
+	subtreeURL := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
+	oversized := bytes.Repeat([]byte{0xab}, 4*1024) // 4 KB — far over the 128-byte cap
+	httpmock.RegisterResponder("GET", subtreeURL,
+		httpmock.NewBytesResponder(http.StatusOK, oversized))
+
+	stat := gocore.NewStat("test")
+	_, err := server.getSubtreeTxHashes(context.Background(), stat, &subtreeHash, baseURL)
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrExternal), "expected ErrExternal, got %v", err)
+}
+
 // TestPublishInvalidSubtree_DirectCall tests the publishInvalidSubtree method directly
 func TestPublishInvalidSubtree_DirectCall(t *testing.T) {
 	// setup
@@ -375,4 +412,61 @@ func TestPublishInvalidSubtree_DirectCall(t *testing.T) {
 
 	// verify the Kafka message key is the subtree hash
 	assert.Equal(t, []byte(subtreeHash), kafkaProducer.messages[0].Key)
+}
+
+func TestPublishInvalidSubtree_EndToEndMemoryKafka(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Kafka.InvalidSubtrees = "invalid-subtrees-topic"
+
+	invalidSubtreeURL, err := url.Parse("memory://localhost:9092/invalid-subtrees-topic")
+	require.NoError(t, err)
+	tSettings.Kafka.InvalidSubtreesConfig = invalidSubtreeURL
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	producer, err := initialiseInvalidSubtreeKafkaProducer(ctx, ulogger.TestLogger{}, tSettings)
+	require.NoError(t, err)
+	require.NotNil(t, producer)
+
+	producerCh := make(chan *kafka.Message, 100)
+	producer.Start(ctx, producerCh)
+	defer func() { require.NoError(t, producer.Stop()) }()
+
+	consumer := setupMemoryKafkaConsumer(t, "invalid-subtrees-topic")
+	defer consumer.Close()
+
+	delivered := make(chan *kafkamessage.KafkaInvalidSubtreeTopicMessage, 1)
+	consumer.Start(ctx, func(message *kafka.KafkaMessage) error {
+		var received kafkamessage.KafkaInvalidSubtreeTopicMessage
+		if err := proto.Unmarshal(message.Value, &received); err != nil {
+			return err
+		}
+		select {
+		case delivered <- &received:
+		default:
+		}
+		return nil
+	}, kafka.WithLogErrorAndMoveOn())
+	// In-memory consumer registration is async; wait briefly so the first publish is not missed.
+	time.Sleep(50 * time.Millisecond)
+
+	server := &Server{
+		logger:                       ulogger.TestLogger{},
+		settings:                     tSettings,
+		invalidSubtreeKafkaProducer:  producer,
+		invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute),
+	}
+	defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+	server.publishInvalidSubtree(ctx, "subtree-hash-e2e", testPeerURL, "e2e_reason")
+
+	select {
+	case msg := <-delivered:
+		require.Equal(t, "subtree-hash-e2e", msg.SubtreeHash)
+		require.Equal(t, testPeerURL, msg.PeerUrl)
+		require.Equal(t, "e2e_reason", msg.Reason)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for invalid subtree kafka message")
+	}
 }

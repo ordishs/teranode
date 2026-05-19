@@ -54,9 +54,12 @@ type Interface interface {
 	GetBlocksByHeight(ctx context.Context, startHeight, endHeight uint32) ([]*model.Block, error)
 	GetSubtreeBytes(ctx context.Context, hash *chainhash.Hash) ([]byte, error)
 	GetSubtreeTxIDsReader(ctx context.Context, hash *chainhash.Hash) (io.ReadCloser, error)
+	GetSubtreeNodeHashesReader(ctx context.Context, hash *chainhash.Hash) (io.ReadCloser, error)
+	GetSubtreeNodesPage(ctx context.Context, hash *chainhash.Hash, offset, limit int) ([]subtree.Node, int, error)
 	GetSubtreeDataReaderFromBlockPersister(ctx context.Context, hash *chainhash.Hash) (io.ReadCloser, error)
 	GetSubtreeDataReader(ctx context.Context, subtreeHash *chainhash.Hash) (io.ReadCloser, error)
 	GetSubtree(ctx context.Context, hash *chainhash.Hash) (*subtree.Subtree, error)
+	GetSubtreePage(ctx context.Context, hash *chainhash.Hash, offset, limit int) (*subtree.Subtree, int, int, error)
 	GetSubtreeData(ctx context.Context, hash *chainhash.Hash) (*subtree.Data, error)
 	GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, error)
 	GetSubtreeExists(ctx context.Context, hash *chainhash.Hash) (bool, error)
@@ -778,6 +781,10 @@ func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainh
 	transactionMap := make(map[chainhash.Hash]*bt.Tx, len(subtreeData.Txs))
 
 	for _, tx := range subtreeData.Txs {
+		if tx == nil {
+			continue
+		}
+
 		transactionMap[*tx.TxIDChainHash()] = tx
 	}
 

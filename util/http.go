@@ -83,6 +83,55 @@ func DoHTTPRequest(ctx context.Context, url string, requestBody ...[]byte) ([]by
 	}
 }
 
+// DoHTTPRequestBounded behaves like DoHTTPRequest but caps the response body at maxBytes.
+//
+// Why a separate function: DoHTTPRequest uses io.ReadAll on a peer-supplied response, so a
+// hostile peer can stream arbitrary bytes within the request timeout and force the node to
+// allocate gigabytes. Callers that fetch peer-controlled data (subtree fetches, etc.) must
+// bound the allocation. We read up to maxBytes+1 bytes via io.LimitReader; if the result is
+// longer than maxBytes the body was over the cap and we return ErrExternal without retaining
+// the bytes for the caller.
+func DoHTTPRequestBounded(ctx context.Context, url string, maxBytes int64, requestBody ...[]byte) ([]byte, error) {
+	bodyReaderCloser, cancelFn, err := doHTTPRequest(ctx, url, requestBody...)
+	defer cancelFn()
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if closeErr := bodyReaderCloser.Close(); closeErr != nil {
+			// Log the error but don't override the main return value
+		}
+	}()
+
+	bounded := io.LimitReader(bodyReaderCloser, maxBytes+1)
+
+	done := make(chan struct{})
+	var blockBytes []byte
+	var readErr error
+
+	go func() {
+		blockBytes, readErr = io.ReadAll(bounded)
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, errors.NewNetworkTimeoutError("http request [%s] timed out while reading body", url)
+	case <-done:
+		if readErr != nil {
+			return nil, errors.NewServiceError("http request [%s] failed to read body", url, readErr)
+		}
+
+		if int64(len(blockBytes)) > maxBytes {
+			return nil, errors.NewExternalError("http request [%s] response body exceeds %d bytes", url, maxBytes)
+		}
+
+		return blockBytes, nil
+	}
+}
+
 // readCloserWithCancel wraps an io.ReadCloser and calls a cancel function when closed.
 type readCloserWithCancel struct {
 	io.ReadCloser
@@ -226,11 +275,17 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 		return nil, cancelFn, errors.NewServiceError("failed to create http request", err)
 	}
 
-	// If there is a request body assume we want a POST and write request body
+	// If there is a request body assume we want a POST and write request body.
+	// Content-Type is application/octet-stream because every internal POST that
+	// goes through this helper sends raw bytes (e.g. /api/v1/subtree/{hash}/txs
+	// streams packed 32-byte tx hashes). Tagging it as application/json caused a
+	// WAF in front of asset (ModSecurity) to run the JSON body parser, fail on
+	// the binary payload, and reject the request with HTTP 400 — degrading peer
+	// catchup reputation across the network.
 	if len(requestBody) > 0 && requestBody[0] != nil {
 		req.Body = io.NopCloser(bytes.NewReader(requestBody[0]))
 		req.Method = http.MethodPost
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/octet-stream")
 	}
 
 	var resp *http.Response
