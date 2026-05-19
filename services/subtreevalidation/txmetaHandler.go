@@ -52,8 +52,40 @@ func (u *Server) txmetaMessageHandler(ctx context.Context) func(msg *kafka.Kafka
 //	[4 bytes]  - content length (uint32, little-endian) - 0 for DELETE
 //	[N bytes]  - content (metaBytes) - only for ADD
 //
-// Processing errors are logged and the message is marked as completed
-// to prevent infinite retry loops on malformed data.
+// Entries are sharded by the first byte of the tx hash across
+// txmetaWorkerShardCount (256) worker goroutines, each draining its own
+// bounded channel (txmetaWorkerQueueSize). Sharding by hash byte preserves
+// per-key ordering: every operation for the same hash lands in the same
+// shard and is therefore applied in arrival order. Per-shard parallelism
+// gives us 256-way concurrency without the per-entry-goroutine cost that
+// an earlier design suffered (89K goroutine queue depth at ~1.1M
+// entries/sec, p50 enqueue→complete ~80 ms; spawn+queue dominated the
+// microsecond-scale cache writes).
+//
+// On full shard queues:
+//
+//   - During startup (before u.txmetaCaughtUp latches) the enqueue blocks,
+//     propagating backpressure into the Kafka poll loop so the cold cache
+//     is rebuilt without dropping entries.
+//
+//   - Once caught up (any partition reaches its tail) the enqueue is
+//     drop-on-full and the remainder of the current Kafka batch is
+//     abandoned. The cache will be repopulated from Kafka on the next
+//     restart; live ADDs that are dropped fall through to the UTXO store
+//     on the next BatchDecorate. enqueueTxmetaWorkItem logs a Warn.
+//
+// Memory: ADD content is COPIED out of msg.Value because the worker may
+// run after the puller has advanced past this Kafka record. DELETE entries
+// store only the 32-byte chainhash.Hash by value (no allocation).
+//
+// Errors:
+//
+//   - Truncated message: logged and acked (return nil) to avoid infinite
+//     retry loops on corrupt input.
+//
+//   - Enqueue error (shard channel send fails for a reason other than
+//     full): returned, so the Kafka offset stays uncommitted and the
+//     message is re-delivered on restart.
 func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) error {
 	if msg == nil || len(msg.Value) < 4 {
 		return nil
