@@ -1836,9 +1836,11 @@ func TestBlock_CheckDuplicateTransactionsInSubtree(t *testing.T) {
 // lines, pinning every core on lock contention for blocks with hundreds of thousands of
 // subtrees. This test exercises the dedup path with a few thousand subtrees (last one
 // smaller, exercising the "first tree, except the last one" invariant) and asserts both
-// correctness of the global indices and that the work completes well within a generous
-// wall-clock budget — fast on the O(1) path, but trivially blown past by any reintroduced
-// O(N^2) implementation.
+// correctness of the global indices and that the work completes within a tight wall-clock
+// budget — the O(1) path completes the dedup call in well under 100 ms on a developer
+// machine; the budget below is sized for slow CI runners while still tripping on any
+// reintroduced O(N^2) implementation, which under worker fan-out and RWMutex contention
+// would blow past it by orders of magnitude.
 func TestBlock_CheckDuplicateTransactions_ManySubtrees(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
@@ -1846,7 +1848,7 @@ func TestBlock_CheckDuplicateTransactions_ManySubtrees(t *testing.T) {
 		numSubtrees = 2000
 		subtreeSize = 16 // capacity of every full subtree
 		lastSize    = 8  // capacity of the trailing (smaller) subtree
-		budget      = 30 * time.Second
+		budget      = 2 * time.Second
 	)
 
 	blockHeaderBytes, err := hex.DecodeString(block1Header)
