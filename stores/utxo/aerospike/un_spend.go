@@ -161,9 +161,20 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 
 	offset := s.calculateOffsetForOutput(spend.Vout)
 
+	// SpendingData is mandatory after #766 — the UDF unspend uses it to verify
+	// ownership before reversing the spend. The UDF fallback below receives this
+	// arg verbatim. The native operate-path forwards it to the server too, but
+	// the BSV-forked subOpUnspend=3 dispatcher must be updated to validate it
+	// before the native path can be trusted with the ownership check — tracked
+	// in issue #899.
+	if spend.SpendingData == nil {
+		return errors.NewProcessingError("[Unspend] SpendingData is required for %s:%d", spend.TxID, spend.Vout)
+	}
+
 	ret, aErr := s.executeTeranodeOp(policy, key, subOpUnspend, "unspend",
-		int(offset),       // vout adjusted for utxoBatchSize
-		spend.UTXOHash[:], // utxo hash
+		int(offset),                // vout adjusted for utxoBatchSize
+		spend.UTXOHash[:],          // utxo hash
+		spend.SpendingData.Bytes(), // expected stored spending data (mandatory ownership check; #766)
 		int(s.blockHeight.Load()),
 		s.settings.GetUtxoStoreBlockHeightRetention(),
 	)
@@ -194,6 +205,11 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 		}
 	} else if res.Status == LuaStatusError {
 		prometheusUtxoMapErrors.WithLabelValues("Reset", "error response").Inc()
+
+		if res.ErrorCode == LuaErrorCodeTxNotFound {
+			return errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+		}
+
 		return errors.NewStorageError("error in aerospike unspend record: %s", res.Message)
 	}
 
