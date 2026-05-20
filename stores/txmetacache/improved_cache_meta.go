@@ -1,0 +1,120 @@
+package txmetacache
+
+import (
+	"sync"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+)
+
+// improvedCacheGetScratchInitialCap matches txMetaCacheReadBufferInitialCapacity
+// so the per-Get scratch slice has the same starting profile as the legacy
+// caller-managed buffer.
+const improvedCacheGetScratchInitialCap = 1024
+
+// improvedCacheGetScratchPool recycles the byte buffer used to copy serialised
+// data out of the ring buffer before NewMetaDataFromBytes parses it. The
+// freshly allocated *meta.Data returned to the caller is NOT pooled — it is
+// what satisfies the cacheBackend.Get contract.
+var improvedCacheGetScratchPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, improvedCacheGetScratchInitialCap)
+		return &buf
+	},
+}
+
+// improvedCacheBackend adapts *ImprovedCache to the cacheBackend interface.
+// It exists so that ImprovedCache keeps its existing byte-keyed Set/Get/Del
+// API (used by its own tests and external benchmarks) without method-signature
+// collisions against the interface's pointer-typed Set/Get.
+type improvedCacheBackend struct {
+	cache *ImprovedCache
+}
+
+// Compile-time check that *improvedCacheBackend satisfies the contract.
+var _ cacheBackend = (*improvedCacheBackend)(nil)
+
+// SetFromBytes is the byte-native insert path; the Kafka ingest path already
+// holds serialised bytes so this is the fast lane.
+func (b *improvedCacheBackend) SetFromBytes(key, value []byte) error {
+	return b.cache.Set(key, value)
+}
+
+// SetMultiFromBytes is the batched byte-native insert; preserves
+// ImprovedCache's per-shard fan-out.
+func (b *improvedCacheBackend) SetMultiFromBytes(keys, values [][]byte) error {
+	return b.cache.SetMulti(keys, values)
+}
+
+// SetMultiFromBytesSequential routes to ImprovedCache.SetMultiSequential —
+// same per-bucket grouping as SetMulti but applied on the calling goroutine
+// without errgroup fan-out. Used by the v2 txmeta receiver, which already
+// has goroutine-level parallelism across Kafka partitions.
+func (b *improvedCacheBackend) SetMultiFromBytesSequential(keys, values [][]byte) error {
+	return b.cache.SetMultiSequential(keys, values)
+}
+
+// SetMultiFromBytesSequentialWithHashes routes to
+// ImprovedCache.SetMultiSequentialWithHashes — same shape as the variant
+// above but skips re-hashing keys, using the caller-supplied xxhash values
+// pulled from the v2 wire format.
+func (b *improvedCacheBackend) SetMultiFromBytesSequentialWithHashes(keys, values [][]byte, hashes []uint64) error {
+	return b.cache.SetMultiSequentialWithHashes(keys, values, hashes)
+}
+
+// Set serialises data via MetaBytes and forwards to the underlying byte Set.
+// Bridge cost: one MetaBytes() call per insert.
+func (b *improvedCacheBackend) Set(hash *chainhash.Hash, data *meta.Data) error {
+	bts, err := data.MetaBytes()
+	if err != nil {
+		return err
+	}
+
+	return b.cache.Set(hash[:], bts)
+}
+
+// Get allocates a fresh *meta.Data, deserialises the cached bytes into it,
+// and returns the pointer. One *meta.Data allocation per call plus whatever
+// the deserialiser allocates for slice backings. PointerCache's Get is
+// zero-alloc by contrast — this is the byte-mode legacy tax.
+func (b *improvedCacheBackend) Get(hash chainhash.Hash) (*meta.Data, bool) {
+	scratchPtr := improvedCacheGetScratchPool.Get().(*[]byte)
+	scratch := (*scratchPtr)[:0]
+
+	defer func() {
+		if cap(scratch) > txMetaCacheReadBufferMaxRetain {
+			scratch = make([]byte, 0, improvedCacheGetScratchInitialCap)
+		}
+
+		*scratchPtr = scratch[:0]
+		improvedCacheGetScratchPool.Put(scratchPtr)
+	}()
+
+	if err := b.cache.Get(&scratch, hash[:]); err != nil {
+		if errors.Is(err, errors.ErrNotFound) {
+			return nil, false
+		}
+
+		return nil, false
+	}
+
+	if len(scratch) == 0 {
+		return nil, false
+	}
+
+	data := &meta.Data{}
+	if err := meta.NewMetaDataFromBytes(scratch, data); err != nil {
+		return nil, false
+	}
+
+	return data, true
+}
+
+func (b *improvedCacheBackend) Del(key []byte) {
+	b.cache.Del(key)
+}
+
+func (b *improvedCacheBackend) UpdateStats(s *Stats) {
+	b.cache.UpdateStats(s)
+}
