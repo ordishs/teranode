@@ -662,7 +662,7 @@ func (u *Server) fetchSubtreeFromPeer(ctx context.Context, subtreeHash *chainhas
 	// streams more than this is malicious — fail fast rather than ReadAll into memory.
 	// This must be independent of local BlockAssembly.MaximumMerkleItemsPerSubtree, which
 	// only controls what *this node* assembles; peers may legitimately produce larger subtrees.
-	maxSubtreeBytes := int64(u.settings.SubtreeValidation.MaxIncomingSubtreeBytes)
+	maxSubtreeBytes := u.settings.SubtreeValidation.MaxIncomingSubtreeBytes
 
 	// Use the existing HTTP utility to fetch subtree
 	subtreeBytes, err := util.DoHTTPRequestBounded(ctx, url, maxSubtreeBytes)

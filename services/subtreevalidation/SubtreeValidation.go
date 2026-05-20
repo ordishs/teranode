@@ -955,7 +955,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	// streams more than this is malicious — fail fast rather than ReadAll into memory.
 	// This must be independent of local BlockAssembly.MaximumMerkleItemsPerSubtree, which
 	// only controls what *this node* assembles; peers may legitimately produce larger subtrees.
-	maxSubtreeBytes := int64(u.settings.SubtreeValidation.MaxIncomingSubtreeBytes)
+	maxSubtreeBytes := u.settings.SubtreeValidation.MaxIncomingSubtreeBytes
 
 	// TODO add the metric for how long this takes
 	// body, err := util.DoHTTPRequestBodyReader(spanCtx, url)
