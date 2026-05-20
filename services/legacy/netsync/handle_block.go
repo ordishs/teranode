@@ -27,6 +27,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/blockassemblyutil"
 	"github.com/bsv-blockchain/teranode/util/retry"
@@ -865,6 +866,33 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 		len(pendingTxHashes), totalTxCount, maxRetries)
 }
 
+// classifyAndCountPrewarmError routes a validator error from the pre-warm path
+// (validateTransactions) into the prometheusLegacyNetsyncPrewarmErrors counter
+// and emits a log line at the level appropriate for the class. Pre-warm errors
+// are intentionally dropped — real subtree validation runs later and catches
+// consensus violations on its own — so this helper exists purely to give ops
+// observability into a path that previously silently swallowed every error
+// (see issue #4590).
+func classifyAndCountPrewarmError(logger ulogger.Logger, err error) {
+	switch {
+	case errors.Is(err, errors.ErrTxInvalid):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("tx_invalid").Inc()
+		logger.Errorf("[validateTransactions][prewarm] critical: tx invalid: %v", err)
+	case errors.Is(err, errors.ErrServiceError):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("service").Inc()
+		logger.Warnf("[validateTransactions][prewarm] service error (transient): %v", err)
+	case errors.Is(err, errors.ErrTxConflicting), errors.Is(err, errors.ErrTxExists):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("policy").Inc()
+		logger.Debugf("[validateTransactions][prewarm] expected: %v", err)
+	case errors.Is(err, errors.ErrProcessing):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("processing").Inc()
+		logger.Warnf("[validateTransactions][prewarm] processing error: %v", err)
+	default:
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("other").Inc()
+		logger.Warnf("[validateTransactions][prewarm] unclassified: %v", err)
+	}
+}
+
 // validateTransactions validates all the transactions in the block in parallel
 // per level. This is done to speed up subtree validation later on.
 // The levels indicate the number of parents in the block.
@@ -913,7 +941,9 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 
 				timeStart = time.Now()
 
-				_, _ = sm.validationClient.Validate(ctx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true))
+				if _, validateErr := sm.validationClient.Validate(ctx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true)); validateErr != nil {
+					classifyAndCountPrewarmError(sm.logger, validateErr)
+				}
 
 				prometheusLegacyNetsyncBlockTxValidate.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 			}
@@ -939,7 +969,9 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 					}
 
 					// send to validation, but only if the parent is not in the same block
-					_, _ = sm.validationClient.Validate(gCtx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true))
+					if _, validateErr := sm.validationClient.Validate(gCtx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true)); validateErr != nil {
+						classifyAndCountPrewarmError(sm.logger, validateErr)
+					}
 
 					return nil
 				})
