@@ -5,7 +5,8 @@
 //
 // Key features:
 // - Implements a configurable memory caching mechanism for transaction metadata
-// - Uses height-based expiration to maintain cache freshness
+// - Per-shard FIFO eviction handled by the chosen backend (ImprovedCache ring
+//   buffer or PointerCache key ring)
 // - Integrates with Prometheus for operational metrics and monitoring
 // - Provides both single and batch operations for transaction metadata retrieval and updates
 // - Supports parallel processing for improved performance on multi-core systems
@@ -83,8 +84,10 @@ func putTxMetaCacheReadBuffer(buf *[]byte) {
 //
 // The cache is designed for high-throughput blockchain environments where transaction metadata
 // is frequently accessed during validation, mining, and mempool management operations.
-// It implements an LRU-like eviction policy based on block height to ensure that older, less
-// relevant transactions are removed first when memory pressure occurs.
+// Eviction is delegated to the backend: ImprovedCache overwrites the oldest
+// entries in its per-bucket byte ring, PointerCache evicts the oldest key in
+// its per-bucket FIFO ring. In both cases capacity is configured in MB at
+// construction time.
 //
 // Thread-safety: All operations are thread-safe and can be called concurrently from multiple goroutines.
 type TxMetaCache struct {
@@ -218,7 +221,7 @@ func NewTxMetaCache(
 			return nil, errors.NewProcessingError("error creating cache", err)
 		}
 
-		cache = &improvedCacheBackend{cache: c}
+		cache = &improvedCacheBackend{cache: c, logger: logger}
 	}
 
 	m := &TxMetaCache{
@@ -358,21 +361,20 @@ func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) err
 }
 
 // GetMetaCached retrieves transaction metadata from the cache without falling back to the
-// underlying store. This provides a way to check if data is available in the cache only.
+// underlying store — callers receive nothing if the entry is absent and do not
+// fall back to the UTXO store from this method (use GetMeta for that).
 //
 // Parameters:
-// - ctx: Context for the operation (not used, but maintained for interface consistency)
+// - ctx: Context for the operation (unused; kept for symmetry with GetMeta)
 // - hash: Transaction hash to use as the cache key
 //
 // Returns:
-// - Pointer to the cached transaction metadata if found and not expired, nil otherwise
-// - Error if the cache operation fails or if the data cannot be unmarshalled
+//   - *meta.Data, true on a cache hit. The returned pointer is shared with
+//     every other concurrent reader in pointer mode and freshly allocated in
+//     byte mode; in both cases callers must treat it as read-only.
+//   - nil, false on miss. No error is returned — a miss is the normal path.
 //
-// The function performs several checks:
-// 1. Verifies the data exists in the cache
-// 2. Validates that the data is not empty
-// 3. Checks if the data has expired based on block height
-// All these conditions have corresponding metrics incremented for monitoring.
+// Hit/miss counts are exposed via the standard txmetacache Prometheus metrics.
 func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*meta.Data, bool) {
 	d, ok := t.cache.Get(hash)
 	if !ok {

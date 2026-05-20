@@ -510,7 +510,7 @@ func TestMap(t *testing.T) {
 }
 
 func Test_txMetaCache_GetFunctions(t *testing.T) {
-	t.Run("test Get with height encoding", func(t *testing.T) {
+	t.Run("test Get bypasses cache", func(t *testing.T) {
 		ctx := context.Background()
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
@@ -614,7 +614,7 @@ func Test_txMetaCache_GetFunctions(t *testing.T) {
 }
 
 func Test_txMetaCache_MultiOperations(t *testing.T) {
-	t.Run("test SetCacheMulti with height encoding", func(t *testing.T) {
+	t.Run("test SetCacheMulti round-trip", func(t *testing.T) {
 		ctx := context.Background()
 		utxoStoreURL, err := url.Parse("sqlitememory:///test")
 		require.NoError(t, err)
@@ -662,9 +662,9 @@ func Test_txMetaCache_MultiOperations(t *testing.T) {
 		err = cache.SetCacheMulti([][]byte{hash1[:], hash2[:]}, [][]byte{metaBytes1, metaBytes2})
 		require.NoError(t, err)
 
-		// Verify heights are encoded correctly — reach through the byte-cache
-		// adapter to inspect the raw stored bytes (height encoding is an
-		// implementation detail of ImprovedCache, not the interface).
+		// Reach through the byte-cache adapter to confirm each key landed in
+		// the underlying ring buffer (verifies the SetCacheMulti fan-out
+		// reached the right shards).
 		byteBackend, ok := cache.cache.(*improvedCacheBackend)
 		require.True(t, ok, "test relies on ImprovedCache byte backend")
 

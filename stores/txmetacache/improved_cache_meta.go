@@ -2,10 +2,12 @@ package txmetacache
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // improvedCacheGetScratchInitialCap matches txMetaCacheReadBufferInitialCapacity
@@ -28,8 +30,16 @@ var improvedCacheGetScratchPool = sync.Pool{
 // It exists so that ImprovedCache keeps its existing byte-keyed Set/Get/Del
 // API (used by its own tests and external benchmarks) without method-signature
 // collisions against the interface's pointer-typed Set/Get.
+//
+// unmarshalErrors counts entries that came back from the ring buffer but failed
+// to deserialise — operationally this means a format mismatch or in-place
+// corruption. Affected entries are evicted on the spot to prevent the same
+// bad bytes from being repeatedly reparsed; the counter is exposed via
+// UpdateStats so the rate is observable.
 type improvedCacheBackend struct {
-	cache *ImprovedCache
+	cache           *ImprovedCache
+	logger          ulogger.Logger
+	unmarshalErrors atomic.Uint64
 }
 
 // Compile-time check that *improvedCacheBackend satisfies the contract.
@@ -78,6 +88,10 @@ func (b *improvedCacheBackend) Set(hash *chainhash.Hash, data *meta.Data) error 
 // and returns the pointer. One *meta.Data allocation per call plus whatever
 // the deserialiser allocates for slice backings. PointerCache's Get is
 // zero-alloc by contrast — this is the byte-mode legacy tax.
+//
+// On unmarshal failure the entry is evicted and a warning is logged: a
+// corrupt entry would otherwise be reparsed on every subsequent Get for the
+// same key, masking format mismatches and chewing CPU.
 func (b *improvedCacheBackend) Get(hash chainhash.Hash) (*meta.Data, bool) {
 	scratchPtr := improvedCacheGetScratchPool.Get().(*[]byte)
 	scratch := (*scratchPtr)[:0]
@@ -105,6 +119,13 @@ func (b *improvedCacheBackend) Get(hash chainhash.Hash) (*meta.Data, bool) {
 
 	data := &meta.Data{}
 	if err := meta.NewMetaDataFromBytes(scratch, data); err != nil {
+		b.unmarshalErrors.Add(1)
+		b.cache.Del(hash[:])
+
+		if b.logger != nil {
+			b.logger.Warnf("txMetaCache: failed to unmarshal cached entry for %s (evicting): %v", hash.String(), err)
+		}
+
 		return nil, false
 	}
 

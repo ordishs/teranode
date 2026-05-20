@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/cespare/xxhash/v2"
@@ -30,7 +31,39 @@ func TestPointerCache_SetGetRoundTrip(t *testing.T) {
 
 	got, ok := c.Get(*h)
 	require.True(t, ok)
-	require.Same(t, d, got, "pointer cache must return the same pointer that was stored")
+	require.NotSame(t, d, got, "Set must clone into a metadata-only snapshot, not retain the caller's pointer")
+	require.Equal(t, d.Fee, got.Fee)
+	require.Equal(t, d.SizeInBytes, got.SizeInBytes)
+	require.Equal(t, d.IsCoinbase, got.IsCoinbase)
+}
+
+// TestPointerCache_SetStripsNonCachedFields confirms that Set drops fields the
+// byte backend would never have stored (Tx, BlockIDs, ...), keeping the two
+// backends semantically equivalent.
+func TestPointerCache_SetStripsNonCachedFields(t *testing.T) {
+	c, err := NewPointerCache(64 * 1024 * 1024)
+	require.NoError(t, err)
+
+	h := hashN(11)
+	fatTx := &bt.Tx{LockTime: 99}
+	d := &meta.Data{
+		Fee:         500,
+		SizeInBytes: 800,
+		IsCoinbase:  false,
+		Tx:          fatTx,
+		BlockIDs:    []uint32{1, 2, 3},
+		LockTime:    42,
+		CreatedAt:   1234567890,
+	}
+
+	require.NoError(t, c.Set(h, d))
+
+	got, ok := c.Get(*h)
+	require.True(t, ok)
+	require.Nil(t, got.Tx, "Tx must not be retained in the cache (matches byte backend behaviour)")
+	require.Nil(t, got.BlockIDs, "BlockIDs must not be retained")
+	require.Zero(t, got.LockTime, "LockTime is not part of the cached field set")
+	require.Zero(t, got.CreatedAt, "CreatedAt is not part of the cached field set")
 }
 
 func TestPointerCache_MissReturnsFalse(t *testing.T) {
@@ -55,9 +88,9 @@ func TestPointerCache_OverwriteDoesNotConsumeRingSlot(t *testing.T) {
 
 	got, ok := c.Get(*h)
 	require.True(t, ok)
-	require.Same(t, d2, got)
+	require.Equal(t, d2.Fee, got.Fee, "Get must return the most recently stored entry")
 
-	b := c.bucketFor(xxhash.Sum64(h[:]))
+	b := c.bucketFor(*h)
 	require.Equal(t, uint64(1), b.added.Load(),
 		"overwriting an existing key must not increment insertion count")
 }
@@ -99,13 +132,13 @@ func TestPointerCache_FIFOEvictionWhenRingFull(t *testing.T) {
 	require.NoError(t, c.Set(first, d1))                    // either evicts the prime or coexists, depending on bucket
 	require.NoError(t, c.Set(second, d2))                   // capacity is 1; second must evict whatever's there
 
-	// d2 must still be present
+	// d2 must still be present (field-level equality; Set clones into a snapshot)
 	got, ok := c.Get(*second)
 	require.True(t, ok)
-	require.Same(t, d2, got)
+	require.Equal(t, d2.Fee, got.Fee)
 
 	// The bucket now has at most one entry
-	b := c.bucketFor(xxhash.Sum64(second[:]))
+	b := c.bucketFor(*second)
 	b.mu.RLock()
 	require.LessOrEqual(t, len(b.m), 1, "ring size is 1; bucket must not exceed one live entry")
 	b.mu.RUnlock()
