@@ -1829,6 +1829,94 @@ func TestBlock_CheckDuplicateTransactionsInSubtree(t *testing.T) {
 	})
 }
 
+// TestBlock_CheckDuplicateTransactions_ManySubtrees is a regression guard for issue #900.
+// PR #198 replaced the O(1) base-index formula (subIdx*subtreeSize) with an O(N) prefix-sum
+// loop that called Subtree.Size() on every prior subtree. Subtree.Size() takes an RWMutex,
+// so under the concurrent dedup workers this scaled as O(N^2) atomic ops on shared cache
+// lines, pinning every core on lock contention for blocks with hundreds of thousands of
+// subtrees. This test exercises the dedup path with a few thousand subtrees (last one
+// smaller, exercising the "first tree, except the last one" invariant) and asserts both
+// correctness of the global indices and that the work completes within a tight wall-clock
+// budget — the O(1) path completes the dedup call in well under 100 ms on a developer
+// machine; the budget below is sized for slow CI runners while still tripping on any
+// reintroduced O(N^2) implementation, which under worker fan-out and RWMutex contention
+// would blow past it by orders of magnitude.
+func TestBlock_CheckDuplicateTransactions_ManySubtrees(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+
+	const (
+		numSubtrees = 2000
+		subtreeSize = 16 // capacity of every full subtree
+		lastSize    = 8  // capacity of the trailing (smaller) subtree
+		budget      = 2 * time.Second
+	)
+
+	blockHeaderBytes, err := hex.DecodeString(block1Header)
+	require.NoError(t, err)
+	blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+	require.NoError(t, err)
+	coinbase, err := bt.NewTxFromString(CoinbaseHex)
+	require.NoError(t, err)
+
+	subtreeHashes := make([]*chainhash.Hash, numSubtrees)
+	subtrees := make([]*subtreepkg.Subtree, numSubtrees)
+	// Track a few node hashes we'll probe back to ensure indices are correct at scale.
+	probeIndices := []int{0, 1, subtreeSize, (numSubtrees / 2) * subtreeSize, (numSubtrees-1)*subtreeSize + lastSize - 1}
+	probeHashes := make(map[int]chainhash.Hash, len(probeIndices))
+	probeSet := make(map[int]struct{}, len(probeIndices))
+	for _, p := range probeIndices {
+		probeSet[p] = struct{}{}
+	}
+
+	totalTxs := uint64(0)
+	for sIdx := 0; sIdx < numSubtrees; sIdx++ {
+		capacity := subtreeSize
+		if sIdx == numSubtrees-1 {
+			capacity = lastSize
+		}
+		st, sErr := subtreepkg.NewTreeByLeafCount(capacity)
+		require.NoError(t, sErr)
+
+		for nIdx := 0; nIdx < capacity; nIdx++ {
+			buf := make([]byte, 32)
+			_, _ = rand.Read(buf)
+			h, hErr := chainhash.NewHash(buf)
+			require.NoError(t, hErr)
+			require.NoError(t, st.AddNode(*h, 1, 0))
+
+			global := sIdx*subtreeSize + nIdx
+			if _, ok := probeSet[global]; ok {
+				probeHashes[global] = *h
+			}
+		}
+
+		subtrees[sIdx] = st
+		subtreeHashes[sIdx] = st.RootHash()
+		totalTxs += uint64(capacity)
+	}
+
+	b, err := NewBlock(blockHeader, coinbase, subtreeHashes, totalTxs, 0, 0, 0)
+	require.NoError(t, err)
+	b.SubtreeSlices = subtrees
+
+	start := time.Now()
+	err = b.checkDuplicateTransactions(context.Background(), ulogger.TestLogger{}, tSettings.Block.CheckDuplicateTransactionsConcurrency, nil)
+	elapsed := time.Since(start)
+	require.NoError(t, err, "dedup should succeed on a block with unique hashes")
+	require.Less(t, elapsed, budget, "dedup wall time exceeded %s (got %s) — likely a re-introduced O(N^2) prefix sum, see issue #900", budget, elapsed)
+
+	// Spot-check that probed nodes ended up at the expected global indices — this is the
+	// invariant the prefix-sum loop was (mistakenly) trying to defend, and proves the
+	// O(1) formula handles the last-smaller-subtree case correctly.
+	for _, global := range probeIndices {
+		hash, ok := probeHashes[global]
+		require.True(t, ok, "probe at global index %d not recorded", global)
+		got, exists := b.txMap.Get(hash)
+		require.True(t, exists, "probe hash at global index %d not in txMap", global)
+		require.Equal(t, uint64(global), got, "global index mismatch for probe at %d", global)
+	}
+}
+
 func TestBlock_GetSubtrees(t *testing.T) {
 	t.Run("get subtrees with missing store", func(t *testing.T) {
 		tSettings := test.CreateBaseTestSettings(t)
