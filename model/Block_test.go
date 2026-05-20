@@ -4807,7 +4807,7 @@ func buildBlockWithSubtrees(t *testing.T, subtreeSize, totalTxs int) (*Block, *c
 	leftRoot, err := left.RootHashWithReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size())) // nolint: gosec
 	require.NoError(t, err)
 
-	rightLifted, err := liftSubtreeRootToTargetHeight(right, left.Height)
+	rightLifted, err := right.RootHashPadded(left.Height)
 	require.NoError(t, err)
 
 	top, err := subtreepkg.NewTreeByLeafCount(2)

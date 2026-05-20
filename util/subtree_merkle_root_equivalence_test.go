@@ -2,9 +2,7 @@ package util
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"fmt"
-	mathbits "math/bits"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -145,11 +143,11 @@ func TestSubtreeMerkleRootEquivalence_NonPowerOfTwoFinal(t *testing.T) {
 
 			require.Equal(t, r, right.Length())
 
-			// Lift the right subtree's root to the left subtree's height. The
-			// right subtree's RootHash() naturally lives at height ceil(log2(r))
-			// because BuildMerkleTreeStoreFromBytes applies duplicate-when-odd
-			// internally — we just need to self-hash up the phantom levels.
-			rightLifted := liftRootForTest(right.RootHash(), right.Length(), left.Height)
+			// Lift the right subtree's root to the left subtree's height.
+			// RootHashPadded handles non-power-of-two leaf counts since
+			// go-subtree v1.4.2 (see bsv-blockchain/go-subtree#127).
+			rightLifted, err := right.RootHashPadded(left.Height)
+			require.NoError(t, err)
 
 			topTree, err := subtree.NewTreeByLeafCount(2)
 			require.NoError(t, err)
@@ -160,26 +158,4 @@ func TestSubtreeMerkleRootEquivalence_NonPowerOfTwoFinal(t *testing.T) {
 				"composed root must equal reference root for r=%d (final subtree has %d leaves)", r, r)
 		})
 	}
-}
-
-// liftRootForTest mirrors the inline lift in model.Block.CheckMerkleRoot,
-// duplicated here to keep this test in package util (which cannot import
-// package model without creating a cycle). For any leaf count, the
-// duplicate-when-odd rule applied internally during merkle-tree construction
-// makes the natural root live at height ceil(log2(length)); the phantom-step
-// lift then self-hashes up to targetHeight.
-func liftRootForTest(root *chainhash.Hash, length, targetHeight int) *chainhash.Hash {
-	actualHeight := mathbits.Len(uint(length - 1))
-	out := *root
-
-	var buf [64]byte
-
-	for i := 0; i < targetHeight-actualHeight; i++ {
-		copy(buf[0:32], out[:])
-		copy(buf[32:64], out[:])
-		first := sha256.Sum256(buf[:])
-		out = chainhash.Hash(sha256.Sum256(first[:]))
-	}
-
-	return &out
 }
