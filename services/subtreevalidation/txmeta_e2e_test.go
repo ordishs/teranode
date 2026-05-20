@@ -218,7 +218,16 @@ func (h *txmetaE2EHarness) publishV2(t testing.TB, hashes []chainhash.Hash, payl
 	t.Helper()
 
 	numPartitions := h.server.settings.Validator.TxMetaNumPartitions
+	// Cap to BucketsCount so the floor below keeps bucketsPerPartition >= 1.
+	// Under the testtxmetacache build tag BucketsCount=8, so the harness's
+	// default 32 partitions would otherwise divide to zero.
+	if numPartitions > e2eBucketsCount {
+		numPartitions = e2eBucketsCount
+	}
 	bucketsPerPartition := e2eBucketsCount / numPartitions
+	if bucketsPerPartition < 1 {
+		bucketsPerPartition = 1
+	}
 
 	type item struct {
 		hash    chainhash.Hash
@@ -477,7 +486,16 @@ var benchV2ScratchPool = sync.Pool{
 // done reading those bytes. This eliminates the producer-side allocations
 // that previously dominated the bench's mem profile (~50% of total).
 func serializeV2Partitioned(hashes []chainhash.Hash, payloads [][]byte, numPartitions int) ([][]byte, *benchV2Scratch) {
+	// Same floor as validator.sendTxMetaBatchV2 — necessary under the
+	// testtxmetacache build tag where BucketsCount=8 collapses to zero
+	// against the bench's default 32 partitions.
+	if numPartitions > e2eBucketsCount {
+		numPartitions = e2eBucketsCount
+	}
 	bucketsPerPartition := e2eBucketsCount / numPartitions
+	if bucketsPerPartition < 1 {
+		bucketsPerPartition = 1
+	}
 
 	s := benchV2ScratchPool.Get().(*benchV2Scratch)
 
