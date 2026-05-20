@@ -4889,4 +4889,3 @@ func buildBlockWithFinalSubtreeLargerThanFirst(t *testing.T) *Block {
 		SubtreeSlices: []*subtreepkg.Subtree{first, second},
 	}
 }
-
