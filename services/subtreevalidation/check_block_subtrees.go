@@ -211,9 +211,11 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 					// get the subtree from the peer
 					url := fmt.Sprintf("%s/subtree/%s", request.BaseUrl, subtreeHash.String())
 
-					// Bound the body at the policy cap (MaximumMerkleItemsPerSubtree * HashSize) so
-					// a malicious peer can't OOM us by streaming oversized responses.
-					maxSubtreeBytes := int64(u.settings.BlockAssembly.MaximumMerkleItemsPerSubtree) * int64(chainhash.HashSize)
+					// Bound the body at the receive-side policy cap (MaxIncomingSubtreeBytes) so a
+					// malicious peer can't OOM us by streaming oversized responses. This must be
+					// independent of local BlockAssembly.MaximumMerkleItemsPerSubtree, which only
+					// controls what *this node* assembles; peers may legitimately produce larger subtrees.
+					maxSubtreeBytes := int64(u.settings.SubtreeValidation.MaxIncomingSubtreeBytes)
 
 					subtreeNodeBytes, err := util.DoHTTPRequestBounded(gCtx, url, maxSubtreeBytes)
 					if err != nil {

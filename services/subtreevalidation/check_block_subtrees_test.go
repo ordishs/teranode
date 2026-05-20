@@ -426,8 +426,8 @@ func TestCheckBlockSubtrees(t *testing.T) {
 }
 
 // TestCheckBlockSubtrees_OversizedBody verifies that the peer-fetch fallback at
-// check_block_subtrees.go:218 refuses to allocate a response body larger than
-// MaximumMerkleItemsPerSubtree * HashSize. Pre-fix a malicious peer could OOM the node by
+// check_block_subtrees.go refuses to allocate a response body larger than
+// SubtreeValidation.MaxIncomingSubtreeBytes. Pre-fix a malicious peer could OOM the node by
 // streaming oversized bytes inside the request window; post-fix the chain surfaces ErrExternal.
 func TestCheckBlockSubtrees_OversizedBody(t *testing.T) {
 	httpmock.ActivateNonDefault(util.HTTPClient())
@@ -436,7 +436,7 @@ func TestCheckBlockSubtrees_OversizedBody(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	server.settings.BlockAssembly.MaximumMerkleItemsPerSubtree = 4 // 4 * 32 = 128 byte cap
+	server.settings.SubtreeValidation.MaxIncomingSubtreeBytes = 128 // tiny cap
 
 	server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
 		mock.Anything, mock.Anything, mock.Anything).
