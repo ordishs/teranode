@@ -4784,17 +4784,23 @@ func TestCheckMerkleRoot_RejectsFinalSubtreeLargerThanFirst(t *testing.T) {
 	require.Contains(t, err.Error(), "final subtree exceeds first subtree size")
 }
 
-// TestCheckMerkleRoot_RejectsNonPowerOfTwoFinalSubtree verifies that
-// CheckMerkleRoot rejects a block whose final subtree leaf count is not a
-// power of two (lifting requires a power-of-two leaf count).
-func TestCheckMerkleRoot_RejectsNonPowerOfTwoFinalSubtree(t *testing.T) {
-	// First subtree complete (4 leaves). Final subtree has 3 leaves.
-	block := buildBlockWithNonPowerOfTwoFinal(t)
+// TestCheckMerkleRoot_AcceptsNonPowerOfTwoFinalSubtree verifies that
+// CheckMerkleRoot accepts a block whose final subtree leaf count is not a
+// power of two. The duplicate-when-odd rule already pads the subtree's own
+// merkle root internally, so the phantom-step lift composes correctly with
+// non-power-of-two final lengths — see issue #901 for why this matters.
+func TestCheckMerkleRoot_AcceptsNonPowerOfTwoFinalSubtree(t *testing.T) {
+	// 7 leaves split across two capacity-4 subtrees: [4, 3]. The final subtree
+	// has a non-power-of-two leaf count.
+	const (
+		totalTxs    = 7
+		subtreeSize = 4
+	)
 
-	err := block.CheckMerkleRoot(context.Background())
-	require.Error(t, err)
-	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected BlockInvalidError, got %v", err)
-	require.Contains(t, err.Error(), "leaf count is not a power of two")
+	block, expectedRoot := buildBlockWithSubtrees(t, subtreeSize, totalTxs)
+	block.Header.HashMerkleRoot = expectedRoot
+
+	require.NoError(t, block.CheckMerkleRoot(context.Background()))
 }
 
 // TestCheckMerkleRoot_RejectsFirstSubtreeNotPowerOfTwo verifies that
@@ -4870,8 +4876,9 @@ func newTestBlockHeader(t *testing.T) *BlockHeader {
 // buildBlockWithSubtrees constructs a Block with two subtrees: a fully populated
 // first subtree of `subtreeSize` leaves and a final subtree containing the
 // remaining `totalTxs - subtreeSize` leaves (which may be fewer than
-// `subtreeSize`). It returns the block and the expected top-level merkle root
-// computed with the final subtree's root lifted to the first subtree's height.
+// `subtreeSize`, and may be a non-power-of-two count). It returns the block
+// and the expected top-level merkle root computed with the final subtree's
+// root lifted to the first subtree's height.
 func buildBlockWithSubtrees(t *testing.T, subtreeSize, totalTxs int) (*Block, *chainhash.Hash) {
 	t.Helper()
 	require.Greater(t, totalTxs, subtreeSize)
@@ -4889,7 +4896,9 @@ func buildBlockWithSubtrees(t *testing.T, subtreeSize, totalTxs int) (*Block, *c
 		require.NoError(t, left.AddNode(hashes[i], 0, 0))
 	}
 
-	right, err := subtreepkg.NewTreeByLeafCount(subtreeSize)
+	rightLeafCount := totalTxs - subtreeSize
+
+	right, err := subtreepkg.NewIncompleteTreeByLeafCount(rightLeafCount)
 	require.NoError(t, err)
 
 	for i := subtreeSize; i < totalTxs; i++ {
@@ -4973,35 +4982,6 @@ func buildBlockWithFinalSubtreeLargerThanFirst(t *testing.T) *Block {
 	require.NoError(t, err)
 
 	for i := 10; i < 14; i++ {
-		require.NoError(t, second.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
-	}
-
-	return &Block{
-		Header:        newTestBlockHeader(t),
-		CoinbaseTx:    newTestCoinbaseTx(t),
-		Subtrees:      []*chainhash.Hash{first.RootHash(), second.RootHash()},
-		SubtreeSlices: []*subtreepkg.Subtree{first, second},
-	}
-}
-
-// buildBlockWithNonPowerOfTwoFinal returns a Block whose final subtree has a
-// non-power-of-two leaf count (3 leaves in a capacity-4 subtree). This
-// violates the new lift rules because RootHashPadded requires a power-of-two
-// leaf count.
-func buildBlockWithNonPowerOfTwoFinal(t *testing.T) *Block {
-	t.Helper()
-
-	first, err := subtreepkg.NewTreeByLeafCount(4)
-	require.NoError(t, err)
-
-	for i := 0; i < 4; i++ {
-		require.NoError(t, first.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
-	}
-
-	second, err := subtreepkg.NewTreeByLeafCount(4)
-	require.NoError(t, err)
-
-	for i := 10; i < 13; i++ {
 		require.NoError(t, second.AddNode(chainhash.HashH([]byte{byte(i)}), 0, 0))
 	}
 

@@ -289,10 +289,14 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 	}
 
 	// Partition the block's transactions into K subtrees so each non-final subtree
-	// is exactly subtreeSize leaves and the final subtree's leaf count is a power of
-	// two ≤ subtreeSize — matching model.Block.CheckMerkleRoot's Length-based lift
-	// rules. For blocks where txCount ≤ MaximumMerkleItemsPerSubtree the partition
-	// is the unchanged single-subtree case.
+	// is exactly subtreeSize leaves and the final subtree's leaf count is in
+	// [1, subtreeSize] — matching model.Block.CheckMerkleRoot's Length-based lift
+	// rules. The final subtree does not need to be a power of two: the
+	// duplicate-when-odd rule applied inside BuildMerkleTreeStoreFromBytes already
+	// pads its natural root to height ceil(log2(length)), which is what the lift
+	// in CheckMerkleRoot expects. For blocks where txCount ≤
+	// MaximumMerkleItemsPerSubtree the partition is the unchanged single-subtree
+	// case.
 	maxItems := sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree
 
 	subtreeSize, numSubtrees, finalLeafCount, err := partitionLegacyBlock(txCount, maxItems)

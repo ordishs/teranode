@@ -1430,18 +1430,18 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 					b.String(), sub.Length(), targetLength,
 				)
 			}
-
-			if isLast && sub.Length() < targetLength && !subtreepkg.IsPowerOfTwo(sub.Length()) {
-				return errors.NewBlockInvalidError(
-					"[BLOCK][%s] final subtree leaf count is not a power of two: %d",
-					b.String(), sub.Length(),
-				)
-			}
 		}
 
 		// If the final subtree is shorter than the target length, lift its root
 		// to the target height so it occupies the slot of a same-capacity subtree
-		// in the top-level merkle tree.
+		// in the top-level merkle tree. The final subtree's leaf count does NOT
+		// need to be a power of two: BuildMerkleTreeStoreFromBytes already applies
+		// the duplicate-when-odd rule at every internal level, so the subtree's
+		// own RootHash() naturally lives at height ceil(log2(Length)) and matches
+		// what the canonical flat tree produces for that segment. Allowing
+		// non-power-of-two final subtrees is what lets the legacy-block
+		// partitioner stay at maxItems instead of degenerating to tiny subtrees
+		// for adversarial transaction counts — see issue #901.
 		if last := b.SubtreeSlices[len(b.SubtreeSlices)-1]; last.Length() < targetLength {
 			liftedRoot, err := last.RootHashPadded(targetHeight)
 			if err != nil {
