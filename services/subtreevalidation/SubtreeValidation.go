@@ -142,6 +142,17 @@ type txMetaCacheOps interface {
 	// a single Kafka message containing many entries acquires each touched bucket lock once
 	// instead of once per entry. Critical for txmetaHandler throughput under heavy load.
 	SetCacheMulti(keys [][]byte, values [][]byte) error
+
+	// SetCacheMultiSequential is the partition-aware twin of SetCacheMulti: writes
+	// all keys on the caller's goroutine without errgroup fan-out. The txmeta
+	// handler uses this because it already has parallelism via per-partition
+	// Kafka consumer goroutines, so the inner cache fan-out is pure overhead.
+	SetCacheMultiSequential(keys [][]byte, values [][]byte) error
+
+	// SetCacheMultiSequentialWithHashes is SetCacheMultiSequential with caller-
+	// supplied xxhash values, so the receiver can pass the on-wire v2 hash
+	// straight through without recomputing. hashes[i] MUST equal xxhash.Sum64(keys[i]).
+	SetCacheMultiSequentialWithHashes(keys [][]byte, values [][]byte, hashes []uint64) error
 }
 
 // SetTxMetaCacheFromBytes stores raw transaction metadata bytes in the cache.
@@ -179,6 +190,33 @@ func (u *Server) SetTxMetaCacheMulti(_ context.Context, keys [][]byte, values []
 	}
 	if cache, ok := u.utxoStore.(txMetaCacheOps); ok {
 		return cache.SetCacheMulti(keys, values)
+	}
+	return nil
+}
+
+// SetTxMetaCacheMultiSequential stores multiple txmeta entries via the cache's
+// sequential write path (no errgroup fan-out). Used by the Kafka txmeta
+// handler, which is itself running on a per-partition goroutine — pushing
+// parallelism inside the cache call would just thrash the scheduler.
+func (u *Server) SetTxMetaCacheMultiSequential(_ context.Context, keys [][]byte, values [][]byte) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if cache, ok := u.utxoStore.(txMetaCacheOps); ok {
+		return cache.SetCacheMultiSequential(keys, values)
+	}
+	return nil
+}
+
+// SetTxMetaCacheMultiSequentialWithHashes stores entries using caller-supplied
+// xxhash values. Used by the v2 txmeta handler to skip re-hashing on receive.
+// Returns nil if the underlying store does not implement txMetaCacheOps.
+func (u *Server) SetTxMetaCacheMultiSequentialWithHashes(_ context.Context, keys [][]byte, values [][]byte, hashes []uint64) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if cache, ok := u.utxoStore.(txMetaCacheOps); ok {
+		return cache.SetCacheMultiSequentialWithHashes(keys, values, hashes)
 	}
 	return nil
 }
