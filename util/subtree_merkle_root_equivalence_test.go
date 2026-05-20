@@ -3,6 +3,7 @@ package util
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"fmt"
 	mathbits "math/bits"
 	"testing"
 
@@ -104,7 +105,7 @@ func TestSubtreeMerkleRootEquivalence_NonPowerOfTwoFinal(t *testing.T) {
 	rValues := []int{1, 2, 3, 5, 6, 7, 9, 11, 13, 15, 17, 21, 23, 27, 31}
 
 	for _, r := range rValues {
-		t.Run(formatLeafCount(r), func(t *testing.T) {
+		t.Run(fmt.Sprintf("final_subtree_has_%d_leaves", r), func(t *testing.T) {
 			totalTxs := subtreeSize + r
 
 			txHashes := make([]chainhash.Hash, totalTxs)
@@ -181,26 +182,4 @@ func liftRootForTest(root *chainhash.Hash, length, targetHeight int) *chainhash.
 	}
 
 	return &out
-}
-
-func formatLeafCount(r int) string {
-	return "final_subtree_has_" + intToASCII(r) + "_leaves"
-}
-
-func intToASCII(n int) string {
-	if n == 0 {
-		return "0"
-	}
-
-	var buf [20]byte
-
-	i := len(buf)
-
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-
-	return string(buf[i:])
 }
