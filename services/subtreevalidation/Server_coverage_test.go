@@ -755,6 +755,8 @@ func TestResolveTxMetaCacheBucketType(t *testing.T) {
 		{"trimmed", txmetacache.Trimmed},
 		{"native", txmetacache.Native},
 		{"Native", txmetacache.Native},
+		{"pointer", txmetacache.Pointer},
+		{"Pointer", txmetacache.Pointer},
 		{"gibberish", txmetacache.Unallocated}, // unknown → fallback
 	}
 
