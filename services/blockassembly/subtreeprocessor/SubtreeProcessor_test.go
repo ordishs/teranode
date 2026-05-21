@@ -218,6 +218,25 @@ func TestRotate(t *testing.T) {
 	assert.Equal(t, 1, chainedSubtreesLen)
 }
 
+// Test_subtreeProcessorClockOverride verifies the clock seam on
+// SubtreeProcessor. NewSubtreeProcessor must wire a real clock by default,
+// and tests must be able to substitute a fake. The validFromMillis
+// calculation in the Start loop and dequeueDuringBlockMovement reads through
+// stp.clock, so installing a fake here makes those paths deterministic.
+func Test_subtreeProcessorClockOverride(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	newSubtreeChan := make(chan NewSubtreeRequest, 1)
+
+	stp, err := NewSubtreeProcessor(context.Background(), ulogger.TestLogger{}, tSettings, nil, nil, nil, newSubtreeChan)
+	require.NoError(t, err)
+	require.NotNil(t, stp.clock, "default clock must be wired in NewSubtreeProcessor")
+
+	fixed := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	stp.clock = fixedClock{t: fixed}
+
+	require.Equal(t, fixed, stp.clock.Now())
+}
+
 func Test_RemoveTxFromSubtrees(t *testing.T) {
 	t.Run("remove transaction from subtrees", func(t *testing.T) {
 		newSubtreeChan := make(chan NewSubtreeRequest)
@@ -629,8 +648,13 @@ func TestMoveForwardBlock(t *testing.T) {
 
 	wg.Wait()
 
-	// this is to make sure the subtrees are added to the chain
-	for stp.txCount.Load() < n-1 {
+	// this is to make sure the subtrees are added to the chain.
+	// txCount starts at 1 (coinbase placeholder counted by setTxCountFromSubtrees)
+	// and reaches 1+(n-1) = n after all AddBatch items are processed. Polling for n-1
+	// races: the worker can transiently expose txCount = n-1 between iterations
+	// when only n-2 of n-1 items are committed, letting lengthCh fire before the
+	// last item is added to the current subtree.
+	for stp.txCount.Load() < n {
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -2602,11 +2626,18 @@ func createSubtreeMeta(t *testing.T, subtree *subtreepkg.Subtree) *subtreepkg.Me
 
 	parent := chainhash.HashH([]byte("txInpoints"))
 
+	parentInput := &bt.Input{PreviousTxOutIndex: 1}
+	if err := parentInput.PreviousTxIDAdd(&parent); err != nil {
+		panic(err)
+	}
+
+	ti, err := subtreepkg.NewTxInpointsFromInputs([]*bt.Input{parentInput})
+	if err != nil {
+		panic(err)
+	}
+
 	for idx := range subtree.Nodes {
-		_ = subtreeMeta.SetTxInpoints(idx, subtreepkg.TxInpoints{
-			ParentTxHashes: []chainhash.Hash{parent},
-			Idxs:           [][]uint32{{1}},
-		})
+		_ = subtreeMeta.SetTxInpoints(idx, ti)
 	}
 
 	return subtreeMeta
