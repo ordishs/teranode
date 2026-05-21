@@ -302,7 +302,8 @@ Each metric measures "The time taken to handle a specific legacy action handler"
 | `teranode_subtreevalidation_validate_subtree_handler`       | Histogram | Duration of subtree handler                       |
 | `teranode_subtreevalidation_validate_subtree_duration`      | Histogram | Duration of validate subtree                      |
 | `teranode_subtreevalidation_bless_missing_transaction`      | Histogram | Duration of bless missing transaction             |
-| `teranode_subtreevalidation_set_tx_meta_cache_kafka`        | Histogram | Duration of setting tx meta cache from kafka      |
+| `teranode_subtreevalidation_set_tx_meta_cache_kafka_batch`  | Histogram | Duration of one SetCacheMulti batch from a Kafka txmeta message (per Kafka message, not per entry) |
+| `teranode_subtreevalidation_set_tx_meta_cache_kafka_count`  | Counter   | Number of ADD entries processed from Kafka (per-entry; mirrors the pre-batching histogram count)   |
 | `teranode_subtreevalidation_del_tx_meta_cache_kafka`        | Histogram | Duration of deleting tx meta cache from kafka     |
 | `teranode_subtreevalidation_set_tx_meta_cache_kafka_errors` | Counter   | Number of errors setting tx meta cache from kafka |
 

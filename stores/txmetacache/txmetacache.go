@@ -4,12 +4,12 @@
 // transaction processing throughput.
 //
 // Key features:
-// - Implements a configurable memory caching mechanism for transaction metadata
-// - Per-shard FIFO eviction handled by the chosen backend (ImprovedCache ring
-//   buffer or PointerCache key ring)
-// - Integrates with Prometheus for operational metrics and monitoring
-// - Provides both single and batch operations for transaction metadata retrieval and updates
-// - Supports parallel processing for improved performance on multi-core systems
+//   - Implements a configurable memory caching mechanism for transaction metadata
+//   - Per-shard FIFO eviction handled by the chosen backend (ImprovedCache ring
+//     buffer or PointerCache key ring)
+//   - Integrates with Prometheus for operational metrics and monitoring
+//   - Provides both single and batch operations for transaction metadata retrieval and updates
+//   - Supports parallel processing for improved performance on multi-core systems
 //
 // The package works by intercepting calls to the underlying UTXO store, caching results
 // in memory, and proxying other calls through to the underlying store. This architecture
