@@ -850,4 +850,5 @@ func TestHandleNewPeerMsg_NilFSMState(t *testing.T) {
 	sm.handleNewPeerMsg(smPeer)
 
 	require.True(t, sm.peerStates.Exists(smPeer), "peer must be registered even when FSM state is unavailable")
+	require.Equal(t, uint64(0), sm.currentFeeFilter.Load(), "fee filter must not be set when FSM state is unavailable")
 }
