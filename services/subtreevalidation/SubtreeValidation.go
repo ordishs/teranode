@@ -983,9 +983,11 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	url := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
 	u.logger.Debugf("[getSubtreeTxHashes][%s] getting subtree from %s", subtreeHash.String(), url)
 
-	// Bound the body at the policy cap (MaximumMerkleItemsPerSubtree * HashSize). A peer that
+	// Bound the body at the receive-side policy cap (MaxIncomingSubtreeBytes). A peer that
 	// streams more than this is malicious — fail fast rather than ReadAll into memory.
-	maxSubtreeBytes := int64(u.settings.BlockAssembly.MaximumMerkleItemsPerSubtree) * int64(chainhash.HashSize)
+	// This must be independent of local BlockAssembly.MaximumMerkleItemsPerSubtree, which
+	// only controls what *this node* assembles; peers may legitimately produce larger subtrees.
+	maxSubtreeBytes := u.settings.SubtreeValidation.MaxIncomingSubtreeBytes
 
 	// TODO add the metric for how long this takes
 	// body, err := util.DoHTTPRequestBodyReader(spanCtx, url)
