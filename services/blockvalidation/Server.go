@@ -624,6 +624,28 @@ func (u *Server) Init(ctx context.Context) (err error) {
 							continue
 						}
 
+						// Peer-side data-quality failure: every peer we tried (primary +
+						// alternatives) returned bad/incomplete data. Distinguished from
+						// ErrServiceError so the silent "clear markers, retry" loop above
+						// doesn't absorb peer issues. We clear markers (so future P2P
+						// notifications for this block can re-trigger catchup), report
+						// peer failure for the originating peer (so P2P routes the next
+						// attempt to a different peer), and log loudly. This avoids the
+						// hot-loop where the same peer keeps being asked for the same
+						// missing subtree data.
+						if errors.Is(err, errors.ErrExternal) {
+							u.logger.Warnf("[catchup] All peers failed for block %s, clearing markers and reporting peer failure to allow retry from a different peer: %v", c.block.Hash().String(), err)
+							u.processBlockNotify.Delete(*c.block.Hash())
+							u.catchupAlternatives.Delete(*c.block.Hash())
+							u.reportCatchupFailure(ctx, c.peerID)
+
+							if reportErr := u.blockchainClient.ReportPeerFailure(ctx, c.block.Hash(), c.peerID, "catchup", err.Error()); reportErr != nil {
+								u.logger.Errorf("[catchup] failed to report peer failure for block %s peer %s: %v", c.block.Hash().String(), c.peerID, reportErr)
+							}
+
+							continue
+						}
+
 						// Report catchup failure to P2P service
 						u.reportCatchupFailure(ctx, c.peerID)
 
