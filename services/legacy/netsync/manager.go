@@ -710,10 +710,10 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 
 	state, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
 	if err != nil {
-		sm.logger.Debugf("Error getting FSM current state: %v", err)
+		sm.logger.Errorf("[handleNewPeerMsg] failed to get current FSM state: %v", err)
 	}
 
-	if *state == teranodeblockchain.FSMStateLEGACYSYNCING && sm.currentFeeFilter.Load() != bsvutil.SatoshiPerBitcoin {
+	if state != nil && *state == teranodeblockchain.FSMStateLEGACYSYNCING && sm.currentFeeFilter.Load() != bsvutil.SatoshiPerBitcoin {
 		// Set fee filter to inform peers that we don't want to be notified of transactions while we're syncing
 		feeFilter := wire.NewMsgFeeFilter(bsvutil.SatoshiPerBitcoin)
 
@@ -929,6 +929,9 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 	buf := bytes.NewBuffer(make([]byte, 0, tmsg.tx.MsgTx().SerializeSize()))
 	_ = tmsg.tx.MsgTx().Serialize(buf)
 
+	// Single inbound tx per call, passed downstream to the validator. Stays
+	// on the standard heap path — no arena amortisation possible for a
+	// one-shot decode where the tx must outlive this function frame.
 	btTx, err := bt.NewTxFromBytes(buf.Bytes())
 	if err != nil {
 		sm.logger.Errorf("Failed to create transaction from bytes: %v", err)
@@ -1932,8 +1935,17 @@ func (sm *SyncManager) blockHandler() {
 	ticker := time.NewTicker(syncPeerTickerInterval)
 	defer ticker.Stop()
 
-	// TODO make this configurable
-	maxBlockQueue := 10_000
+	// TODO make this configurable.
+	//
+	// This buffer pins one *wire.MsgBlock per slot. Each MsgBlock carries
+	// its go-wire decode arena (≥4 MiB per block today), so the previous
+	// 10_000-deep queue could pin ~40 GiB of arena memory ahead of the
+	// sequential processor. On a memory-constrained box that turns into
+	// the dominant live-heap source and starves the GC. Cap at a small
+	// value: enough to absorb processor-stall jitter, far below anything
+	// that would meaningfully pin memory. The downloader naturally
+	// back-pressures via TCP when the queue is full.
+	maxBlockQueue := 100
 
 	// create a block queue to handle block messages in a separate goroutine, in order
 	blockQueue := make(chan *blockQueueMsg, maxBlockQueue)
