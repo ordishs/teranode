@@ -52,8 +52,8 @@ compose/multinode.sh blast
 # Rebuild the blaster, then blast all nodes with auto-mining on node 1
 compose/multinode.sh blast --build --auto-mine
 
-# Headless, 50 tx/s, only nodes 1 and 3
-compose/multinode.sh blast 1,3 -- --headless --max-tps 50 --duration 5m
+# Headless, nodes 1 and 3, limited concurrency, auto-stop after 5m
+compose/multinode.sh blast 1,3 -- --headless --workers 50 --duration 5m
 
 # Tighter block cadence
 BLAST_AUTO_MINE_INTERVAL=2 compose/multinode.sh blast --auto-mine
@@ -69,6 +69,16 @@ The blaster binary is located via `$BLASTER_BIN` (if set), otherwise `../teranod
 
 Blaster snapshot + embedded coinbase state goes to `data/multinode-blaster/` (outside the docker-managed `data/multinode/` tree so it stays user-owned). `multinode.sh down` wipes this alongside the chain state so a fresh stack doesn't inherit stale UTXOs.
 
+## Network chaos tests
+
+Go scenarios at `test/multinode/` drive this script through split-brain, crash-recovery, and slow-peer cases and assert invariants (tip convergence, reorg resolution, catchup). Run them with:
+
+```bash
+make network-chaos-test
+```
+
+The suite is gated behind the `network_chaos` build tag so it does not run under `go test ./...` or `make smoketest`. Scenarios refuse to start if another multinode stack is already running (set `MULTINODE_ALLOW_TAKEOVER=1` to override, or `MULTINODE_BYOS=1` to skip `up`/`down` entirely and reuse a running stack). Prereqs and per-scenario details are documented in `test/multinode/README.md`.
+
 ### Chaos commands
 
 | Command | Description |
@@ -79,7 +89,7 @@ Blaster snapshot + embedded coinbase state goes to `data/multinode-blaster/` (ou
 | `chaos start <node>` | Start a stopped node container |
 | `chaos pause <node>` | Freeze a node (simulates hang/GC pause) |
 | `chaos unpause <node>` | Unfreeze a paused node |
-| `chaos slow <node> <ms>` | Add network latency to a node (requires sudo) |
+| `chaos slow <node> <ms>` | Add network latency to a node |
 | `chaos unslow <node>` | Remove added latency from a node |
 
 ```bash
@@ -100,7 +110,7 @@ compose/multinode.sh chaos kill 4
 compose/multinode.sh chaos start 4
 ```
 
-The `isolate`/`heal` commands use `iptables` via `nsenter` to block traffic to other teranode containers while keeping RPC, dashboard, and shared infrastructure (Kafka, Postgres) accessible. The `slow`/`unslow` commands use `tc` (traffic control) via `nsenter`. Both require `sudo` and `iproute2` on the host. The `kill`/`start`/`pause`/`unpause` commands are pure Docker operations with no extra dependencies.
+The `isolate`/`heal`/`slow`/`unslow` commands inject `iptables` and `tc` rules into the target container's network namespace via a short-lived `nicolaka/netshoot` sidecar that shares the netns (`docker run --net=container:teranodeN --cap-add=NET_ADMIN ...`). Rules persist in the target's netns after the sidecar exits. No `sudo`, `nsenter`, or `iproute2` on the host — works identically on Linux and macOS (Docker Desktop). The sidecar image (~200MB) is pulled on first use and cached. Override with `NETSHOOT_IMAGE=...` if you need a different tag or mirror. The `kill`/`start`/`pause`/`unpause` commands are pure Docker operations with no extra dependencies.
 
 ## Architecture
 
