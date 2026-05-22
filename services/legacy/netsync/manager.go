@@ -710,10 +710,10 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 
 	state, err := sm.blockchainClient.GetFSMCurrentState(sm.ctx)
 	if err != nil {
-		sm.logger.Debugf("Error getting FSM current state: %v", err)
+		sm.logger.Errorf("[handleNewPeerMsg] failed to get current FSM state: %v", err)
 	}
 
-	if *state == teranodeblockchain.FSMStateLEGACYSYNCING && sm.currentFeeFilter.Load() != bsvutil.SatoshiPerBitcoin {
+	if state != nil && *state == teranodeblockchain.FSMStateLEGACYSYNCING && sm.currentFeeFilter.Load() != bsvutil.SatoshiPerBitcoin {
 		// Set fee filter to inform peers that we don't want to be notified of transactions while we're syncing
 		feeFilter := wire.NewMsgFeeFilter(bsvutil.SatoshiPerBitcoin)
 
@@ -1455,9 +1455,11 @@ func (sm *SyncManager) fetchHeaderBlocks() {
 		headerListLen, currentInFlight, dynamicMaxInFlight, avgBlockSize, maxBlocks)
 
 	// Build up a getdata request for the list of blocks the headers
-	// describe.  The size hint will be limited to wire.MaxInvPerMsg by
-	// the function, so no need to double check it here.
-	getDataMessage := wire.NewMsgGetDataSizeHint(uint(sm.headerList.Len())) // nolint:gosec
+	// describe. Size the InvList to maxBlocks rather than headerList.Len()
+	// because the loop below breaks at maxBlocks — sizing to headerList.Len()
+	// (often 2000) caused large repeated allocations (~16 KB) when only a
+	// handful of slots ever get used (maxBlocks shrinks to 1 for >2 GB blocks).
+	getDataMessage := wire.NewMsgGetDataSizeHint(uint(maxBlocks)) // nolint:gosec
 	numRequested := 0
 
 	for e := sm.startHeader; e != nil; e = e.Next() {
@@ -1930,8 +1932,17 @@ func (sm *SyncManager) blockHandler() {
 	ticker := time.NewTicker(syncPeerTickerInterval)
 	defer ticker.Stop()
 
-	// TODO make this configurable
-	maxBlockQueue := 10_000
+	// TODO make this configurable.
+	//
+	// This buffer pins one *wire.MsgBlock per slot. Each MsgBlock carries
+	// its go-wire decode arena (≥4 MiB per block today), so the previous
+	// 10_000-deep queue could pin ~40 GiB of arena memory ahead of the
+	// sequential processor. On a memory-constrained box that turns into
+	// the dominant live-heap source and starves the GC. Cap at a small
+	// value: enough to absorb processor-stall jitter, far below anything
+	// that would meaningfully pin memory. The downloader naturally
+	// back-pressures via TCP when the queue is full.
+	maxBlockQueue := 100
 
 	// create a block queue to handle block messages in a separate goroutine, in order
 	blockQueue := make(chan *blockQueueMsg, maxBlockQueue)

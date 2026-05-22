@@ -139,6 +139,14 @@ type Store struct {
 	indexMutex          sync.Mutex    // Mutex for index creation operations
 	indexOnce           sync.Once     // Ensures index creation/wait is only done once per process
 	spendLuaPackages    []string      // Pre-initialized array of Lua package names for spend operations
+
+	// batchKeysPool is a per-Store sync.Pool of *[]*aerospike.Key slices reused
+	// across SetMinedMulti calls. Per-Store scoping ensures the Key's intrinsic
+	// namespace/setName never crosses Store instances.
+	batchKeysPool sync.Pool
+
+	// batchOperateFn is a test-only override for s.client.BatchOperate; nil means use the real client.
+	batchOperateFn func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error
 }
 
 // New creates a new Aerospike-based UTXO store.
