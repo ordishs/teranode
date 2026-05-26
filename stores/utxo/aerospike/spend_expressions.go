@@ -516,7 +516,14 @@ func (s *Store) processSpendBatchResultsExpressions(
 	// path checks UtxoSpendableIn per-offset and returns the precise rejection
 	// reason for records that genuinely cannot be spent. Each item still has a
 	// pending errCh receive — Lua sends exactly one response on it.
+	//
+	// This is a single additional batched Lua call per expression batch — its
+	// cost is independent of how many records were filtered out, but it is only
+	// paid when at least one record needed re-evaluation.
 	if len(retryThroughLua) > 0 {
+		prometheusUtxoSpendExpressionLuaRetry.Inc()
+		prometheusUtxoSpendExpressionLuaRetryN.Add(float64(len(retryThroughLua)))
+
 		s.executeLuaSpendBatch(retryThroughLua)
 	}
 }
