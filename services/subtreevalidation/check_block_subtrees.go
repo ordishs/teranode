@@ -305,7 +305,20 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 					// Retry on 503 — peer's asset service may reject under admission control
 					// while it generates the file on-demand from Aerospike.
-					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(gCtx, url)
+					//
+					// IMPORTANT: pass the parent ctx, NOT gCtx, to the HTTP fetch and the
+					// stream processor. gCtx is the errgroup's cancellable context — using
+					// it here means a single sibling failure cancels every in-flight
+					// subtree_data download in this batch. Because each cancellation closes
+					// the upstream connection, the peer aborts its on-demand creation
+					// (storer.Abort), discarding work that was already paid for in Aerospike
+					// reads. Detaching from gCtx lets each fetch complete (or hit its own
+					// http_streaming_timeout) so the peer can finish writing its subtreeData
+					// file — converting wasted Aerospike work into a pre-warmed cache for
+					// the next retry. The trade-off is that batch failure detection waits
+					// for in-flight peers instead of cancelling early; acceptable here
+					// because the per-fetch streaming timeout still bounds it.
+					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
 					if subtreeDataErr != nil {
 						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
 					}
@@ -317,8 +330,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 						bytesRead: &bytesRead,
 					}
 
-					// Process transactions directly from the stream while storing to disk
-					err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
+					// Process transactions directly from the stream while storing to disk.
+					// Same rationale as above for using ctx instead of gCtx.
+					err = u.processSubtreeDataStream(ctx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
 					_ = countingBody.Close()
 
 					// Track bytes downloaded from peer after stream is consumed
