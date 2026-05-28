@@ -10,16 +10,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.4
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260518042519-1ca0c6519af9
-	// BSV fork of aerospike-client-go-v8 (adds TeranodeModifyOp /
-	// TeranodeReadOp wire opcodes 200/201 — see
-	// github.com/bsv-blockchain/aerospike-server-private feat/
-	// teranode-native-op for the matching server-side dispatcher).
-	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv2.0.20260518145742-72616cb3187f
+	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv3
 	github.com/bsv-blockchain/go-bt/v2 v2.6.4
 	github.com/bsv-blockchain/go-chaincfg v1.5.8
 	github.com/bsv-blockchain/go-sdk v1.2.23
 	github.com/bsv-blockchain/go-subtree v1.4.2
-	github.com/bsv-blockchain/testcontainers-aerospike-go v0.3.7
+	github.com/bsv-blockchain/testcontainers-aerospike-go v0.4.0
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd
 	github.com/btcsuite/goleveldb v1.0.0
 	github.com/centrifugal/centrifuge v0.33.2
@@ -72,8 +68,6 @@ require (
 	k8s.io/client-go v0.35.2
 	modernc.org/sqlite v1.47.0
 )
-
-require github.com/aerospike/aerospike-client-go/v8 v8.7.0 // indirect
 
 require (
 	bitbucket.org/simon_ordish/cryptolib v1.0.48 // indirect
@@ -189,7 +183,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.4 // indirect
-	golang.org/x/telemetry v0.0.0-20260421165255-392afab6f40e // indirect
+	golang.org/x/telemetry v0.0.0-20260508192327-42602be52be6 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
@@ -412,8 +406,8 @@ require (
 	github.com/spf13/viper v1.21.0
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/tilt-dev/fsnotify v1.4.8-0.20220602155310-fff9c274a375 // indirect
-	github.com/tklauser/go-sysconf v0.3.16 // indirect
-	github.com/tklauser/numcpus v0.11.0 // indirect
+	github.com/tklauser/go-sysconf v0.4.0 // indirect
+	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/tonistiigi/fsutil v0.0.0-20251211185533-a2aa163d723f // indirect
 	github.com/tonistiigi/units v0.0.0-20180711220420-6950e57a87ea // indirect
 	github.com/tonistiigi/vt100 v0.0.0-20240514184818-90bafcd6abab // indirect
@@ -442,10 +436,10 @@ require (
 	go.uber.org/mock v0.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
-	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/mod v0.36.0 // indirect
+	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
-	golang.org/x/tools v0.44.0 // indirect
+	golang.org/x/tools v0.45.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
