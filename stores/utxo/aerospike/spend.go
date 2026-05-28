@@ -800,8 +800,10 @@ func (s *Store) handleBatchError(batchRecord aerospike.BatchRecordIfc, batchByKe
 		}
 		s.sendSpendBatchItemError(batch, idx, errors.NewStorageError("[spendMulti][%s] aerospike spend batch record failed, batchId %d blockHeight %d; %s; %s: %s", describeBatchSpendAt(batch, idx), batchID, thisBlockHeight, diagnostics, group, err.Error(), err))
 	}
-	// Record batch-level failure for circuit breaker
-	if s.spendCircuitBreaker != nil {
+	// Only count infrastructure failures toward the circuit breaker.
+	// Per-record data-state errors (e.g. KEY_NOT_FOUND_ERROR from missing
+	// parents during catch-up sync) must not trip the breaker — issue #953.
+	if s.spendCircuitBreaker != nil && isInfrastructureFailure(err) {
 		s.spendCircuitBreaker.RecordFailure()
 	}
 }
