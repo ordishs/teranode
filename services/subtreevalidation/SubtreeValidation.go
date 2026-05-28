@@ -958,14 +958,26 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 
 	txHashes := make([]chainhash.Hash, 0, u.settings.BlockAssembly.InitialMerkleItemsPerSubtree)
 
-	// check whether we have a subtreeToCheck file and use that instead of doing a network request
-	subtreeToCheckBytes, err := u.subtreeStore.Get(spanCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
-	if err == nil && subtreeToCheckBytes != nil {
-		u.logger.Debugf("[getSubtreeTxHashes][%s] found subtreeToCheck file in store, using it instead of network request", subtreeHash.String())
+	// Use the local subtree file (under either FileTypeSubtreeToCheck or
+	// FileTypeSubtree) instead of a network request — see findLocalSubtreeFile.
+	localFileType, localExists, err := u.findLocalSubtreeFile(spanCtx, *subtreeHash)
+	if err != nil {
+		return nil, errors.NewStorageError("[getSubtreeTxHashes][%s] failed to check local subtree store", subtreeHash.String(), err)
+	}
+	if localExists {
+		localBytes, getErr := u.subtreeStore.Get(spanCtx, subtreeHash[:], localFileType)
+		if getErr != nil {
+			return nil, errors.NewStorageError("[getSubtreeTxHashes][%s] failed to read local subtree (%s)", subtreeHash.String(), localFileType.String(), getErr)
+		}
+		if localBytes == nil {
+			return nil, errors.NewStorageError("[getSubtreeTxHashes][%s] local subtree (%s) returned nil bytes despite Exists=true", subtreeHash.String(), localFileType.String())
+		}
 
-		subtree, err := subtreepkg.NewSubtreeFromBytes(subtreeToCheckBytes)
+		u.logger.Debugf("[getSubtreeTxHashes][%s] found local subtree file in store (%s), using it instead of network request", subtreeHash.String(), localFileType.String())
+
+		subtree, err := subtreepkg.NewSubtreeFromBytes(localBytes)
 		if err != nil {
-			return nil, errors.NewProcessingError("[getSubtreeTxHashes][%s] failed to create subtree from subtreeToCheck bytes", subtreeHash.String(), err)
+			return nil, errors.NewProcessingError("[getSubtreeTxHashes][%s] failed to create subtree from local bytes", subtreeHash.String(), err)
 		}
 
 		// return the transaction hashes from the subtree

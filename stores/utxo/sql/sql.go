@@ -3312,8 +3312,12 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		return nil, err
 	}
 
-	// check utxoHash is the same as expected
-	if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
+	// Verify the caller-supplied hash matches the stored one. When the caller
+	// passes nil (e.g. the bulk /api/v1/utxos endpoint, which intentionally
+	// avoids fetching the full transaction to recompute it) we trust the
+	// stored hash — the row was located by primary key (txid, vout) and the
+	// stored hash is canonical.
+	if spend.UTXOHash != nil && !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
 		return nil, errors.NewUtxoHashMismatchError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 

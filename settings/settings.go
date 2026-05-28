@@ -213,6 +213,16 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Streaming configuration
 			SubtreeDataStreamingChunkSize:   getInt("asset_subtreeDataStreamingChunkSize", 10000, alternativeContext...),
 			SubtreeDataStreamingConcurrency: getInt("asset_subtreeDataStreamingConcurrency", 2, alternativeContext...),
+
+			// HTTP rate limiting / auth / proxy trust (added in #643).
+			HTTPRateLimit:                getInt("asset_httpRateLimit", 1024, alternativeContext...),
+			HTTPHeavyRateLimit:           getInt("asset_httpHeavyRateLimit", 10, alternativeContext...),
+			HTTPPeerRateMultiplier:       getInt("asset_httpPeerRateMultiplier", 5, alternativeContext...),
+			HTTPMinerRateLimit:           getInt("asset_httpMinerRateLimit", 0, alternativeContext...),
+			HTTPBodyLimit:                getString("asset_httpBodyLimit", "100MB", alternativeContext...),
+			TrustedProxyCIDRs:            getString("asset_trustedProxyCIDRs", "", alternativeContext...),
+			PeerAuthAllowlist:            getString("asset_peerAuthAllowlist", "", alternativeContext...),
+			PeerMinerReputationThreshold: getFloat64("asset_peerMinerReputationThreshold", 50.0, alternativeContext...),
 		},
 		Block: BlockSettings{
 			MinedCacheMaxMB:                       getInt("blockMinedCacheMaxMB", 256, alternativeContext...),
@@ -592,6 +602,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			TempStore:                        getURL("temp_store", "file://./data/tempstore", alternativeContext...),
 			PeerIdleTimeout:                  getDuration("legacy_peerIdleTimeout", 125*time.Second, alternativeContext...),     // ping/pong interval is 2 mins, so we set this to 125s to be sure
 			PeerProcessingTimeout:            getDuration("legacy_peerProcessingTimeout", 3*time.Minute, alternativeContext...), // processing a block will be the largest message to process
+
+			MaxOrphanTxs: getInt("legacy_maxOrphanTxs", 100, alternativeContext...), // PR #776: cap on orphan tx pool
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

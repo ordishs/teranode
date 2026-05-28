@@ -181,16 +181,25 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			subtreeIdx := subtreeIdx
 
 			g.Go(func() (err error) {
-				subtreeToCheckExists, err := u.subtreeStore.Exists(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+				// A subtree may be available locally under either:
+				//   - FileTypeSubtreeToCheck — fetched from a peer, pending validation
+				//   - FileTypeSubtree        — already validated (e.g. legacy catch-up's
+				//                               quickValidationMode validated txs inline
+				//                               before writing the subtree)
+				// We must consult both before falling back to an HTTP fetch. Otherwise
+				// CheckBlockSubtrees will try to HTTP-download a subtree we already have
+				// — and for baseURL="legacy" the synthetic URL has no scheme, so the
+				// request fails outright.
+				localFileType, localExists, err := u.findLocalSubtreeFile(gCtx, subtreeHash)
 				if err != nil {
-					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree exists in store", subtreeHash.String(), err)
+					return errors.NewStorageError("[CheckBlockSubtrees][%s] failed to check if subtree exists in store", subtreeHash.String(), err)
 				}
 
 				var subtreeToCheck *subtreepkg.Subtree
 
-				if subtreeToCheckExists {
-					// get the subtreeToCheck from the store
-					subtreeReader, err := u.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+				if localExists {
+					// read from whichever local file we found
+					subtreeReader, err := u.subtreeStore.GetIoReader(gCtx, subtreeHash[:], localFileType)
 					if err != nil {
 						return errors.NewStorageError("[CheckBlockSubtrees][%s] failed to get subtree from store", subtreeHash.String(), err)
 					}
@@ -296,7 +305,20 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 
 					// Retry on 503 — peer's asset service may reject under admission control
 					// while it generates the file on-demand from Aerospike.
-					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(gCtx, url)
+					//
+					// IMPORTANT: pass the parent ctx, NOT gCtx, to the HTTP fetch and the
+					// stream processor. gCtx is the errgroup's cancellable context — using
+					// it here means a single sibling failure cancels every in-flight
+					// subtree_data download in this batch. Because each cancellation closes
+					// the upstream connection, the peer aborts its on-demand creation
+					// (storer.Abort), discarding work that was already paid for in Aerospike
+					// reads. Detaching from gCtx lets each fetch complete (or hit its own
+					// http_streaming_timeout) so the peer can finish writing its subtreeData
+					// file — converting wasted Aerospike work into a pre-warmed cache for
+					// the next retry. The trade-off is that batch failure detection waits
+					// for in-flight peers instead of cancelling early; acceptable here
+					// because the per-fetch streaming timeout still bounds it.
+					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
 					if subtreeDataErr != nil {
 						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
 					}
@@ -308,8 +330,9 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 						bytesRead: &bytesRead,
 					}
 
-					// Process transactions directly from the stream while storing to disk
-					err = u.processSubtreeDataStream(gCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
+					// Process transactions directly from the stream while storing to disk.
+					// Same rationale as above for using ctx instead of gCtx.
+					err = u.processSubtreeDataStream(ctx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
 					_ = countingBody.Close()
 
 					// Track bytes downloaded from peer after stream is consumed
@@ -435,6 +458,35 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	return &subtreevalidation_api.CheckBlockSubtreesResponse{
 		Blessed: true,
 	}, nil
+}
+
+// findLocalSubtreeFile reports whether this node already has a copy of the given
+// subtree in its subtree store, and which file type holds it. It checks
+// FileTypeSubtreeToCheck first (the "downloaded from peer, pending validation"
+// marker used on the normal p2p path) and then falls back to FileTypeSubtree
+// (the "already validated" marker used by legacy catch-up's quickValidationMode
+// and by block assembly / block persister). Either file carries the same
+// tx-hash list, so CheckBlockSubtrees can proceed either way.
+//
+// This avoids a pathological fallback to HTTP when the subtree is in fact
+// present locally — particularly important for baseURL="legacy", where the
+// synthetic URL "legacy/subtree/<hash>" has no scheme and cannot be fetched.
+func (u *Server) findLocalSubtreeFile(ctx context.Context, subtreeHash chainhash.Hash) (fileformat.FileType, bool, error) {
+	exists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+	if err != nil {
+		return fileformat.FileTypeUnknown, false, err
+	}
+	if exists {
+		return fileformat.FileTypeSubtreeToCheck, true, nil
+	}
+	exists, err = u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	if err != nil {
+		return fileformat.FileTypeUnknown, false, err
+	}
+	if exists {
+		return fileformat.FileTypeSubtree, true, nil
+	}
+	return fileformat.FileTypeUnknown, false, nil
 }
 
 // validateMissingSubtreesWithOrderedRetry runs phase-2 parallel validation and

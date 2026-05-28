@@ -27,20 +27,18 @@ type cacheBackend interface {
 	// shards in parallel; PointerCache loops serially.
 	SetMultiFromBytes(keys, values [][]byte) error
 
-	// SetMultiFromBytesSequential is the partition-aware twin of
-	// SetMultiFromBytes. The caller already has goroutine-level parallelism
-	// (one writer per Kafka partition, partitions aligned with disjoint
-	// cache bucket ranges), so the backend skips its own fan-out. For
-	// ImprovedCache this routes to SetMultiSequential (sequential bucket
-	// walk, no errgroup). For PointerCache it is functionally identical to
-	// SetMultiFromBytes — its existing implementation is already serial.
-	SetMultiFromBytesSequential(keys, values [][]byte) error
+	// SetMultiSequential is the partition-aware variant: like
+	// SetMultiFromBytes but without goroutine fan-out. The caller provides
+	// parallelism (typically one goroutine per Kafka partition, aligned with
+	// disjoint bucket ranges). PointerCache shares its implementation with
+	// SetMultiFromBytes — it has no per-bucket scratch fan-out to skip.
+	SetMultiSequential(keys, values [][]byte) error
 
-	// SetMultiFromBytesSequentialWithHashes is SetMultiFromBytesSequential
-	// with caller-supplied xxhash values, so the v2 txmeta receiver can pass
-	// the on-wire hash straight through and skip the backend's own xxhash.
+	// SetMultiSequentialWithHashes is SetMultiSequential with caller-supplied
+	// xxhash values for each key, letting the v2 txmeta receiver avoid
+	// recomputing the hash when the wire format already carries it.
 	// hashes[i] MUST equal xxhash.Sum64(keys[i]).
-	SetMultiFromBytesSequentialWithHashes(keys, values [][]byte, hashes []uint64) error
+	SetMultiSequentialWithHashes(keys, values [][]byte, hashes []uint64) error
 
 	// Set inserts a *meta.Data. ImprovedCache serialises via MetaBytes;
 	// PointerCache stores the pointer directly.

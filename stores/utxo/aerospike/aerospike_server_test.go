@@ -226,6 +226,31 @@ func TestAerospike(t *testing.T) {
 		assert.Equal(t, spendTxClone.TxIDChainHash().String(), resp.SpendingData.TxID.String())
 	})
 
+	// Regression guard for the remotely-triggerable panic identified on PR #950:
+	// the bulk POST /api/v1/utxos endpoint and the simplified GET /api/v1/utxo
+	// both forward client-controlled vouts straight to GetSpend without
+	// pre-validating against the tx's output count. An out-of-range vout (e.g.
+	// vout=99 against a tx with 2 outputs) used to index past len(utxos) and
+	// panic with index-out-of-range inside an errgroup goroutine that
+	// echo.middleware.Recover does not cover — crashing the asset process.
+	// Contract: out-of-range vout returns Status_NOT_FOUND, not an error and
+	// not a panic.
+	t.Run("aerospike_get_spend_out_of_range_vout", func(t *testing.T) {
+		cleanDB(t, client)
+
+		_, err := store.Create(ctx, tx, 0)
+		require.NoError(t, err)
+
+		// tx fixture has a small number of outputs (well under utxoBatchSize=128).
+		resp, err := store.GetSpend(ctx, &utxo.Spend{
+			TxID:     tx.TxIDChainHash(),
+			Vout:     99,
+			UTXOHash: nil,
+		})
+		require.NoError(t, err)
+		require.Equal(t, int(utxo.Status_NOT_FOUND), resp.Status)
+	})
+
 	t.Run("aerospike_get inputs", func(t *testing.T) {
 		cleanDB(t, client)
 

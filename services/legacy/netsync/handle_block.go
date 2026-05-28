@@ -738,14 +738,56 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	// Merge our blockID into any tx that already existed. Without this, those txs
 	// keep their stale (or empty) BlockIDs and the next block's validOrderAndBlessed
 	// check fails in model/Block.go getParentTxMetaBlockIDs.
+	//
+	// Chunk the merge across a worker pool (#936). A single SetMinedMulti call with
+	// every existing tx in the block overruns the aerospike client connection pool
+	// on fat blocks (e.g. mainnet 755880 = 2.87M txs). Pattern mirrors
+	// stores/utxo/aerospike/longest_chain.go:MarkTransactionsOnLongestChain.
 	if len(existingTxHashes) > 0 {
 		sm.logger.Debugf("[createUtxos] merging blockID %d into %d pre-existing tx(s)", blockID, len(existingTxHashes))
-		if _, err = sm.utxoStore.SetMinedMulti(ctx, existingTxHashes, utxo.MinedBlockInfo{
+
+		batchSize := sm.settings.UtxoStore.MaxMinedBatchSize
+		if batchSize < 1 {
+			batchSize = 1
+		}
+		numChunks := (len(existingTxHashes) + batchSize - 1) / batchSize
+		numWorkers := min(sm.settings.UtxoStore.MaxMinedRoutines, numChunks)
+		if numWorkers < 1 {
+			numWorkers = 1
+		}
+
+		minedBlockInfo := utxo.MinedBlockInfo{
 			BlockID:        blockID,
 			BlockHeight:    blockHeightUint32,
 			SubtreeIdx:     0,
 			OnLongestChain: true,
-		}); err != nil {
+		}
+
+		rangeSize := (len(existingTxHashes) + numWorkers - 1) / numWorkers
+
+		mergeG, mergeCtx := errgroup.WithContext(ctx)
+
+		for w := 0; w < numWorkers && w*rangeSize < len(existingTxHashes); w++ {
+			workerStart := w * rangeSize
+			workerEnd := min(workerStart+rangeSize, len(existingTxHashes))
+			workerHashes := existingTxHashes[workerStart:workerEnd]
+
+			mergeG.Go(func() error {
+				for i := 0; i < len(workerHashes); i += batchSize {
+					if mergeCtx.Err() != nil {
+						return mergeCtx.Err()
+					}
+					chunkEnd := min(i+batchSize, len(workerHashes))
+					chunk := workerHashes[i:chunkEnd]
+					if _, err := sm.utxoStore.SetMinedMulti(mergeCtx, chunk, minedBlockInfo); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}
+
+		if err = mergeG.Wait(); err != nil {
 			return errors.NewProcessingError("failed to merge blockID into %d pre-existing txs", len(existingTxHashes), err)
 		}
 	}
@@ -838,6 +880,12 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					validator.WithSkipPolicyChecks(true),
 					validator.WithSkipTxMetaPublishing(true),
 					validator.WithCreateConflicting(true),
+					// PreValidateTransactions is only reached via the quickValidationMode
+					// path (see prepareSubtrees → ValidateTransactionsLegacyMode), which
+					// runs only when the block height is at or below the highest
+					// hard-coded checkpoint. PoW + checkpoint linkage establish the chain
+					// as canonical, so re-running BDK scripts is pure overhead.
+					validator.WithSkipScriptValidation(true),
 				); validateErr != nil {
 					// ErrTxConflicting is expected during legacy catchup when the UTXO store
 					// has stale spending data. The block is confirmed, so its transactions

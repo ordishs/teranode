@@ -716,14 +716,15 @@ func Test_txMetaCache_MultiOperations(t *testing.T) {
 		err = cache.SetCacheMulti([][]byte{hash[:]}, [][]byte{[]byte{}})
 		require.NoError(t, err)
 
-		// With height appending removed, an empty value is stored as zero bytes.
+		// An empty value still gets the 4-byte height suffix appended by
+		// SetCacheMulti, so the stored entry is exactly 4 bytes.
 		byteBackend, ok := cache.cache.(*improvedCacheBackend)
 		require.True(t, ok, "test relies on ImprovedCache byte backend")
 
 		cachedBytes := make([]byte, 0)
 		err = byteBackend.cache.Get(&cachedBytes, hash[:])
 		require.NoError(t, err)
-		require.Equal(t, 0, len(cachedBytes))
+		require.Equal(t, 4, len(cachedBytes))
 	})
 }
 
@@ -942,6 +943,31 @@ func Test_TxMetaCache_MiningOperations(t *testing.T) {
 		if err != nil {
 			t.Logf("SetMinedMultiParallel returned error (expected in test environment): %v", err)
 		}
+	})
+
+	t.Run("SetMinedMultiParallel_EvictsCache", func(t *testing.T) {
+		// Pin the contract that SetMinedMultiParallel evicts cache entries
+		// rather than trying (and silently failing) to update BlockIDs in a
+		// cache format that doesn't carry them. After this call, GetMetaCached
+		// must miss on the hash; the next read goes to the underlying store
+		// which has the up-to-date BlockIDs.
+		evictHash := chainhash.HashH([]byte("setminedmultiparallel-evict"))
+
+		seed := &meta.Data{
+			Fee:         42,
+			SizeInBytes: 100,
+			TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{}},
+			BlockIDs:    make([]uint32, 0),
+		}
+		require.NoError(t, cache.SetCache(&evictHash, seed))
+
+		_, found := cache.GetMetaCached(ctx, evictHash)
+		require.True(t, found, "test precondition: entry must be in cache before SetMinedMultiParallel")
+
+		require.NoError(t, cache.SetMinedMultiParallel(ctx, []*chainhash.Hash{&evictHash}, 9))
+
+		_, found = cache.GetMetaCached(ctx, evictHash)
+		require.False(t, found, "SetMinedMultiParallel must evict cache entries; stale BlockIDs would otherwise survive")
 	})
 
 	t.Run("GetUnminedTxIterator", func(t *testing.T) {

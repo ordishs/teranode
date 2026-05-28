@@ -5,9 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
-	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // improvedCacheGetScratchInitialCap matches txMetaCacheReadBufferInitialCapacity
@@ -38,7 +36,6 @@ var improvedCacheGetScratchPool = sync.Pool{
 // UpdateStats so the rate is observable.
 type improvedCacheBackend struct {
 	cache           *ImprovedCache
-	logger          ulogger.Logger
 	unmarshalErrors atomic.Uint64
 }
 
@@ -57,19 +54,15 @@ func (b *improvedCacheBackend) SetMultiFromBytes(keys, values [][]byte) error {
 	return b.cache.SetMulti(keys, values)
 }
 
-// SetMultiFromBytesSequential routes to ImprovedCache.SetMultiSequential —
-// same per-bucket grouping as SetMulti but applied on the calling goroutine
-// without errgroup fan-out. Used by the v2 txmeta receiver, which already
-// has goroutine-level parallelism across Kafka partitions.
-func (b *improvedCacheBackend) SetMultiFromBytesSequential(keys, values [][]byte) error {
+// SetMultiSequential delegates to the underlying ImprovedCache's partition-
+// aware twin, which skips the per-bucket goroutine fan-out.
+func (b *improvedCacheBackend) SetMultiSequential(keys, values [][]byte) error {
 	return b.cache.SetMultiSequential(keys, values)
 }
 
-// SetMultiFromBytesSequentialWithHashes routes to
-// ImprovedCache.SetMultiSequentialWithHashes — same shape as the variant
-// above but skips re-hashing keys, using the caller-supplied xxhash values
-// pulled from the v2 wire format.
-func (b *improvedCacheBackend) SetMultiFromBytesSequentialWithHashes(keys, values [][]byte, hashes []uint64) error {
+// SetMultiSequentialWithHashes delegates to the underlying ImprovedCache,
+// allowing the caller-supplied xxhash values to be reused.
+func (b *improvedCacheBackend) SetMultiSequentialWithHashes(keys, values [][]byte, hashes []uint64) error {
 	return b.cache.SetMultiSequentialWithHashes(keys, values, hashes)
 }
 
@@ -106,25 +99,23 @@ func (b *improvedCacheBackend) Get(hash chainhash.Hash) (*meta.Data, bool) {
 	}()
 
 	if err := b.cache.Get(&scratch, hash[:]); err != nil {
-		if errors.Is(err, errors.ErrNotFound) {
-			return nil, false
-		}
-
+		// ErrNotFound and any other backend error both surface as a miss to
+		// the caller — the cacheBackend.Get contract has no error channel.
 		return nil, false
 	}
 
-	if len(scratch) == 0 {
-		return nil, false
-	}
-
+	// NewMetaDataFromBytes handles short/empty input via its own length
+	// check (returns an error for len<17), so no separate empty-scratch
+	// guard is needed here.
 	data := &meta.Data{}
 	if err := meta.NewMetaDataFromBytes(scratch, data); err != nil {
+		// Deserialise failure means either an empty entry, or in-place
+		// corruption / format mismatch. Evict so subsequent Gets on the
+		// same key don't replay the same bad parse, and bump a counter so
+		// operators can see the rate. Logging is deliberately omitted to
+		// avoid flooding on pathological keys.
 		b.unmarshalErrors.Add(1)
 		b.cache.Del(hash[:])
-
-		if b.logger != nil {
-			b.logger.Warnf("txMetaCache: failed to unmarshal cached entry for %s (evicting): %v", hash.String(), err)
-		}
 
 		return nil, false
 	}

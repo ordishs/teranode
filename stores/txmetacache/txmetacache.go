@@ -19,6 +19,7 @@ package txmetacache
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 
@@ -42,12 +43,14 @@ import (
 // These metrics are critical for operational monitoring and can help identify:
 // - Cache hit ratio (hits vs. misses) to evaluate cache effectiveness
 // - Insertion and eviction rates to detect memory pressure
+// - Age-related expiration patterns through hitOldTx tracking
 type metrics struct {
 	insertions atomic.Uint64 // Tracks number of items inserted into the cache; indicates write throughput
 	hits       atomic.Uint64 // Tracks number of successful cache retrievals; indicates cache effectiveness
 	misses     atomic.Uint64 // Tracks number of failed cache retrievals; helps identify sizing issues
 	evictions  atomic.Uint64 // Tracks number of items evicted from the cache; indicates memory pressure
 	getOrigin  atomic.Uint64 // Tracks origin-store metadata retrievals
+	hitOldTx   atomic.Uint64 // Tracks number of cache hits for outdated transactions; monitors expiration policy
 }
 
 const (
@@ -91,10 +94,11 @@ func putTxMetaCacheReadBuffer(buf *[]byte) {
 //
 // Thread-safety: All operations are thread-safe and can be called concurrently from multiple goroutines.
 type TxMetaCache struct {
-	utxoStore utxo.Store     // The underlying UTXO store that this cache wraps; provides persistence
-	cache     cacheBackend   // Storage primitive (ImprovedCache or PointerCache) chosen by BucketType at construction
-	metrics   metrics        // Performance metrics for monitoring cache efficiency and throughput
-	logger    ulogger.Logger // Logger for operational logging and diagnostic information
+	utxoStore                     utxo.Store     // The underlying UTXO store that this cache wraps; provides persistence
+	cache                         cacheBackend   // Storage primitive (ImprovedCache or PointerCache) chosen by BucketType at construction
+	metrics                       metrics        // Performance metrics for monitoring cache efficiency and throughput
+	logger                        ulogger.Logger // Logger for operational logging and diagnostic information
+	noOfBlocksToKeepInTxMetaCache uint32         // Cache retention horizon (blocks); kept for compatibility with the height-based expiration plumbing in ImprovedCache
 }
 
 // CacheStats provides statistical information about the current state of the cache.
@@ -221,14 +225,25 @@ func NewTxMetaCache(
 			return nil, errors.NewProcessingError("error creating cache", err)
 		}
 
-		cache = &improvedCacheBackend{cache: c, logger: logger}
+		cache = &improvedCacheBackend{cache: c}
+	}
+
+	const percentageOfGlobalBlockHeightRetentionToKeep = 10
+
+	var noOfBlocksToKeepInTxMetaCache uint32
+
+	if tSettings.GlobalBlockHeightRetention < percentageOfGlobalBlockHeightRetentionToKeep {
+		noOfBlocksToKeepInTxMetaCache = 1
+	} else {
+		noOfBlocksToKeepInTxMetaCache = tSettings.GlobalBlockHeightRetention / percentageOfGlobalBlockHeightRetentionToKeep
 	}
 
 	m := &TxMetaCache{
-		utxoStore: utxoStore,
-		cache:     cache,
-		metrics:   metrics{},
-		logger:    logger,
+		utxoStore:                     utxoStore,
+		cache:                         cache,
+		metrics:                       metrics{},
+		logger:                        logger,
+		noOfBlocksToKeepInTxMetaCache: noOfBlocksToKeepInTxMetaCache,
 	}
 
 	if bucketType == Pointer {
@@ -275,7 +290,7 @@ func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
-	if err := t.cache.SetFromBytes(key, txMetaBytes); err != nil {
+	if err := t.cache.SetFromBytes(key, t.appendHeightToValue(txMetaBytes)); err != nil {
 		return err
 	}
 
@@ -295,7 +310,12 @@ func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
 // Returns:
 // - Error if the batch cache operation fails
 func (t *TxMetaCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
-	if err := t.cache.SetMultiFromBytes(keys, values); err != nil {
+	valuesWithHeight := make([][]byte, len(values))
+	for i, value := range values {
+		valuesWithHeight[i] = t.appendHeightToValue(value)
+	}
+
+	if err := t.cache.SetMultiFromBytes(keys, valuesWithHeight); err != nil {
 		return err
 	}
 
@@ -304,24 +324,25 @@ func (t *TxMetaCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
 	return nil
 }
 
-// SetCacheMultiSequential is the partition-aware twin of SetCacheMulti.
-// Routes through cacheBackend.SetMultiFromBytesSequential — for the
-// ImprovedCache backend that means a sequential per-bucket walk on the
-// calling goroutine (no errgroup fan-out); for PointerCache it is the same
-// serial loop as SetMultiFromBytes.
+// SetCacheMultiSequential is the partition-aware twin of SetCacheMulti. It
+// appends the current block height to each value (same as SetCacheMulti) and
+// then delegates to ImprovedCache.SetMultiSequential, which performs all
+// bucket writes on the calling goroutine without errgroup fan-out.
 //
-// Use in receivers that already have goroutine-level parallelism — one
-// writer per Kafka partition, partitions aligned with disjoint cache
-// bucket ranges. The previous form prepended a 4-byte block height to each
-// value via appendHeightToValue; that height-encoding scheme was removed
-// in the pointer-cache refactor (eviction is the ring buffer's job, not a
-// height suffix) so the values pass through untouched.
+// Use this in receivers that already have parallelism elsewhere (one
+// goroutine per Kafka partition, partitions aligned with disjoint cache
+// bucket ranges). See SetMultiSequential's doc for the throughput rationale.
 func (t *TxMetaCache) SetCacheMultiSequential(keys [][]byte, values [][]byte) error {
 	if len(keys) == 0 {
 		return nil
 	}
 
-	if err := t.cache.SetMultiFromBytesSequential(keys, values); err != nil {
+	valuesWithHeight := make([][]byte, len(values))
+	for i, value := range values {
+		valuesWithHeight[i] = t.appendHeightToValue(value)
+	}
+
+	if err := t.cache.SetMultiSequential(keys, valuesWithHeight); err != nil {
 		return err
 	}
 
@@ -333,15 +354,18 @@ func (t *TxMetaCache) SetCacheMultiSequential(keys [][]byte, values [][]byte) er
 // SetCacheMultiSequentialWithHashes is SetCacheMultiSequential with caller-
 // supplied xxhash values, allowing the v2 txmeta receiver to skip its own
 // xxhash by reading the hash from the wire format. hashes[i] MUST equal
-// xxhash.Sum64(keys[i]). Only the ImprovedCache backend benefits from the
-// supplied hashes today — PointerCache ignores them and re-hashes inside
-// SetFromBytes.
+// xxhash.Sum64(keys[i]) — see ImprovedCache.SetMultiSequentialWithHashes.
 func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values [][]byte, hashes []uint64) error {
 	if len(keys) == 0 {
 		return nil
 	}
 
-	if err := t.cache.SetMultiFromBytesSequentialWithHashes(keys, values, hashes); err != nil {
+	valuesWithHeight := make([][]byte, len(values))
+	for i, value := range values {
+		valuesWithHeight[i] = t.appendHeightToValue(value)
+	}
+
+	if err := t.cache.SetMultiSequentialWithHashes(keys, valuesWithHeight, hashes); err != nil {
 		return err
 	}
 
@@ -402,12 +426,38 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 // with a caching layer in between for improved performance.
 func (t *TxMetaCache) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
 	if cached, ok := t.cache.Get(*hash); ok {
+		// In pointer mode the cache hands out the same *meta.Data to every
+		// concurrent reader. *data = *cached copies the struct but
+		// ParentTxHashes still points at the cache's backing slice — a
+		// caller doing append(data.TxInpoints.ParentTxHashes, …) would
+		// corrupt every other reader. Deep-clone TxInpoints to break the
+		// aliasing. Byte mode is unaffected (its Get returns a freshly
+		// allocated *meta.Data already), and the hot validator path uses
+		// GetMetaCached which keeps the shared-pointer read-only contract.
+		if _, isPointer := t.cache.(*PointerCache); isPointer {
+			inpoints, err := cloneTxInpoints(cached.TxInpoints)
+			if err != nil {
+				// Clone failure is pathological (the cached entry was
+				// already cloned on insert). Treat as a cache miss so the
+				// caller gets a fresh copy from the underlying store
+				// instead of aliased data.
+				t.metrics.misses.Add(1)
+				goto fromStore
+			}
+
+			*data = *cached
+			data.TxInpoints = inpoints
+		} else {
+			*data = *cached
+		}
+
 		t.metrics.hits.Add(1)
-		*data = *cached
 		data.BlockIDs = make([]uint32, 0) // expected behavior, needs to be non-nil
 
 		return nil
 	}
+
+fromStore:
 
 	t.metrics.misses.Add(1)
 	t.logger.Warnf("txMetaCache GetMeta miss for %s", hash.String())
@@ -670,19 +720,22 @@ func (t *TxMetaCache) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockI
 	return t.utxoStore.RemoveBlockIDs(ctx, removals)
 }
 
-// setMinedInCacheParallel is an internal helper method that updates the mined status
-// of multiple transactions in parallel, using goroutines to improve performance.
+// setMinedInCacheParallel evicts the cache entries for a batch of newly-mined
+// transactions, in parallel. Eviction is the only safe response — neither
+// backend can round-trip BlockIDs through the cached format (ImprovedCache's
+// MetaBytes wire format omits the field, and PointerCache's metadataOnly
+// strips it to match), so any SetCache here would silently drop the new
+// blockID. After eviction the next read on each hash falls through to the
+// underlying store which has the up-to-date BlockIDs.
 //
-// Parameters:
-// - ctx: Context for the operation
-// - hashes: List of transaction hashes to mark as mined
-// - blockID: ID of the block where the transactions were mined
-//
-// Returns:
-// - Error if updating the cache for any transaction fails
-//
-// The method uses an errgroup to manage concurrent updates while properly handling errors.
-func (t *TxMetaCache) setMinedInCacheParallel(ctx context.Context, hashes []*chainhash.Hash, blockID uint32) error {
+// Matches the eviction pattern used by SetMinedMulti above. Parameters:
+//   - ctx:     used for tracing; not currently consulted for cancellation
+//     because Delete is a fast in-memory op and the errgroup's semantics
+//     handle early-return naturally.
+//   - hashes:  the mined transactions to evict.
+//   - blockID: accepted for API symmetry with the byte path; not consulted —
+//     the actual store update happens before this method is invoked.
+func (t *TxMetaCache) setMinedInCacheParallel(ctx context.Context, hashes []*chainhash.Hash, _ uint32) error {
 	g := new(errgroup.Group)
 	util.SafeSetLimit(g, 100)
 
@@ -690,24 +743,7 @@ func (t *TxMetaCache) setMinedInCacheParallel(ctx context.Context, hashes []*cha
 		hash := hash
 
 		g.Go(func() error {
-			txMeta, err := t.Get(ctx, hash)
-			if err != nil {
-				txMeta, err = t.utxoStore.Get(ctx, hash)
-			}
-
-			if err != nil {
-				return err
-			}
-
-			if txMeta.BlockIDs == nil {
-				txMeta.BlockIDs = []uint32{
-					blockID,
-				}
-			} else {
-				txMeta.BlockIDs = append(txMeta.BlockIDs, blockID)
-			}
-
-			return t.SetCache(hash, txMeta)
+			return t.Delete(ctx, hash)
 		})
 	}
 
@@ -734,6 +770,22 @@ func (t *TxMetaCache) Delete(_ context.Context, hash *chainhash.Hash) error {
 	t.metrics.evictions.Add(1)
 
 	return nil
+}
+
+// appendHeightToValue appends the current block height to the end of the
+// txMetaBytes. Kept for compatibility with the existing ImprovedCache plumbing
+// (the v2 receiver in #912 uses the same pattern). PointerCache's bridge
+// tolerates the trailing 4 bytes — NewMetaDataFromBytes reads forward by
+// declared lengths and ignores the suffix.
+//
+// The height is encoded as a big-endian uint32 in the last 4 bytes.
+func (t *TxMetaCache) appendHeightToValue(txMetaBytes []byte) []byte {
+	height := t.utxoStore.GetBlockHeight()
+	valueWithHeight := make([]byte, len(txMetaBytes)+4)
+	copy(valueWithHeight, txMetaBytes)
+	binary.BigEndian.PutUint32(valueWithHeight[len(txMetaBytes):], height)
+
+	return valueWithHeight
 }
 
 // GetCacheStats retrieves current operational statistics from the underlying cache.

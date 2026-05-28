@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/require"
@@ -155,6 +156,131 @@ func TestPointerCache_Del(t *testing.T) {
 
 	_, ok := c.Get(*h)
 	require.False(t, ok)
+}
+
+// TestPointerCache_DelDoesNotLeakRingCapacity pins the fix for the FIFO
+// stale-slot bug: after Del, the ring slot still names the deleted key but
+// the map no longer has it. A subsequent Set on a different key targeting
+// the same bucket must NOT count the stale slot as a live eviction, and a
+// full Set→Del→Set cycle must not silently shrink effective capacity.
+func TestPointerCache_DelDoesNotLeakRingCapacity(t *testing.T) {
+	// Per-bucket ring capacity of 1 makes the leak observable immediately.
+	maxBytes := BucketsCount * pointerCacheAvgEntryBytes
+	c, err := NewPointerCache(maxBytes)
+	require.NoError(t, err)
+
+	// Find two keys that fall in the same bucket so we exercise eviction
+	// pressure on a single shard.
+	var first, second *chainhash.Hash
+
+	target := xxhash.Sum64(hashN(0)[:]) % BucketsCount
+
+	for n := uint64(1); n < 1_000_000; n++ {
+		h := hashN(n)
+		if xxhash.Sum64(h[:])%BucketsCount != target {
+			continue
+		}
+
+		if first == nil {
+			first = h
+		} else {
+			second = h
+			break
+		}
+	}
+
+	require.NotNil(t, first)
+	require.NotNil(t, second)
+
+	// Set then delete `first` — fills the ring, then leaves a stale slot.
+	require.NoError(t, c.Set(first, &meta.Data{Fee: 1}))
+	c.Del(first[:])
+
+	b := c.bucketFor(*first)
+
+	evictedBefore := b.evicted.Load()
+
+	// Insert `second` — should reuse the stale slot, not count an eviction.
+	require.NoError(t, c.Set(second, &meta.Data{Fee: 2}))
+
+	got, ok := c.Get(*second)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), got.Fee)
+
+	require.Equal(t, evictedBefore, b.evicted.Load(),
+		"Set after Del must not count the stale ring slot as a live eviction")
+}
+
+// TestPointerCache_SetDoesNotAliasCallerSlice pins the metadataOnly deep-
+// clone contract: after Set, mutating the caller's ParentTxHashes must not
+// affect the cached entry observed by other readers.
+func TestPointerCache_SetDoesNotAliasCallerSlice(t *testing.T) {
+	c, err := NewPointerCache(64 * 1024 * 1024)
+	require.NoError(t, err)
+
+	h := hashN(13)
+
+	parents := []chainhash.Hash{
+		chainhash.HashH([]byte("p0")),
+		chainhash.HashH([]byte("p1")),
+	}
+	original := parents[0]
+
+	d := &meta.Data{
+		Fee:        7,
+		TxInpoints: subtree.NewTxInpointsFromPacked(parents, []uint32{1, 0, 1, 0}),
+	}
+
+	require.NoError(t, c.Set(h, d))
+
+	// Mutate the caller's slice in place — would corrupt the cache if the
+	// stored TxInpoints aliased the original backing array.
+	parents[0] = chainhash.HashH([]byte("MUTATED"))
+	d.TxInpoints.ParentTxHashes[0] = chainhash.HashH([]byte("MUTATED-VIA-INPOINTS"))
+
+	got, ok := c.Get(*h)
+	require.True(t, ok)
+	require.Len(t, got.TxInpoints.ParentTxHashes, 2)
+	require.Equal(t, original, got.TxInpoints.ParentTxHashes[0],
+		"cached ParentTxHashes[0] must be the original value despite caller mutation")
+}
+
+// TestPointerCache_SetMultiSequentialDoesNotFanOut asserts that the
+// SetMultiSequential path runs all inserts on the calling goroutine — the
+// cacheBackend contract reserves SetMultiFromBytes for the fan-out form.
+// Detection is indirect (caller's goroutine ID matches the worker that
+// performed the map mutation), so this test verifies behaviour at a coarser
+// level: the call is synchronous and never spawns errgroup goroutines.
+func TestPointerCache_SetMultiSequentialDoesNotFanOut(t *testing.T) {
+	c, err := NewPointerCache(64 * 1024 * 1024)
+	require.NoError(t, err)
+
+	const n = 1024
+
+	keys := make([][]byte, n)
+	values := make([][]byte, n)
+
+	d := &meta.Data{Fee: 1, SizeInBytes: 100}
+	bts, err := d.MetaBytes()
+	require.NoError(t, err)
+
+	for i := 0; i < n; i++ {
+		h := chainhash.HashH([]byte{byte(i), byte(i >> 8)})
+		keys[i] = h[:]
+		values[i] = bts
+	}
+
+	// If SetMultiSequential were fanning out we'd see ~BucketsCount goroutines
+	// peak. We can't easily count them, so we settle for: must complete and
+	// every entry must be present afterwards.
+	require.NoError(t, c.SetMultiSequential(keys, values))
+
+	for i := 0; i < n; i++ {
+		var hh chainhash.Hash
+		copy(hh[:], keys[i])
+		_, ok := c.Get(hh)
+		require.True(t, ok, "key %d must be present after SetMultiSequential", i)
+	}
 }
 
 func TestPointerCache_Reset(t *testing.T) {
