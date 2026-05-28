@@ -57,7 +57,7 @@
 
 ## Spend Circuit Breaker Trigger Set
 
-The spend circuit breaker counts only **infrastructure-level** aerospike errors toward `SpendCircuitBreakerFailureCount`. Data-state errors (e.g. `KEY_NOT_FOUND_ERROR` for a missing parent during catch-up sync, `FILTERED_OUT` for a Lua business-rule rejection) are handled by the orphanage and per-record error paths and never increment the failure counter.
+The spend circuit breaker counts only **infrastructure-level** aerospike errors toward `SpendCircuitBreakerFailureCount`. Data-state errors (e.g. `KEY_NOT_FOUND_ERROR` for a missing parent during catch-up sync, `FILTERED_OUT` for a Lua business-rule rejection) are handled by per-record error paths in the calling code — missing parents flow into subtree validation's sequential revalidation pass, and Lua business-rule rejections surface to the caller — and never increment the failure counter.
 
 Counted as infrastructure failure:
 
