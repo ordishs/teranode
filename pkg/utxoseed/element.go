@@ -14,7 +14,8 @@ import (
 //	txid(32) | vout(4 LE) | (height<<1 | coinbase)(4 LE) | value(8 LE) | scriptLen(4 LE) | script
 //
 // txid is written in chainhash internal byte order. coinbase occupies the
-// least-significant bit of the height word.
+// least-significant bit of the height word, so height must be < 2^31; higher
+// values would overflow the shift and alias distinct UTXOs to the same element.
 func Element(txid chainhash.Hash, vout, height uint32, coinbase bool, value uint64, script []byte) []byte {
 	buf := make([]byte, 0, 32+4+4+8+4+len(script))
 	buf = append(buf, txid[:]...)
