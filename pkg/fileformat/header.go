@@ -32,6 +32,7 @@ const (
 	FileTypePeerRegistry   FileType = "peer-registry"
 	FileTypeSeedChunk      FileType = "seed-chunk"
 	FileTypeSeedManifest   FileType = "seed-manifest"
+	FileTypeSeedCheckpoint FileType = "seed-checkpoint"
 	FileTypeUnknown        FileType = ""
 )
 
@@ -68,6 +69,7 @@ var (
 	magicPeerRegistry   = [8]byte{'P', 'R', '-', '1', '.', '0', ' ', ' '} // PR-1.0
 	magicSeedChunk      = [8]byte{'S', 'C', 'K', '-', '1', '.', '0', ' '} // SCK-1.0
 	magicSeedManifest   = [8]byte{'S', 'M', 'F', '-', '1', '.', '0', ' '} // SMF-1.0
+	magicSeedCheckpoint = [8]byte{'S', 'C', 'P', '-', '1', '.', '0', ' '} // SCP-1.0
 )
 
 var fileTypeToMagic = map[FileType][8]byte{
@@ -93,6 +95,7 @@ var fileTypeToMagic = map[FileType][8]byte{
 	FileTypePeerRegistry:   magicPeerRegistry,
 	FileTypeSeedChunk:      magicSeedChunk,
 	FileTypeSeedManifest:   magicSeedManifest,
+	FileTypeSeedCheckpoint: magicSeedCheckpoint,
 }
 
 var magicToFileType = map[[8]byte]FileType{
@@ -119,6 +122,7 @@ var magicToFileType = map[[8]byte]FileType{
 	magicPeerRegistry:   FileTypePeerRegistry,
 	magicSeedChunk:      FileTypeSeedChunk,
 	magicSeedManifest:   FileTypeSeedManifest,
+	magicSeedCheckpoint: FileTypeSeedCheckpoint,
 }
 
 type Header struct {
