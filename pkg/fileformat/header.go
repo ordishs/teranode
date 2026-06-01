@@ -14,6 +14,7 @@ const (
 	FileTypeUtxoDeletions  FileType = "utxo-deletions"
 	FileTypeUtxoHeaders    FileType = "utxo-headers"
 	FileTypeUtxoSet        FileType = "utxo-set"
+	FileTypeUtxoSetHash    FileType = "utxo-set-hash"
 	FileTypeBlock          FileType = "block"
 	FileTypeSubtree        FileType = "subtree"
 	FileTypeSubtreeToCheck FileType = "subtreeToCheck"
@@ -47,6 +48,7 @@ var (
 	magicUtxoHeaders    = [8]byte{'U', '-', 'H', '-', '1', '.', '0', ' '} // U-H-1.0 (legacy, without coinbase)
 	magicUtxoHeadersV2  = [8]byte{'U', '-', 'H', '-', '2', '.', '0', ' '} // U-H-2.0 (with coinbase tx)
 	magicUtxoSet        = [8]byte{'U', '-', 'S', '-', '1', '.', '0', ' '} // U-S-1.0
+	magicUtxoSetHash    = [8]byte{'U', 'S', 'H', '-', '1', '.', '0', ' '} // USH-1.0
 	magicBlock          = [8]byte{'B', '-', '1', '.', '0', ' ', ' ', ' '} // B-1.0
 	magicSubtree        = [8]byte{'S', '-', '1', '.', '0', ' ', ' ', ' '} // S-1.0
 	magicSubtreeToCheck = [8]byte{'S', 'C', '-', '1', '.', '0', ' ', ' '} // SC-1.0
@@ -69,6 +71,7 @@ var fileTypeToMagic = map[FileType][8]byte{
 	FileTypeUtxoDeletions:  magicUtxoDeletions,
 	FileTypeUtxoHeaders:    magicUtxoHeadersV2, // Default to V2 (with coinbase)
 	FileTypeUtxoSet:        magicUtxoSet,
+	FileTypeUtxoSetHash:    magicUtxoSetHash,
 	FileTypeBlock:          magicBlock,
 	FileTypeSubtree:        magicSubtree,
 	FileTypeSubtreeToCheck: magicSubtreeToCheck,
@@ -92,6 +95,7 @@ var magicToFileType = map[[8]byte]FileType{
 	magicUtxoHeaders:    FileTypeUtxoHeaders,
 	magicUtxoHeadersV2:  FileTypeUtxoHeaders, // V2 also maps to same FileType
 	magicUtxoSet:        FileTypeUtxoSet,
+	magicUtxoSetHash:    FileTypeUtxoSetHash,
 	magicBlock:          FileTypeBlock,
 	magicSubtree:        FileTypeSubtree,
 	magicSubtreeToCheck: FileTypeSubtreeToCheck,
