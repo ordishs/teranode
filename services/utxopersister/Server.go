@@ -543,7 +543,7 @@ func (s *Server) processNextBlock(ctx context.Context) (time.Duration, error) {
 		return 0, err
 	}
 
-	s.logger.Infof("[utxopersister] wrote utxo-set-hash %x for block %s at height %d", setHash, c.lastBlockHash.String(), c.lastBlockHeight)
+	s.logger.Infof("[UTXOPersister] wrote utxo-set-hash %x for block %s at height %d", setHash, c.lastBlockHash.String(), c.lastBlockHeight)
 
 	s.lastHeight = c.lastBlockHeight
 
@@ -563,7 +563,7 @@ func (s *Server) processNextBlock(ctx context.Context) (time.Duration, error) {
 		}
 
 		if err := s.blockStore.Del(ctx, lastWrittenUTXOSetHash[:], fileformat.FileTypeUtxoSetHash); err != nil {
-			s.logger.Warnf("[utxopersister] failed to delete previous utxo-set-hash for %s: %v", lastWrittenUTXOSetHash.String(), err)
+			s.logger.Warnf("[UTXOPersister] failed to delete previous utxo-set-hash for %s: %v", lastWrittenUTXOSetHash.String(), err)
 		}
 
 		if err := s.blockStore.Del(ctx, lastWrittenUTXOSetHash[:], fileformat.FileTypeUtxoSet+".sha256"); err != nil {
