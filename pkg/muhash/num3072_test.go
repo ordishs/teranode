@@ -36,3 +36,21 @@ func TestNumToBytesIsLittleEndian(t *testing.T) {
 		require.Equal(t, byte(0), le[i])
 	}
 }
+
+func TestElementToNumDeterministic(t *testing.T) {
+	a := elementToNum([]byte("hello"))
+	b := elementToNum([]byte("hello"))
+	require.Equal(t, 0, a.Cmp(b))
+}
+
+func TestElementToNumDistinct(t *testing.T) {
+	a := elementToNum([]byte("hello"))
+	b := elementToNum([]byte("world"))
+	require.NotEqual(t, 0, a.Cmp(b))
+}
+
+func TestElementToNumInRange(t *testing.T) {
+	x := elementToNum([]byte("anything"))
+	require.Equal(t, -1, x.Cmp(modulus)) // x < modulus
+	require.True(t, x.Sign() > 0)        // x > 0 (negligible chance of 0)
+}

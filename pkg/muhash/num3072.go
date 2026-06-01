@@ -1,6 +1,11 @@
 package muhash
 
-import "math/big"
+import (
+	"crypto/sha256"
+	"math/big"
+
+	"golang.org/x/crypto/chacha20"
+)
 
 // numBytes is the byte length of a 3072-bit group element (3072 / 8).
 const numBytes = 384
@@ -26,6 +31,28 @@ func numToBytes(x *big.Int) []byte {
 		le[i] = be[numBytes-1-i]
 	}
 	return le
+}
+
+// elementToNum maps arbitrary data to a group element in [0, modulus).
+// Construction: key = SHA256(data); generate a numBytes-long ChaCha20 keystream
+// under that key with an all-zero 12-byte nonce and counter 0; interpret the
+// keystream as a little-endian integer reduced mod modulus. This construction
+// is frozen — changing it changes every commitment.
+func elementToNum(data []byte) *big.Int {
+	key := sha256.Sum256(data)
+
+	var nonce [12]byte
+
+	c, err := chacha20.NewUnauthenticatedCipher(key[:], nonce[:])
+	if err != nil {
+		// key is always 32 bytes and nonce 12 bytes, so this cannot happen.
+		panic(err)
+	}
+
+	buf := make([]byte, numBytes)
+	c.XORKeyStream(buf, buf) // buf is zero-filled, so output is the raw keystream
+
+	return bytesToNum(buf)
 }
 
 // bytesToNum interprets a little-endian byte slice as an integer reduced mod modulus.
