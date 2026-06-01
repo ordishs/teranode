@@ -64,3 +64,8 @@ func bytesToNum(le []byte) *big.Int {
 	x := new(big.Int).SetBytes(be)
 	return x.Mod(x, modulus)
 }
+
+// sha256Sum is a thin wrapper so muhash.go need not import crypto/sha256 directly.
+func sha256Sum(b []byte) [32]byte {
+	return sha256.Sum256(b)
+}
