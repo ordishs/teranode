@@ -538,6 +538,13 @@ func (s *Server) processNextBlock(ctx context.Context) (time.Duration, error) {
 		return 0, err
 	}
 
+	setHash := c.acc.Digest()
+	if err := persistSetHash(ctx, s.blockStore, c.lastBlockHash, setHash); err != nil {
+		return 0, err
+	}
+
+	s.logger.Infof("[utxopersister] wrote utxo-set-hash %x for block %s at height %d", setHash, c.lastBlockHash.String(), c.lastBlockHeight)
+
 	s.lastHeight = c.lastBlockHeight
 
 	// Write the headers file for the UTXO set
@@ -553,6 +560,10 @@ func (s *Server) processNextBlock(ctx context.Context) (time.Duration, error) {
 	if lastWrittenUTXOSetHash.String() != s.settings.ChainCfgParams.GenesisHash.String() && !s.settings.BlockPersister.SkipUTXODelete {
 		if err := s.blockStore.Del(ctx, lastWrittenUTXOSetHash[:], fileformat.FileTypeUtxoSet); err != nil {
 			return 0, errors.NewProcessingError("[UTXOPersister] Error deleting UTXOSet for block %s height %d", lastWrittenUTXOSetHash, c.firstBlockHeight, err)
+		}
+
+		if err := s.blockStore.Del(ctx, lastWrittenUTXOSetHash[:], fileformat.FileTypeUtxoSetHash); err != nil {
+			s.logger.Warnf("[utxopersister] failed to delete previous utxo-set-hash for %s: %v", lastWrittenUTXOSetHash.String(), err)
 		}
 
 		if err := s.blockStore.Del(ctx, lastWrittenUTXOSetHash[:], fileformat.FileTypeUtxoSet+".sha256"); err != nil {
