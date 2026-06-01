@@ -69,6 +69,13 @@ func ParseManifest(b []byte) (Manifest, error) {
 
 	count := binary.LittleEndian.Uint32(b[72:76])
 
+	// Bound count by what the buffer could possibly hold before any arithmetic
+	// or allocation, so a crafted manifest cannot overflow the size calculation
+	// or trigger a huge allocation (manifests come from untrusted seed packages).
+	if maxCount := uint32((len(b) - manifestHeaderLen) / chunkRefLen); count > maxCount {
+		return m, errors.NewProcessingError("manifest claims %d chunks, buffer holds at most %d", count, maxCount)
+	}
+
 	want := manifestHeaderLen + int(count)*chunkRefLen
 	if len(b) != want {
 		return m, errors.NewProcessingError("manifest length %d, expected %d for %d chunks", len(b), want, count)
