@@ -30,6 +30,8 @@ const (
 	FileTypeBatchKeys      FileType = "batch-keys"
 	FileTypePreserveUntil  FileType = "preserveUntil"
 	FileTypePeerRegistry   FileType = "peer-registry"
+	FileTypeSeedChunk      FileType = "seed-chunk"
+	FileTypeSeedManifest   FileType = "seed-manifest"
 	FileTypeUnknown        FileType = ""
 )
 
@@ -64,6 +66,8 @@ var (
 	magicBatchKeys      = [8]byte{'B', 'K', '-', '1', '.', '0', ' ', ' '} // BK-1.0
 	magicPreserveUntil  = [8]byte{'P', 'U', '-', '1', '.', '0', ' ', ' '} // PU-1.0
 	magicPeerRegistry   = [8]byte{'P', 'R', '-', '1', '.', '0', ' ', ' '} // PR-1.0
+	magicSeedChunk      = [8]byte{'S', 'C', 'K', '-', '1', '.', '0', ' '} // SCK-1.0
+	magicSeedManifest   = [8]byte{'S', 'M', 'F', '-', '1', '.', '0', ' '} // SMF-1.0
 )
 
 var fileTypeToMagic = map[FileType][8]byte{
@@ -87,6 +91,8 @@ var fileTypeToMagic = map[FileType][8]byte{
 	FileTypeBatchKeys:      magicBatchKeys,
 	FileTypePreserveUntil:  magicPreserveUntil,
 	FileTypePeerRegistry:   magicPeerRegistry,
+	FileTypeSeedChunk:      magicSeedChunk,
+	FileTypeSeedManifest:   magicSeedManifest,
 }
 
 var magicToFileType = map[[8]byte]FileType{
@@ -111,6 +117,8 @@ var magicToFileType = map[[8]byte]FileType{
 	magicBatchKeys:      FileTypeBatchKeys,
 	magicPreserveUntil:  FileTypePreserveUntil,
 	magicPeerRegistry:   FileTypePeerRegistry,
+	magicSeedChunk:      FileTypeSeedChunk,
+	magicSeedManifest:   FileTypeSeedManifest,
 }
 
 type Header struct {
