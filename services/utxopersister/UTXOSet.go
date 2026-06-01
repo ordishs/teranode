@@ -31,6 +31,7 @@ import (
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/pkg/utxoseed"
 	"github.com/bsv-blockchain/teranode/services/utxopersister/filestorer"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -688,6 +689,10 @@ func (us *UTXOSet) CreateUTXOSet(ctx context.Context, c *consolidator) (err erro
 
 					utxoCount += uint64(len(utxoWrapper.UTXOs))
 
+					for _, u := range utxoWrapper.UTXOs {
+						c.acc.Add(utxoseed.Element(utxoWrapper.TxID, u.Index, utxoWrapper.Height, utxoWrapper.Coinbase, u.Value, u.Script))
+					}
+
 					ts = writeStat.AddTime(ts)
 				}
 			}
@@ -712,6 +717,10 @@ func (us *UTXOSet) CreateUTXOSet(ctx context.Context, c *consolidator) (err erro
 
 			txCount++
 			utxoCount += uint64(len(utxoWrapper.UTXOs))
+
+			for _, u := range utxoWrapper.UTXOs {
+				c.acc.Add(utxoseed.Element(utxoWrapper.TxID, u.Index, utxoWrapper.Height, utxoWrapper.Coinbase, u.Value, u.Script))
+			}
 
 			ts = writeStat.AddTime(ts)
 		}
