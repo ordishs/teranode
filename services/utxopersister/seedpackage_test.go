@@ -111,3 +111,34 @@ func TestSeedPackageDedup(t *testing.T) {
 		require.Equal(t, c.Hash, sha256.Sum256(blob))
 	}
 }
+
+func TestStreamSeedPackageMatchesReassembly(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+
+	body := pseudoBytes(8000, 21)
+	blockHash := chainhash.HashH([]byte("stream-block"))
+
+	require.NoError(t, BuildSeedPackage(ctx, store, bytes.NewReader(body), 1, blockHash, [32]byte{}, testChunkCfg()))
+
+	var buf bytes.Buffer
+	require.NoError(t, StreamSeedPackage(ctx, store, blockHash, &buf))
+	require.Equal(t, body, buf.Bytes())
+}
+
+func TestStreamSeedPackageDetectsCorruption(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+
+	body := pseudoBytes(8000, 22)
+	blockHash := chainhash.HashH([]byte("stream-block-2"))
+
+	require.NoError(t, BuildSeedPackage(ctx, store, bytes.NewReader(body), 1, blockHash, [32]byte{}, testChunkCfg()))
+
+	m, err := readManifest(ctx, store, blockHash)
+	require.NoError(t, err)
+	require.NoError(t, overwriteChunk(ctx, store, m.Chunks[0].Hash, make([]byte, int(m.Chunks[0].Size))))
+
+	var buf bytes.Buffer
+	require.Error(t, StreamSeedPackage(ctx, store, blockHash, &buf))
+}

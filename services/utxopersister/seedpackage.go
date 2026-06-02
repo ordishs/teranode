@@ -83,6 +83,37 @@ func ReadSeedPackage(ctx context.Context, store blob.Store, blockHash chainhash.
 	return out, nil
 }
 
+// StreamSeedPackage reassembles the UTXO-set body into w, in manifest order,
+// verifying each chunk's content hash and length as it goes. Unlike
+// ReadSeedPackage it never holds the whole set in memory.
+func StreamSeedPackage(ctx context.Context, store blob.Store, blockHash chainhash.Hash, w io.Writer) error {
+	m, err := readManifest(ctx, store, blockHash)
+	if err != nil {
+		return err
+	}
+
+	for i, ref := range m.Chunks {
+		chunk, err := getChunk(ctx, store, ref.Hash)
+		if err != nil {
+			return err
+		}
+
+		if uint32(len(chunk)) != ref.Size {
+			return errors.NewProcessingError("chunk %d size %d, manifest says %d", i, len(chunk), ref.Size)
+		}
+
+		if got := sha256.Sum256(chunk); got != ref.Hash {
+			return errors.NewProcessingError("chunk %d content hash mismatch", i)
+		}
+
+		if _, err := w.Write(chunk); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func readManifest(ctx context.Context, store blob.Store, blockHash chainhash.Hash) (seedpack.Manifest, error) {
 	b, err := store.Get(ctx, blockHash[:], fileformat.FileTypeSeedManifest)
 	if err != nil {
