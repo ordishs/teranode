@@ -206,6 +206,47 @@ func TestRunRejectsNotOnMainChain(t *testing.T) {
 	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg))
 }
 
+func TestRunRollsBackOnSetHashMismatch(t *testing.T) {
+	ctx := context.Background()
+
+	wrappers := sampleWrappers()
+	seedStore, blockHash, _ := buildSeed(t, wrappers, 101)
+	utxoStore := newTestUTXOStore(t)
+
+	// Re-sign the checkpoint over a WRONG setHash with a key we control. The
+	// chunks remain valid, so the set streams and loads; the recomputed digest
+	// then disagrees with the signed setHash, forcing a rollback.
+	priv, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+
+	var wrongSetHash [32]byte
+	for i := range wrongSetHash {
+		wrongSetHash[i] = 0xee
+	}
+
+	sc, err := seedcheckpoint.Sign(priv, seedcheckpoint.Checkpoint{Height: 101, BlockHash: blockHash, SetHash: wrongSetHash})
+	require.NoError(t, err)
+
+	require.NoError(t, seedStore.Set(ctx, blockHash[:], fileformat.FileTypeSeedCheckpoint, sc.Serialize(), options.WithAllowOverwrite(true)))
+
+	cfg := Config{
+		SeedStore:   seedStore,
+		UTXOStore:   utxoStore,
+		Lookup:      stubLookup{id: 7, height: 101, onMain: true},
+		TrustedKeys: [][]byte{priv.PubKey().Compressed()},
+		BlockHash:   blockHash,
+	}
+
+	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg), "a set hash mismatch must fail")
+
+	// Rollback must have deleted every record it created.
+	for _, w := range wrappers {
+		txid := w.TxID
+		_, err := utxoStore.Get(ctx, &txid)
+		require.Error(t, err, "record for %s should have been rolled back", txid.String())
+	}
+}
+
 func TestRunRejectsTamperedSet(t *testing.T) {
 	ctx := context.Background()
 
