@@ -3,13 +3,16 @@ package seedimport
 
 import (
 	"context"
+	"encoding/hex"
 	"io"
 	"strings"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/pkg/muhash"
 	"github.com/bsv-blockchain/teranode/pkg/seedcheckpoint"
@@ -71,6 +74,67 @@ func loadWrapper(ctx context.Context, store utxo.Store, w *utxopersister.UTXOWra
 // BlockHeaderLookup binds a seed's block hash to the PoW-validated header chain.
 type BlockHeaderLookup interface {
 	BlockIDAndHeight(ctx context.Context, blockHash *chainhash.Hash) (id uint32, height uint32, onMainChain bool, err error)
+}
+
+// blockchainStore is the minimal slice of the blockchain store needed to resolve
+// a block hash to its ID, height, and main-chain membership.
+type blockchainStore interface {
+	GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error)
+	CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32) (bool, error)
+}
+
+// blockchainLookup is the production BlockHeaderLookup backed by the blockchain store.
+type blockchainLookup struct {
+	store blockchainStore
+}
+
+// NewBlockchainLookup returns a BlockHeaderLookup that resolves block hashes
+// against the given blockchain store.
+func NewBlockchainLookup(store blockchainStore) BlockHeaderLookup {
+	return &blockchainLookup{store: store}
+}
+
+func (l *blockchainLookup) BlockIDAndHeight(ctx context.Context, h *chainhash.Hash) (uint32, uint32, bool, error) {
+	_, meta, err := l.store.GetBlockHeader(ctx, h)
+	if err != nil {
+		return 0, 0, false, err
+	}
+
+	onMain, err := l.store.CheckBlockIsInCurrentChain(ctx, []uint32{meta.ID})
+	if err != nil {
+		return 0, 0, false, err
+	}
+
+	return meta.ID, meta.Height, onMain, nil
+}
+
+// LoadTrustedKeys parses compiled-in + flag-provided compressed authority pubkeys (hex).
+func LoadTrustedKeys(compiledIn []string, flagHex string) ([][]byte, error) {
+	hexKeys := append([]string{}, compiledIn...)
+	if flagHex != "" {
+		hexKeys = append(hexKeys, flagHex)
+	}
+
+	if len(hexKeys) == 0 {
+		return nil, errors.NewProcessingError("no trusted authority key: build with a compiled-in key or pass --authority-pubkey")
+	}
+
+	out := make([][]byte, 0, len(hexKeys))
+
+	for _, h := range hexKeys {
+		raw, err := hex.DecodeString(h)
+		if err != nil {
+			return nil, errors.NewProcessingError("invalid authority pubkey hex %q", h, err)
+		}
+
+		if _, err := bec.ParsePubKey(raw); err != nil {
+			return nil, errors.NewProcessingError("invalid authority pubkey %q", h, err)
+		}
+
+		out = append(out, raw)
+	}
+
+	return out, nil
 }
 
 // Config holds everything Run needs; stores are injected so Run is testable.

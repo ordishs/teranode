@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"net/url"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/pkg/muhash"
 	"github.com/bsv-blockchain/teranode/pkg/seedcheckpoint"
@@ -89,6 +91,71 @@ type stubLookup struct {
 
 func (s stubLookup) BlockIDAndHeight(ctx context.Context, h *chainhash.Hash) (uint32, uint32, bool, error) {
 	return s.id, s.height, s.onMain, s.err
+}
+
+type stubBlockchainStore struct {
+	meta   *model.BlockHeaderMeta
+	onMain bool
+}
+
+func (s stubBlockchainStore) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	return nil, s.meta, nil
+}
+
+func (s stubBlockchainStore) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32) (bool, error) {
+	return s.onMain, nil
+}
+
+func TestBlockchainLookupReturnsIDHeightAndOnMain(t *testing.T) {
+	ctx := context.Background()
+
+	stub := stubBlockchainStore{meta: &model.BlockHeaderMeta{ID: 5, Height: 101}, onMain: true}
+
+	h := chainhash.HashH([]byte("block"))
+
+	id, height, onMain, err := NewBlockchainLookup(stub).BlockIDAndHeight(ctx, &h)
+	require.NoError(t, err)
+	require.Equal(t, uint32(5), id)
+	require.Equal(t, uint32(101), height)
+	require.True(t, onMain)
+}
+
+func TestLoadTrustedKeysParsesValidKey(t *testing.T) {
+	priv, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+
+	keyHex := hex.EncodeToString(priv.PubKey().Compressed())
+
+	keys, err := LoadTrustedKeys(nil, keyHex)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	require.Equal(t, priv.PubKey().Compressed(), keys[0])
+}
+
+func TestLoadTrustedKeysAcceptsCompiledIn(t *testing.T) {
+	priv, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+
+	keyHex := hex.EncodeToString(priv.PubKey().Compressed())
+
+	keys, err := LoadTrustedKeys([]string{keyHex}, "")
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+}
+
+func TestLoadTrustedKeysErrorsWhenEmpty(t *testing.T) {
+	_, err := LoadTrustedKeys(nil, "")
+	require.Error(t, err)
+}
+
+func TestLoadTrustedKeysErrorsOnGarbageHex(t *testing.T) {
+	_, err := LoadTrustedKeys(nil, "not-hex")
+	require.Error(t, err)
+}
+
+func TestLoadTrustedKeysErrorsOnInvalidPubKey(t *testing.T) {
+	_, err := LoadTrustedKeys(nil, "deadbeef")
+	require.Error(t, err)
 }
 
 // buildSeed writes a utxo-set body (header|wrappers|footer) into a memory blob
