@@ -75,11 +75,22 @@ func TestWrapperToTxUsesRealTxID(t *testing.T) {
 		UTXOs:  []*utxopersister.UTXO{{Index: 0, Value: 1, Script: []byte{0x51}}},
 	}
 
-	tx := wrapperToTx(w)
+	tx, err := wrapperToTx(w)
+	require.NoError(t, err)
 	require.Equal(t, txid, *tx.TxIDChainHash(), "synthesized tx must report the real txid via SetTxHash")
 	require.Empty(t, tx.Inputs)
 	require.Len(t, tx.Outputs, 1)
 	require.Equal(t, uint64(1), tx.Outputs[0].Satoshis)
+}
+
+func TestWrapperToTxRejectsHugeVout(t *testing.T) {
+	w := &utxopersister.UTXOWrapper{
+		TxID:  chainhash.HashH([]byte("huge")),
+		UTXOs: []*utxopersister.UTXO{{Index: 0xFFFFFFFF, Value: 1, Script: []byte{0x51}}},
+	}
+
+	_, err := wrapperToTx(w)
+	require.Error(t, err, "an absurd vout from an unverified wrapper must be rejected before allocation")
 }
 
 type stubLookup struct {

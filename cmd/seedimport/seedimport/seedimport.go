@@ -23,19 +23,29 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
+// maxOutputsPerTx bounds the synthesized output slice. Seed data is unverified
+// until the post-load set-hash check, so a hostile seed could carry an absurd
+// vout index; without this bound make([]*bt.Output, maxVout+1) could OOM before
+// the integrity gate is reached. No real transaction approaches this many outputs.
+const maxOutputsPerTx = 1 << 24
+
 // wrapperToTx synthesizes a partial transaction carrying only the surviving
 // outputs of a UTXOWrapper. Inputs are empty; Outputs are sparse (nil at vouts
 // that were already spent). The real txid is set via SetTxHash so any internal
 // TxIDChainHash() call is correct; Create is additionally given WithTXID.
-func wrapperToTx(w *utxopersister.UTXOWrapper) *bt.Tx {
-	tx := bt.NewTx()
-
+func wrapperToTx(w *utxopersister.UTXOWrapper) (*bt.Tx, error) {
 	maxVout := uint32(0)
 	for _, u := range w.UTXOs {
 		if u.Index > maxVout {
 			maxVout = u.Index
 		}
 	}
+
+	if maxVout >= maxOutputsPerTx {
+		return nil, errors.NewProcessingError("wrapper %s vout %d exceeds bound %d", w.TxID.String(), maxVout, maxOutputsPerTx)
+	}
+
+	tx := bt.NewTx()
 
 	tx.Outputs = make([]*bt.Output, maxVout+1)
 	for _, u := range w.UTXOs {
@@ -48,16 +58,20 @@ func wrapperToTx(w *utxopersister.UTXOWrapper) *bt.Tx {
 	txid := w.TxID
 	tx.SetTxHash(&txid)
 
-	return tx
+	return tx, nil
 }
 
 // loadWrapper stores a wrapper's surviving outputs as UTXOs mined in block
 // blockID, keyed by the wrapper's real txid.
 func loadWrapper(ctx context.Context, store utxo.Store, w *utxopersister.UTXOWrapper, blockID uint32) error {
-	tx := wrapperToTx(w)
+	tx, err := wrapperToTx(w)
+	if err != nil {
+		return err
+	}
+
 	txid := w.TxID
 
-	_, err := store.Create(ctx, tx, w.Height,
+	_, err = store.Create(ctx, tx, w.Height,
 		utxo.WithTXID(&txid),
 		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{
 			BlockID:        blockID,
@@ -210,6 +224,10 @@ func verifyAgainstTrusted(sc *seedcheckpoint.SignedCheckpoint, trusted [][]byte)
 
 func streamLoad(ctx context.Context, cfg Config, blockID uint32) ([]chainhash.Hash, [32]byte, error) {
 	pr, pw := io.Pipe()
+
+	// Closing the read end on every return path unblocks the writer goroutine
+	// (otherwise a mid-stream error leaves it blocked forever in w.Write).
+	defer pr.Close()
 
 	go func() {
 		pw.CloseWithError(utxopersister.StreamSeedPackage(ctx, cfg.SeedStore, cfg.BlockHash, pw))
