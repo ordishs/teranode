@@ -15,7 +15,9 @@ env:
 jobs:
   chainintegrity:
     name: Chain Integrity Test
-    runs-on: teranode-runner-16-core
+    # arm64: no SV-node here; all images arm64-capable — teranode:latest
+    # (multi-arch), aerospike-server:8.1 (arm64), postgres + redpanda (arm64).
+    runs-on: teranode-runner-16-core-arm
     timeout-minutes: 30
     steps:
       - name: Checkout code

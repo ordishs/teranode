@@ -19,7 +19,9 @@ permissions:
 jobs:
   go-test:
     name: Go test
-    runs-on: teranode-runner-16-core
+    # ARM runner (see teranode_pr_tests.yaml): more headroom for the heavy
+    # `make test` -race+coverage compile; runs natively on arm64.
+    runs-on: teranode-runner-16-core-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
@@ -103,7 +105,8 @@ jobs:
 
   prunertest:
     name: prunertest
-    runs-on: teranode-runner-8-core
+    # arm64: aerospike (8.1, arm64), no SV-node (see teranode_pr_smoketests.yaml).
+    runs-on: teranode-runner-8-core-arm
     continue-on-error: true
     steps:
       - name: Login to Docker Hub
