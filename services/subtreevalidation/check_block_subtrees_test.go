@@ -1509,7 +1509,7 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 		var allTransactions []*bt.Tx
 		blockIds := make(map[uint32]bool)
 
-		err := server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
+		err := server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, nil)
 		require.NoError(t, err)
 	})
 
@@ -1533,7 +1533,7 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(true, nil)
 
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
+		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, nil)
 		require.NoError(t, err)
 	})
 
@@ -1560,7 +1560,7 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			Return(true, nil)
 
 		// Should fail with validation errors (errors are logged but not returned)
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
+		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, nil)
 		require.Error(t, err)
 	})
 
@@ -1581,83 +1581,11 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 		// Add missing parent error
 		mockValidator.Errors = []error{errors.NewTxMissingParentError("missing parent for testing")}
 
-		// Mock blockchain client to return running state
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(true, nil)
-
 		// Missing-parent errors are deferred (not fatal) so the caller's
 		// sequential revalidation pass can re-run the failed subtrees in
-		// block order and resolve cross-subtree parent dependencies. The tx
-		// is still recorded in the orphanage.
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
+		// block order and resolve cross-subtree parent dependencies.
+		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, nil)
 		require.NoError(t, err)
-
-		// Verify transaction was added to orphanage for the caller to retry
-		assert.Equal(t, 1, server.orphanage.Len())
-	})
-
-	t.Run("BlockchainNotRunning", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Create test transactions
-		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-		require.NoError(t, err)
-
-		allTransactions := []*bt.Tx{tx1}
-		blockIds := make(map[uint32]bool)
-
-		// Mock validator to return missing parent errors
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-		mockValidator.Errors = []error{errors.NewTxMissingParentError("missing parent for testing")}
-
-		// Mock blockchain client to return NOT running state
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(false, nil)
-
-		// Missing-parent errors are deferred to the sequential revalidation
-		// pass. The orphanage is skipped because FSM isn't RUNNING, but the
-		// caller still gets a chance to retry.
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
-		require.NoError(t, err)
-
-		// Verify transaction was NOT added to orphanage (blockchain not running)
-		assert.Equal(t, 0, server.orphanage.Len())
-	})
-
-	t.Run("BlockchainClientError", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Create test transactions
-		tx1, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
-		require.NoError(t, err)
-
-		allTransactions := []*bt.Tx{tx1}
-		blockIds := make(map[uint32]bool)
-
-		// Mock validator to return missing parent errors
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-		mockValidator.Errors = []error{errors.NewTxMissingParentError("missing parent for testing")}
-
-		// Mock blockchain client to return error
-		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-			mock.Anything, blockchain.FSMStateRUNNING).
-			Return(false, errors.NewServiceError("blockchain client error"))
-
-		// Missing-parent errors are deferred even when the FSM check fails.
-		// The orphanage is skipped (conservative when we can't confirm running
-		// state) but the caller's sequential revalidation pass still gets a
-		// chance to retry.
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
-		require.NoError(t, err)
-
-		// Verify transaction was NOT added to orphanage (blockchain client error)
-		assert.Equal(t, 0, server.orphanage.Len())
 	})
 
 	t.Run("NilTransaction", func(t *testing.T) {
@@ -1669,7 +1597,7 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 		blockIds := make(map[uint32]bool)
 
 		// Should fail with nil transaction
-		err := server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
+		err := server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "transaction is nil")
 	})
@@ -1704,7 +1632,7 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			mock.Anything, blockchain.FSMStateRUNNING).
 			Return(true, nil)
 
-		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
+		err = server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, nil)
 		require.NoError(t, err)
 	})
 
@@ -1737,8 +1665,82 @@ func TestProcessTransactionsInLevels(t *testing.T) {
 			Return(true, nil)
 
 		// Should return error even some validation failures
-		err := server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, blockIds)
+		err := server.processTransactionsInLevels(context.Background(), allTransactions, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, blockIds, nil)
 		require.Error(t, err)
+	})
+
+	// Regression test for the seed-already-known consensus gap: a parent
+	// tx that is already accepted into the UTXO store or cache BEFORE
+	// block validation (e.g. validated earlier via the peer-announced
+	// subtree path) was never seeded into the block-scoped accumulator.
+	// A child in the same candidate block referencing such a parent would
+	// then see empty ParentMetadata, fall through to the UTXO-store
+	// BlockHeights path, find it empty (the parent's blocks_transactions
+	// row is only written by SetMinedMulti AFTER this block is accepted),
+	// and the validator would stamp unconfirmedParentHeight — triggering
+	// bad-txns-unconfirmed-input-in-block on a legitimate block.
+	t.Run("SeedsAlreadyKnownTxsIntoAccumulator", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		tx, err := createTestTransaction("tx1")
+		require.NoError(t, err)
+		txHash := *tx.TxIDChainHash()
+
+		// Override BatchDecorate so this tx is reported as found in the
+		// store (Data populated). This is the "parent already in store"
+		// half of the bug scenario above.
+		mockStore := server.utxoStore.(*utxo.MockUtxostore)
+		mockStore.ExpectedCalls = nil
+		mockStore.On("Create", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(&utxometa.Data{}, nil).Maybe()
+		mockStore.On("GetBlockHeight").Return(uint32(100)).Maybe()
+		mockStore.On("GetMeta", mock.Anything, mock.Anything).
+			Return(&utxometa.Data{}, nil).Maybe()
+		mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				slice := args.Get(1).([]*utxo.UnresolvedMetaData)
+				for _, item := range slice {
+					if item.Hash.Equal(txHash) {
+						// Empty BlockHeights — this is the bug-triggering shape:
+						// the tx is "known to the store" but unmined. Without
+						// seeding, the child's validator would stamp
+						// unconfirmedParentHeight here.
+						item.Data = &utxometa.Data{
+							Fee:         1,
+							SizeInBytes: 100,
+						}
+					}
+				}
+			}).
+			Return(nil).Maybe()
+
+		server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
+			mock.Anything, blockchain.FSMStateRUNNING).
+			Return(true, nil).Maybe()
+
+		accumulator := &parentMetadataAccumulator{
+			delta: make(map[chainhash.Hash]*validator.ParentTxMetadata),
+		}
+		const candidateHeight = uint32(150)
+
+		err = server.processTransactionsInLevels(context.Background(),
+			[]*bt.Tx{tx},
+			chainhash.Hash{}, chainhash.Hash{},
+			candidateHeight, 0, 0,
+			make(map[uint32]bool), accumulator)
+		require.NoError(t, err)
+
+		// Pin: the already-known tx is seeded into the block-scoped
+		// accumulator with the candidate block's height. A sibling/child in
+		// the same block referencing this tx via filterParentMetadataForInputs
+		// now resolves the parent through the accumulator instead of falling
+		// back to the UTXO-store BlockHeights path.
+		seeded := accumulator.lookup(txHash)
+		require.NotNil(t, seeded,
+			"already-known candidate-block tx must be seeded into the block-scoped accumulator")
+		require.Equal(t, candidateHeight, seeded.BlockHeight,
+			"seeding height must be the candidate block height — the height this tx is being mined at in this block")
 	})
 }
 
@@ -2017,46 +2019,6 @@ func TestBlessMissingTransaction(t *testing.T) {
 		// Call blessMissingTransaction
 		validatorOptions := validator.ProcessOptions()
 		_, _ = server.blessMissingTransaction(context.Background(), blockHash, blockHash, tx, 100, blockIds, validatorOptions)
-	})
-}
-
-func TestProcessOrphans(t *testing.T) {
-	t.Run("NoOrphans", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		blockHash := chainhash.Hash{}
-		copy(blockHash[:], []byte("test_block_hash_32_bytes_long___!"))
-
-		blockIds := make(map[uint32]bool)
-
-		// Process orphans with empty orphanage
-		server.processOrphans(context.Background(), blockHash, 100, blockIds)
-
-		// Verify orphanage is still empty
-		assert.Equal(t, 0, server.orphanage.Len())
-	})
-
-	t.Run("WithOrphans", func(t *testing.T) {
-		server, cleanup := setupTestServer(t)
-		defer cleanup()
-
-		// Add orphaned transaction
-		tx, err := createTestTransaction("orphan")
-		require.NoError(t, err)
-		server.orphanage.Set(*tx.TxIDChainHash(), tx)
-
-		blockHash := chainhash.Hash{}
-		copy(blockHash[:], []byte("test_block_hash_32_bytes_long___!"))
-
-		blockIds := make(map[uint32]bool)
-
-		// Mock validator to return success
-		mockValidator := server.validatorClient.(*validator.MockValidatorClient)
-		mockValidator.UtxoStore = server.utxoStore
-
-		// Process orphans
-		server.processOrphans(context.Background(), blockHash, 100, blockIds)
 	})
 }
 
@@ -2340,10 +2302,6 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).
 		Return(&currentState, nil).Maybe()
 
-	// Create orphanage to avoid nil pointer dereference
-	orphanage, err := NewOrphanage(time.Minute*10, 100, logger)
-	require.NoError(t, err)
-
 	server := &Server{
 		logger:           logger,
 		settings:         testSettings,
@@ -2352,7 +2310,6 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 		utxoStore:        mockUtxoStore,
 		validatorClient:  mockValidatorClient,
 		blockchainClient: mockBlockchainClient,
-		orphanage:        orphanage,
 	}
 
 	return server, func() {

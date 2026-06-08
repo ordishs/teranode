@@ -6,6 +6,7 @@ This file implements the GoBDK transaction validation adapter.
 package validator
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
@@ -22,7 +23,63 @@ import (
 const (
 	errMsgInvalidTx = "GoBDK fail to ValidateTransaction"
 	errMsgPolicy    = "GoBDK fail to ValidateTransaction by policy settings"
+
+	// mempoolHeight is the BDK / svnode sentinel for "this UTXO is not yet
+	// confirmed" — sourced from bitcoin-sv/src/protocol_era.h:14
+	// (MEMPOOL_HEIGHT = 0x7FFFFFFF) and exercised by BDK at
+	// bdk/core/txvalidator.cpp:779 (consensus rejection) and
+	// txvalidator.hpp:178-192 (caller contract).
+	//
+	// This constant lives in the BDK-adapter file because MEMPOOL_HEIGHT is a
+	// BDK / svnode concept; the rest of the validator works with
+	// unconfirmedParentHeight (defined in Validator.go) and only this adapter
+	// translates outward at the BDK call boundary.
+	mempoolHeight uint32 = 0x7FFFFFFF
 )
+
+// substituteUnconfirmedHeights translates the teranode-internal
+// unconfirmedParentHeight sentinel into the value BDK expects at the call
+// boundary. The helper allocates a new slice only when the input contains at
+// least one sentinel; in the common path (no unconfirmed parents) the input
+// is returned unchanged.
+//
+// Translation rules:
+//   - consensus == true  → mempoolHeight (0x7FFFFFFF). BDK rejects with
+//     UnconfirmedInputInBlock → bad-txns-unconfirmed-input-in-block
+//     (bdk/core/txvalidator.cpp:779).
+//   - consensus == false → blockHeight (the candidate height the caller is
+//     validating against; in policy mode that is tip+1, matching svnode's
+//     GetInputScriptBlockHeight conversion of chainActive.Height()+1 at
+//     bitcoin-sv/src/validation.cpp:2668-2675).
+func substituteUnconfirmedHeights(utxoHeights []uint32, blockHeight uint32, consensus bool) []uint32 {
+	hasSentinel := false
+	for _, h := range utxoHeights {
+		if h == unconfirmedParentHeight {
+			hasSentinel = true
+			break
+		}
+	}
+	if !hasSentinel {
+		return utxoHeights
+	}
+
+	var substitute uint32
+	if consensus {
+		substitute = mempoolHeight
+	} else {
+		substitute = blockHeight
+	}
+
+	out := make([]uint32, len(utxoHeights))
+	for i, h := range utxoHeights {
+		if h == unconfirmedParentHeight {
+			out[i] = substitute
+		} else {
+			out[i] = h
+		}
+	}
+	return out
+}
 
 // uint2int safely converts uint32 slice to int32 slice, checking for overflow.
 func uint2int(arr []uint32) ([]int32, error) {
@@ -135,6 +192,37 @@ func newScriptVerifierGoBDK(l ulogger.Logger, po *settings.PolicySettings, pa *c
 	se.SetRequireStandard(po.RequireStandard)
 	se.SetPermitBareMultisig(po.PermitBareMultisig)
 
+	// Convert MinMiningTxFee from float BSV/kB to integer satoshis/kB.
+	// math.Round (not truncation) because IEEE-754 decimal representations can
+	// drop one satoshi otherwise — e.g. 0.00000250 stores as 0.0000024999…,
+	// truncating yields 249 instead of 250.
+	//
+	// panic() not l.Fatalf() so the stop guarantee doesn't depend on the logger
+	// implementation — TestLogger.Fatalf only logs, leaving an invalid policy
+	// silently in effect under unit tests.
+	if po.MinMiningTxFee < 0 {
+		panic(errors.NewConfigurationError("invalid minminingtxfee=%f: must not be negative", po.MinMiningTxFee))
+	}
+
+	satoshisPerKB := int64(math.Round(po.MinMiningTxFee * 1e8))
+	if err := se.SetMinMiningTxFee(satoshisPerKB); err != nil {
+		panic(errors.NewConfigurationError("invalid minminingtxfee=%f (=%d sat/kB)", po.MinMiningTxFee, satoshisPerKB, err))
+	}
+
+	if err := se.SetMinConsolidationFactor(int64(po.MinConsolidationFactor)); err != nil {
+		panic(errors.NewConfigurationError("invalid minconsolidationfactor=%d", po.MinConsolidationFactor, err))
+	}
+
+	if err := se.SetMaxConsolidationInputScriptSize(int64(po.MaxConsolidationInputScriptSize)); err != nil {
+		panic(errors.NewConfigurationError("invalid maxconsolidationinputscriptsize=%d", po.MaxConsolidationInputScriptSize, err))
+	}
+
+	if err := se.SetMinConfConsolidationInput(int64(po.MinConfConsolidationInput)); err != nil {
+		panic(errors.NewConfigurationError("invalid minconfconsolidationinput=%d", po.MinConfConsolidationInput, err))
+	}
+
+	se.SetAcceptNonStdConsolidationInput(po.AcceptNonStdConsolidationInput)
+
 	return &scriptVerifierGoBDK{
 		logger: l,
 		policy: po,
@@ -177,6 +265,12 @@ func (v *scriptVerifierGoBDK) ValidateTransaction(tx *bt.Tx, blockHeight uint32,
 		return errors.NewTxInvalidError("coinbase transactions are not supported")
 	}
 
+	// Translate the teranode-internal unconfirmedParentHeight sentinel into
+	// BDK's MEMPOOL_HEIGHT (consensus) or the candidate next-block height
+	// (policy). Other slots pass through untouched. See
+	// substituteUnconfirmedHeights for the full contract.
+	utxoHeights = substituteUnconfirmedHeights(utxoHeights, blockHeight, consensus)
+
 	eTxBytes := tx.ExtendedBytes()
 	intUtxoHeights, errConv := uint2int(utxoHeights)
 
@@ -213,6 +307,9 @@ func (v *scriptVerifierGoBDK) mapBDKValidationError(errVerify error, consensus b
 		switch dosErr.Code() {
 		case bdkscript.DOS_ERR_NOT_STANDARD, bdkscript.DOS_ERR_SIGOPS_POLICY, bdkscript.DOS_ERR_NOT_FREE_CONSOLIDATION:
 			policyErr := errors.NewTxPolicyError(errMsgPolicy, errVerify)
+			return errors.NewTxInvalidError(errMsgInvalidTx, policyErr)
+		case bdkscript.DOS_ERR_INSUFFICIENT_FEE:
+			policyErr := errors.NewTxPolicyError("transaction fee is too low", errVerify)
 			return errors.NewTxInvalidError(errMsgInvalidTx, policyErr)
 		default:
 			if dosErr.Code() <= bdkscript.DOS_ERR_OK || dosErr.Code() >= bdkscript.DOS_ERR_COUNT {

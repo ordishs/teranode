@@ -51,7 +51,6 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
-	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
@@ -600,8 +599,32 @@ type metaSliceItem struct {
 //
 // This method is typically called by higher-level API handlers after performing
 // necessary authorization and parameter validation.
+// ValidateSubtreeInternal is the public entry point used by peer-announced
+// subtree validation. It preserves the original signature so peer-side
+// callers compile without changes; behaviour for those callers is unchanged
+// — no block-scoped accumulator is supplied, the validator falls back to
+// the UTXO store for in-block parents, and the peer-subtree path remains
+// best-effort with the block-validation backstop in CheckBlockSubtrees as
+// the authoritative consensus path.
+//
+// Block-validation callers (CheckBlockSubtrees and its ordered-retry
+// callback) invoke validateSubtreeInternalImpl directly with the block-
+// scoped accumulator so in-block parents resolve through the accumulator
+// rather than the UTXO-store fallback.
 func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree, blockHeight uint32,
 	blockIds map[uint32]bool, validationOptions ...validator.Option) (subtree *subtreepkg.Subtree, err error) {
+	return u.validateSubtreeInternalImpl(ctx, v, blockHeight, blockIds, nil, validationOptions...)
+}
+
+// validateSubtreeInternalImpl is the inner accumulator-aware implementation.
+// When blockAccumulator is non-nil it is threaded into processMissingTransactions
+// so per-tx validations receive the in-block-parent metadata they need to
+// avoid the bad-txns-unconfirmed-input-in-block silent rejection on the
+// block-validation path. Callers control the accumulator's sharing model
+// (single-map for Phase 3 sequential retries; snapshot+delta for Phase 2
+// parallel — see validateMissingSubtreesWithOrderedRetryAccumulated).
+func (u *Server) validateSubtreeInternalImpl(ctx context.Context, v ValidateSubtree, blockHeight uint32,
+	blockIds map[uint32]bool, blockAccumulator *parentMetadataAccumulator, validationOptions ...validator.Option) (subtree *subtreepkg.Subtree, err error) {
 	stat := gocore.NewStat("ValidateSubtreeInternal")
 	startTotal := time.Now()
 
@@ -725,6 +748,26 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			}
 		}
 
+		// Seed the block-scoped accumulator with subtree txs that were already
+		// known to the cache or UTXO store (e.g. validated earlier via
+		// peer-announced subtree path). Without this, a child elsewhere in
+		// the candidate block that references such a parent would fall
+		// through to the UTXO-store BlockHeights path, find it empty (the
+		// parent's blocks_transactions row is only written by SetMinedMulti
+		// after this block is accepted), and the validator would stamp
+		// unconfirmedParentHeight — triggering bad-txns-unconfirmed-input-in-block
+		// on a legitimate block.
+		//
+		// first-writer-wins (acc.add): if an entry already exists from an
+		// earlier batch or an earlier subtree we keep it.
+		if blockAccumulator != nil {
+			for idx, txHash := range txHashes {
+				if txMetaSlice[idx].isSet && !txHash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
+					blockAccumulator.add(txHash, &validator.ParentTxMetadata{BlockHeight: blockHeight})
+				}
+			}
+		}
+
 		if missed > 0 {
 			// 3. ...then attempt to load the txMeta from the network
 			start, stat5, ctx5 := tracing.NewStatFromDefaultContext(ctx, "5. processMissingTransactions")
@@ -754,6 +797,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 				txMetaSlice,
 				blockHeight,
 				blockIds,
+				blockAccumulator,
 				validationOptions...,
 			)
 			if err != nil {
@@ -1098,9 +1142,27 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 //
 // Returns:
 //   - error: Any error encountered during retrieval or validation
+//
+// processMissingTransactions validates each missing tx in dependency-level
+// order. When blockAccumulator is non-nil it doubles as the in-block-parent
+// metadata source: each per-tx Options clone receives the filtered subset of
+// the accumulator that matches the tx's input prevouts, then after each
+// level's g.Wait() the level's successful txs are merged into the
+// accumulator. Callers control whether that map is shared across calls
+// (Phase 3 sequential retries reuse the live accumulator) or isolated per
+// call (Phase 2 parallel callers each receive a frozen copy and the deltas
+// are merged back in block-subtree order — see
+// validateMissingSubtreesWithOrderedRetryAccumulated).
+//
+// When blockAccumulator is nil the function preserves the legacy peer-
+// announced behaviour: no ParentMetadata is set on per-tx Options, the
+// validator falls back to the UTXO store, and in-block parents may surface
+// as bad-txns-unconfirmed-input-in-block. That path is best-effort by
+// design — the block-validation backstop in CheckBlockSubtrees uses the
+// accumulator-aware path.
 func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
 	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL string, txMetaSlice []metaSliceItem, blockHeight uint32,
-	blockIds map[uint32]bool, validationOptions ...validator.Option) (err error) {
+	blockIds map[uint32]bool, blockAccumulator *parentMetadataAccumulator, validationOptions ...validator.Option) (err error) {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "SubtreeValidation:processMissingTransactions",
 		tracing.WithDebugLogMessage(u.logger, "[processMissingTransactions][%s] processing %d missing txs", subtreeHash.String(), len(missingTxHashes)),
 		tracing.WithNewRoot(), // decouple tracing from the parent context, otherwise it will explode with too many spans
@@ -1109,11 +1171,6 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 	defer func() {
 		deferFn(err)
 	}()
-
-	isRunning, err := u.blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
-	if err != nil {
-		return errors.NewProcessingError("[validateSubtree][%s] failed to check if blockchain is running: %v", subtreeHash.String(), err)
-	}
 
 	missingTxs, err := u.getSubtreeMissingTxs(ctx, subtreeHash, subtree, missingTxHashes, allTxs, baseURL)
 	if err != nil {
@@ -1142,10 +1199,9 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 	processedValidatorOptions := validator.ProcessOptions(validationOptions...)
 
 	var (
-		errorsFound      = atomic.Uint64{}
-		addedToOrphanage = atomic.Uint64{}
-		firstError       error
-		firstErrorOnce   sync.Once
+		errorsFound    = atomic.Uint64{}
+		firstError     error
+		firstErrorOnce sync.Once
 	)
 
 	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
@@ -1154,11 +1210,18 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		return errors.NewProcessingError("[processMissingTransactions][%s] failed to pre-load MTP store: %v", subtreeHash.String(), err)
 	}
 
+	// Per-level success tracking for the accumulator merge below. Goroutines
+	// write tx hashes under a mutex; the post-g.Wait() merge into
+	// blockAccumulator is single-threaded.
+	var levelSuccessMutex sync.Mutex
+
 	for level := uint32(0); level <= maxLevel; level++ {
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, u.settings.SubtreeValidation.SpendBatcherSize*2)
 
 		u.logger.Debugf("[processMissingTransactions][%s] processing level %d/%d with %d transactions", subtreeHash.String(), level+1, maxLevel+1, len(txsPerLevel[level]))
+
+		levelSuccessfulTxs := make([]chainhash.Hash, 0, len(txsPerLevel[level]))
 
 		for _, mTx = range txsPerLevel[level] {
 			tx := mTx.tx
@@ -1168,9 +1231,17 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 				return errors.NewProcessingError("[validateSubtree][%s] missing transaction is nil", subtreeHash.String())
 			}
 
+			// Pre-filter the block-scoped accumulator to just this tx's input
+			// parents and clone Options so the spawned goroutine never touches
+			// the shared accumulator. When blockAccumulator is nil
+			// (peer-announced path) the filter returns nil and per-tx Options
+			// carry no ParentMetadata — preserving legacy behaviour.
+			perTxOpts := *processedValidatorOptions
+			perTxOpts.ParentMetadata = filterParentMetadataForInputs(tx, blockAccumulator)
+
 			// process each transaction in the background, since the transactions are all batched into the utxo store
 			g.Go(func() error {
-				txMeta, err := u.blessMissingTransaction(gCtx, chainhash.Hash{}, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
+				txMeta, err := u.blessMissingTransaction(gCtx, chainhash.Hash{}, subtreeHash, tx, blockHeight, blockIds, &perTxOpts)
 				if err != nil {
 					// Log the error, but do not return it, since we want to process all transactions in the subtree
 					u.logger.Debugf("[validateSubtree][%s] failed to bless missing transaction: %s: %v", subtreeHash.String(), tx.TxIDChainHash().String(), err)
@@ -1182,16 +1253,11 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 
 					// Check if this is a truly invalid transaction (not just policy error)
 					if errors.Is(err, errors.ErrTxMissingParent) {
-						// check whether we are in a running state, otherwise we can just ignore the missing parent transactions
-						if isRunning {
-							// add tx to the orphanage
-							u.logger.Debugf("[validateSubtree][%s] transaction %s is missing parent, adding to orphanage", subtreeHash.String(), tx.TxIDChainHash().String())
-							if u.orphanage.Set(*tx.TxIDChainHash(), tx) {
-								addedToOrphanage.Add(1)
-							} else {
-								u.logger.Warnf("[validateSubtree][%s] Failed to add transaction %s to orphanage - orphanage is full", subtreeHash.String(), tx.TxIDChainHash().String())
-							}
-						}
+						// Missing parent in the peer-announced subtree path. The subtree validation
+						// still fails (errorsFound was incremented above); the block path is the
+						// backstop — when the block arrives, Phase-3 sequential revalidation in
+						// CheckBlockSubtrees resolves cross-subtree parents in block order.
+						u.logger.Debugf("[validateSubtree][%s] transaction %s is missing parent", subtreeHash.String(), tx.TxIDChainHash().String())
 					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
 						// Report invalid subtree - contains truly invalid transaction
 						u.publishInvalidSubtree(gCtx, subtreeHash.String(), baseURL, "contains_invalid_transaction")
@@ -1234,6 +1300,12 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 					}
 				}
 
+				// Record success for the post-Wait merge into blockAccumulator.
+				// Only reached when blessMissingTransaction returned no error.
+				levelSuccessMutex.Lock()
+				levelSuccessfulTxs = append(levelSuccessfulTxs, *tx.TxIDChainHash())
+				levelSuccessMutex.Unlock()
+
 				return nil
 			})
 		}
@@ -1242,11 +1314,22 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		if err = g.Wait(); err != nil {
 			return err
 		}
+
+		// Synchronisation point: merge this level's successes into the
+		// block-scoped accumulator. Safe — all per-tx goroutines have
+		// returned and the next level hasn't spawned yet. acc.add is
+		// first-writer-wins: if a tx was already seeded as already-known or
+		// merged in an earlier level the existing entry is preserved.
+		if blockAccumulator != nil {
+			for _, txHash := range levelSuccessfulTxs {
+				blockAccumulator.add(txHash, &validator.ParentTxMetadata{BlockHeight: blockHeight})
+			}
+		}
 	}
 
 	if errorsFound.Load() > 0 {
 		// If there are errors found, we return here, so that the caller can handle it
-		return errors.NewProcessingError("[validateSubtree][%s] found %d errors while processing subtree, added %d to orphanage", subtreeHash.String(), errorsFound.Load(), addedToOrphanage.Load(), firstError)
+		return errors.NewProcessingError("[validateSubtree][%s] found %d errors while processing subtree", subtreeHash.String(), errorsFound.Load(), firstError)
 	}
 
 	if missingCount.Load() > 0 {

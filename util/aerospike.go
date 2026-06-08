@@ -100,6 +100,34 @@ func GetAerospikeClient(logger ulogger.Logger, url *url.URL, tSettings *settings
 	return client, nil
 }
 
+// CloseAerospikeClient closes the cached aerospike client for the given host and
+// removes it from the process-wide connection cache. GetAerospikeClient hands
+// out a shared client per host, so closing the client without evicting it would
+// leave a closed client in the cache: a subsequent store for the same host (for
+// example an in-process daemon restart that reuses the same Aerospike container)
+// would "reuse" the closed client and fail with INVALID_NODE_ERROR. Evicting
+// here forces the next GetAerospikeClient to build a fresh client.
+//
+// host MUST be the exact key GetAerospikeClient cached under — i.e. url.Host
+// (which may include a port and is not just a hostname); pass the same
+// url.Host, not a bare hostname, or the eviction silently no-ops.
+//
+// IMPORTANT — assumes sole ownership of the host's client. Because the cache is
+// keyed per host with no reference counting, this closes the client for ALL
+// users of that host. That is correct for the current single-UTXO-store daemon
+// (one store owns the host), but if more than one store/namespace on the same
+// host ever shares this client, closing it here would break the others. Add
+// reference counting before relying on shared ownership.
+func CloseAerospikeClient(host string) {
+	aerospikeConnectionMutex.Lock()
+	defer aerospikeConnectionMutex.Unlock()
+
+	if client, found := aerospikeConnections[host]; found {
+		client.Close()
+		delete(aerospikeConnections, host)
+	}
+}
+
 func getAerospikeClient(logger ulogger.Logger, url *url.URL, tSettings *settings.Settings) (*uaerospike.Client, error) {
 	if len(url.Path) < 1 {
 		return nil, errors.NewConfigurationError("aerospike namespace not found")
@@ -459,6 +487,10 @@ func aerospikePolicySummary(p *aerospike.ClientPolicy) string {
 }
 
 func initStats(logger ulogger.Logger, client *uaerospike.Client, tSettings *settings.Settings) {
+	if client == nil {
+		return
+	}
+
 	if !tSettings.Aerospike.EnableClientMetrics {
 		// Gated by aerospike_enable_client_metrics. When disabled we skip both
 		// client.EnableMetrics(nil) AND the stats-polling goroutine — the latter is
@@ -472,7 +504,13 @@ func initStats(logger ulogger.Logger, client *uaerospike.Client, tSettings *sett
 
 	aerospikeStatsRefreshInterval := tSettings.Aerospike.StatsRefreshDuration
 
-	client.EnableMetrics(nil)
+	// Aerospike client metrics are intentionally NOT enabled: the fork's
+	// per-record stats path (nodeStats.updateOrInsert) is quadratic per batch
+	// — every batch command pays ~N^2 counter increments. Worst observed during
+	// mainnet IBD (44-60% of legacy CPU) where batches are largest, but it is a
+	// general per-batch cost. Re-enable once the fork fix lands.
+	// See https://github.com/bsv-blockchain/teranode/issues/1001
+	// client.EnableMetrics(nil)
 
 	aerospikeLatencyBuckets := func() []float64 {
 		buckets := make([]float64, 24)

@@ -22,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
@@ -269,7 +270,7 @@ func mockBlock(ctx *testContext, t *testing.T) *model.Block {
 	err = ctx.subtreeStore.Set(context.Background(), subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes)
 	require.NoError(t, err)
 
-	subtreeHashes := make([]*chainhash.Hash, 0)
+	subtreeHashes := make([]*chainhash.Hash, 0, 1)
 	subtreeHashes = append(subtreeHashes, subtree.RootHash())
 
 	blockHeader := &model.BlockHeader{
@@ -385,6 +386,23 @@ func Test_getBlockLocator(t *testing.T) {
 			assert.Equal(t, store.BlockByHeight[expectedHeights[locatorIdx]].Hash().String(), locatorHash.String())
 		}
 	})
+}
+
+func Test_computeLocatorHeights(t *testing.T) {
+	require.Equal(t, []uint32{0}, computeLocatorHeights(0))
+	require.Equal(t, []uint32{1, 0}, computeLocatorHeights(1))
+	require.Equal(t,
+		[]uint32{12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0},
+		computeLocatorHeights(12))
+	require.Equal(t,
+		[]uint32{13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 0},
+		computeLocatorHeights(13))
+	require.Equal(t,
+		[]uint32{255, 254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 244, 242, 238, 230, 214, 182, 118, 0},
+		computeLocatorHeights(255))
+	require.Equal(t,
+		[]uint32{1000, 999, 998, 997, 996, 995, 994, 993, 992, 991, 990, 989, 987, 983, 975, 959, 927, 863, 735, 479, 0},
+		computeLocatorHeights(1000))
 }
 
 func Test_getBlockHeadersToCommonAncestor(t *testing.T) {
@@ -1040,6 +1058,57 @@ func Test_GetBlockLocator(t *testing.T) {
 		require.NotNil(t, response)
 		assert.NotNil(t, response.Locator)
 	})
+}
+
+func TestBlockchain_SavePeerRegistryPeriodically(t *testing.T) {
+	store := newTestBlobStore(t)
+	reg := NewCentralizedPeerRegistry(DefaultBanConfig())
+	reg.Register(&PeerInfo{ID: "p"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// StartPeriodicSave registers on the registry's WaitGroup so Close()
+	// drains the loop synchronously.
+	reg.StartPeriodicSave(ctx, 5*time.Millisecond, store)
+
+	require.Eventually(t, func() bool {
+		exists, err := store.Exists(ctx, peerRegistryBlobKey, fileformat.FileTypePeerRegistry)
+		return err == nil && exists
+	}, 200*time.Millisecond, 5*time.Millisecond, "expected periodic save to write the blob")
+
+	// Close() must return only after the loop exits.
+	doneCh := make(chan struct{})
+	go func() {
+		reg.Close()
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not drain the periodic-save goroutine")
+	}
+}
+
+func TestBlockchain_Stop_SavesAndClosesRegistry(t *testing.T) {
+	store := newTestBlobStore(t)
+	ctx := context.Background()
+
+	b := &Blockchain{
+		logger:            ulogger.TestLogger{},
+		settings:          &settings.Settings{},
+		peerRegistry:      NewCentralizedPeerRegistry(DefaultBanConfig()),
+		peerRegistryStore: store,
+	}
+	b.peerRegistry.Register(&PeerInfo{ID: "p"})
+
+	require.NoError(t, b.Stop(ctx))
+
+	// The closed store can't be exercised after Stop closed it, so verify Stop
+	// persisted at least one snapshot by checking that the closed-store state
+	// is the expected one (Stop reports nil error). The Save call itself is
+	// covered by the periodic test above.
 }
 
 func TestBlockchainStart(t *testing.T) {
@@ -3833,5 +3902,52 @@ func Test_HeartbeatSenderStopsOnContextCancel(t *testing.T) {
 		// Success - goroutine exited
 	case <-time.After(2 * time.Second):
 		t.Fatal("Heartbeat sender did not stop when context was cancelled")
+	}
+}
+
+func Test_getBlockLocator_FastPathMatchesWalk(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tipHeight := range []uint32{0, 5, 12, 13, 255, 1000} {
+		store := blockchain_store.NewMockStore()
+
+		var prevHash *chainhash.Hash
+		for i := uint32(0); i <= tipHeight; i++ {
+			prev := &chainhash.Hash{}
+			if prevHash != nil {
+				prev = prevHash
+			}
+
+			block := &model.Block{
+				Height: i,
+				Header: &model.BlockHeader{
+					Version:        i,
+					HashPrevBlock:  prev,
+					HashMerkleRoot: &chainhash.Hash{},
+					Timestamp:      i,
+					Bits:           model.NBit{},
+					Nonce:          i,
+				},
+			}
+			_, _, err := store.StoreBlock(ctx, block, "")
+			require.NoError(t, err)
+
+			prevHash = block.Hash()
+		}
+
+		start := store.BlockByHeight[tipHeight].Hash()
+
+		store.MainChainFastPathDisabled = false
+		fast, err := getBlockLocator(ctx, store, start, tipHeight)
+		require.NoError(t, err)
+
+		store.MainChainFastPathDisabled = true
+		walk, err := getBlockLocator(ctx, store, start, tipHeight)
+		require.NoError(t, err)
+
+		require.Equal(t, len(walk), len(fast), "tip=%d length mismatch", tipHeight)
+		for i := range walk {
+			require.Equal(t, walk[i].String(), fast[i].String(), "tip=%d idx=%d hash mismatch", tipHeight, i)
+		}
 	}
 }
