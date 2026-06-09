@@ -161,12 +161,12 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 
 	offset := s.calculateOffsetForOutput(spend.Vout)
 
-	// SpendingData is mandatory after #766 — the UDF unspend uses it to verify
-	// ownership before reversing the spend. The UDF fallback below receives this
-	// arg verbatim. The native operate-path forwards it to the server too, but
-	// the BSV-forked subOpUnspend=3 dispatcher must be updated to validate it
-	// before the native path can be trusted with the ownership check — tracked
-	// in issue #899.
+	// SpendingData is mandatory after #766 — unspend uses it to verify ownership
+	// before reversing the spend. It is forwarded verbatim as arg index 2 on both
+	// paths: the UDF fallback below and the native operate-path (subOpUnspend=3).
+	// The native dispatcher in the BSV fork of aerospike-server enforces the same
+	// ownership comparison as the Lua path (resolves #899), so the native path is
+	// now safe for unspend on any server build including that fix.
 	if spend.SpendingData == nil {
 		return errors.NewProcessingError("[Unspend] SpendingData is required for %s:%d", spend.TxID, spend.Vout)
 	}

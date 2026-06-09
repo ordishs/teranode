@@ -9,7 +9,7 @@
 // The native path bypasses the UDF executor and runs under the same
 // lock as native ops like LIST_APPEND. It requires both:
 //
-//   - A server with the BSV-forked aerospike-server-private (which
+//   - A server running the BSV fork of aerospike-server (which
 //     adds wire opcodes 200/201 and the SUBOP_TABLE dispatcher).
 //   - The setting `AerospikeSettings.UseNativeTeranodeOps = true`.
 //
