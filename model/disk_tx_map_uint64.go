@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -20,6 +21,7 @@ var _ txmap.TxMap = (*DiskTxMapUint64)(nil)
 type DiskTxMapUint64 struct {
 	tables   []*mmaphash.Table
 	numDisks int
+	frozen   atomic.Bool
 }
 
 // DiskTxMapUint64Options configures the DiskTxMapUint64.
@@ -76,6 +78,10 @@ func (m *DiskTxMapUint64) tableFor(hash chainhash.Hash) *mmaphash.Table {
 // exists. A table-capacity failure returns a processing error (NOT ErrTxExists),
 // so the caller halts instead of misreporting a duplicate.
 func (m *DiskTxMapUint64) Put(hash chainhash.Hash, value uint64) error {
+	if m.frozen.Load() {
+		return txmap.ErrMapFrozen
+	}
+
 	_, inserted, err := m.tableFor(hash).Upsert(hash[:], value)
 	if err != nil {
 		return errors.NewProcessingError("DiskTxMapUint64: Put failed (table capacity exceeded?)", err)
@@ -165,4 +171,24 @@ func (m *DiskTxMapUint64) PutMulti(_ []chainhash.Hash, _ uint64) error {
 func (m *DiskTxMapUint64) Iter(_ func(hash chainhash.Hash, value uint64) bool) {
 	// No-op: block validation only uses Put/Get/Exists/Length. Iter exists
 	// solely to satisfy the txmap.TxMap interface and is intentionally empty.
+}
+
+// Freeze marks the map read-only, matching the txmap.TxMap contract: after
+// Freeze, Put returns txmap.ErrMapFrozen. Block validation calls this once the
+// duplicate-check write phase is done, before the read-only validation phase.
+//
+// It is a write guard only: the mmap table's reads are not made lock-free by
+// Freeze (the in-memory split maps are the contended read path Freeze targets;
+// the disk-backed map is the capacity fallback).
+func (m *DiskTxMapUint64) Freeze() {
+	m.frozen.Store(true)
+}
+
+// Clear lifts a Freeze so the map accepts writes again. It does NOT erase
+// stored entries: DiskTxMapUint64 is ephemeral and single-use — block
+// validation releases it with Close, never pooled reuse — so a
+// content-clearing Clear (as the in-memory maps provide) is unnecessary. Clear
+// exists to satisfy txmap.TxMap; do not rely on it to empty the map.
+func (m *DiskTxMapUint64) Clear() {
+	m.frozen.Store(false)
 }

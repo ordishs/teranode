@@ -565,6 +565,19 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		ReportTxMapStats(diskMap.Stats())
 	}
 
+	// The duplicate-check write phase (checkDuplicateTransactions) is complete and
+	// flushed; validOrderAndBlessed below only reads b.txMap — one Get per tx plus
+	// one per parent, fanned out across every core. Freeze it so those reads skip
+	// the per-bucket RWMutex.RLock, whose reader-counter atomic otherwise
+	// cache-line ping-pongs across cores and dominates the read phase on many-core
+	// validation nodes. checkDuplicateTransactions' internal errgroup.Wait is the
+	// happens-before edge that guarantees all writes precede this Freeze.
+	// releaseTxMap resets the freeze on its way back to the pool (in-memory Clear)
+	// or discards the map (disk Close).
+	if b.txMap != nil {
+		b.txMap.Freeze()
+	}
+
 	// 12. Check that all transactions are in the valid order and blessed
 	//     Can only be done with a valid texMetaStore passed in
 	if txMetaStore != nil {

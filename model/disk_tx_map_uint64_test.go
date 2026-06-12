@@ -192,6 +192,29 @@ func TestDiskTxMapUint64_ImplementsTxMap(t *testing.T) {
 	var _ txmap.TxMap = (*DiskTxMapUint64)(nil)
 }
 
+func TestDiskTxMapUint64_FreezeBlocksWrites(t *testing.T) {
+	m := newTestDiskTxMapUint64(t)
+
+	h := makeHash(1)
+	require.NoError(t, m.Put(h, 7))
+	require.NoError(t, m.Flush())
+
+	m.Freeze()
+
+	// Reads keep working on a frozen map.
+	v, ok := m.Get(h)
+	require.True(t, ok)
+	require.Equal(t, uint64(7), v)
+	require.True(t, m.Exists(h))
+
+	// Writes fail loudly with the shared sentinel from go-tx-map.
+	require.ErrorIs(t, m.Put(makeHash(2), 9), txmap.ErrMapFrozen)
+
+	// Clear lifts the freeze so the map accepts writes again.
+	m.Clear()
+	require.NoError(t, m.Put(makeHash(3), 11))
+}
+
 func TestDiskTxMapUint64_NoPaths(t *testing.T) {
 	_, err := NewDiskTxMapUint64(DiskTxMapUint64Options{})
 	require.Error(t, err)
