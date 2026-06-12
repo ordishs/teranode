@@ -75,7 +75,9 @@ func TestGetParentSpendsMap_RoundTrip(t *testing.T) {
 		var inp subtreepkg.Inpoint
 		inp.Hash[0] = byte(i)
 		inp.Index = uint32(i)
-		require.True(t, m1.SetIfNotExists(inp))
+		ok, err := m1.SetIfNotExists(inp)
+		require.NoError(t, err)
+		require.True(t, ok)
 	}
 	PutParentSpendsMap(m1, 1_000_000)
 
@@ -87,7 +89,9 @@ func TestGetParentSpendsMap_RoundTrip(t *testing.T) {
 		var inp subtreepkg.Inpoint
 		inp.Hash[0] = byte(i)
 		inp.Index = uint32(i)
-		require.True(t, m2.SetIfNotExists(inp), "cleared map should accept inpoint")
+		ok, err := m2.SetIfNotExists(inp)
+		require.NoError(t, err)
+		require.True(t, ok, "cleared map should accept inpoint")
 	}
 	PutParentSpendsMap(m2, 1_000_000)
 }
