@@ -52,6 +52,11 @@ func createTestUTXOStore(t *testing.T) utxo.Store {
 	utxoStore, err := sql.New(ctx, logger, settings, utxoStoreURL)
 	require.NoError(t, err)
 
+	// Close the store when the test ends. Without this the sqlitememory store's
+	// spendBatcher worker goroutine + connection pool leak for the whole binary
+	// lifetime; tests calling this helper many times accumulate them (#1051).
+	t.Cleanup(func() { _ = utxoStore.Close(ctx) })
+
 	return utxoStore
 }
 

@@ -573,6 +573,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			blockIds,
 			accumulator,
 			validator.WithSkipPolicyChecks(true),
+			validator.WithInBlock(true),
 			validator.WithCreateConflicting(true),
 			validator.WithIgnoreLocked(true),
 			validator.WithCandidateBlockTime(candidateBlockTime),
@@ -1116,6 +1117,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 
 	validatorOptions := []validator.Option{
 		validator.WithSkipPolicyChecks(true),
+		validator.WithInBlock(true),
 		validator.WithCreateConflicting(true),
 		validator.WithIgnoreLocked(true),
 		validator.WithCandidateBlockTime(candidateBlockTime),

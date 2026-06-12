@@ -1151,6 +1151,7 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					validator.WithSkipUtxoCreation(true),
 					validator.WithAddTXToBlockAssembly(false),
 					validator.WithSkipPolicyChecks(true),
+					validator.WithInBlock(true),
 					validator.WithSkipTxMetaPublishing(true),
 					validator.WithCreateConflicting(true),
 					// PreValidateTransactions is only reached via the quickValidationMode
@@ -1295,7 +1296,7 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 
 				timeStart = time.Now()
 
-				if _, validateErr := sm.validationClient.Validate(ctx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true), validator.WithCandidateBlockTime(candidateBlockTime), validator.WithCandidateParentMedianTime(candidateParentMedianTime)); validateErr != nil {
+				if _, validateErr := sm.validationClient.Validate(ctx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true), validator.WithInBlock(true), validator.WithCandidateBlockTime(candidateBlockTime), validator.WithCandidateParentMedianTime(candidateParentMedianTime)); validateErr != nil {
 					classifyAndCountPrewarmError(sm.logger, validateErr)
 				}
 
@@ -1323,7 +1324,7 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 					}
 
 					// send to validation, but only if the parent is not in the same block
-					if _, validateErr := sm.validationClient.Validate(gCtx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true), validator.WithCandidateBlockTime(candidateBlockTime), validator.WithCandidateParentMedianTime(candidateParentMedianTime)); validateErr != nil {
+					if _, validateErr := sm.validationClient.Validate(gCtx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true), validator.WithInBlock(true), validator.WithCandidateBlockTime(candidateBlockTime), validator.WithCandidateParentMedianTime(candidateParentMedianTime)); validateErr != nil {
 						classifyAndCountPrewarmError(sm.logger, validateErr)
 					}
 
