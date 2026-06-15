@@ -675,7 +675,7 @@ func (u *Server) Init(ctx context.Context) (err error) {
 							continue
 						}
 
-						// FSM rejected the transition (e.g. LEGACYSYNCING active) — not a peer issue
+						// FSM rejected the transition — not a peer issue
 						if errors.Is(err, errors.ErrStateError) {
 							u.logger.Warnf("[catchup] FSM rejected catchup for block %s (node not in RUNNING state), clearing markers", c.block.Hash().String())
 							u.processBlockNotify.Delete(*c.block.Hash())
@@ -1357,7 +1357,7 @@ func (u *Server) ProcessBlock(ctx context.Context, request *blockvalidation_api.
 
 	block.Height = height
 
-	// If a block ID was pre-assigned by the caller (e.g. legacy netsync in LEGACYSYNCING mode),
+	// If a block ID was pre-assigned by the caller (e.g. legacy netsync during catch-up),
 	// apply it so the validation path can use AddBlock(WithID, WithMinedSet(true)) and allow
 	// the setMinedChan worker to skip setTxMinedStatus via the existing MinedSet guard.
 	if request.BlockId != 0 {

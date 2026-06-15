@@ -2667,7 +2667,7 @@ func (s *server) BanPeer(sp *serverPeer) {
 
 // canRelayTx reports whether the legacy server may emit transaction inventory
 // to its peers. Transactions must only be relayed once the node is fully
-// synced (FSM RUNNING). While syncing (LEGACYSYNCING/CATCHINGBLOCKS) the local
+// synced (FSM RUNNING). While syncing (CATCHINGBLOCKS) the local
 // chain tip may sit below the Genesis activation height, in which case the
 // validator accepts pre-Genesis-only outputs such as P2SH. Re-broadcasting
 // those to post-Genesis peers earns an instant ban for `bad-txns-vout-p2sh`.
