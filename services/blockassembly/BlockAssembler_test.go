@@ -1244,22 +1244,37 @@ func TestBlockAssembly_CoinbaseSubsidyBugReproduction(t *testing.T) {
 
 		wg.Wait()
 
-		// Test with normal parameters - should get full subsidy + fees
-		miningCandidate, _, err := testItems.blockAssembler.GetMiningCandidate(ctx)
-		require.NoError(t, err, "Failed to get mining candidate")
-		assert.NotNil(t, miningCandidate)
-
 		expectedSubsidy := uint64(5000000000) // 50 BSV for early blocks
 		expectedTotal := totalExpectedFees + expectedSubsidy
 
-		assert.Equal(t, expectedTotal, miningCandidate.CoinbaseValue,
+		// Wait until the assembler has committed all 3 txs into the mining
+		// candidate before asserting on the coinbase value. AddTxBatch enqueues
+		// asynchronously (subtreeProcessor.AddBatch -> queue), so a candidate
+		// read too early reports NumTxs < 3 and a coinbase missing the
+		// not-yet-aggregated fees — the source of the CI flake where
+		// CoinbaseValue equalled the subsidy only. Mirrors the wait already used
+		// by the GetMiningCandidate test earlier in this file.
+		var coinbaseValue uint64
+
+		require.Eventually(t, func() bool {
+			mc, _, mcErr := testItems.blockAssembler.GetMiningCandidate(ctx)
+			if mcErr != nil || mc == nil || mc.NumTxs != 3 {
+				return false
+			}
+
+			coinbaseValue = mc.CoinbaseValue
+
+			return true
+		}, 5*time.Second, 20*time.Millisecond, "mining candidate did not include all 3 txs in time")
+
+		assert.Equal(t, expectedTotal, coinbaseValue,
 			"Normal scenario: should have fees (%d) + subsidy (%d) = %d",
 			totalExpectedFees, expectedSubsidy, expectedTotal)
 
 		t.Logf("NORMAL CASE: height=%d, fees=%d (%.8f BSV), subsidy=%d (%.8f BSV), total=%d (%.8f BSV)",
 			height, totalExpectedFees, float64(totalExpectedFees)/1e8,
 			expectedSubsidy, float64(expectedSubsidy)/1e8,
-			miningCandidate.CoinbaseValue, float64(miningCandidate.CoinbaseValue)/1e8)
+			coinbaseValue, float64(coinbaseValue)/1e8)
 
 		// Now test what happens if we could somehow corrupt the chain params
 		// (This demonstrates what the bug would look like)
@@ -2005,7 +2020,7 @@ func TestBlockAssembly_LoadUnminedTransactions_ReseedsMinedTx_WhenUnminedSinceNo
 	require.NoError(t, err)
 
 	// Verify the transaction was (incorrectly) re-added to the assembler
-	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
+	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx)
 	assert.True(t, containsHash(hashes, *txHash),
 		"mined tx with incorrect unmined_since should have been reloaded into assembler")
 }
@@ -2052,7 +2067,7 @@ func TestBlockAssembly_LoadUnminedTransactions_ReorgCornerCase_MisUnsetMinedStat
 	require.NoError(t, err)
 
 	// The mined tx should now be present in the assembler due to the incorrect flip
-	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
+	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx)
 	assert.True(t, containsHash(hashes, *txHash),
 		"tx incorrectly marked not-on-longest should be reloaded into assembler")
 }
@@ -2124,7 +2139,7 @@ func TestBlockAssembly_LoadUnminedTransactions_SkipsTransactionsOnCurrentChain(t
 	require.NoError(t, err)
 
 	// Verify results
-	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
+	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx)
 
 	// tx1 should NOT be in the assembler (it's on the current chain)
 	assert.False(t, containsHash(hashes, *txHash1), "transaction already on current chain should be skipped during loadUnminedTransactions")
@@ -2987,7 +3002,7 @@ func TestReset_ConflictDetectionViaValidateInputs(t *testing.T) {
 	err = items.blockAssembler.reset(ctx, true)
 	require.NoError(t, err)
 
-	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes()
+	hashes := items.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx)
 	require.False(t, containsHash(hashes, *txAHash),
 		"after reset(validateInputs=true), a tx whose input is spent by another tx must NOT be in block assembly")
 }

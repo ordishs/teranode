@@ -66,8 +66,8 @@ func (m *MockSubtreeProcessor) Start(ctx context.Context) {
 	m.Called(ctx)
 }
 
-func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, isLegacySync bool, postProcess func() error) ResetResponse {
-	args := m.Called(blockHeader, moveBackBlocks, moveForwardBlocks, isLegacySync, postProcess)
+func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, useFastForwardReset bool, postProcess func() error) ResetResponse {
+	args := m.Called(blockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcess)
 	return args.Get(0).(ResetResponse)
 }
 
@@ -109,8 +109,8 @@ func (m *MockSubtreeProcessor) GetSubtreeHashes(ctx context.Context) []chainhash
 	return args.Get(0).([]chainhash.Hash)
 }
 
-func (m *MockSubtreeProcessor) GetTransactionHashes() []chainhash.Hash {
-	args := m.Called()
+func (m *MockSubtreeProcessor) GetTransactionHashes(ctx context.Context) []chainhash.Hash {
+	args := m.Called(ctx)
 	if args.Get(0) == nil {
 		return nil
 	}

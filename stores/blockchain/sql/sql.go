@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -39,6 +40,9 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/usql"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jellydator/ttlcache/v3"
+	"github.com/lib/pq"
 	"golang.org/x/sync/singleflight"
 	_ "modernc.org/sqlite"
 )
@@ -47,6 +51,21 @@ import (
 // GetBlockHeaders). Set to 10 minutes because block validation in production can take
 // several minutes, and the cached results (parent_id walks) are immutable.
 const chainWalkCacheTTL = 10 * time.Minute
+
+// blockIDReservationTTL bounds how long a block-id reservation (AssignBlockID)
+// survives in the in-memory L1 cache without a commit. Reservations are normally
+// cleared on commit; the TTL only reclaims L1 entries for blocks that are fetched
+// but never committed. The durable L2 table (block_id_reservations) outlives this
+// TTL and is reclaimed by the age-based sweep below.
+const blockIDReservationTTL = 10 * time.Minute
+
+// staleReservationSweepAge bounds how long a durable block-id reservation
+// (block_id_reservations) survives without a commit before reservationSweepLoop
+// sweeps it. Set well above any plausible single-block processing time (and above
+// blockIDReservationTTL) so an in-flight block is never swept mid-processing; only
+// genuinely abandoned reservations (fetched but never committed — e.g. a block
+// that failed validation) are reclaimed, bounding table growth.
+const staleReservationSweepAge = 1 * time.Hour
 
 // rebuildOffChainSetTimeout bounds the duration of rebuildOffChainSet calls made with
 // context.Background() (in InvalidateBlock, RevalidateBlock). This prevents the rebuild
@@ -99,6 +118,18 @@ type SQL struct {
 	// false without consulting the off-chain set. This prevents non-existent/garbage
 	// block IDs from being incorrectly treated as on-chain.
 	maxBlockID atomic.Uint64
+	// blockIDReservations maps a not-yet-committed block hash to the block ID
+	// reserved for it. Two ingestion paths (legacy netsync + blockvalidation
+	// catchup) can race on the same block during IBD; without a shared authority
+	// each calls nextval and gets a DIFFERENT id, one of which is written into the
+	// block's UTXO mined-info while the block commits under the other — orphaning
+	// the first id (a phantom that later fails checkOldBlockIDs and wedges sync).
+	// This cache makes assignment idempotent per hash. Entries are deleted on
+	// commit (StoreBlock) and auto-expire to bound growth from abandoned blocks.
+	blockIDReservations *ttlcache.Cache[chainhash.Hash, uint64]
+	// blockIDReservationMu serializes the check-then-reserve critical section so
+	// concurrent callers for the same hash converge on one id.
+	blockIDReservationMu sync.Mutex
 	// chainWalkCache is a dedicated cache for chain-walking queries (GetBlockHeaderIDs,
 	// GetBlockHeaders) that follow parent_id links. Unlike responseCache, this is only
 	// invalidated on chain reorganizations (InvalidateBlock/RevalidateBlock), because
@@ -241,6 +272,16 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 	}
 
 	s.backgroundDone = make(chan struct{})
+
+	s.blockIDReservations = ttlcache.New[chainhash.Hash, uint64](
+		ttlcache.WithTTL[chainhash.Hash, uint64](blockIDReservationTTL),
+		// Do not extend the TTL on lookups: a reservation must expire a fixed time
+		// after it was created, so a repeatedly-polled-but-never-committed hash is
+		// reclaimed instead of being kept alive by reads (bounds map growth).
+		ttlcache.WithDisableTouchOnHit[chainhash.Hash, uint64](),
+	)
+	go s.blockIDReservations.Start() // janitor
+
 	if useInMemory {
 		s.chainWalkCache = NewGenerationalCache()
 		s.offChainBlockIDs = make(map[uint32]struct{})
@@ -248,6 +289,7 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 
 	err = s.insertGenesisTransaction(logger, s.chainParams)
 	if err != nil {
+		s.blockIDReservations.Stop() // avoid leaking the janitor goroutine on the error path
 		return nil, errors.NewStorageError("failed to insert genesis transaction", err)
 	}
 
@@ -320,6 +362,10 @@ func New(logger ulogger.Logger, storeURL *url.URL, tSettings *settings.Settings)
 		go s.backgroundRefreshLoop()
 	}
 
+	// Always reclaim abandoned durable block-id reservations: the table is written
+	// regardless of useInMemoryChainCheck, so its sweep must run regardless too.
+	go s.reservationSweepLoop()
+
 	return s, nil
 }
 
@@ -354,6 +400,9 @@ func (s *SQL) Close() error {
 	s.responseCache.Stop()
 	if s.chainWalkCache != nil {
 		s.chainWalkCache.Stop()
+	}
+	if s.blockIDReservations != nil {
+		s.blockIDReservations.Stop()
 	}
 	return s.db.Close()
 }
@@ -446,6 +495,19 @@ func isBlockchainSchemaCurrent(db *usql.DB, withIndexes bool) (bool, error) {
 		return false, err
 	}
 	if !hasBlocks {
+		return false, nil
+	}
+
+	// block_id_reservations table present? Added after blocks; an existing
+	// deployment that predates it must re-run the DDL (CREATE TABLE IF NOT EXISTS)
+	// to gain it, so treat its absence as "not current".
+	var hasReservations bool
+	if err := db.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'block_id_reservations')`,
+	).Scan(&hasReservations); err != nil {
+		return false, err
+	}
+	if !hasReservations {
 		return false, nil
 	}
 
@@ -545,6 +607,21 @@ func createPostgresSchemaUnlocked(db *usql.DB, withIndexes bool) error {
 	`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not create blocks table", err)
+	}
+
+	// block_id_reservations durably backs the in-memory AssignBlockID cache so a
+	// reservation survives the cache TTL, a restart, and a second instance. No FK
+	// to blocks: a reservation exists BEFORE the block row does. Cleared on commit
+	// (StoreBlock) and swept by age (reservationSweepLoop).
+	if _, err := db.Exec(`
+      CREATE TABLE IF NOT EXISTS block_id_reservations (
+        hash         BYTEA   NOT NULL PRIMARY KEY
+        ,block_id    BIGINT  NOT NULL
+        ,reserved_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+	`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create block_id_reservations table", err)
 	}
 
 	// change the blocks table peer_id column to TEXT, if it is not already
@@ -832,6 +909,19 @@ func createSqliteSchema(db *usql.DB) error {
 	`); err != nil {
 		_ = db.Close()
 		return errors.NewStorageError("could not create blocks table", err)
+	}
+
+	// block_id_reservations: see the Postgres schema for rationale. Durably backs
+	// the in-memory AssignBlockID reservation cache.
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS block_id_reservations (
+		 hash         BLOB    NOT NULL PRIMARY KEY
+		,block_id     INTEGER NOT NULL
+		,reserved_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+	`); err != nil {
+		_ = db.Close()
+		return errors.NewStorageError("could not create block_id_reservations table", err)
 	}
 
 	// add the processed_at column to the blocks table if it does not exist
@@ -1345,12 +1435,86 @@ func (s *SQL) reconcileOnMainChain(ctx context.Context) error {
 // mainChainRebuilding is incremented for the duration of the call so concurrent
 // queries fall back to the authoritative CTE rather than reading partially-updated
 // flags. The counter-based guard is safe under reentrant/overlapping callers.
-func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) (err error) {
+func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) error {
 	s.mainChainRebuilding.Add(1)
 	defer s.mainChainRebuilding.Add(-1)
 
+	// The transaction below runs at REPEATABLE READ (see rebuildOnMainChainFlagTx)
+	// so all of its statements share one snapshot. On Postgres a snapshot-isolated
+	// transaction can abort with 40001 (serialization_failure) or 40P01
+	// (deadlock_detected) if a concurrent committed transaction modified a row it
+	// writes. The only caller that runs without slowPathMu held is the startup
+	// goroutine (see New); Invalidate/Revalidate hold slowPathMu and StoreBlock
+	// holds it for its whole duration, so they cannot conflict. The startup window
+	// can, however, race a slow-path StoreBlock UPDATE — so retry the whole
+	// transaction (begin → reads → UPDATEs → commit) as a unit on those codes.
+	// tx.ExecContext / tx.QueryRowContext are stdlib *sql.Tx methods and do NOT
+	// go through usql's per-statement retry, so the retry has to live here.
+	//
+	// On SQLite the modernc driver ignores the isolation option and never returns
+	// 40001/40P01, so isSerializationRetry is always false and the loop runs once.
+	const (
+		maxRebuildAttempts = 3
+		retryBaseDelay     = 100 * time.Millisecond
+	)
+
+	var err error
+	for attempt := 0; attempt < maxRebuildAttempts; attempt++ {
+		err = s.rebuildOnMainChainFlagTx(ctx, full)
+		if err == nil || !s.isSerializationRetry(err) {
+			return err
+		}
+
+		// On the final attempt, stop here and fall through to the exhaustion log +
+		// return below — logging "retrying" when no retry follows would be misleading.
+		if attempt == maxRebuildAttempts-1 {
+			break
+		}
+
+		// Exponential backoff (100ms, 200ms, ...) to match util/usql house style,
+		// aborting early if the context is cancelled.
+		backoff := retryBaseDelay << uint(attempt)
+		s.logger.Warnf("rebuildOnMainChainFlag: serialization conflict (attempt %d/%d), retrying in %s: %v", attempt+1, maxRebuildAttempts, backoff, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	// Retries exhausted on a serialization conflict. Return the raw typed driver
+	// error (not wrapped) so callers can still classify it via errors.As; log here
+	// for visibility since the error is otherwise only surfaced by the caller.
+	s.logger.Warnf("rebuildOnMainChainFlag: serialization conflict persisted after %d attempts: %v", maxRebuildAttempts, err)
+
+	return err
+}
+
+// isSerializationRetry reports whether err is a Postgres serialization_failure
+// (40001) or deadlock_detected (40P01) — the two codes a REPEATABLE READ
+// transaction can raise on a write-write conflict and which are safe to retry by
+// re-running the whole transaction. SQLite never produces these codes.
+func (*SQL) isSerializationRetry(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == usql.PgErrSerializationFail || pgErr.Code == usql.PgErrDeadlockDetected
+	}
+
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		code := string(pqErr.Code)
+		return code == usql.PgErrSerializationFail || code == usql.PgErrDeadlockDetected
+	}
+
+	return false
+}
+
+// rebuildOnMainChainFlagTx runs one attempt of the on_main_chain rebuild inside a
+// single REPEATABLE READ transaction. See rebuildOnMainChainFlag for the retry
+// wrapper and the snapshot-isolation rationale.
+func (s *SQL) rebuildOnMainChainFlagTx(ctx context.Context, full bool) (err error) {
 	var tx *sql.Tx
-	tx, err = s.db.BeginTx(ctx, nil)
+	tx, err = s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return errors.NewStorageError("rebuildOnMainChainFlag: failed to begin transaction", err)
 	}
@@ -1367,6 +1531,12 @@ func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) (err error)
 	if err = tx.QueryRowContext(ctx, bestQ).Scan(&bestBlockID, &bestHeight); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil // empty DB — nothing to rebuild
+		}
+		// Return the raw driver error on a serialization/deadlock abort so the
+		// retry wrapper can classify it: errors.NewStorageError captures only the
+		// message string of a non-*Error cause, discarding the typed *pgconn.PgError.
+		if s.isSerializationRetry(err) {
+			return err
 		}
 		return errors.NewStorageError("rebuildOnMainChainFlag: failed to get best block", err)
 	}
@@ -1397,6 +1567,9 @@ func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) (err error)
 		WHERE on_main_chain = true AND height >= $2 AND id NOT IN (SELECT id FROM main_chain)
 	`
 	if _, err = tx.ExecContext(ctx, q1, bestBlockID, windowBottom); err != nil {
+		if s.isSerializationRetry(err) {
+			return err
+		}
 		return errors.NewStorageError("rebuildOnMainChainFlag: failed to clear stale on_main_chain flags", err)
 	}
 
@@ -1415,10 +1588,16 @@ func (s *SQL) rebuildOnMainChainFlag(ctx context.Context, full bool) (err error)
 		WHERE on_main_chain = false AND height >= $2 AND id IN (SELECT id FROM main_chain)
 	`
 	if _, err = tx.ExecContext(ctx, q2, bestBlockID, windowBottom); err != nil {
+		if s.isSerializationRetry(err) {
+			return err
+		}
 		return errors.NewStorageError("rebuildOnMainChainFlag: failed to set on_main_chain flags", err)
 	}
 
 	if err = tx.Commit(); err != nil {
+		if s.isSerializationRetry(err) {
+			return err
+		}
 		return errors.NewStorageError("rebuildOnMainChainFlag: failed to commit transaction", err)
 	}
 
@@ -1543,6 +1722,64 @@ func (s *SQL) backgroundRefreshLoop() {
 			}
 			cancel()
 		}
+	}
+}
+
+// reservationSweepInterval is how often reservationSweepLoop reclaims abandoned
+// durable block-id reservations. Frequent relative to staleReservationSweepAge
+// (1h) is fine — the table is tiny and each sweep is a single indexed DELETE. A
+// var (not const) only so tests can shorten it; production never reassigns it.
+var reservationSweepInterval = 10 * time.Minute
+
+// reservationSweepLoop periodically reclaims abandoned durable block-id
+// reservations. It runs INDEPENDENTLY of blockchain_use_in_memory_chain_check:
+// block_id_reservations is written by AssignBlockID on every ingestion path
+// regardless of that toggle, so its sweep must run regardless too. (The
+// off-chain-set backgroundRefreshLoop is toggle-gated because the off-chain set
+// only matters when the toggle is on; that gating must not also disable this
+// sweep, or a toggle-off node would never reclaim reservations for blocks that get
+// an id but never commit — failed validation, crash-before-commit, abandoned
+// forks — letting the table grow unbounded.)
+func (s *SQL) reservationSweepLoop() {
+	ticker := time.NewTicker(reservationSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.backgroundDone:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), rebuildOffChainSetTimeout)
+			s.sweepStaleReservations(ctx)
+			cancel()
+		}
+	}
+}
+
+// sweepStaleReservations deletes durable block-id reservations older than
+// staleReservationSweepAge. Reservations for committed blocks are already removed
+// by StoreBlock; this reclaims rows for blocks that were fetched but never
+// committed (e.g. failed validation, crash before commit), bounding table growth.
+// Best-effort: a failure is logged and retried on the next tick. Uses each
+// engine's own clock and native timestamp format to avoid Go/DB time-format skew.
+func (s *SQL) sweepStaleReservations(ctx context.Context) {
+	mins := int(staleReservationSweepAge / time.Minute)
+
+	var (
+		q   string
+		arg interface{}
+	)
+
+	if s.engine == util.Postgres {
+		q = `DELETE FROM block_id_reservations WHERE reserved_at < NOW() - make_interval(mins => $1)`
+		arg = mins
+	} else {
+		q = `DELETE FROM block_id_reservations WHERE reserved_at < datetime('now', $1)`
+		arg = fmt.Sprintf("-%d minutes", mins)
+	}
+
+	if _, err := s.db.ExecContext(ctx, q, arg); err != nil {
+		s.logger.Warnf("sweep stale block-id reservations: %v", err)
 	}
 }
 

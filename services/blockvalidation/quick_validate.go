@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -162,6 +163,17 @@ func (u *BlockValidation) buildSubtreeAndQueueWrite(ctx context.Context, block *
 	}, nil
 }
 
+// blockIDToUint32 narrows an assigned (uint64) block id to the uint32 the model
+// uses, erroring instead of silently wrapping — a wrap would alias a different
+// block's id and break the one-id-per-hash idempotency AssignBlockID guarantees.
+func blockIDToUint32(id uint64, blockHash string) (uint32, error) {
+	v, err := safeconversion.Uint64ToUint32(id)
+	if err != nil {
+		return 0, errors.NewProcessingError("[%s] assigned block id %d exceeds uint32", blockHash, id, err)
+	}
+	return v, nil
+}
+
 // quickValidateBlock performs optimized validation for blocks below checkpoints.
 // This follows the legacy sync approach: create all UTXOs first, then validate later.
 // This is safe because checkpoints guarantee these blocks are valid.
@@ -204,12 +216,15 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 			return errors.NewProcessingError("[quickValidateBlock][%s] block ID was not assigned during subtree processing", block.Hash().String())
 		}
 	} else {
-		// No subtrees to process, get next block ID
-		id, err = u.blockchainClient.GetNextBlockID(ctx)
+		// No subtrees to process, assign block ID idempotently
+		id, err = u.blockchainClient.AssignBlockID(ctx, block.Hash())
 		if err != nil {
-			return errors.NewProcessingError("[quickValidateBlock][%s] failed to get next block ID", block.Hash().String(), err)
+			return errors.NewProcessingError("[quickValidateBlock][%s] failed to assign block ID", block.Hash().String(), err)
 		}
-		block.ID = uint32(id) // nolint:gosec
+		block.ID, err = blockIDToUint32(id, block.Hash().String())
+		if err != nil {
+			return err
+		}
 	}
 
 	// add block directly to blockchain
@@ -289,13 +304,16 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		}
 	}
 
-	// If no block ID was assigned during processing, get next block ID
+	// If no block ID was assigned during processing, assign idempotently
 	if block.ID == 0 {
-		id, err = u.blockchainClient.GetNextBlockID(ctx)
+		id, err = u.blockchainClient.AssignBlockID(ctx, block.Hash())
 		if err != nil {
-			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to get next block ID", block.Hash().String(), err)
+			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to assign block ID", block.Hash().String(), err)
 		}
-		block.ID = uint32(id) // nolint:gosec
+		block.ID, err = blockIDToUint32(id, block.Hash().String())
+		if err != nil {
+			return err
+		}
 	}
 
 	// add block directly to blockchain
@@ -392,7 +410,10 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 		}
 
 		// Phase 4: Check for retry and get block ID (only on first batch)
-		// This is specific to quick validation to handle retries gracefully
+		// This is specific to quick validation to handle retries gracefully.
+		// batchTxs[0] is the first non-coinbase tx; its recorded mined-in id is
+		// this block's. The legacy quick path (netsync reuseBlockIDFromUTXO) keys
+		// the same recovery on its first non-coinbase tx — keep them in sync.
 		if !blockIDSet && len(batch.batchTxs) > 0 {
 			existingMeta, err := u.utxoStore.Get(ctx, batch.batchTxs[0].TxIDChainHash(), fields.BlockIDs)
 			if err == nil && existingMeta != nil && len(existingMeta.BlockIDs) > 0 {
@@ -400,11 +421,14 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 				block.ID = existingMeta.BlockIDs[0]
 				u.logger.Debugf("[processBlockSubtreesSequential][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 			} else if block.ID == 0 {
-				id, err := u.blockchainClient.GetNextBlockID(ctx)
+				id, err := u.blockchainClient.AssignBlockID(ctx, block.Hash())
 				if err != nil {
-					return 0, errors.NewProcessingError("[processBlockSubtreesSequential][%s] failed to get block ID", block.Hash().String(), err)
+					return 0, errors.NewProcessingError("[processBlockSubtreesSequential][%s] failed to assign block ID", block.Hash().String(), err)
 				}
-				block.ID = uint32(id) // nolint:gosec
+				block.ID, err = blockIDToUint32(id, block.Hash().String())
+				if err != nil {
+					return 0, err
+				}
 			}
 			blockIDSet = true
 		}
@@ -523,11 +547,14 @@ func (u *BlockValidation) processBlockSubtreesPipeline(ctx context.Context, bloc
 					block.ID = existingMeta.BlockIDs[0]
 					u.logger.Debugf("[processBlockSubtreesPipeline][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 				} else if block.ID == 0 {
-					id, err := u.blockchainClient.GetNextBlockID(gCtx)
+					id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
 					if err != nil {
-						return errors.NewProcessingError("[processBlockSubtreesPipeline][%s] failed to get block ID", block.Hash().String(), err)
+						return errors.NewProcessingError("[processBlockSubtreesPipeline][%s] failed to assign block ID", block.Hash().String(), err)
 					}
-					block.ID = uint32(id) // nolint:gosec
+					block.ID, err = blockIDToUint32(id, block.Hash().String())
+					if err != nil {
+						return err
+					}
 				}
 				blockIDSet = true
 			}
@@ -652,11 +679,14 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 					block.ID = existingMeta.BlockIDs[0]
 					u.logger.Debugf("[processBlockSubtreesPipelineAsync][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 				} else if block.ID == 0 {
-					id, err := u.blockchainClient.GetNextBlockID(gCtx)
+					id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
 					if err != nil {
-						return errors.NewProcessingError("[processBlockSubtreesPipelineAsync][%s] failed to get block ID", block.Hash().String(), err)
+						return errors.NewProcessingError("[processBlockSubtreesPipelineAsync][%s] failed to assign block ID", block.Hash().String(), err)
 					}
-					block.ID = uint32(id) // nolint:gosec
+					block.ID, err = blockIDToUint32(id, block.Hash().String())
+					if err != nil {
+						return err
+					}
 				}
 				blockIDSet = true
 			}
@@ -900,7 +930,7 @@ func (u *BlockValidation) unlockSubtreeTransactions(ctx context.Context, subtree
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(g, 128)
+	util.SafeSetLimit(u.logger, g, 128)
 
 	for subtreeIdx, subtree := range subtrees {
 		if subtree == nil || len(subtree.Nodes) == 0 {
@@ -1016,7 +1046,7 @@ func (u *BlockValidation) processSubtreeBatch(
 
 	readerCtx, cancelReaders := context.WithCancel(ctx)
 	g, gCtx := errgroup.WithContext(readerCtx)
-	util.SafeSetLimit(g, 128)
+	util.SafeSetLimit(u.logger, g, 128)
 
 	for i := 0; i < batchSize; i++ {
 		globalIdx := batchStart + i
@@ -1121,7 +1151,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 	// Set concurrency to 8x StoreBatcherSize to allow sufficient parallelism while the
 	// UTXO store batches operations internally. This multiplier balances throughput with
 	// resource usage, allowing multiple batches to be in flight simultaneously.
-	util.SafeSetLimit(createG, u.settings.UtxoStore.StoreBatcherSize*8)
+	util.SafeSetLimit(u.logger, createG, u.settings.UtxoStore.StoreBatcherSize*8)
 
 	// Track transactions that already exist so we can update their mined info
 	var existingTxsMu sync.Mutex
@@ -1175,7 +1205,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 
 	// Phase 2: Spend all transactions in parallel
 	spendG, spendCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(spendG, u.settings.UtxoStore.SpendBatcherSize*u.settings.UtxoStore.SpendBatcherConcurrency*2)
+	util.SafeSetLimit(u.logger, spendG, u.settings.UtxoStore.SpendBatcherSize*u.settings.UtxoStore.SpendBatcherConcurrency*2)
 
 	for _, tx := range batch.batchTxs {
 		tx := tx
@@ -1203,7 +1233,7 @@ func (u *BlockValidation) createAndSpendUTXOsForBatch(ctx context.Context, block
 //   - error: If file writing fails
 func (u *BlockValidation) writeSubtreeFilesForBatch(ctx context.Context, block *model.Block, batch *SubtreeProcessingBatch) error {
 	writeG, writeCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(writeG, u.settings.BlockValidation.SubtreeBatchWriteConcurrency)
+	util.SafeSetLimit(u.logger, writeG, u.settings.BlockValidation.SubtreeBatchWriteConcurrency)
 
 	batchSize := batch.batchEnd - batch.batchStart
 	for i := 0; i < batchSize; i++ {
@@ -1240,7 +1270,7 @@ func (u *BlockValidation) writeSubtreeFilesForBatch(ctx context.Context, block *
 func (u *BlockValidation) buildSubtreeJobsForBatch(ctx context.Context, block *model.Block, batch *SubtreeProcessingBatch, writeJobsChan chan<- *SubtreeWriteJob) error {
 	// Build subtrees in parallel (CPU-bound work)
 	buildG, buildCtx := errgroup.WithContext(ctx)
-	util.SafeSetLimit(buildG, u.settings.BlockValidation.SubtreeBatchWriteConcurrency)
+	util.SafeSetLimit(u.logger, buildG, u.settings.BlockValidation.SubtreeBatchWriteConcurrency)
 
 	batchSize := batch.batchEnd - batch.batchStart
 	jobs := make([]*SubtreeWriteJob, batchSize)
@@ -1327,7 +1357,7 @@ func (u *BlockValidation) prefetchSubtreeBatch(
 
 	readerCtx, cancelReaders := context.WithCancel(ctx)
 	g, gCtx := errgroup.WithContext(readerCtx)
-	util.SafeSetLimit(g, 128)
+	util.SafeSetLimit(u.logger, g, 128)
 
 	for i := 0; i < batchSize; i++ {
 		globalIdx := batchStart + i

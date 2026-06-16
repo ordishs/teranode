@@ -3709,38 +3709,6 @@ func Test_IsFullyReady(t *testing.T) {
 	}
 }
 
-// Test_LegacySync tests the LegacySync gRPC method
-func Test_LegacySync(t *testing.T) {
-	ctx := setup(t)
-
-	tests := []struct {
-		name        string
-		expectError bool
-	}{
-		{
-			name:        "legacy sync request",
-			expectError: false, // Should succeed or be idempotent
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			request := &emptypb.Empty{}
-
-			response, err := ctx.server.LegacySync(context.Background(), request)
-
-			if tt.expectError {
-				require.Error(t, err)
-				require.Nil(t, response)
-				return
-			}
-
-			require.NoError(t, err)
-			require.NotNil(t, response)
-		})
-	}
-}
-
 // Test_Idle tests the Idle gRPC method
 func Test_Idle(t *testing.T) {
 	ctx := setup(t)
@@ -3950,4 +3918,24 @@ func Test_getBlockLocator_FastPathMatchesWalk(t *testing.T) {
 			require.Equal(t, walk[i].String(), fast[i].String(), "tip=%d idx=%d hash mismatch", tipHeight, i)
 		}
 	}
+}
+
+// TestServerAssignBlockID covers the gRPC AssignBlockID handler: a stable id is
+// returned per hash (idempotent across calls), and a malformed hash is rejected.
+func TestServerAssignBlockID(t *testing.T) {
+	ctx := setup(t)
+	c := context.Background()
+
+	h := chainhash.HashH([]byte("assign-block-id-server"))
+
+	resp, err := ctx.server.AssignBlockID(c, &blockchain_api.AssignBlockIDRequest{BlockHash: h[:]})
+	require.NoError(t, err)
+	require.NotZero(t, resp.BlockId)
+
+	resp2, err := ctx.server.AssignBlockID(c, &blockchain_api.AssignBlockIDRequest{BlockHash: h[:]})
+	require.NoError(t, err)
+	require.Equal(t, resp.BlockId, resp2.BlockId, "same hash must return the same id")
+
+	_, err = ctx.server.AssignBlockID(c, &blockchain_api.AssignBlockIDRequest{BlockHash: []byte{0x01, 0x02}})
+	require.Error(t, err, "a non-32-byte hash must be rejected as invalid argument")
 }

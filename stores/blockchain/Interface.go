@@ -92,6 +92,12 @@ type Store interface {
 	// Returns: next block ID and any error encountered
 	GetNextBlockID(ctx context.Context) (uint64, error)
 
+	// AssignBlockID returns a stable block ID for the given block hash: repeated
+	// calls for the same hash (and concurrent callers) return the same id, and a
+	// committed block returns its authoritative id. Used by ingestion paths so a
+	// block's UTXO mined-info and its committed row share one id.
+	AssignBlockID(ctx context.Context, blockHash *chainhash.Hash) (uint64, error)
+
 	// GetBlockInChainByHeightHash retrieves a block at a specific height in a chain determined by the start hash. This is useful for getting the block at a given height in a chain that may have a different tip.
 	// Parameters:
 	//   - ctx: Context for the operation
@@ -398,22 +404,6 @@ type Store interface {
 	//   - blockIDs: Slice of block IDs to check
 	// Returns: Boolean indicating if blocks are in current chain and any error encountered
 	CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32) (bool, error)
-
-	// OffChainBlockIDs returns the complete set of block IDs known NOT to be on the
-	// current main chain (the in-memory off-chain/forked set). It lets callers
-	// prefetch the negative set once and answer main-chain membership locally.
-	// Parameters:
-	//   - ctx: Context for the operation
-	// Returns:
-	//   - the off-chain block IDs (nil when none)
-	//   - maxBlockID: the highest known block ID. IDs above this cannot be on the
-	//     main chain, so callers must apply the same id > maxBlockID skip that
-	//     CheckBlockIsInCurrentChain enforces, to stay consensus-equivalent
-	//   - rebuilding: true when the in-memory set is unavailable or stale (in-memory
-	//     check disabled, or a reorg/startup rebuild is in progress); callers must
-	//     fall back to per-block CheckBlockIsInCurrentChain checks
-	//   - any error encountered
-	OffChainBlockIDs(ctx context.Context) (offChainBlockIDs []uint32, maxBlockID uint32, rebuilding bool, err error)
 
 	// CheckBlockIsAncestorOfBlock checks if any of the given block IDs are ancestors of the block with the given hash.
 	// This is used for double-spend detection on fork blocks where we need to check against
