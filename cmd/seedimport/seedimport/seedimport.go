@@ -141,11 +141,15 @@ func LoadTrustedKeys(compiledIn []string, flagHex string) ([][]byte, error) {
 			return nil, errors.NewProcessingError("invalid authority pubkey hex %q", h, err)
 		}
 
-		if _, err := bec.ParsePubKey(raw); err != nil {
+		pub, err := bec.ParsePubKey(raw)
+		if err != nil {
 			return nil, errors.NewProcessingError("invalid authority pubkey %q", h, err)
 		}
 
-		out = append(out, raw)
+		// Normalize to the 33-byte compressed form. The checkpoint embeds the
+		// signer's compressed pubkey and VerifyWithKey compares raw bytes, so an
+		// operator who pastes an uncompressed key would otherwise never match.
+		out = append(out, pub.Compressed())
 	}
 
 	return out, nil
@@ -158,6 +162,11 @@ type Config struct {
 	Lookup      BlockHeaderLookup
 	TrustedKeys [][]byte
 	BlockHash   chainhash.Hash
+
+	// NetworkMagic is the local network's wire magic (settings.ChainCfgParams.Net).
+	// It is mixed into the checkpoint signature digest so a checkpoint signed for
+	// another network cannot verify here.
+	NetworkMagic uint32
 }
 
 // Run verifies and loads the seed identified by cfg.BlockHash.
@@ -167,8 +176,12 @@ func Run(ctx context.Context, logger ulogger.Logger, cfg Config) error {
 		return err
 	}
 
-	if err := verifyAgainstTrusted(sc, cfg.TrustedKeys); err != nil {
+	if err := verifyAgainstTrusted(sc, cfg.TrustedKeys, cfg.NetworkMagic); err != nil {
 		return err
+	}
+
+	if sc.Checkpoint.CommitmentVersion != utxoseed.CommitmentVersion {
+		return errors.NewProcessingError("unsupported commitment version %d: this build computes the set commitment at version %d", sc.Checkpoint.CommitmentVersion, utxoseed.CommitmentVersion)
 	}
 
 	if sc.Checkpoint.BlockHash != cfg.BlockHash {
@@ -212,14 +225,14 @@ func readSignedCheckpointBlob(ctx context.Context, store blob.Store, blockHash c
 	return seedcheckpoint.ParseSignedCheckpoint(b)
 }
 
-func verifyAgainstTrusted(sc *seedcheckpoint.SignedCheckpoint, trusted [][]byte) error {
+func verifyAgainstTrusted(sc *seedcheckpoint.SignedCheckpoint, trusted [][]byte, netMagic uint32) error {
 	for _, key := range trusted {
-		if sc.VerifyWithKey(key) == nil {
+		if sc.VerifyWithKey(key, netMagic) == nil {
 			return nil
 		}
 	}
 
-	return errors.NewProcessingError("checkpoint not signed by any trusted authority key")
+	return errors.NewProcessingError("checkpoint not signed by any trusted authority key (or signed for a different network)")
 }
 
 func streamLoad(ctx context.Context, cfg Config, blockID uint32) ([]chainhash.Hash, [32]byte, error) {

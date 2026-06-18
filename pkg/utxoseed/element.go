@@ -9,6 +9,13 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
+// CommitmentVersion identifies this frozen commitment construction: the Element
+// byte layout below together with the MuHash3072 element mapping. Bump it on ANY
+// change to either. A signed checkpoint carries this value, so a consumer built
+// for a different version refuses the seed up front instead of silently failing
+// the set-hash check.
+const CommitmentVersion uint32 = 1
+
 // Element serializes a single UTXO into its canonical commitment bytes:
 //
 //	txid(32) | vout(4 LE) | (height<<1 | coinbase)(4 LE) | value(8 LE) | scriptLen(4 LE) | script

@@ -26,6 +26,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testNetMagic is an arbitrary network magic; producer signing and consumer
+// verification in these tests must agree on it.
+const testNetMagic uint32 = 0xe8f3e1e3
+
 func newTestUTXOStore(t *testing.T) utxo.Store {
 	t.Helper()
 
@@ -143,6 +147,21 @@ func TestLoadTrustedKeysParsesValidKey(t *testing.T) {
 	require.Equal(t, priv.PubKey().Compressed(), keys[0])
 }
 
+func TestLoadTrustedKeysNormalizesUncompressedKey(t *testing.T) {
+	priv, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+
+	// An operator pastes the uncompressed (65-byte) form. It must be normalized
+	// to the 33-byte compressed key the checkpoint embeds, or it would never
+	// match and every import would fail.
+	uncompressedHex := hex.EncodeToString(priv.PubKey().Uncompressed())
+
+	keys, err := LoadTrustedKeys(nil, uncompressedHex)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	require.Equal(t, priv.PubKey().Compressed(), keys[0])
+}
+
 func TestLoadTrustedKeysAcceptsCompiledIn(t *testing.T) {
 	priv, err := bec.NewPrivateKey()
 	require.NoError(t, err)
@@ -214,7 +233,7 @@ func buildSeed(t *testing.T, wrappers []*utxopersister.UTXOWrapper, height uint3
 	priv, err := bec.NewPrivateKey()
 	require.NoError(t, err)
 
-	sc, err := seedcheckpoint.Sign(priv, seedcheckpoint.Checkpoint{Height: height, BlockHash: blockHash, SetHash: setHash})
+	sc, err := seedcheckpoint.Sign(priv, seedcheckpoint.Checkpoint{CommitmentVersion: utxoseed.CommitmentVersion, Height: height, BlockHash: blockHash, SetHash: setHash}, testNetMagic)
 	require.NoError(t, err)
 
 	require.NoError(t, store.Set(ctx, blockHash[:], fileformat.FileTypeSeedCheckpoint, sc.Serialize(), options.WithAllowOverwrite(true)))
@@ -240,11 +259,12 @@ func TestRunLoadsAndVerifies(t *testing.T) {
 	utxoStore := newTestUTXOStore(t)
 
 	cfg := Config{
-		SeedStore:   seedStore,
-		UTXOStore:   utxoStore,
-		Lookup:      stubLookup{id: 7, height: 101, onMain: true},
-		TrustedKeys: [][]byte{trustedKey},
-		BlockHash:   blockHash,
+		SeedStore:    seedStore,
+		UTXOStore:    utxoStore,
+		Lookup:       stubLookup{id: 7, height: 101, onMain: true},
+		TrustedKeys:  [][]byte{trustedKey},
+		BlockHash:    blockHash,
+		NetworkMagic: testNetMagic,
 	}
 
 	require.NoError(t, Run(ctx, ulogger.TestLogger{}, cfg))
@@ -271,7 +291,7 @@ func TestRunRejectsUntrustedKey(t *testing.T) {
 	other, err := bec.NewPrivateKey()
 	require.NoError(t, err)
 
-	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: true}, TrustedKeys: [][]byte{other.PubKey().Compressed()}, BlockHash: blockHash}
+	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: true}, TrustedKeys: [][]byte{other.PubKey().Compressed()}, BlockHash: blockHash, NetworkMagic: testNetMagic}
 	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg))
 }
 
@@ -280,7 +300,7 @@ func TestRunRejectsNotOnMainChain(t *testing.T) {
 
 	seedStore, blockHash, trustedKey := buildSeed(t, sampleWrappers(), 101)
 
-	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: false}, TrustedKeys: [][]byte{trustedKey}, BlockHash: blockHash}
+	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: false}, TrustedKeys: [][]byte{trustedKey}, BlockHash: blockHash, NetworkMagic: testNetMagic}
 	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg))
 }
 
@@ -302,17 +322,18 @@ func TestRunRollsBackOnSetHashMismatch(t *testing.T) {
 		wrongSetHash[i] = 0xee
 	}
 
-	sc, err := seedcheckpoint.Sign(priv, seedcheckpoint.Checkpoint{Height: 101, BlockHash: blockHash, SetHash: wrongSetHash})
+	sc, err := seedcheckpoint.Sign(priv, seedcheckpoint.Checkpoint{CommitmentVersion: utxoseed.CommitmentVersion, Height: 101, BlockHash: blockHash, SetHash: wrongSetHash}, testNetMagic)
 	require.NoError(t, err)
 
 	require.NoError(t, seedStore.Set(ctx, blockHash[:], fileformat.FileTypeSeedCheckpoint, sc.Serialize(), options.WithAllowOverwrite(true)))
 
 	cfg := Config{
-		SeedStore:   seedStore,
-		UTXOStore:   utxoStore,
-		Lookup:      stubLookup{id: 7, height: 101, onMain: true},
-		TrustedKeys: [][]byte{priv.PubKey().Compressed()},
-		BlockHash:   blockHash,
+		SeedStore:    seedStore,
+		UTXOStore:    utxoStore,
+		Lookup:       stubLookup{id: 7, height: 101, onMain: true},
+		TrustedKeys:  [][]byte{priv.PubKey().Compressed()},
+		BlockHash:    blockHash,
+		NetworkMagic: testNetMagic,
 	}
 
 	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg), "a set hash mismatch must fail")
@@ -339,6 +360,117 @@ func TestRunRejectsTamperedSet(t *testing.T) {
 
 	require.NoError(t, seedStore.Set(ctx, m.Chunks[0].Hash[:], fileformat.FileTypeSeedChunk, make([]byte, int(m.Chunks[0].Size)), options.WithAllowOverwrite(true)))
 
-	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: true}, TrustedKeys: [][]byte{trustedKey}, BlockHash: blockHash}
+	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: true}, TrustedKeys: [][]byte{trustedKey}, BlockHash: blockHash, NetworkMagic: testNetMagic}
 	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg))
+}
+
+func TestRunRejectsUnsupportedCommitmentVersion(t *testing.T) {
+	ctx := context.Background()
+
+	seedStore, blockHash, _ := buildSeed(t, sampleWrappers(), 101)
+
+	// A validly signed checkpoint by a trusted key, but at a commitment version
+	// this build does not implement. It must be refused before any loading: the
+	// consumer cannot recompute the set hash under an unknown construction.
+	priv, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+
+	sc, err := seedcheckpoint.Sign(priv, seedcheckpoint.Checkpoint{CommitmentVersion: utxoseed.CommitmentVersion + 1, Height: 101, BlockHash: blockHash, SetHash: [32]byte{}}, testNetMagic)
+	require.NoError(t, err)
+
+	require.NoError(t, seedStore.Set(ctx, blockHash[:], fileformat.FileTypeSeedCheckpoint, sc.Serialize(), options.WithAllowOverwrite(true)))
+
+	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: true}, TrustedKeys: [][]byte{priv.PubKey().Compressed()}, BlockHash: blockHash, NetworkMagic: testNetMagic}
+	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg))
+}
+
+// TestRunConsumesProductionBuiltSeed is the consumer half of the full
+// production-to-production round trip. It builds a seed with the *real*
+// producer functions — utxopersister.BuildSeedPackage (content-defined
+// chunking + manifest) and utxopersister.BuildSignedCheckpoint (reads the
+// persisted set hash, signs it) — and then ingests it with the real
+// seedimport.Run, asserting the verified set lands in the UTXO store.
+//
+// The producer half (real consolidator + CreateUTXOSet framing) is proved in
+// utxopersister.TestProductionSeedIsConsumerReadable; package utxopersister
+// cannot import seedimport (cycle), so the round trip is expressed as two tests
+// meeting at the on-disk seed package + signed checkpoint.
+func TestRunConsumesProductionBuiltSeed(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+
+	wrappers := sampleWrappers()
+	const seedHeight = uint32(101)
+
+	blockHash := chainhash.HashH([]byte("p2p-seed-block"))
+	prevHash := chainhash.HashH([]byte("p2p-seed-prev"))
+
+	// Body framing matches what CreateUTXOSet writes (and what streamLoad
+	// reads): blockHash(32) | height(4 LE) | prevHash(32) | wrappers | footer.
+	var body []byte
+	body = append(body, blockHash[:]...)
+
+	var hb [4]byte
+	binary.LittleEndian.PutUint32(hb[:], seedHeight)
+	body = append(body, hb[:]...)
+	body = append(body, prevHash[:]...)
+
+	acc := muhash.New()
+
+	var utxoCount uint64
+	for _, w := range wrappers {
+		body = append(body, w.Bytes()...)
+		utxoCount += uint64(len(w.UTXOs))
+
+		for _, u := range w.UTXOs {
+			acc.Add(utxoseed.Element(w.TxID, u.Index, w.Height, w.Coinbase, u.Value, u.Script))
+		}
+	}
+
+	var footer [16]byte
+	binary.LittleEndian.PutUint64(footer[0:8], uint64(len(wrappers)))
+	binary.LittleEndian.PutUint64(footer[8:16], utxoCount)
+	body = append(body, footer[:]...)
+
+	setHash := acc.Digest()
+
+	// Real producer packaging.
+	cfg := seedpack.Config{Min: 16, Max: 256, Mask: (1 << 6) - 1}
+	require.NoError(t, utxopersister.BuildSeedPackage(ctx, store, bytes.NewReader(body), seedHeight, blockHash, setHash, cfg))
+
+	// Persist the set hash so the production BuildSignedCheckpoint can read it.
+	// This single store.Set mirrors the unexported persistSetHash, which the
+	// producer's Server.processNextBlock calls before building the checkpoint.
+	require.NoError(t, store.Set(ctx, blockHash[:], fileformat.FileTypeUtxoSetHash, setHash[:], options.WithAllowOverwrite(true)))
+
+	priv, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+
+	// Real producer signing.
+	sc, err := utxopersister.BuildSignedCheckpoint(ctx, store, blockHash, seedHeight, priv, testNetMagic)
+	require.NoError(t, err)
+	require.Equal(t, setHash, sc.Checkpoint.SetHash)
+
+	// Real consumer ingest.
+	icfg := Config{
+		SeedStore:    store,
+		UTXOStore:    newTestUTXOStore(t),
+		Lookup:       stubLookup{id: 9, height: seedHeight, onMain: true},
+		TrustedKeys:  [][]byte{priv.PubKey().Compressed()},
+		BlockHash:    blockHash,
+		NetworkMagic: testNetMagic,
+	}
+	require.NoError(t, Run(ctx, ulogger.TestLogger{}, icfg))
+
+	// Non-coinbase output is immediately spendable.
+	txB := wrappers[1].TxID
+	resp, err := icfg.UTXOStore.GetSpend(ctx, &utxo.Spend{TxID: &txB, Vout: 0})
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_OK), resp.Status)
+
+	// Coinbase at height 100 is still within the maturity window at height 101.
+	txA := wrappers[0].TxID
+	respA, err := icfg.UTXOStore.GetSpend(ctx, &utxo.Spend{TxID: &txA, Vout: 0})
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_IMMATURE), respA.Status)
 }

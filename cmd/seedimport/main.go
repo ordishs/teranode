@@ -115,12 +115,17 @@ func run(ctx context.Context, logger ulogger.Logger, s *settings.Settings, block
 		return errors.NewStorageError("failed to create blockchain store", err)
 	}
 
+	if s.ChainCfgParams == nil {
+		return errors.NewConfigurationError("network parameters (ChainCfgParams) not found in config")
+	}
+
 	cfg := seedimport.Config{
-		SeedStore:   seedStore,
-		UTXOStore:   utxoStore,
-		Lookup:      seedimport.NewBlockchainLookup(bcStore),
-		TrustedKeys: trustedKeys,
-		BlockHash:   *blockHash,
+		SeedStore:    seedStore,
+		UTXOStore:    utxoStore,
+		Lookup:       seedimport.NewBlockchainLookup(bcStore),
+		TrustedKeys:  trustedKeys,
+		BlockHash:    *blockHash,
+		NetworkMagic: uint32(s.ChainCfgParams.Net),
 	}
 
 	return seedimport.Run(ctx, logger, cfg)

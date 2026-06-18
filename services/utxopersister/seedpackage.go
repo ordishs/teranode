@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/pkg/seedpack"
@@ -17,14 +18,27 @@ import (
 // content-defined chunks, writes each not-yet-present chunk to the store
 // (content-addressed, deduplicated), and writes a manifest keyed by blockHash.
 func BuildSeedPackage(ctx context.Context, store blob.Store, r io.Reader, height uint32, blockHash chainhash.Hash, setHash [32]byte, cfg seedpack.Config) error {
+	chunkMin, err := safeconversion.IntToUint32(cfg.Min)
+	if err != nil {
+		return errors.NewProcessingError("invalid chunk Min %d", cfg.Min, err)
+	}
+
+	chunkMax, err := safeconversion.IntToUint32(cfg.Max)
+	if err != nil {
+		return errors.NewProcessingError("invalid chunk Max %d", cfg.Max, err)
+	}
+
 	manifest := seedpack.Manifest{
 		FormatVersion: seedpack.FormatVersion,
 		Height:        height,
 		BlockHash:     blockHash,
 		SetHash:       setHash,
+		ChunkMin:      chunkMin,
+		ChunkMax:      chunkMax,
+		ChunkMask:     cfg.Mask,
 	}
 
-	err := seedpack.SplitStream(r, cfg, func(chunk []byte) error {
+	err = seedpack.SplitStream(r, cfg, func(chunk []byte) error {
 		hash := sha256.Sum256(chunk)
 
 		exists, err := store.Exists(ctx, hash[:], fileformat.FileTypeSeedChunk)
@@ -125,8 +139,4 @@ func readManifest(ctx context.Context, store blob.Store, blockHash chainhash.Has
 
 func getChunk(ctx context.Context, store blob.Store, hash [32]byte) ([]byte, error) {
 	return store.Get(ctx, hash[:], fileformat.FileTypeSeedChunk)
-}
-
-func overwriteChunk(ctx context.Context, store blob.Store, hash [32]byte, data []byte) error {
-	return store.Set(ctx, hash[:], fileformat.FileTypeSeedChunk, data, options.WithAllowOverwrite(true))
 }

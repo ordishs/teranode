@@ -7,10 +7,19 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/pkg/seedpack"
+	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/stretchr/testify/require"
 )
+
+// overwriteChunk replaces a stored chunk's bytes in place. It is a test-only
+// helper for corrupting a seed package to exercise the chunk-integrity checks.
+func overwriteChunk(ctx context.Context, store blob.Store, hash [32]byte, data []byte) error {
+	return store.Set(ctx, hash[:], fileformat.FileTypeSeedChunk, data, options.WithAllowOverwrite(true))
+}
 
 func pseudoBytes(n int, seed uint64) []byte {
 	out := make([]byte, n)
