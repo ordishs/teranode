@@ -164,9 +164,14 @@ func (s *Store) unspendLua(ctx context.Context, spend *utxo.Spend) error {
 	// SpendingData is mandatory after #766 — unspend uses it to verify ownership
 	// before reversing the spend. It is forwarded verbatim as arg index 2 on both
 	// paths: the UDF fallback below and the native operate-path (subOpUnspend=3).
-	// The native dispatcher in the BSV fork of aerospike-server enforces the same
-	// ownership comparison as the Lua path (resolves #899), so the native path is
-	// now safe for unspend on any server build including that fix.
+	// The UDF path always enforces the ownership comparison. The native path only
+	// enforces it when the server runs a BSV-fork build that includes the matching
+	// subOpUnspend dispatcher fix (#899); the startup capability probe exercises
+	// only setLocked, so it does NOT verify unspend-ownership enforcement. Running
+	// the native path against a build without that fix skips the #766 check and
+	// misparses the shifted arg layout — so it is the operator's responsibility to
+	// deploy a server build with the #899 fix before enabling
+	// aerospike_use_native_teranode_ops (see that setting's longdesc).
 	if spend.SpendingData == nil {
 		return errors.NewProcessingError("[Unspend] SpendingData is required for %s:%d", spend.TxID, spend.Vout)
 	}
