@@ -10,31 +10,31 @@
       
       
       
-        <link rel="canonical" href="https://bsv-blockchain.github.io/teranode/topics/features/two_phase_commit/">
+        <link rel="canonical" href="https://bsv-blockchain.github.io/teranode/howto/miners/kubernetes/minersHowToExposeP2P/">
       
       
-        <link rel="prev" href="../../functionalRequirementTests/">
+        <link rel="prev" href="../minersHowToConfigureTheNode/">
       
       
-        <link rel="next" href="../peer_registry_reputation/">
+        <link rel="next" href="../../minersHowToAerospikeTuning/">
       
       
         
       
       
-      <link rel="icon" href="../../../assets/favicon.png">
+      <link rel="icon" href="../../../../assets/favicon.png">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>Two Phase Commit - Teranode</title>
+        <title>P2P Public Exposure (Kubernetes) - Teranode</title>
       
     
     
-      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../../../assets/stylesheets/main.484c7ddc.min.css">
       
         
-        <link rel="stylesheet" href="../../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../../../assets/stylesheets/palette.ab4e12ef.min.css">
       
       
 
@@ -48,14 +48,14 @@
         
         
         
-        <link rel="stylesheet" href="../../../assets/external/fonts.googleapis.com/css.56f7ac64.css">
+        <link rel="stylesheet" href="../../../../assets/external/fonts.googleapis.com/css.56f7ac64.css">
         <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
       
     
     
-      <link rel="stylesheet" href="../../../overrides/custom.css?v=8cf07571">
+      <link rel="stylesheet" href="../../../../overrides/custom.css?v=8cf07571">
     
-    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -80,7 +80,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#two-phase-transaction-commit-process" class="md-skip">
+        <a href="#how-to-expose-the-p2p-service-publicly-kubernetes" class="md-skip">
           Skip to content
         </a>
       
@@ -96,9 +96,9 @@
 
 <header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href="../../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../assets/bsv-logo.png" alt="logo">
+  <img src="../../../../assets/bsv-logo.png" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -115,7 +115,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Two Phase Commit
+              P2P Public Exposure (Kubernetes)
             
           </span>
         </div>
@@ -227,7 +227,7 @@
   
   
     <li class="md-tabs__item">
-      <a href="../../.." class="md-tabs__link">
+      <a href="../../../.." class="md-tabs__link">
         
   
   
@@ -244,6 +244,8 @@
   
   
   
+    
+  
   
     
     
@@ -251,11 +253,13 @@
   
   
   
+    
+  
   
     
     
-      <li class="md-tabs__item">
-        <a href="../../../howto/developerSetup/" class="md-tabs__link">
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../../../developerSetup/" class="md-tabs__link">
           
   
   
@@ -276,13 +280,11 @@
   
   
   
-    
-  
   
     
     
-      <li class="md-tabs__item md-tabs__item--active">
-        <a href="../../teranodeIntro/" class="md-tabs__link">
+      <li class="md-tabs__item">
+        <a href="../../../../topics/teranodeIntro/" class="md-tabs__link">
           
   
   
@@ -304,7 +306,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../references/projectStructure/" class="md-tabs__link">
+        <a href="../../../../references/projectStructure/" class="md-tabs__link">
           
   
   
@@ -346,9 +348,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href="../../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../assets/bsv-logo.png" alt="logo">
+  <img src="../../../../assets/bsv-logo.png" alt="logo">
 
     </a>
     Teranode
@@ -375,7 +377,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../.." class="md-nav__link">
+      <a href="../../../.." class="md-nav__link">
         
   
   
@@ -399,8 +401,10 @@
       
   
   
+    
   
   
+  
     
     
       
@@ -430,19 +434,22 @@
     
     
       
+        
+        
+      
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" checked>
         
           
-          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
             
   
   
@@ -460,7 +467,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_2">
             <span class="md-nav__icon md-icon"></span>
             
@@ -494,17 +501,20 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_1" >
         
           
-          <label class="md-nav__link" for="__nav_2_1" id="__nav_2_1_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_1" id="__nav_2_1_label" tabindex="">
             
   
   
@@ -540,7 +550,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/developerSetup/" class="md-nav__link">
+      <a href="../../../developerSetup/" class="md-nav__link">
         
   
   
@@ -568,7 +578,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/forkAndPullRequestGuidelines/" class="md-nav__link">
+      <a href="../../../forkAndPullRequestGuidelines/" class="md-nav__link">
         
   
   
@@ -596,7 +606,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/locallyRunningServices/" class="md-nav__link">
+      <a href="../../../locallyRunningServices/" class="md-nav__link">
         
   
   
@@ -624,7 +634,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+      <a href="../../../howToRemoteDebugTeranode/" class="md-nav__link">
         
   
   
@@ -660,7 +670,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/generatingProtobuf/" class="md-nav__link">
+      <a href="../../../generatingProtobuf/" class="md-nav__link">
         
   
   
@@ -688,7 +698,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/addingNewProtobufServices/" class="md-nav__link">
+      <a href="../../../addingNewProtobufServices/" class="md-nav__link">
         
   
   
@@ -716,7 +726,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/configuringGrpcLogging/" class="md-nav__link">
+      <a href="../../../configuringGrpcLogging/" class="md-nav__link">
         
   
   
@@ -744,7 +754,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/runningTests/" class="md-nav__link">
+      <a href="../../../runningTests/" class="md-nav__link">
         
   
   
@@ -772,7 +782,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/automatedTestingHowTo/" class="md-nav__link">
+      <a href="../../../automatedTestingHowTo/" class="md-nav__link">
         
   
   
@@ -800,7 +810,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/chain-integrity-testing/" class="md-nav__link">
+      <a href="../../../chain-integrity-testing/" class="md-nav__link">
         
   
   
@@ -828,7 +838,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/makefile/" class="md-nav__link">
+      <a href="../../../makefile/" class="md-nav__link">
         
   
   
@@ -856,7 +866,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/bugReporting/" class="md-nav__link">
+      <a href="../../../bugReporting/" class="md-nav__link">
         
   
   
@@ -884,7 +894,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../../../developersHowToTeranodeCLI/" class="md-nav__link">
         
   
   
@@ -909,8 +919,10 @@
                 
   
   
+    
   
   
+  
     
     
       
@@ -937,18 +949,21 @@
     
       
       
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11" >
         
           
-          <label class="md-nav__link" for="__nav_2_11" id="__nav_2_11_label" tabindex="0">
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_2_11" id="__nav_2_11_label" tabindex="">
             
   
   
@@ -966,7 +981,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_2_11_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_2_11_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_2_11">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1042,7 +1057,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+      <a href="../../docker/minersHowToInstallation/" class="md-nav__link">
         
   
   
@@ -1070,7 +1085,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+      <a href="../minersHowToInstallation/" class="md-nav__link">
         
   
   
@@ -1103,8 +1118,10 @@
                 
   
   
+    
   
   
+  
     
     
       
@@ -1131,11 +1148,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_2" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_2" checked>
         
           
           <label class="md-nav__link" for="__nav_2_11_2" id="__nav_2_11_2_label" tabindex="0">
@@ -1156,7 +1173,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_2_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_2_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_2_11_2">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1174,7 +1191,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../../docker/minersHowToConfigureTheNode/" class="md-nav__link">
         
   
   
@@ -1202,7 +1219,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../minersHowToConfigureTheNode/" class="md-nav__link">
         
   
   
@@ -1227,10 +1244,37 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToExposeP2P/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    P2P Public Exposure (Kubernetes)
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -1246,6 +1290,142 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#why-this-matters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why This Matters
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#awseks-network-load-balancer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        AWS/EKS: Network Load Balancer
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="AWS/EKS: Network Load Balancer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#service-manifest" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Service Manifest
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-externaltrafficpolicy-local" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why externalTrafficPolicy: Local
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#advertise-the-load-balancer-address" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Advertise the Load Balancer Address
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#verify-reachability" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verify Reachability
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#choosing-a-dht-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Choosing a DHT Mode
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#joining-the-dns-bootstrap-pool" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Joining the DNS Bootstrap Pool
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#other-cloud-providers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other Cloud Providers
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#related-documentation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Related Documentation
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -1258,7 +1438,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+      <a href="../../minersHowToAerospikeTuning/" class="md-nav__link">
         
   
   
@@ -1286,7 +1466,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+      <a href="../../minersHowToInteractWithAssetServer/" class="md-nav__link">
         
   
   
@@ -1314,7 +1494,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+      <a href="../../minersHowToInteractWithFSM/" class="md-nav__link">
         
   
   
@@ -1342,7 +1522,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+      <a href="../../minersHowToInteractWithRPCServer/" class="md-nav__link">
         
   
   
@@ -1436,7 +1616,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+      <a href="../../docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
         
   
   
@@ -1464,7 +1644,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+      <a href="../minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
         
   
   
@@ -1558,7 +1738,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../../docker/minersUpdatingTeranode/" class="md-nav__link">
         
   
   
@@ -1586,7 +1766,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../minersUpdatingTeranode/" class="md-nav__link">
         
   
   
@@ -1680,7 +1860,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../../docker/minersSecurityBestPractices/" class="md-nav__link">
         
   
   
@@ -1708,7 +1888,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../minersSecurityBestPractices/" class="md-nav__link">
         
   
   
@@ -1802,7 +1982,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
+      <a href="../../docker/minersHowToTroubleshooting/" class="md-nav__link">
         
   
   
@@ -1830,7 +2010,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+      <a href="../minersHowToTroubleshooting/" class="md-nav__link">
         
   
   
@@ -1924,7 +2104,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToResetTeranode/" class="md-nav__link">
+      <a href="../../docker/minersHowToResetTeranode/" class="md-nav__link">
         
   
   
@@ -1952,7 +2132,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToResetTeranode/" class="md-nav__link">
+      <a href="../minersHowToResetTeranode/" class="md-nav__link">
         
   
   
@@ -2046,7 +2226,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToSyncTheNode/" class="md-nav__link">
+      <a href="../../docker/minersHowToSyncTheNode/" class="md-nav__link">
         
   
   
@@ -2074,7 +2254,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToSyncTheNode/" class="md-nav__link">
+      <a href="../minersHowToSyncTheNode/" class="md-nav__link">
         
   
   
@@ -2174,7 +2354,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToBackup/" class="md-nav__link">
+      <a href="../../minersHowToBackup/" class="md-nav__link">
         
   
   
@@ -2202,7 +2382,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+      <a href="../../minersHowToCPUMiner/" class="md-nav__link">
         
   
   
@@ -2230,7 +2410,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../../minersHowToTeranodeCLI/" class="md-nav__link">
         
   
   
@@ -2258,7 +2438,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+      <a href="../../minersManagingDiskSpace/" class="md-nav__link">
         
   
   
@@ -2286,7 +2466,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToUseListenMode/" class="md-nav__link">
+      <a href="../../minersHowToUseListenMode/" class="md-nav__link">
         
   
   
@@ -2334,10 +2514,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -2385,22 +2563,19 @@
     
     
       
-        
-        
-      
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
         
           
-          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
             
   
   
@@ -2418,7 +2593,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_3">
             <span class="md-nav__icon md-icon"></span>
             
@@ -2436,7 +2611,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../teranodeIntro/" class="md-nav__link">
+      <a href="../../../../topics/teranodeIntro/" class="md-nav__link">
         
   
   
@@ -2464,7 +2639,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/teranode-overall-system-design/" class="md-nav__link">
+      <a href="../../../../topics/architecture/teranode-overall-system-design/" class="md-nav__link">
         
   
   
@@ -2492,7 +2667,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/teranode-architecture-brief/" class="md-nav__link">
+      <a href="../../../../topics/architecture/teranode-architecture-brief/" class="md-nav__link">
         
   
   
@@ -2520,7 +2695,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/teranode-microservices-overview/" class="md-nav__link">
+      <a href="../../../../topics/architecture/teranode-microservices-overview/" class="md-nav__link">
         
   
   
@@ -2548,7 +2723,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../transactionLifecycle/" class="md-nav__link">
+      <a href="../../../../topics/transactionLifecycle/" class="md-nav__link">
         
   
   
@@ -2576,7 +2751,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/stateManagement/" class="md-nav__link">
+      <a href="../../../../topics/architecture/stateManagement/" class="md-nav__link">
         
   
   
@@ -2604,7 +2779,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../state-machine.diagram/" class="md-nav__link">
+      <a href="../../../../state-machine.diagram/" class="md-nav__link">
         
   
   
@@ -2632,7 +2807,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/understandingDoubleSpends/" class="md-nav__link">
+      <a href="../../../../topics/architecture/understandingDoubleSpends/" class="md-nav__link">
         
   
   
@@ -2660,7 +2835,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../technologyStack/" class="md-nav__link">
+      <a href="../../../../topics/technologyStack/" class="md-nav__link">
         
   
   
@@ -2688,7 +2863,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../understandingTheTestingFramework/" class="md-nav__link">
+      <a href="../../../../topics/understandingTheTestingFramework/" class="md-nav__link">
         
   
   
@@ -2716,7 +2891,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../functionalRequirementTests/" class="md-nav__link">
+      <a href="../../../../topics/functionalRequirementTests/" class="md-nav__link">
         
   
   
@@ -2741,10 +2916,8 @@
                 
   
   
-    
   
   
-  
     
     
       
@@ -2759,21 +2932,18 @@
     
       
       
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_12" >
         
           
-          
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_12" checked>
-        
-          
-          <label class="md-nav__link" for="__nav_3_12" id="__nav_3_12_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3_12" id="__nav_3_12_label" tabindex="0">
             
   
   
@@ -2791,7 +2961,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_12_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_12_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_3_12">
             <span class="md-nav__icon md-icon"></span>
             
@@ -2806,37 +2976,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Two Phase Commit
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../../../topics/features/two_phase_commit/" class="md-nav__link">
         
   
   
@@ -2852,320 +2995,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#index" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Index
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#1-overview" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        1. Overview
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#2-purpose-and-benefits" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        2. Purpose and Benefits
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="2. Purpose and Benefits">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#21-critical-assumptions" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        2.1. Critical Assumptions
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#3-implementation-details" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3. Implementation Details
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="3. Implementation Details">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#31-phase-1-initial-transaction-creation-with-locked-flag" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.1. Phase 1: Initial Transaction Creation with Locked Flag
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#32-phase-2-unsetting-the-locked-flag" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2. Phase 2: Unsetting the Locked Flag
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="3.2. Phase 2: Unsetting the Locked Flag">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#321-normal-path-after-successful-addition-to-block-assembly" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2.1. Normal Path: After Successful Addition to Block Assembly
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#322-fallback-path-when-mined-in-a-block" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2.2. Fallback Path: When Mined in a Block
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#323-quick-validation-path-checkpointed-blocks" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2.3. Quick Validation Path: Checkpointed Blocks
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#33-special-case-transactions-from-blocks" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.3. Special Case: Transactions from Blocks
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#4-service-interaction" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4. Service Interaction
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="4. Service Interaction">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#41-validator-service-role" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4.1. Validator Service Role
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#42-block-validation-service-role" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4.2. Block Validation Service Role
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#43-block-assembly-service-role" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4.3. Block Assembly Service Role
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#5-data-model-impact" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        5. Data Model Impact
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#6-internal-implementation-options" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        6. Internal Implementation Options
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#7-flow-diagrams" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7. Flow Diagrams
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="7. Flow Diagrams">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#71-two-phase-commit-overview" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.1. Two-Phase Commit Overview
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#72-transaction-validation-flow-primary-path" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.2. Transaction Validation Flow (Primary Path)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#73-locked-flag-state-machine" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.3. Locked Flag State Machine
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#74-block-validation-and-mining-fallback-path" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.4. Block Validation and Mining (Fallback Path)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#75-block-assembly-recovery-flow" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.5. Block Assembly Recovery Flow
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#8-related-documentation" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        8. Related Documentation
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -3178,7 +3007,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../peer_registry_reputation/" class="md-nav__link">
+      <a href="../../../../topics/features/peer_registry_reputation/" class="md-nav__link">
         
   
   
@@ -3206,7 +3035,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../utxo_lock_records/" class="md-nav__link">
+      <a href="../../../../topics/features/utxo_lock_records/" class="md-nav__link">
         
   
   
@@ -3242,7 +3071,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../dashboard/" class="md-nav__link">
+      <a href="../../../../topics/dashboard/" class="md-nav__link">
         
   
   
@@ -3270,7 +3099,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../tui_tools/" class="md-nav__link">
+      <a href="../../../../topics/tui_tools/" class="md-nav__link">
         
   
   
@@ -3322,20 +3151,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_15" >
         
           
-          <label class="md-nav__link" for="__nav_3_15" id="__nav_3_15_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3_15" id="__nav_3_15_label" tabindex="0">
             
   
   
@@ -3371,7 +3197,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/alert/" class="md-nav__link">
+      <a href="../../../../topics/services/alert/" class="md-nav__link">
         
   
   
@@ -3399,7 +3225,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/assetServer/" class="md-nav__link">
+      <a href="../../../../topics/services/assetServer/" class="md-nav__link">
         
   
   
@@ -3427,7 +3253,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockAssembly/" class="md-nav__link">
+      <a href="../../../../topics/services/blockAssembly/" class="md-nav__link">
         
   
   
@@ -3455,7 +3281,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockValidation/" class="md-nav__link">
+      <a href="../../../../topics/services/blockValidation/" class="md-nav__link">
         
   
   
@@ -3483,7 +3309,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockchain/" class="md-nav__link">
+      <a href="../../../../topics/services/blockchain/" class="md-nav__link">
         
   
   
@@ -3511,7 +3337,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/propagation/" class="md-nav__link">
+      <a href="../../../../topics/services/propagation/" class="md-nav__link">
         
   
   
@@ -3539,7 +3365,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/subtreeValidation/" class="md-nav__link">
+      <a href="../../../../topics/services/subtreeValidation/" class="md-nav__link">
         
   
   
@@ -3567,7 +3393,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/validator/" class="md-nav__link">
+      <a href="../../../../topics/services/validator/" class="md-nav__link">
         
   
   
@@ -3625,20 +3451,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_16" >
         
           
-          <label class="md-nav__link" for="__nav_3_16" id="__nav_3_16_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3_16" id="__nav_3_16_label" tabindex="0">
             
   
   
@@ -3674,7 +3497,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockPersister/" class="md-nav__link">
+      <a href="../../../../topics/services/blockPersister/" class="md-nav__link">
         
   
   
@@ -3702,7 +3525,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/p2p/" class="md-nav__link">
+      <a href="../../../../topics/services/p2p/" class="md-nav__link">
         
   
   
@@ -3730,7 +3553,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../P2P_NAT_TRAVERSAL/" class="md-nav__link">
+      <a href="../../../../P2P_NAT_TRAVERSAL/" class="md-nav__link">
         
   
   
@@ -3758,7 +3581,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/pruner/" class="md-nav__link">
+      <a href="../../../../topics/services/pruner/" class="md-nav__link">
         
   
   
@@ -3786,7 +3609,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/legacy/" class="md-nav__link">
+      <a href="../../../../topics/services/legacy/" class="md-nav__link">
         
   
   
@@ -3814,7 +3637,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/rpc/" class="md-nav__link">
+      <a href="../../../../topics/services/rpc/" class="md-nav__link">
         
   
   
@@ -3842,7 +3665,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/utxoPersister/" class="md-nav__link">
+      <a href="../../../../topics/services/utxoPersister/" class="md-nav__link">
         
   
   
@@ -3890,20 +3713,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_17" >
         
           
-          <label class="md-nav__link" for="__nav_3_17" id="__nav_3_17_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3_17" id="__nav_3_17_label" tabindex="0">
             
   
   
@@ -3939,7 +3759,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../stores/blob/" class="md-nav__link">
+      <a href="../../../../topics/stores/blob/" class="md-nav__link">
         
   
   
@@ -3967,7 +3787,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../stores/utxo/" class="md-nav__link">
+      <a href="../../../../topics/stores/utxo/" class="md-nav__link">
         
   
   
@@ -4021,20 +3841,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_18" >
         
           
-          <label class="md-nav__link" for="__nav_3_18" id="__nav_3_18_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3_18" id="__nav_3_18_label" tabindex="0">
             
   
   
@@ -4070,7 +3887,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/block_data_model/" class="md-nav__link">
+      <a href="../../../../topics/datamodel/block_data_model/" class="md-nav__link">
         
   
   
@@ -4098,7 +3915,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/block_header_data_model/" class="md-nav__link">
+      <a href="../../../../topics/datamodel/block_header_data_model/" class="md-nav__link">
         
   
   
@@ -4126,7 +3943,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/subtree_data_model/" class="md-nav__link">
+      <a href="../../../../topics/datamodel/subtree_data_model/" class="md-nav__link">
         
   
   
@@ -4154,7 +3971,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/transaction_data_model/" class="md-nav__link">
+      <a href="../../../../topics/datamodel/transaction_data_model/" class="md-nav__link">
         
   
   
@@ -4182,7 +3999,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/utxo_data_model/" class="md-nav__link">
+      <a href="../../../../topics/datamodel/utxo_data_model/" class="md-nav__link">
         
   
   
@@ -4228,20 +4045,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_19" >
         
           
-          <label class="md-nav__link" for="__nav_3_19" id="__nav_3_19_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3_19" id="__nav_3_19_label" tabindex="0">
             
   
   
@@ -4277,7 +4091,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../kafka/kafka/" class="md-nav__link">
+      <a href="../../../../topics/kafka/kafka/" class="md-nav__link">
         
   
   
@@ -4323,20 +4137,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_20" >
         
           
-          <label class="md-nav__link" for="__nav_3_20" id="__nav_3_20_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3_20" id="__nav_3_20_label" tabindex="0">
             
   
   
@@ -4372,7 +4183,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../commands/seeder/" class="md-nav__link">
+      <a href="../../../../topics/commands/seeder/" class="md-nav__link">
         
   
   
@@ -4483,7 +4294,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/projectStructure/" class="md-nav__link">
+      <a href="../../../../references/projectStructure/" class="md-nav__link">
         
   
   
@@ -4577,7 +4388,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/errorHandling/" class="md-nav__link">
+      <a href="../../../../references/errorHandling/" class="md-nav__link">
         
   
   
@@ -4605,7 +4416,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/glossary/" class="md-nav__link">
+      <a href="../../../../references/glossary/" class="md-nav__link">
         
   
   
@@ -4633,7 +4444,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/codingConventions/" class="md-nav__link">
+      <a href="../../../../references/codingConventions/" class="md-nav__link">
         
   
   
@@ -4661,7 +4472,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/kafkaMessageFormat/" class="md-nav__link">
+      <a href="../../../../references/kafkaMessageFormat/" class="md-nav__link">
         
   
   
@@ -4689,7 +4500,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/networkConsensusRules/" class="md-nav__link">
+      <a href="../../../../references/networkConsensusRules/" class="md-nav__link">
         
   
   
@@ -4793,7 +4604,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/alertProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/alertProto/" class="md-nav__link">
         
   
   
@@ -4821,7 +4632,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/assetProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/assetProto/" class="md-nav__link">
         
   
   
@@ -4849,7 +4660,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
         
   
   
@@ -4877,7 +4688,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
         
   
   
@@ -4905,7 +4716,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
         
   
   
@@ -4933,7 +4744,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/legacyPeerProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/legacyPeerProto/" class="md-nav__link">
         
   
   
@@ -4961,7 +4772,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/p2pProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/p2pProto/" class="md-nav__link">
         
   
   
@@ -4989,7 +4800,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
         
   
   
@@ -5017,7 +4828,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/prunerProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/prunerProto/" class="md-nav__link">
         
   
   
@@ -5045,7 +4856,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
         
   
   
@@ -5073,7 +4884,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
+      <a href="../../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
         
   
   
@@ -5187,7 +4998,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/alert_reference/" class="md-nav__link">
+      <a href="../../../../references/services/alert_reference/" class="md-nav__link">
         
   
   
@@ -5215,7 +5026,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/asset_reference/" class="md-nav__link">
+      <a href="../../../../references/services/asset_reference/" class="md-nav__link">
         
   
   
@@ -5243,7 +5054,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockassembly_reference/" class="md-nav__link">
+      <a href="../../../../references/services/blockassembly_reference/" class="md-nav__link">
         
   
   
@@ -5271,7 +5082,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockvalidation_reference/" class="md-nav__link">
+      <a href="../../../../references/services/blockvalidation_reference/" class="md-nav__link">
         
   
   
@@ -5299,7 +5110,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockchain_reference/" class="md-nav__link">
+      <a href="../../../../references/services/blockchain_reference/" class="md-nav__link">
         
   
   
@@ -5327,7 +5138,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/propagation_reference/" class="md-nav__link">
+      <a href="../../../../references/services/propagation_reference/" class="md-nav__link">
         
   
   
@@ -5355,7 +5166,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/subtreevalidation_reference/" class="md-nav__link">
+      <a href="../../../../references/services/subtreevalidation_reference/" class="md-nav__link">
         
   
   
@@ -5383,7 +5194,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/validator_reference/" class="md-nav__link">
+      <a href="../../../../references/services/validator_reference/" class="md-nav__link">
         
   
   
@@ -5485,7 +5296,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockpersister_reference/" class="md-nav__link">
+      <a href="../../../../references/services/blockpersister_reference/" class="md-nav__link">
         
   
   
@@ -5513,7 +5324,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/p2p_reference/" class="md-nav__link">
+      <a href="../../../../references/services/p2p_reference/" class="md-nav__link">
         
   
   
@@ -5541,7 +5352,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/legacy_reference/" class="md-nav__link">
+      <a href="../../../../references/services/legacy_reference/" class="md-nav__link">
         
   
   
@@ -5569,7 +5380,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/pruner_reference/" class="md-nav__link">
+      <a href="../../../../references/services/pruner_reference/" class="md-nav__link">
         
   
   
@@ -5597,7 +5408,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/rpc_reference/" class="md-nav__link">
+      <a href="../../../../references/services/rpc_reference/" class="md-nav__link">
         
   
   
@@ -5625,7 +5436,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/utxopersister_reference/" class="md-nav__link">
+      <a href="../../../../references/services/utxopersister_reference/" class="md-nav__link">
         
   
   
@@ -5719,7 +5530,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/stores/blob_reference/" class="md-nav__link">
+      <a href="../../../../references/stores/blob_reference/" class="md-nav__link">
         
   
   
@@ -5747,7 +5558,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/stores/utxo_reference/" class="md-nav__link">
+      <a href="../../../../references/stores/utxo_reference/" class="md-nav__link">
         
   
   
@@ -5851,7 +5662,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/" class="md-nav__link">
+      <a href="../../../../references/settings/" class="md-nav__link">
         
   
   
@@ -5879,7 +5690,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings_reference/" class="md-nav__link">
+      <a href="../../../../references/settings_reference/" class="md-nav__link">
         
   
   
@@ -5907,7 +5718,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/global_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/global_settings/" class="md-nav__link">
         
   
   
@@ -5935,7 +5746,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/policy_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/policy_settings/" class="md-nav__link">
         
   
   
@@ -5963,7 +5774,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/kafka_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/kafka_settings/" class="md-nav__link">
         
   
   
@@ -6073,7 +5884,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/alert_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/alert_settings/" class="md-nav__link">
         
   
   
@@ -6101,7 +5912,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/asset_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/asset_settings/" class="md-nav__link">
         
   
   
@@ -6129,7 +5940,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockassembly_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/blockassembly_settings/" class="md-nav__link">
         
   
   
@@ -6157,7 +5968,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockchain_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/blockchain_settings/" class="md-nav__link">
         
   
   
@@ -6185,7 +5996,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockpersister_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/blockpersister_settings/" class="md-nav__link">
         
   
   
@@ -6213,7 +6024,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockvalidation_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/blockvalidation_settings/" class="md-nav__link">
         
   
   
@@ -6241,7 +6052,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/legacy_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/legacy_settings/" class="md-nav__link">
         
   
   
@@ -6269,7 +6080,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/p2p_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/p2p_settings/" class="md-nav__link">
         
   
   
@@ -6297,7 +6108,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/propagation_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/propagation_settings/" class="md-nav__link">
         
   
   
@@ -6325,7 +6136,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/pruner_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/pruner_settings/" class="md-nav__link">
         
   
   
@@ -6353,7 +6164,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/rpc_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/rpc_settings/" class="md-nav__link">
         
   
   
@@ -6381,7 +6192,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/subtreevalidation_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/subtreevalidation_settings/" class="md-nav__link">
         
   
   
@@ -6409,7 +6220,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/utxopersister_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/utxopersister_settings/" class="md-nav__link">
         
   
   
@@ -6437,7 +6248,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/validator_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/services/validator_settings/" class="md-nav__link">
         
   
   
@@ -6533,7 +6344,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/stores/aerospike_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/stores/aerospike_settings/" class="md-nav__link">
         
   
   
@@ -6561,7 +6372,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/stores/blob_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/stores/blob_settings/" class="md-nav__link">
         
   
   
@@ -6589,7 +6400,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/stores/utxo_settings/" class="md-nav__link">
+      <a href="../../../../references/settings/stores/utxo_settings/" class="md-nav__link">
         
   
   
@@ -6701,7 +6512,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../misc/BIP-239/" class="md-nav__link">
+      <a href="../../../../misc/BIP-239/" class="md-nav__link">
         
   
   
@@ -6729,7 +6540,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
+      <a href="../../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
         
   
   
@@ -6757,7 +6568,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/licenseInformation/" class="md-nav__link">
+      <a href="../../../../references/licenseInformation/" class="md-nav__link">
         
   
   
@@ -6785,7 +6596,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/prometheusMetrics/" class="md-nav__link">
+      <a href="../../../../references/prometheusMetrics/" class="md-nav__link">
         
   
   
@@ -6813,7 +6624,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/teranodeDaemonReference/" class="md-nav__link">
+      <a href="../../../../references/teranodeDaemonReference/" class="md-nav__link">
         
   
   
@@ -6841,7 +6652,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/testingTechnicalReference/" class="md-nav__link">
+      <a href="../../../../references/testingTechnicalReference/" class="md-nav__link">
         
   
   
@@ -6869,7 +6680,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
+      <a href="../../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
         
   
   
@@ -6932,10 +6743,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#index" class="md-nav__link">
+  <a href="#why-this-matters" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Index
+        Why This Matters
       
     </span>
   </a>
@@ -6943,33 +6754,55 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#1-overview" class="md-nav__link">
+  <a href="#awseks-network-load-balancer" class="md-nav__link">
     <span class="md-ellipsis">
       
-        1. Overview
+        AWS/EKS: Network Load Balancer
       
     </span>
   </a>
   
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#2-purpose-and-benefits" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        2. Purpose and Benefits
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="2. Purpose and Benefits">
+    <nav class="md-nav" aria-label="AWS/EKS: Network Load Balancer">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#21-critical-assumptions" class="md-nav__link">
+  <a href="#service-manifest" class="md-nav__link">
     <span class="md-ellipsis">
       
-        2.1. Critical Assumptions
+        Service Manifest
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-externaltrafficpolicy-local" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why externalTrafficPolicy: Local
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#advertise-the-load-balancer-address" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Advertise the Load Balancer Address
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#verify-reachability" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verify Reachability
       
     </span>
   </a>
@@ -6982,149 +6815,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#3-implementation-details" class="md-nav__link">
+  <a href="#choosing-a-dht-mode" class="md-nav__link">
     <span class="md-ellipsis">
       
-        3. Implementation Details
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="3. Implementation Details">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#31-phase-1-initial-transaction-creation-with-locked-flag" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.1. Phase 1: Initial Transaction Creation with Locked Flag
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#32-phase-2-unsetting-the-locked-flag" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2. Phase 2: Unsetting the Locked Flag
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="3.2. Phase 2: Unsetting the Locked Flag">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#321-normal-path-after-successful-addition-to-block-assembly" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2.1. Normal Path: After Successful Addition to Block Assembly
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#322-fallback-path-when-mined-in-a-block" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2.2. Fallback Path: When Mined in a Block
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#323-quick-validation-path-checkpointed-blocks" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.2.3. Quick Validation Path: Checkpointed Blocks
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#33-special-case-transactions-from-blocks" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3.3. Special Case: Transactions from Blocks
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#4-service-interaction" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4. Service Interaction
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="4. Service Interaction">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#41-validator-service-role" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4.1. Validator Service Role
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#42-block-validation-service-role" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4.2. Block Validation Service Role
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#43-block-assembly-service-role" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        4.3. Block Assembly Service Role
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#5-data-model-impact" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        5. Data Model Impact
+        Choosing a DHT Mode
       
     </span>
   </a>
@@ -7132,10 +6826,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#6-internal-implementation-options" class="md-nav__link">
+  <a href="#joining-the-dns-bootstrap-pool" class="md-nav__link">
     <span class="md-ellipsis">
       
-        6. Internal Implementation Options
+        Joining the DNS Bootstrap Pool
       
     </span>
   </a>
@@ -7143,82 +6837,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#7-flow-diagrams" class="md-nav__link">
+  <a href="#other-cloud-providers" class="md-nav__link">
     <span class="md-ellipsis">
       
-        7. Flow Diagrams
+        Other Cloud Providers
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="7. Flow Diagrams">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#71-two-phase-commit-overview" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.1. Two-Phase Commit Overview
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#72-transaction-validation-flow-primary-path" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.2. Transaction Validation Flow (Primary Path)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#73-locked-flag-state-machine" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.3. Locked Flag State Machine
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#74-block-validation-and-mining-fallback-path" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.4. Block Validation and Mining (Fallback Path)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#75-block-assembly-recovery-flow" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        7.5. Block Assembly Recovery Flow
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#8-related-documentation" class="md-nav__link">
+  <a href="#related-documentation" class="md-nav__link">
     <span class="md-ellipsis">
       
-        8. Related Documentation
+        Related Documentation
       
     </span>
   </a>
@@ -7250,7 +6883,7 @@
   
   
     <li class="md-path__item">
-      <a href="../../.." class="md-path__link">
+      <a href="../../../.." class="md-path__link">
         
   <span class="md-ellipsis">
     Home
@@ -7267,15 +6900,49 @@
   
     
     
+      
+  
+  
+    
+    
       <li class="md-path__item">
-        <a href="../../teranodeIntro/" class="md-path__link">
+        <a href="../../../developerSetup/" class="md-path__link">
           
   <span class="md-ellipsis">
-    Key Topics
+    How-To Guides
   </span>
 
         </a>
       </li>
+    
+  
+
+    
+  
+
+      
+        
+  
+  
+    
+    
+      
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../../docker/minersHowToInstallation/" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Miners
+  </span>
+
+        </a>
+      </li>
+    
+  
+
     
   
 
@@ -7286,10 +6953,10 @@
     
     
       <li class="md-path__item">
-        <a href="./" class="md-path__link">
+        <a href="../../docker/minersHowToConfigureTheNode/" class="md-path__link">
           
   <span class="md-ellipsis">
-    Features
+    Configuration
   </span>
 
         </a>
@@ -7311,352 +6978,131 @@
   
 
 
-<h1 id="two-phase-transaction-commit-process">Two-Phase Transaction Commit Process<a class="headerlink" href="#two-phase-transaction-commit-process" title="Permanent link">&para;</a></h1>
-<h2 id="index">Index<a class="headerlink" href="#index" title="Permanent link">&para;</a></h2>
-<ol>
-<li><a href="#1-overview">Overview</a></li>
-<li><a href="#2-purpose-and-benefits">Purpose and Benefits</a><ul>
-<li><a href="#21-critical-assumptions">2.1. Critical Assumptions</a></li>
-</ul>
-</li>
-<li><a href="#3-implementation-details">Implementation Details</a><ul>
-<li><a href="#31-phase-1-initial-transaction-creation-with-locked-flag">3.1. Phase 1: Initial Transaction Creation with Locked Flag</a></li>
-<li><a href="#32-phase-2-unsetting-the-locked-flag">3.2. Phase 2: Unsetting the Locked Flag</a><ul>
-<li><a href="#321-normal-path-after-successful-addition-to-block-assembly">3.2.1. Normal Path: After Successful Addition to Block Assembly</a></li>
-<li><a href="#322-fallback-path-when-mined-in-a-block">3.2.2. Fallback Path: When Mined in a Block</a></li>
-<li><a href="#323-quick-validation-path-checkpointed-blocks">3.2.3. Quick Validation Path: Checkpointed Blocks</a></li>
-</ul>
-</li>
-<li><a href="#33-special-case-transactions-from-blocks">3.3. Special Case: Transactions from Blocks</a></li>
-</ul>
-</li>
-<li><a href="#4-service-interaction">Service Interaction</a><ul>
-<li><a href="#41-validator-service-role">4.1. Validator Service Role</a></li>
-<li><a href="#42-block-validation-service-role">4.2. Block Validation Service Role</a></li>
-<li><a href="#43-block-assembly-service-role">4.3. Block Assembly Service Role</a></li>
-</ul>
-</li>
-<li><a href="#5-data-model-impact">Data Model Impact</a></li>
-<li><a href="#6-internal-implementation-options">Internal Implementation Options</a></li>
-<li><a href="#7-flow-diagrams">Flow Diagrams</a></li>
-<li><a href="#8-related-documentation">Related Documentation</a></li>
-</ol>
-<h2 id="1-overview">1. Overview<a class="headerlink" href="#1-overview" title="Permanent link">&para;</a></h2>
-<p>The Two-Phase Transaction Commit process is a mechanism implemented in Teranode to ensure atomicity and data consistency during transaction processing across the system's microservice architecture. This process uses a "locked" flag to temporarily lock transaction outputs until they are safely included in Block Assembly, and then makes them available for spending after confirmation.</p>
-<p>When a Bitcoin transaction is processed, it both spends existing outputs (inputs) and creates new outputs that can be spent in the future. In Teranode's distributed architecture, transaction processing spans multiple services - particularly the UTXO store (where transaction data is persisted) and Block Assembly (where transactions are prepared for inclusion in blocks). The two-phase commit process ensures atomicity across these services, preventing scenarios where a transaction might exist in one component but not another.</p>
-<p>This approach ensures transaction consistency across the entire system, preventing situations where a transaction might be included in a block but not properly recorded in the UTXO store, or vice versa. It maintains system integrity in a distributed environment by coordinating state changes across microservices.</p>
-<h2 id="2-purpose-and-benefits">2. Purpose and Benefits<a class="headerlink" href="#2-purpose-and-benefits" title="Permanent link">&para;</a></h2>
-<p>The Two-Phase Transaction Commit process addresses several critical concerns that arise in a distributed transaction processing system:</p>
-<ul>
-<li>
-<p><strong>Atomicity in a Microservice Architecture</strong>: The process ensures that a transaction is either fully processed across all components or effectively doesn't exist at all. This prevents serious inconsistencies between the UTXO store and Block Assembly.</p>
-</li>
-<li>
-<p><strong>Prevention of Data Corruption Scenarios</strong>:</p>
-<ul>
-<li><strong>Scenario 1 - Block Assembly Without UTXO Storage</strong>: Without two-phase commit, if a transaction were added to Block Assembly but failed to be stored in the UTXO store, when that block is mined, future transactions trying to spend its outputs would be rejected because the outputs don't exist in the UTXO store. This could cause a chain fork.</li>
-<li><strong>Scenario 2 - UTXO Storage Without Block Assembly</strong>: If a transaction is stored in the UTXO store but not added to Block Assembly, it creates "ghost money" that exists in the database but isn't in the blockchain.</li>
-</ul>
-</li>
-<li>
-<p><strong>Safe Failure Mode</strong>: In case of system failures, the worst case is that money temporarily can't be spent (rather than creating invalid money or losing funds). This preserves the integrity of the monetary system.</p>
-</li>
-<li>
-<p><strong>System Consistency</strong>: Ensures that the UTXO database state and Block Assembly state are synchronized, maintaining a consistent view of transactions across the system.</p>
-</li>
-<li>
-<p><strong>Transaction Dependency Management</strong>: Ensures proper handling of transaction dependencies in a distributed processing environment.</p>
-</li>
-<li>
-<p><strong>Improved Validation</strong>: Provides a clear state transition mechanism that helps track the status of transactions throughout the system.</p>
-</li>
-</ul>
-<h3 id="21-critical-assumptions">2.1. Critical Assumptions<a class="headerlink" href="#21-critical-assumptions" title="Permanent link">&para;</a></h3>
-<p>The Two-Phase Transaction Commit process is built on a critical assumption that must be understood to grasp how the system prevents double-spending and maintains consistency:</p>
-<blockquote>
-<p><strong>Critical Assumption</strong>: Parent transactions are either mined, in block template, or in previous block. No other option is possible.</p>
-</blockquote>
-<p>This means that for any transaction being processed, <strong>all input transactions (parent transactions) must be in one of these states</strong>:</p>
-<ul>
-<li>Already mined in a confirmed block (transactions in blocks with multiple confirmations)</li>
-<li>Currently in a block template (pending mining, not yet in a block)</li>
-<li>In the immediately previous block (transactions in the most recently mined block)</li>
-</ul>
-<blockquote>
-<p><strong>Note</strong>: The distinction between "already mined in a confirmed block" and "in the immediately previous block" is important. The former refers to transactions with multiple confirmations that are considered stable, while the latter refers specifically to transactions in the most recently added block that have only one confirmation and may still be subject to reorganization.</p>
-</blockquote>
-<p><strong>Implications</strong>:</p>
-<ul>
-<li>This assumption ensures that all parent transactions are either confirmed or in the process of being confirmed</li>
-<li>It prevents the system from processing transactions that refer to parent transactions that are still in an intermediate state</li>
-<li>It creates a clean dependency chain where transactions build upon others that are already securely in the system</li>
-</ul>
-<p><strong>Security Benefits</strong>:</p>
-<ul>
-<li>Prevents transaction graph inconsistencies</li>
-<li>Eliminates scenarios where transaction outputs could be spent before their parent transactions are fully committed</li>
-<li>Supports the effectiveness of the locked flag mechanism</li>
-</ul>
-<p>This assumption is foundational to the system's security model and crucial for the proper functioning of the two-phase commit process.</p>
-<h2 id="3-implementation-details">3. Implementation Details<a class="headerlink" href="#3-implementation-details" title="Permanent link">&para;</a></h2>
-<h3 id="31-phase-1-initial-transaction-creation-with-locked-flag">3.1. Phase 1: Initial Transaction Creation with Locked Flag<a class="headerlink" href="#31-phase-1-initial-transaction-creation-with-locked-flag" title="Permanent link">&para;</a></h3>
-<p>When a transaction is validated and accepted by the system:</p>
-<ol>
-<li>
-<p>The Validator service processes and validates the transaction according to Bitcoin consensus rules.</p>
-</li>
-<li>
-<p>Upon successful validation, new UTXOs generated by the transaction are created in the UTXO store with the "locked" flag set to <code>true</code>.</p>
-</li>
-<li>
-<p>This flag prevents these UTXOs from being spent in subsequent transactions while they're still being processed through the system.</p>
-</li>
-<li>
-<p>The transaction is marked as valid and forwarded to Block Assembly for inclusion in a block.</p>
-</li>
-</ol>
-<h3 id="32-phase-2-unsetting-the-locked-flag">3.2. Phase 2: Unsetting the Locked Flag<a class="headerlink" href="#32-phase-2-unsetting-the-locked-flag" title="Permanent link">&para;</a></h3>
-<p>The locked flag is unset in two key scenarios:</p>
-<h4 id="321-normal-path-after-successful-addition-to-block-assembly">3.2.1. Normal Path: After Successful Addition to Block Assembly<a class="headerlink" href="#321-normal-path-after-successful-addition-to-block-assembly" title="Permanent link">&para;</a></h4>
-<p>This is the primary unlock mechanism that occurs during normal transaction processing:</p>
-<ol>
-<li>Transaction is successfully validated by the Validator service</li>
-<li>UTXOs are created in the UTXO store with <code>locked=true</code></li>
-<li>Transaction is sent to Block Assembly via the <code>Store()</code> method</li>
-<li>Transaction metadata is published to the Kafka topic for subtree validation</li>
-<li>The Validator service calls <code>twoPhaseCommitTransaction()</code> which executes <code>SetLocked(txHash, false)</code> on the UTXO store</li>
-<li>The locked flag is now <code>false</code>, making the transaction outputs available for spending</li>
-</ol>
-<p><strong>Important Notes:</strong></p>
-<ul>
-<li>The unlock happens AFTER successful Block Assembly addition and Kafka publishing, not immediately after</li>
-<li>This is implemented in the <code>Validator.twoPhaseCommitTransaction()</code> function in <code>services/validator/Validator.go</code></li>
-<li>If this step fails, it's logged but not considered fatal since the transaction will be unlocked when mined (fallback mechanism)</li>
-<li>Once unlocked, transaction outputs can be spent even before the transaction is mined in a block</li>
-</ul>
-<h4 id="322-fallback-path-when-mined-in-a-block">3.2.2. Fallback Path: When Mined in a Block<a class="headerlink" href="#322-fallback-path-when-mined-in-a-block" title="Permanent link">&para;</a></h4>
-<p>This is a safety mechanism that ensures the locked flag is eventually unset even if the normal path fails:</p>
-<ol>
-<li>
-<p>When a block containing the transaction is validated, the Block Validation service processes the block and identifies all transactions within it</p>
-</li>
-<li>
-<p>As part of the <code>SetMinedMulti</code> operation during block processing, the service updates transaction metadata in the UTXO store</p>
-</li>
-<li>
-<p>The Lua script in <code>stores/utxo/aerospike/teranode.lua</code> automatically unsets the locked flag (changes it to <code>false</code>) if it hasn't been unset already:</p>
-<div class="language-lua highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1">-- set the record to not be locked again, if it was locked, since if was just mined into a block</span>
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kr">if</span><span class="w"> </span><span class="nv">rec</span><span class="p">[</span><span class="nv">BIN_LOCKED</span><span class="p">]</span><span class="w"> </span><span class="kr">then</span>
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="nv">rec</span><span class="p">[</span><span class="nv">BIN_LOCKED</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="kr">end</span>
+<h1 id="how-to-expose-the-p2p-service-publicly-kubernetes">How to Expose the P2P Service Publicly (Kubernetes)<a class="headerlink" href="#how-to-expose-the-p2p-service-publicly-kubernetes" title="Permanent link">&para;</a></h1>
+<p>Last modified: 11-June-2026</p>
+<h2 id="why-this-matters">Why This Matters<a class="headerlink" href="#why-this-matters" title="Permanent link">&para;</a></h2>
+<p>Teranode's P2P layer (libp2p) needs inbound TCP connections on the P2P port (<code>9905</code> in the shipped configuration) to accept direct peer connections. The port peers actually dial is whatever your <code>p2p_listen_addresses</code> / <code>p2p_advertise_addresses</code> multiaddrs specify — the load balancer listener port must match the port in your advertise multiaddr. A node that can only dial out still works, but it contributes far less to network health: it cannot be dialed by other peers, cannot serve as a DHT server, and cannot join the BSV Association bootstrap pool (see <a href="#joining-the-dns-bootstrap-pool">Joining the DNS Bootstrap Pool</a>).</p>
+<p>Inside Kubernetes this is not automatic. Pod IPs are not routable from the internet, and the default Service behaviour (<code>externalTrafficPolicy: Cluster</code>) breaks libp2p in subtle ways described below. This guide shows a working pattern for AWS/EKS; the principles carry over to other cloud providers.</p>
+<h2 id="awseks-network-load-balancer">AWS/EKS: Network Load Balancer<a class="headerlink" href="#awseks-network-load-balancer" title="Permanent link">&para;</a></h2>
+<p>Use a <strong>Network Load Balancer (NLB)</strong>, not an ALB or Classic ELB. libp2p speaks a raw TCP protocol with its own multiplexing and encryption — an L7 load balancer cannot proxy it. The NLB operates at L4 and passes TCP streams through untouched.</p>
+<h3 id="service-manifest">Service Manifest<a class="headerlink" href="#service-manifest" title="Permanent link">&para;</a></h3>
+<p>The example below uses <a href="https://kubernetes-sigs.github.io/aws-load-balancer-controller/">AWS Load Balancer Controller</a> annotations (<code>aws-load-balancer-type: "external"</code>, <code>aws-load-balancer-nlb-target-type</code>) — install the controller in your cluster as a prerequisite. Adapt the <code>selector</code> to whatever labels your peer pod actually carries.</p>
+<div class="language-yaml highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="nt">metadata</span><span class="p">:</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">teranode-p2p-nlb</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span><span class="nt">annotations</span><span class="p">:</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="c1"># Use NLB for better performance with libp2p</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="nt">service.beta.kubernetes.io/aws-load-balancer-type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;external&quot;</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="nt">service.beta.kubernetes.io/aws-load-balancer-nlb-target-type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;instance&quot;</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="nt">service.beta.kubernetes.io/aws-load-balancer-scheme</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;internet-facing&quot;</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="nt">spec</span><span class="p">:</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">LoadBalancer</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">  </span><span class="nt">externalTrafficPolicy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Local</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">  </span><span class="c1"># With Local policy, the NLB only routes to nodes running a peer pod.</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">  </span><span class="c1"># This prevents cross-node forwarding issues with libp2p.</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">  </span><span class="nt">selector</span><span class="p">:</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">    </span><span class="nt">app</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">peer</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">  </span><span class="nt">ports</span><span class="p">:</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">9905</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="w">      </span><span class="nt">targetPort</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">9905</span>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">      </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TCP</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">      </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">teranode-p2p</span>
 </span></code></pre></div>
-</li>
-<li>
-<p>The transaction is now fully committed and integrated into the blockchain</p>
-</li>
-</ol>
-<p><strong>Purpose</strong>: This fallback ensures that even if the normal unlock path (3.2.1) fails for any reason, transactions will still be unlocked when they're mined in a block. This maintains system consistency and prevents permanently locked transactions.</p>
-<h4 id="323-quick-validation-path-checkpointed-blocks">3.2.3. Quick Validation Path: Checkpointed Blocks<a class="headerlink" href="#323-quick-validation-path-checkpointed-blocks" title="Permanent link">&para;</a></h4>
-<p>For blocks below checkpoints (trusted historical blocks), a specialized validation path is used:</p>
-<ol>
-<li>
-<p>Block Validation service identifies the block is below a checkpoint</p>
-</li>
-<li>
-<p>UTXOs are created for all transactions in the block with <code>locked=true</code> (via <code>createAllUTXOs()</code>)</p>
-</li>
-<li>
-<p>All transactions are spent/validated in parallel (via <code>spendAllTransactions()</code> with <code>IgnoreLocked: true</code>)</p>
-</li>
-<li>
-<p>Block is added to the blockchain with <code>MinedSet=true</code></p>
-</li>
-<li>
-<p>The Block Validation service calls <code>SetLocked(txHashes, false)</code> to unlock all transaction outputs at once</p>
-</li>
-</ol>
-<p><strong>Key Differences from Normal Path:</strong></p>
+<h3 id="why-externaltrafficpolicy-local">Why <code>externalTrafficPolicy: Local</code><a class="headerlink" href="#why-externaltrafficpolicy-local" title="Permanent link">&para;</a></h3>
+<p>This setting is <strong>required</strong>, not an optimisation. With the default <code>Cluster</code> policy:</p>
 <ul>
-<li>UTXOs are created BEFORE validation (trusted checkpoint assumption)</li>
-<li>All transactions unlocked together in batch operation</li>
-<li>Direct call to <code>SetLocked()</code> instead of going through <code>twoPhaseCommitTransaction()</code></li>
-<li>Implemented in <code>Block Validation.quickValidateBlock()</code> in <code>services/blockvalidation/quick_validate.go</code></li>
+<li>The NLB routes incoming connections to <em>any</em> node in the cluster, and <code>kube-proxy</code> forwards them to the peer pod with source NAT applied.</li>
+<li>Peers connecting to your node appear to come from your own cluster node IPs, not their real addresses. This breaks libp2p's Identify/observed-address mechanism (see <a href="../../../../P2P_NAT_TRAVERSAL/">P2P NAT Traversal</a>), peer-level bans, and any source-IP-based diagnostics.</li>
+<li>The extra cross-node hop adds latency and a second failure point on every inbound stream.</li>
 </ul>
-<p><strong>When Used</strong>: Only for blocks below checkpoints during initial blockchain synchronization or when catching up from far behind</p>
-<h3 id="33-special-case-transactions-from-blocks">3.3. Special Case: Transactions from Blocks<a class="headerlink" href="#33-special-case-transactions-from-blocks" title="Permanent link">&para;</a></h3>
-<p>For transactions that are received as part of a block (rather than through the transaction validation process):</p>
-<ol>
-<li>
-<p>The Validator can be configured to ignore the locked flag when validating transactions that are part of a received block.</p>
-</li>
-<li>
-<p>This is controlled via the <code>WithIgnoreLocked</code> option in the Validator service.</p>
-</li>
-<li>
-<p>This approach allows the system to accept transactions that are already part of a valid block, even if they would spend outputs that are marked as locked in the local UTXO store.</p>
-</li>
-<li>
-<p>This mechanism is essential for handling block synchronization and reorgs properly.</p>
-</li>
-</ol>
-<h2 id="4-service-interaction">4. Service Interaction<a class="headerlink" href="#4-service-interaction" title="Permanent link">&para;</a></h2>
-<h3 id="41-validator-service-role">4.1. Validator Service Role<a class="headerlink" href="#41-validator-service-role" title="Permanent link">&para;</a></h3>
-<p>The Validator service is responsible for:</p>
+<p>With <code>Local</code>:</p>
 <ul>
-<li><strong>Phase 1 (Lock)</strong>: Validating incoming transactions against consensus rules and creating UTXOs with <code>locked=true</code> in the UTXO store</li>
-<li><strong>Transaction Forwarding</strong>: Sending validated transactions to Block Assembly via the <code>Store()</code> method and publishing transaction metadata to Kafka</li>
-<li><strong>Phase 2 (Unlock)</strong>: Calling <code>twoPhaseCommitTransaction()</code> to unset the locked flag after successful Block Assembly addition and Kafka publishing</li>
-<li><strong>Error Handling</strong>: Logging but not treating unlock failures as fatal, since the fallback mechanism (SetMinedMulti) will unlock the transaction when mined</li>
-<li><strong>Special Case</strong>: Ignoring the locked flag when validating transactions that are already part of a received block (controlled via <code>WithIgnoreLocked</code> option)</li>
+<li>The NLB health checks fail on nodes without a peer pod, so traffic only ever lands on the node actually running the pod — no second hop, no SNAT.</li>
+<li>The peer pod sees the genuine source IP of every connecting peer.</li>
 </ul>
-<p>The Validator orchestrates the complete two-phase commit flow for transactions entering the system through the validation pipeline. See <code>services/validator/Validator.go</code> for implementation details.</p>
-<h3 id="42-block-validation-service-role">4.2. Block Validation Service Role<a class="headerlink" href="#42-block-validation-service-role" title="Permanent link">&para;</a></h3>
-<p>The Block Validation service plays a critical role in the fallback unlock mechanism and has two distinct paths for unlocking transactions:</p>
-<p><strong>Normal Block Processing (Fallback Path):</strong></p>
-<ul>
-<li>Validates blocks and their transactions against consensus rules</li>
-<li>Calls <code>SetMinedMulti()</code> to mark transactions as mined in a block</li>
-<li>The <code>SetMinedMulti</code> operation triggers a Lua script (<code>stores/utxo/aerospike/teranode.lua</code>) that automatically unsets the locked flag if it was still set</li>
-<li>This provides the safety net that ensures transactions are eventually unlocked even if the Validator's unlock step failed</li>
-<li>Implemented in <code>services/blockvalidation/</code> using the UTXO store's batch operations</li>
-</ul>
-<p><strong>Quick Validation Path (Checkpointed Blocks):</strong></p>
-<ul>
-<li>Identifies blocks below checkpoints (trusted historical blocks)</li>
-<li>Creates all UTXOs with <code>locked=true</code> before validation (trusted checkpoint assumption)</li>
-<li>Validates all transactions in parallel with <code>IgnoreLocked: true</code></li>
-<li>Directly calls <code>SetLocked(txHashes, false)</code> to unlock all transactions in a single batch operation</li>
-<li>Implemented in <code>BlockValidation.quickValidateBlock()</code> in <code>services/blockvalidation/quick_validate.go</code></li>
-</ul>
-<p>The Block Validation service ensures that the second phase of the commit process is always completed, either through the Lua script during normal processing or through direct unlock during quick validation.</p>
-<h3 id="43-block-assembly-service-role">4.3. Block Assembly Service Role<a class="headerlink" href="#43-block-assembly-service-role" title="Permanent link">&para;</a></h3>
-<p>The Block Assembly service participates in the two-phase commit process in two ways:</p>
-<p><strong>Normal Operation:</strong></p>
-<ul>
-<li>Receives validated transactions from the Validator service via the <code>Store()</code> method</li>
-<li>Stores transactions in its internal data structures for block template assembly</li>
-<li>Transactions remain locked during this process until the Validator completes the unlock via <code>twoPhaseCommitTransaction()</code></li>
-<li>Does not directly interact with the locked flag during normal transaction acceptance</li>
-</ul>
-<p><strong>Recovery/Startup Path:</strong></p>
-<ul>
-<li>During service startup or recovery, Block Assembly loads previously stored unmined transactions via <code>loadUnminedTransactions()</code></li>
-<li>Identifies transactions that are still marked as <code>locked=true</code> in the UTXO store</li>
-<li>Calls <code>SetLocked(lockedTxHashes, false)</code> to unlock these transactions, as they were successfully added to Block Assembly in a previous run</li>
-<li>This ensures transactions don't remain permanently locked if the Validator's unlock step was interrupted by a service restart</li>
-<li>Implemented in <code>BlockAssembler.loadUnminedTransactions()</code> in <code>services/blockassembly/BlockAssembler.go</code></li>
-</ul>
-<p>The Block Assembly service acts as an additional safety mechanism that unlocks transactions during recovery scenarios, complementing the Validator's normal unlock path and the Block Validation fallback path.</p>
-<h2 id="5-data-model-impact">5. Data Model Impact<a class="headerlink" href="#5-data-model-impact" title="Permanent link">&para;</a></h2>
-<p>The Two-Phase Transaction Commit process impacts the UTXO data model by using the "locked" flag field in the UTXO records. This flag is stored in the UTXO metadata and is used to track the state of transaction outputs throughout the system.</p>
-<p>For complete details on the UTXO data model, including all fields and their descriptions, please refer to the <a href="../../datamodel/utxo_data_model/">UTXO Data Model Documentation</a>.</p>
-<p><strong>Locked Flag Field:</strong></p>
+<div class="admonition warning">
+<p class="admonition-title">Pod scheduling caveat</p>
+<p>With <code>Local</code> policy, a node passes NLB health checks only while it hosts a peer pod. If the pod is rescheduled, expect a brief window of failed health checks while the NLB target group converges. Keep the peer pod stable (e.g. node affinity or a dedicated node group) to avoid flapping.</p>
+</div>
+<p>The example above uses <code>aws-load-balancer-nlb-target-type: "instance"</code>. Target type <code>ip</code> (routing straight to the pod ENI, requires the AWS Load Balancer Controller) also works and likewise preserves source IPs; <code>instance</code> + <code>Local</code> is the simpler, proven combination.</p>
+<h3 id="advertise-the-load-balancer-address">Advertise the Load Balancer Address<a class="headerlink" href="#advertise-the-load-balancer-address" title="Permanent link">&para;</a></h3>
+<p>The pod listens on its pod IP, so left to its own devices it advertises an unroutable address. Point <code>p2p_advertise_addresses</code> at the NLB:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a># Using the NLB DNS name
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>p2p_advertise_addresses = /dns4/&lt;your-nlb-or-route53-name&gt;/tcp/9905
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a># Or, if you attached an Elastic IP to the NLB
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>p2p_advertise_addresses = /ip4/&lt;elastic-ip&gt;/tcp/9905
+</span></code></pre></div>
+<p>A stable DNS name (e.g. via external-dns and Route 53) or an Elastic IP attached to the NLB is strongly recommended — the auto-generated NLB DNS name changes if the Service is recreated, and a changed advertise address makes your node temporarily undialable until peers rediscover it.</p>
+<h3 id="verify-reachability">Verify Reachability<a class="headerlink" href="#verify-reachability" title="Permanent link">&para;</a></h3>
+<p>From a machine <strong>outside</strong> your VPC:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># TCP-level check: the NLB should accept the connection</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>nc<span class="w"> </span>-vz<span class="w"> </span>&lt;your-nlb-dns-name&gt;<span class="w"> </span><span class="m">9905</span>
+</span></code></pre></div>
+<p>Then confirm peers are dialing in: inbound connections appear in the P2P service logs, and other nodes should list yours in their peer set. If outbound peering works but you never see inbound connections, re-check the NLB target health and that <code>p2p_advertise_addresses</code> matches the address that is actually reachable.</p>
+<h2 id="choosing-a-dht-mode">Choosing a DHT Mode<a class="headerlink" href="#choosing-a-dht-mode" title="Permanent link">&para;</a></h2>
+<p><code>p2p_dht_mode</code> controls how visible — and how expensive — your node is on the P2P layer:</p>
 <table>
 <thead>
 <tr>
-<th>Field Name</th>
-<th>Type</th>
-<th>Description</th>
+<th>Mode</th>
+<th>Behaviour</th>
+<th>Cost / implications</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>locked</td>
-<td>boolean</td>
-<td>Indicates if the UTXO is temporarily locked during two-phase commit</td>
+<td><code>server</code></td>
+<td>Full DHT participation: advertises your node, stores provider records, routes queries for other peers</td>
+<td>Highest resource usage (memory, CPU, connection count). Maximises direct connections and network contribution. Only useful if your node is publicly dialable as described above.</td>
+</tr>
+<tr>
+<td><code>client</code></td>
+<td>Queries the DHT for discovery but does not advertise or store records</td>
+<td>Still connects to 100+ peers for DHT routing. Suitable for development and home networks.</td>
+</tr>
+<tr>
+<td><code>off</code></td>
+<td>No DHT. Topic-only network: connects to bootstrap peers and topic peers, exchanging addresses via the bootstrap servers</td>
+<td>Most lightweight — no DHT crawling, no random connections.</td>
 </tr>
 </tbody>
 </table>
-<p>This field is part of the UTXO record and is set to <code>true</code> when a transaction is initially created, then set to <code>false</code> after successful addition to Block Assembly or when the transaction is mined in a block.</p>
-<h2 id="6-internal-implementation-options">6. Internal Implementation Options<a class="headerlink" href="#6-internal-implementation-options" title="Permanent link">&para;</a></h2>
-<p>The Two-Phase Transaction Commit process uses several internal options to handle different validation scenarios:</p>
-<p><strong>IgnoreLocked Option:</strong></p>
-<p>The <code>WithIgnoreLocked</code> option controls whether the validator will ignore the locked flag when spending UTXOs:</p>
-<div class="language-go highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">type</span><span class="w"> </span><span class="nx">Options</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="nx">IgnoreLocked</span><span class="w"> </span><span class="kt">bool</span>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="p">}</span>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="kd">func</span><span class="w"> </span><span class="nx">WithIgnoreLocked</span><span class="p">(</span><span class="nx">ignoreLocked</span><span class="w"> </span><span class="kt">bool</span><span class="p">)</span><span class="w"> </span><span class="nx">Option</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">o</span><span class="w"> </span><span class="o">*</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">        </span><span class="nx">o</span><span class="p">.</span><span class="nx">IgnoreLocked</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">ignoreLocked</span>
-</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span><span class="p">}</span>
-</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="p">}</span>
+<p>Set <code>p2p_dht_mode = server</code> when you have completed the NLB setup above and want to strengthen the P2P layer with as many direct connections as possible.</p>
+<div class="admonition note">
+<p class="admonition-title">Operator-managed deployments</p>
+<p>Deployments managed by the teranode-operator use the <code>.operator</code> settings context, which already defaults to <code>p2p_dht_mode = server</code> (<code>p2p_dht_mode.operator = server</code> in <code>settings.conf</code>). You only need to set the mode explicitly to <em>opt out</em> of server mode on such deployments. A <code>server</code> node behind a broken or missing public exposure actively <em>harms</em> discovery: it advertises addresses into the DHT that nobody can dial.</p>
+</div>
+<div class="admonition warning">
+<p class="admonition-title">Abuse-sensitive hosting providers (Hetzner, OVH, …)</p>
+<p><code>server</code> and <code>client</code> modes connect to 100+ semi-random IPs as part of normal DHT operation. Some hosting providers (notably Hetzner and OVH) flag this pattern as network scanning and may send abuse warnings or suspend the server. On such providers, run <code>p2p_dht_mode = off</code> — the node still participates fully in block and transaction propagation via topics, using peer address exchange through the bootstrap servers instead of DHT crawling.</p>
+</div>
+<p>In <code>server</code> mode, DHT maintenance overhead can be tuned with <code>p2p_dht_cleanup_interval</code> (default <code>24h</code>).</p>
+<h2 id="joining-the-dns-bootstrap-pool">Joining the DNS Bootstrap Pool<a class="headerlink" href="#joining-the-dns-bootstrap-pool" title="Permanent link">&para;</a></h2>
+<p>The default bootstrap peer list is resolved dynamically via DNS:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>p2p_bootstrap_peers = /dnsaddr/${network}.bootstrap.teranode.bsvb.tech
 </span></code></pre></div>
-<p><strong>Usage:</strong></p>
-<p>This option is <strong>always set to <code>true</code></strong> when validating blocks (see <code>services/subtreevalidation/</code>). This is necessary because:</p>
+<p>For example, mainnet nodes bootstrap from <code>mainnet.bootstrap.teranode.bsvb.tech</code>.</p>
+<p>This pool is managed by the BSV Association. If your node:</p>
 <ol>
-<li>Transactions in a received block have already been validated and locked during initial propagation</li>
-<li>When validating the entire block, these transactions need to be re-validated for block consensus</li>
-<li>The locked flag must be ignored to allow this re-validation without conflicts</li>
-<li>This is an internal implementation detail, not a user-configurable setting</li>
+<li>is publicly dialable on its P2P port (e.g. via the NLB setup above), and</li>
+<li>runs <code>p2p_dht_mode = server</code>,</li>
 </ol>
-<p><strong>Note:</strong> This is not exposed as a configuration setting in <code>settings.conf</code> because it must always be <code>true</code> for block validation to work correctly. The option exists in the code for API flexibility and testing purposes, but in production it is always used with the value <code>true</code>.</p>
-<h2 id="7-flow-diagrams">7. Flow Diagrams<a class="headerlink" href="#7-flow-diagrams" title="Permanent link">&para;</a></h2>
-<p>The following diagrams illustrate the two-phase commit process from different perspectives. Together, they provide a complete view of how transactions move through the system from validation to final commitment.</p>
-<h3 id="71-two-phase-commit-overview">7.1. Two-Phase Commit Overview<a class="headerlink" href="#71-two-phase-commit-overview" title="Permanent link">&para;</a></h3>
-<p>This diagram shows the complete flow of the two-phase commit process from a high level:</p>
-<p><img alt="two_phase_commit_overview.svg" src="../img/plantuml/two_phase_commit_overview.svg" /></p>
-<p><strong>Key Elements:</strong></p>
+<p>you can contact the BSV Association to have it added to the bootstrap pool. Bootstrap nodes are the entry points every new node uses to join the network — a larger, geographically diverse pool makes the network more resilient.</p>
+<h2 id="other-cloud-providers">Other Cloud Providers<a class="headerlink" href="#other-cloud-providers" title="Permanent link">&para;</a></h2>
+<p>The same principles apply outside AWS:</p>
 <ul>
-<li>Initial transaction validation and UTXO creation with <code>locked=true</code></li>
-<li>All four unlock paths (Primary, Fallback, Quick Validation, Recovery)</li>
-<li>Decision points that determine which unlock path is taken</li>
-<li>Interactions between Validator, Block Assembly, and Block Validation services</li>
-<li>Fail-safe design showing how paths complement each other</li>
+<li>Use an <strong>L4 (TCP) load balancer</strong> — never an HTTP/L7 proxy — for the P2P port.</li>
+<li>Set <code>externalTrafficPolicy: Local</code> on the Service to preserve source IPs and avoid cross-node forwarding.</li>
+<li>Advertise the load balancer's stable public address via <code>p2p_advertise_addresses</code>.</li>
+<li>Verify inbound reachability from outside the provider's network before enabling <code>p2p_dht_mode = server</code>.</li>
 </ul>
-<h3 id="72-transaction-validation-flow-primary-path">7.2. Transaction Validation Flow (Primary Path)<a class="headerlink" href="#72-transaction-validation-flow-primary-path" title="Permanent link">&para;</a></h3>
-<p>This diagram shows the detailed flow of transaction validation and the normal unlock path:</p>
-<p><img alt="tx_validation_post_process.svg" src="../../services/img/plantuml/validator/tx_validation_post_process.svg" /></p>
-<p><strong>Key Steps Shown:</strong></p>
+<h2 id="related-documentation">Related Documentation<a class="headerlink" href="#related-documentation" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Transaction validation by Validator service</li>
-<li>UTXO creation with <code>locked=true</code></li>
-<li>Forwarding to Block Assembly via <code>Store()</code></li>
-<li>Publishing to Kafka for subtree validation</li>
-<li>Unlock via <code>twoPhaseCommitTransaction()</code> → <code>SetLocked(false)</code></li>
-</ul>
-<p><strong>Important</strong>: The diagram shows the timing of when the locked flag is unset - AFTER both Block Assembly storage and Kafka publishing complete successfully.</p>
-<h3 id="73-locked-flag-state-machine">7.3. Locked Flag State Machine<a class="headerlink" href="#73-locked-flag-state-machine" title="Permanent link">&para;</a></h3>
-<p>This diagram illustrates the locked flag's complete lifecycle as a state machine:</p>
-<p><img alt="locked_flag_state_machine.svg" src="../img/plantuml/locked_flag_state_machine.svg" /></p>
-<p><strong>State Transitions Shown:</strong></p>
-<ul>
-<li>Initial state: UTXO created with <code>locked=true</code></li>
-<li>Transition conditions for each of the four unlock paths</li>
-<li>Final state: <code>locked=false</code> (spendable)</li>
-<li>Error states and recovery paths</li>
-<li>Service crash scenarios and recovery mechanisms</li>
-</ul>
-<h3 id="74-block-validation-and-mining-fallback-path">7.4. Block Validation and Mining (Fallback Path)<a class="headerlink" href="#74-block-validation-and-mining-fallback-path" title="Permanent link">&para;</a></h3>
-<p>This diagram shows how transactions are marked as mined and automatically unlocked as a fallback mechanism:</p>
-<p><img alt="block_validation_set_tx_mined.svg" src="../../services/img/plantuml/blockvalidation/block_validation_set_tx_mined.svg" /></p>
-<p><strong>Key Steps Shown:</strong></p>
-<ul>
-<li>Block validation process</li>
-<li><code>SetMinedMulti()</code> operation</li>
-<li>Lua script automatic unlock (fallback mechanism)</li>
-<li>Transaction metadata updates</li>
-</ul>
-<p><strong>Purpose</strong>: This path serves as the safety net that ensures transactions are eventually unlocked even if the primary unlock path (7.2) fails.</p>
-<h3 id="75-block-assembly-recovery-flow">7.5. Block Assembly Recovery Flow<a class="headerlink" href="#75-block-assembly-recovery-flow" title="Permanent link">&para;</a></h3>
-<p>This diagram shows the detailed recovery process that occurs during Block Assembly service startup:</p>
-<p><img alt="block_assembly_recovery.svg" src="../img/plantuml/block_assembly_recovery.svg" /></p>
-<p><strong>Recovery Steps Shown:</strong></p>
-<ul>
-<li>Normal operation before crash (transaction stored, unlock pending)</li>
-<li>Crash scenario (service terminated before unlock)</li>
-<li>Service restart and initialization</li>
-<li>Loading unmined transactions from storage</li>
-<li>Identifying transactions with <code>locked=true</code></li>
-<li>Batch unlock operation via <code>SetLocked(lockedTxHashes, false)</code></li>
-<li>Restoring normal operation state</li>
-</ul>
-<p><strong>Purpose</strong>: Demonstrates how the system recovers gracefully from service restarts or crashes, ensuring transactions don't remain locked indefinitely. This is the fourth unlock path that complements the other three.</p>
-<h2 id="8-related-documentation">8. Related Documentation<a class="headerlink" href="#8-related-documentation" title="Permanent link">&para;</a></h2>
-<ul>
-<li><a href="../../services/validator/#271-two-phase-transaction-commit-process">Validator Service Documentation</a></li>
-<li><a href="../../services/blockValidation/#23-marking-txs-as-mined">Block Validation Service Documentation</a></li>
-<li><a href="../../datamodel/utxo_data_model/">UTXO Data Model Documentation</a></li>
+<li><a href="../../../../P2P_NAT_TRAVERSAL/">P2P NAT Traversal and Address Filtering</a> — how libp2p address discovery works</li>
+<li><a href="../../../../references/settings/services/p2p_settings/">P2P Settings Reference</a> — all P2P configuration options</li>
+<li><a href="../minersSecurityBestPractices/">Security Best Practices (Kubernetes)</a> — firewall and port exposure guidance</li>
 </ul>
 
 
@@ -7695,7 +7141,7 @@
       <nav class="md-footer__inner md-grid" aria-label="Footer" >
         
           
-          <a href="../../functionalRequirementTests/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Functional Requirement Tests">
+          <a href="../minersHowToConfigureTheNode/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Kubernetes">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
@@ -7705,20 +7151,20 @@
                 Previous
               </span>
               <div class="md-ellipsis">
-                Functional Requirement Tests
+                Kubernetes
               </div>
             </div>
           </a>
         
         
           
-          <a href="../peer_registry_reputation/" class="md-footer__link md-footer__link--next" aria-label="Next: Peer Registry and Reputation">
+          <a href="../../minersHowToAerospikeTuning/" class="md-footer__link md-footer__link--next" aria-label="Next: Aerospike Tuning">
             <div class="md-footer__title">
               <span class="md-footer__direction">
                 Next
               </span>
               <div class="md-ellipsis">
-                Peer Registry and Reputation
+                Aerospike Tuning
               </div>
             </div>
             <div class="md-footer__button md-icon">
@@ -7750,10 +7196,10 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "navigation.indexes", "navigation.top", "navigation.instant", "navigation.footer", "search.suggest", "search.highlight", "search.share", "toc.follow", "content.code.copy", "content.code.annotate", "content.tabs.link"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "navigation.indexes", "navigation.top", "navigation.instant", "navigation.footer", "search.suggest", "search.highlight", "search.share", "toc.follow", "content.code.copy", "content.code.annotate", "content.tabs.link"], "search": "../../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>
