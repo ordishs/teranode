@@ -432,16 +432,8 @@ func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.Fie
 // during shutdown while external callers (e.g. an in-flight block-validation
 // goroutine in checkParentsExistOnChain) may still be calling Get. That race
 // must abort the read, not crash the process.
-func (s *Store) putGetBatch(ctx context.Context, item *batchGetItem) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = errors.NewServiceUnavailableError("[get] aerospike get batcher unavailable (store shutting down): %v", r)
-		}
-	}()
-
-	s.getBatcher.PutCtx(ctx, item)
-
-	return nil
+func (s *Store) putGetBatch(ctx context.Context, item *batchGetItem) error {
+	return safeBatcherPutCtx(s.getBatcher, ctx, item, "get")
 }
 
 // getTxFromBins reconstructs a Bitcoin transaction from Aerospike bin data.
@@ -1240,11 +1232,17 @@ func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
 		errChan := make(chan error, 1)
 		errChans = append(errChans, errChan)
 
-		// Wrap the outpoint in OutpointRequest and put it in the batcher
-		s.outpointBatcher.Put(&batchOutpoint{
+		// Wrap the outpoint in OutpointRequest and put it in the batcher. Guard the
+		// enqueue: Store.Close may have closed the outpoint batcher while this
+		// caller is still decorating during shutdown. On a closed batcher, signal
+		// the (buffered) errChan so the bounded wait loop below surfaces the error
+		// instead of the process crashing on a send to a closed channel.
+		if err := safeBatcherPut(s.outpointBatcher, &batchOutpoint{
 			outpoint: input,
 			errCh:    errChan,
-		})
+		}, "outpoint"); err != nil {
+			errChan <- err
+		}
 	}
 
 	// Wait for all error channels to receive a result, bounded so a wedged

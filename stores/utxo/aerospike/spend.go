@@ -375,13 +375,16 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}
 
 			errCh := make(chan error, 1)
-			s.spendBatcher.PutCtx(ctx, &batchSpend{
+			if err := safeBatcherPutCtx(s.spendBatcher, ctx, &batchSpend{
 				spend:             spend,
 				blockHeight:       blockHeight,
 				errCh:             errCh,
 				ignoreConflicting: useIgnoreConflicting,
 				ignoreLocked:      useIgnoreLocked,
-			})
+			}, "spend"); err != nil {
+				spends[idx].Err = err
+				return nil
+			}
 
 			// Wait for batch response with timeout to prevent indefinite blocking
 			var batchErr error

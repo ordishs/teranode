@@ -63,3 +63,41 @@ func TestGet_CancelledContextSkipsBatcher(t *testing.T) {
 
 	require.ErrorIs(t, err, context.Canceled)
 }
+
+// sendOnClosedBatcher is a generic batcherIfc whose Put/PutCtx panic exactly as
+// go-batcher v2.0.4 does after Close. okBatcher is a no-op (open) batcher.
+type sendOnClosedBatcher[T any] struct{}
+
+func (sendOnClosedBatcher[T]) Put(*T, ...int)                     { panic("send on closed channel") }
+func (sendOnClosedBatcher[T]) PutCtx(context.Context, *T, ...int) { panic("send on closed channel") }
+func (sendOnClosedBatcher[T]) Trigger()                           {}
+func (sendOnClosedBatcher[T]) SetDrainMode(bool)                  {}
+func (sendOnClosedBatcher[T]) SetTickInterval(time.Duration)      {}
+func (sendOnClosedBatcher[T]) Close()                             {}
+
+type okBatcher[T any] struct{}
+
+func (okBatcher[T]) Put(*T, ...int)                     {}
+func (okBatcher[T]) PutCtx(context.Context, *T, ...int) {}
+func (okBatcher[T]) Trigger()                           {}
+func (okBatcher[T]) SetDrainMode(bool)                  {}
+func (okBatcher[T]) SetTickInterval(time.Duration)      {}
+func (okBatcher[T]) Close()                             {}
+
+// TestSafeBatcherPut_RecoversSendOnClosed locks the shared guard used by the
+// spend / locked / outpoint / get enqueue paths: a send-on-closed-channel panic
+// becomes a returned shutdown error, and the open-batcher path returns nil.
+func TestSafeBatcherPut_RecoversSendOnClosed(t *testing.T) {
+	closed := sendOnClosedBatcher[batchGetItem]{}
+
+	errCtx := safeBatcherPutCtx[batchGetItem](closed, context.Background(), &batchGetItem{}, "spend")
+	require.Error(t, errCtx)
+	require.Contains(t, errCtx.Error(), "shutting down")
+
+	errPut := safeBatcherPut[batchGetItem](closed, &batchGetItem{}, "outpoint")
+	require.Error(t, errPut)
+	require.Contains(t, errPut.Error(), "shutting down")
+
+	require.NoError(t, safeBatcherPutCtx[batchGetItem](okBatcher[batchGetItem]{}, context.Background(), &batchGetItem{}, "get"))
+	require.NoError(t, safeBatcherPut[batchGetItem](okBatcher[batchGetItem]{}, &batchGetItem{}, "get"))
+}

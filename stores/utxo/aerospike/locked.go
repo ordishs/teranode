@@ -56,12 +56,14 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 		g.Go(func() error {
 			errCh := make(chan error, 1)
 
-			s.lockedBatcher.PutCtx(ctx, &batchLocked{
+			if err := safeBatcherPutCtx(s.lockedBatcher, ctx, &batchLocked{
 				ctx:      ctx,
 				txHash:   txHash,
 				setValue: setValue,
 				errCh:    errCh,
-			})
+			}, "setLocked"); err != nil {
+				return err
+			}
 
 			// Now we need to get totalRecords and do all the child records if necessary...
 
