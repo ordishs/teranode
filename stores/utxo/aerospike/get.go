@@ -367,11 +367,22 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 // The method creates a batchGetItem with the request parameters and sends it to the
 // getBatcher for processing. It then waits on a done channel for the result.
 func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
+	// Abort early on a cancelled context (e.g. graceful shutdown) before touching
+	// the batcher. Store.Close may have already closed the get batcher's input
+	// channel, and enqueuing into it then panics "send on closed channel". The
+	// recover guard below covers the residual race where the store closes while
+	// this caller's context is still live.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	done := make(chan batchGetItemData, 1)
 	item := &batchGetItem{hash: *hash, fields: bins, done: done}
 
 	if s.getBatcher != nil {
-		s.getBatcher.PutCtx(ctx, item)
+		if err := s.putGetBatch(ctx, item); err != nil {
+			return nil, err
+		}
 	} else {
 		// if the batcher is disabled, we still want to process the request in a go routine
 		go func() {
@@ -413,6 +424,24 @@ func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.Fie
 		prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "BatchTimeout").Inc()
 		return nil, errors.NewServiceUnavailableError("aerospike get batch did not complete within %s", s.batcherWait)
 	}
+}
+
+// putGetBatch enqueues item into the get batcher, converting the
+// "send on closed channel" panic — which go-batcher v2.0.4 raises when Put is
+// called after Close — into a returned error. Store.Close closes the get batcher
+// during shutdown while external callers (e.g. an in-flight block-validation
+// goroutine in checkParentsExistOnChain) may still be calling Get. That race
+// must abort the read, not crash the process.
+func (s *Store) putGetBatch(ctx context.Context, item *batchGetItem) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.NewServiceUnavailableError("[get] aerospike get batcher unavailable (store shutting down): %v", r)
+		}
+	}()
+
+	s.getBatcher.PutCtx(ctx, item)
+
+	return nil
 }
 
 // getTxFromBins reconstructs a Bitcoin transaction from Aerospike bin data.
