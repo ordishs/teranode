@@ -77,6 +77,24 @@ func encodeNativeOpPayload(subOp uint8, args []any) ([]byte, error) {
 // path. Most call sites pass LuaPackage as udfPackage; setMined
 // optionally uses LuaPackageMined; spendMulti optionally uses one of
 // s.spendLuaPackages. Pass nil for udfPolicy to get default.
+// useNativeForSubOp decides whether a given mod-teranode sub-op may use the
+// native operate-path. It requires the setting+capability flag, and additionally
+// FENCES unspend (subOpUnspend) to the UDF/Lua path regardless of the flag.
+//
+// Rationale (#899): the UDF unspend path always enforces the #766 SpendingData
+// ownership check before reversing a spend. The native path forwards SpendingData
+// to the server-fork subOpUnspend=3 dispatcher, but that dispatcher's enforcement
+// cannot be verified from the client — it is not in go.mod, and the startup
+// capability probe exercises only setLocked. Running native unspend against a
+// server that accepts sub-op 3 without enforcing ownership (an older fork build,
+// a mixed-version cluster, or a dispatcher that silently ignores the arg) would
+// be a silent spend-reversal / UTXO-resurrection primitive on the reorg /
+// ProcessConflicting / catchup path. Until enforcement is provable, unspend stays
+// on the UDF path. The other sub-ops keep the native win.
+func (s *Store) useNativeForSubOp(subOp uint8) bool {
+	return s.useNativeTeranodeOps && subOp != subOpUnspend
+}
+
 func (s *Store) teranodeBatchRecord(
 	udfPolicy *aerospike.BatchUDFPolicy,
 	udfPackage string,
@@ -85,7 +103,7 @@ func (s *Store) teranodeBatchRecord(
 	udfFnName string,
 	args ...any,
 ) aerospike.BatchRecordIfc {
-	if s.useNativeTeranodeOps {
+	if s.useNativeForSubOp(subOp) {
 		payload, err := encodeNativeOpPayload(subOp, args)
 		if err != nil {
 			// Fallback: encoding shouldn't fail for plain Go types.
@@ -142,7 +160,7 @@ func (s *Store) executeTeranodeOp(
 	udfFnName string,
 	args ...any,
 ) (any, aerospike.Error) {
-	if s.useNativeTeranodeOps {
+	if s.useNativeForSubOp(subOp) {
 		payload, err := encodeNativeOpPayload(subOp, args)
 		if err != nil {
 			s.logger.Warnf("[executeTeranodeOp] msgpack encode failed for sub_op=%d: %v; falling back to UDF",
