@@ -2721,13 +2721,22 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 
 			// we found the transaction in a subtree
 			if foundSubtreeIndex == -1 {
-				// it was found in the current tree, remove it from there and continue
-				// with the remaining hashes. The trailing reChainSubtrees(0) compacts
-				// every subtree, including the current one, after the loop completes.
-				if err := stp.currentSubtree.Load().RemoveNodeAtIndex(foundIndex); err != nil {
+				// it was found in the current subtree. Duplicate before mutating (mirroring
+				// the chained-subtree branch) so any precomputed mining-data snapshot holding
+				// the original stays safe for concurrent reads, and so the duplicate's node
+				// index is rebuilt fresh on the next lookup: RemoveNodeAtIndex leaves the index
+				// map stale for nodes after the removed one, which would otherwise corrupt the
+				// index used to remove a subsequent hash from the same subtree.
+				currentSubtree := stp.currentSubtree.Load().Duplicate()
+
+				if err := currentSubtree.RemoveNodeAtIndex(foundIndex); err != nil {
 					return errors.NewProcessingError("[SubtreeProcessor][removeTxsFromSubtrees][%s] error removing node from current subtree", hash.String(), err)
 				}
 
+				stp.currentSubtree.Store(currentSubtree)
+
+				// the trailing reChainSubtrees(0) compacts every subtree, including the
+				// current one, after the loop completes
 				continue
 			}
 

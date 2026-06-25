@@ -3428,6 +3428,71 @@ func TestRemoveTxsFromSubtreesOrdering(t *testing.T) {
 			require.True(t, cs.IsComplete(), "chained subtree %d must be complete after recompaction", i)
 		}
 	})
+
+	t.Run("removes multiple hashes that all live in the current subtree", func(t *testing.T) {
+		stp := setupTestSubtreeProcessor(t)
+
+		// A,B,C fill and chain the first subtree; D,E remain in the current subtree.
+		labels := []string{"A", "B", "C", "D", "E"}
+		hashes := make(map[string]chainhash.Hash, len(labels))
+
+		for _, l := range labels {
+			h := chainhash.HashH([]byte("cbspend3_" + l))
+			hashes[l] = h
+			node := &subtreepkg.Node{Hash: h, Fee: 1000, SizeInBytes: 250}
+			require.NoError(t, stp.AddDirectly(node, &subtreepkg.TxInpoints{}, true))
+		}
+
+		require.GreaterOrEqual(t, stp.currentSubtree.Load().NodeIndex(hashes["D"]), 0, "D should be in current subtree")
+		require.GreaterOrEqual(t, stp.currentSubtree.Load().NodeIndex(hashes["E"]), 0, "E should be in current subtree")
+
+		// Removing two current-subtree hashes in one call exercises the index map:
+		// RemoveNodeAtIndex leaves a stale index for E after D is removed, so an
+		// in-place removal would use a stale index and remove the wrong node or fail.
+		err := stp.removeTxsFromSubtrees(ctx, []chainhash.Hash{hashes["D"], hashes["E"]})
+		require.NoError(t, err)
+
+		nodeIndexAnywhere := func(h chainhash.Hash) int {
+			if idx := stp.currentSubtree.Load().NodeIndex(h); idx >= 0 {
+				return idx
+			}
+
+			for _, cs := range stp.chainedSubtrees {
+				if idx := cs.NodeIndex(h); idx >= 0 {
+					return idx
+				}
+			}
+
+			return -1
+		}
+
+		for _, l := range []string{"D", "E"} {
+			require.Equal(t, -1, nodeIndexAnywhere(hashes[l]), "%s must be removed from all subtrees", l)
+
+			_, exists := stp.currentTxMap.Get(hashes[l])
+			require.False(t, exists, "%s must be removed from currentTxMap", l)
+		}
+
+		// A,B,C must be untouched and still present exactly once.
+		occurrences := func(h chainhash.Hash) int {
+			count := 0
+			if stp.currentSubtree.Load().NodeIndex(h) >= 0 {
+				count++
+			}
+
+			for _, cs := range stp.chainedSubtrees {
+				if cs.NodeIndex(h) >= 0 {
+					count++
+				}
+			}
+
+			return count
+		}
+
+		for _, l := range []string{"A", "B", "C"} {
+			require.Equal(t, 1, occurrences(hashes[l]), "%s must remain present exactly once", l)
+		}
+	})
 }
 
 // TestRemoveTxsFromSubtreesIntegration tests the function in a more realistic scenario
