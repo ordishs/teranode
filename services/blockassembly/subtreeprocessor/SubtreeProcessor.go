@@ -2721,9 +2721,14 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 
 			// we found the transaction in a subtree
 			if foundSubtreeIndex == -1 {
-				// it was found in the current tree, remove it from there
-				// further processing is not needed, as the subtrees in the chainedSubtrees are older than the current subtree
-				return stp.currentSubtree.Load().RemoveNodeAtIndex(foundIndex)
+				// it was found in the current tree, remove it from there and continue
+				// with the remaining hashes. The trailing reChainSubtrees(0) compacts
+				// every subtree, including the current one, after the loop completes.
+				if err := stp.currentSubtree.Load().RemoveNodeAtIndex(foundIndex); err != nil {
+					return errors.NewProcessingError("[SubtreeProcessor][removeTxsFromSubtrees][%s] error removing node from current subtree", hash.String(), err)
+				}
+
+				continue
 			}
 
 			// it was found in a chained subtree, remove it from there and chain the subtrees again from the point it was removed

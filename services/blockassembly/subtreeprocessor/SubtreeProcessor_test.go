@@ -3303,6 +3303,133 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 	})
 }
 
+// TestRemoveTxsFromSubtreesOrdering reproduces the coinbase-spend ordering bug
+// where removeTxsFromSubtrees early-returned on the first hash found in the
+// current subtree, leaving later hashes (and the trailing reChainSubtrees(0)
+// compaction) unprocessed. This mirrors removeCoinbaseUtxos removing N child
+// spends where children[0] sits in the current subtree and children[1..] span a
+// chained subtree.
+func TestRemoveTxsFromSubtreesOrdering(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("removes all hashes when a current-subtree hash precedes a chained-subtree hash", func(t *testing.T) {
+		stp := setupTestSubtreeProcessor(t) // InitialMerkleItemsPerSubtree = 4
+
+		// Add A,B,C: first subtree fills to [coinbase,A,B,C] and chains.
+		// Add D,E: these land in the current subtree.
+		labels := []string{"A", "B", "C", "D", "E"}
+		hashes := make(map[string]chainhash.Hash, len(labels))
+
+		for _, l := range labels {
+			h := chainhash.HashH([]byte("cbspend_" + l))
+			hashes[l] = h
+			node := &subtreepkg.Node{Hash: h, Fee: 1000, SizeInBytes: 250}
+			require.NoError(t, stp.AddDirectly(node, &subtreepkg.TxInpoints{}, true))
+		}
+
+		// Sanity: A is in a chained subtree, D is in the current subtree.
+		require.GreaterOrEqual(t, len(stp.chainedSubtrees), 1, "expected at least one chained subtree")
+		require.GreaterOrEqual(t, stp.chainedSubtrees[0].NodeIndex(hashes["A"]), 0, "A should be in chained subtree 0")
+		require.GreaterOrEqual(t, stp.currentSubtree.Load().NodeIndex(hashes["D"]), 0, "D should be in current subtree")
+
+		// Remove D (current subtree, listed first) then A (chained subtree).
+		// Pre-fix, the D hit triggers an early return, so A is never removed and
+		// reChainSubtrees(0) never runs.
+		err := stp.removeTxsFromSubtrees(ctx, []chainhash.Hash{hashes["D"], hashes["A"]})
+		require.NoError(t, err)
+
+		nodeIndexAnywhere := func(h chainhash.Hash) int {
+			if idx := stp.currentSubtree.Load().NodeIndex(h); idx >= 0 {
+				return idx
+			}
+
+			for _, cs := range stp.chainedSubtrees {
+				if idx := cs.NodeIndex(h); idx >= 0 {
+					return idx
+				}
+			}
+
+			return -1
+		}
+
+		// Both targeted hashes must be gone from every subtree and from currentTxMap.
+		for _, l := range []string{"D", "A"} {
+			require.Equal(t, -1, nodeIndexAnywhere(hashes[l]), "%s must be removed from all subtrees", l)
+
+			_, exists := stp.currentTxMap.Get(hashes[l])
+			require.False(t, exists, "%s must be removed from currentTxMap", l)
+		}
+
+		// The untouched hashes must survive, exactly once each.
+		occurrences := func(h chainhash.Hash) int {
+			count := 0
+			if stp.currentSubtree.Load().NodeIndex(h) >= 0 {
+				count++
+			}
+
+			for _, cs := range stp.chainedSubtrees {
+				if cs.NodeIndex(h) >= 0 {
+					count++
+				}
+			}
+
+			return count
+		}
+
+		for _, l := range []string{"B", "C", "E"} {
+			require.Equal(t, 1, occurrences(hashes[l]), "%s must remain present exactly once", l)
+		}
+
+		// reChainSubtrees(0) must have recompacted the chain: every chained subtree
+		// is full (no hole left by the in-place removal from a chained subtree).
+		for i, cs := range stp.chainedSubtrees {
+			require.True(t, cs.IsComplete(), "chained subtree %d must be complete after recompaction", i)
+		}
+	})
+
+	t.Run("removes all hashes when a chained-subtree hash precedes a current-subtree hash", func(t *testing.T) {
+		stp := setupTestSubtreeProcessor(t)
+
+		labels := []string{"A", "B", "C", "D", "E"}
+		hashes := make(map[string]chainhash.Hash, len(labels))
+
+		for _, l := range labels {
+			h := chainhash.HashH([]byte("cbspend2_" + l))
+			hashes[l] = h
+			node := &subtreepkg.Node{Hash: h, Fee: 1000, SizeInBytes: 250}
+			require.NoError(t, stp.AddDirectly(node, &subtreepkg.TxInpoints{}, true))
+		}
+
+		// Remove A (chained) then D (current). Pre-fix, A removal leaves a hole in
+		// the chained subtree, then the D hit early-returns before reChainSubtrees(0),
+		// leaving the chain uncompacted.
+		err := stp.removeTxsFromSubtrees(ctx, []chainhash.Hash{hashes["A"], hashes["D"]})
+		require.NoError(t, err)
+
+		nodeIndexAnywhere := func(h chainhash.Hash) int {
+			if idx := stp.currentSubtree.Load().NodeIndex(h); idx >= 0 {
+				return idx
+			}
+
+			for _, cs := range stp.chainedSubtrees {
+				if idx := cs.NodeIndex(h); idx >= 0 {
+					return idx
+				}
+			}
+
+			return -1
+		}
+
+		for _, l := range []string{"A", "D"} {
+			require.Equal(t, -1, nodeIndexAnywhere(hashes[l]), "%s must be removed from all subtrees", l)
+		}
+
+		for i, cs := range stp.chainedSubtrees {
+			require.True(t, cs.IsComplete(), "chained subtree %d must be complete after recompaction", i)
+		}
+	})
+}
+
 // TestRemoveTxsFromSubtreesIntegration tests the function in a more realistic scenario
 func TestRemoveTxsFromSubtreesIntegration(t *testing.T) {
 	ctx := context.Background()
