@@ -3303,6 +3303,25 @@ func TestRemoveTxsFromSubtreesBasic(t *testing.T) {
 	})
 }
 
+// requireCoinbasePlaceholderIntact asserts that the block's first subtree still
+// carries the coinbase placeholder at Nodes[0]. reChainSubtrees rebuilds the
+// chain from a fresh subtree and skips placeholder nodes in its re-add loop, so a
+// regression that fails to re-assert the placeholder lets the first real tx slide
+// into Nodes[0] — a corrupt coinbase commitment.
+func requireCoinbasePlaceholderIntact(t *testing.T, stp *SubtreeProcessor) {
+	t.Helper()
+
+	first := stp.currentSubtree.Load()
+	if len(stp.chainedSubtrees) > 0 {
+		first = stp.chainedSubtrees[0]
+	}
+
+	require.NotNil(t, first, "block's first subtree must exist")
+	require.Greater(t, first.Length(), 0, "block's first subtree must not be empty")
+	require.True(t, first.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue),
+		"block's first subtree must retain the coinbase placeholder at Nodes[0], got %s", first.Nodes[0].Hash.String())
+}
+
 // TestRemoveTxsFromSubtreesOrdering reproduces the coinbase-spend ordering bug
 // where removeTxsFromSubtrees early-returned on the first hash found in the
 // current subtree, leaving later hashes (and the trailing reChainSubtrees(0)
@@ -3385,6 +3404,8 @@ func TestRemoveTxsFromSubtreesOrdering(t *testing.T) {
 		for i, cs := range stp.chainedSubtrees {
 			require.True(t, cs.IsComplete(), "chained subtree %d must be complete after recompaction", i)
 		}
+
+		requireCoinbasePlaceholderIntact(t, stp)
 	})
 
 	t.Run("removes all hashes when a chained-subtree hash precedes a current-subtree hash", func(t *testing.T) {
@@ -3427,6 +3448,8 @@ func TestRemoveTxsFromSubtreesOrdering(t *testing.T) {
 		for i, cs := range stp.chainedSubtrees {
 			require.True(t, cs.IsComplete(), "chained subtree %d must be complete after recompaction", i)
 		}
+
+		requireCoinbasePlaceholderIntact(t, stp)
 	})
 
 	t.Run("removes multiple hashes that all live in the current subtree", func(t *testing.T) {
@@ -3492,7 +3515,215 @@ func TestRemoveTxsFromSubtreesOrdering(t *testing.T) {
 		for _, l := range []string{"A", "B", "C"} {
 			require.Equal(t, 1, occurrences(hashes[l]), "%s must remain present exactly once", l)
 		}
+
+		requireCoinbasePlaceholderIntact(t, stp)
 	})
+}
+
+// TestRemoveTxFromSubtreesCurrentSnapshotSafety verifies the singular
+// removeTxFromSubtrees duplicates the current subtree before removing a node from
+// it, mirroring removeTxsFromSubtrees. Mutating the live current subtree in place
+// would corrupt any precomputed mining-data snapshot still holding the original
+// pointer.
+func TestRemoveTxFromSubtreesCurrentSnapshotSafety(t *testing.T) {
+	ctx := context.Background()
+	stp := setupTestSubtreeProcessor(t)
+
+	h := chainhash.HashH([]byte("singular_current_tx"))
+	require.NoError(t, stp.AddDirectly(&subtreepkg.Node{Hash: h, Fee: 1000, SizeInBytes: 250}, &subtreepkg.TxInpoints{}, true))
+
+	before := stp.currentSubtree.Load()
+	require.GreaterOrEqual(t, before.NodeIndex(h), 0, "precondition: tx in current subtree")
+
+	require.NoError(t, stp.removeTxFromSubtrees(ctx, h))
+
+	after := stp.currentSubtree.Load()
+	require.Equal(t, -1, after.NodeIndex(h), "tx must be removed from the live current subtree")
+	require.NotSame(t, before, after, "current subtree must be duplicated before mutation, not mutated in place")
+	require.GreaterOrEqual(t, before.NodeIndex(h), 0, "the pre-removal snapshot must remain untouched")
+}
+
+// TestRemoveTxsFromSubtreesNoMatchSkipsRechain verifies that removeTxsFromSubtrees
+// does not run reChainSubtrees(0) when no hash matched. An unconditional rebuild on
+// a no-op call needlessly replaces every subtree pointer (invalidating mining
+// snapshots) and burns an O(N) rebuild, matching the singular path's foundIndex>=0
+// gate.
+func TestRemoveTxsFromSubtreesNoMatchSkipsRechain(t *testing.T) {
+	ctx := context.Background()
+	stp := setupTestSubtreeProcessor(t)
+
+	for _, l := range []string{"A", "B", "C", "D"} {
+		h := chainhash.HashH([]byte("nomatch_" + l))
+		require.NoError(t, stp.AddDirectly(&subtreepkg.Node{Hash: h, Fee: 1000, SizeInBytes: 250}, &subtreepkg.TxInpoints{}, true))
+	}
+
+	require.GreaterOrEqual(t, len(stp.chainedSubtrees), 1, "expected at least one chained subtree")
+
+	beforeCurrent := stp.currentSubtree.Load()
+	beforeChained := append([]*subtreepkg.Subtree(nil), stp.chainedSubtrees...)
+
+	err := stp.removeTxsFromSubtrees(ctx, []chainhash.Hash{
+		chainhash.HashH([]byte("ghost_1")),
+		chainhash.HashH([]byte("ghost_2")),
+	})
+	require.NoError(t, err)
+
+	require.Same(t, beforeCurrent, stp.currentSubtree.Load(), "no-match removal must not rebuild the current subtree")
+	require.Equal(t, len(beforeChained), len(stp.chainedSubtrees), "no-match removal must not change the chained subtree count")
+
+	for i := range beforeChained {
+		require.Same(t, beforeChained[i], stp.chainedSubtrees[i], "no-match removal must not rebuild chained subtree %d", i)
+	}
+}
+
+// TestMoveBackBlockDoesNotResurrectRemovedCoinbaseSpends drives the full
+// moveBackBlock path for a block whose coinbase has child-spends sitting in the
+// mempool assembly. moveBackBlock captured the previous chained/current subtrees
+// BEFORE removeCoinbaseUtxos, which rebuilds (and Closes) those subtrees via
+// reChainSubtrees. moveBackBlockBulkBuild then folded the stale pre-removal
+// subtrees back in — resurrecting the just-removed coinbase child-spends (and, for
+// mmap-backed subtrees, reading Closed/unmapped memory). The captured refs must be
+// taken from live state after removeCoinbaseUtxos.
+func TestMoveBackBlockDoesNotResurrectRemovedCoinbaseSpends(t *testing.T) {
+	ctx := context.Background()
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 4
+
+	utxoStore, err := sql.New(ctx, ulogger.TestLogger{}, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+	require.NoError(t, utxoStore.SetBlockHeight(4))
+
+	blobStore := blob_memory.New()
+
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	newSubtreeChan := make(chan NewSubtreeRequest, 10)
+	go func() {
+		for req := range newSubtreeChan {
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+	defer close(newSubtreeChan)
+
+	// NOTE: Start() is intentionally not called so moveBackBlock can be driven
+	// directly without racing the background goroutine (nodes added via addNode).
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, blobStore, blockchainClient, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+
+	// Coinbase with a child and grandchild spend, wired up in the utxo store so
+	// GetAndLockChildren returns them.
+	coinbase := coinbaseTx
+	_, err = utxoStore.Create(ctx, coinbase, 1)
+	require.NoError(t, err)
+
+	childTx := bt.NewTx()
+	require.NoError(t, childTx.From(coinbase.TxIDChainHash().String(), 0, coinbase.Outputs[0].LockingScript.String(), uint64(coinbase.Outputs[0].Satoshis)))
+	require.NoError(t, childTx.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 400000000))
+	childTx.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+
+	grandchildTx := bt.NewTx()
+	require.NoError(t, grandchildTx.From(childTx.TxIDChainHash().String(), 0, childTx.Outputs[0].LockingScript.String(), uint64(childTx.Outputs[0].Satoshis)))
+	require.NoError(t, grandchildTx.AddP2PKHOutputFromAddress("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", 300000000))
+	grandchildTx.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+
+	_, err = utxoStore.Create(ctx, childTx, 1)
+	require.NoError(t, err)
+	_, err = utxoStore.Create(ctx, grandchildTx, 1)
+	require.NoError(t, err)
+
+	spends, err := utxoStore.Spend(ctx, childTx, 2, utxo.IgnoreFlags{})
+	require.NoError(t, err)
+	for _, spend := range spends {
+		require.NoError(t, spend.Err)
+	}
+
+	spends, err = utxoStore.Spend(ctx, grandchildTx, 2, utxo.IgnoreFlags{})
+	require.NoError(t, err)
+	for _, spend := range spends {
+		require.NoError(t, spend.Err)
+	}
+
+	childHash := *childTx.TxIDChainHash()
+	grandchildHash := *grandchildTx.TxIDChainHash()
+
+	// Lay the assembly out so the coinbase child-spends sit in a CHAINED subtree
+	// while the current (incomplete) subtree holds other mempool txs. itemsPerSubtree
+	// is 4, and the first subtree carries the coinbase placeholder, so:
+	//   [coinbase, child, grandchild, f0]  -> chained[0]
+	//   [f1, f2]                           -> current (non-empty)
+	// removeCoinbaseUtxos removes child+grandchild from chained[0] and reChains, which
+	// Closes the live current subtree. moveBackBlock captured that current subtree
+	// before the removal, so folding the stale copy back duplicates f1/f2.
+	require.NoError(t, stp.addNode(subtreepkg.Node{Hash: childHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{childHash}}, true))
+	require.NoError(t, stp.addNode(subtreepkg.Node{Hash: grandchildHash, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{grandchildHash}}, true))
+
+	var fillers []chainhash.Hash
+	for i := 0; i < 3; i++ {
+		fh := chainhash.HashH([]byte("mbb_filler_" + string(rune('0'+i))))
+		fillers = append(fillers, fh)
+		require.NoError(t, stp.addNode(subtreepkg.Node{Hash: fh, Fee: 1}, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{fh}}, true))
+	}
+
+	occurrences := func(h chainhash.Hash) int {
+		count := 0
+		if stp.currentSubtree.Load().NodeIndex(h) >= 0 {
+			count++
+		}
+
+		for _, cs := range stp.chainedSubtrees {
+			if cs.NodeIndex(h) >= 0 {
+				count++
+			}
+		}
+
+		return count
+	}
+	inAssembly := func(h chainhash.Hash) bool { return occurrences(h) > 0 }
+
+	// Sanity: both child-spends are in a chained subtree and the current subtree is non-empty.
+	require.GreaterOrEqual(t, len(stp.chainedSubtrees), 1, "precondition: expected a chained subtree")
+	require.GreaterOrEqual(t, stp.chainedSubtrees[0].NodeIndex(childHash), 0, "precondition: child in chained subtree")
+	require.GreaterOrEqual(t, stp.chainedSubtrees[0].NodeIndex(grandchildHash), 0, "precondition: grandchild in chained subtree")
+	require.Greater(t, stp.currentSubtree.Load().Length(), 0, "precondition: current subtree must be non-empty")
+
+	childrenBefore, err := utxo.GetAndLockChildren(ctx, utxoStore, *coinbase.TxIDChainHash())
+	require.NoError(t, err)
+	require.Len(t, childrenBefore, 2, "coinbase should have two descendant spends")
+
+	stp.InitCurrentBlockHeader(blockHeader)
+
+	block := &model.Block{
+		Header:     prevBlockHeader,
+		CoinbaseTx: coinbase,
+		Subtrees:   []*chainhash.Hash{},
+	}
+
+	_, _, err = stp.moveBackBlock(ctx, block, true)
+	require.NoError(t, err)
+
+	// The removed coinbase child-spends must NOT be folded back into the assembly.
+	require.False(t, inAssembly(childHash), "child spend must not be resurrected into the assembly")
+	require.False(t, inAssembly(grandchildHash), "grandchild spend must not be resurrected into the assembly")
+
+	_, childInMap := stp.currentTxMap.Get(childHash)
+	require.False(t, childInMap, "child spend must not be resurrected into currentTxMap")
+	_, grandchildInMap := stp.currentTxMap.Get(grandchildHash)
+	require.False(t, grandchildInMap, "grandchild spend must not be resurrected into currentTxMap")
+
+	// Non-coinbase mempool txs must survive the move-back exactly once: folding a
+	// stale pre-removal current-subtree copy back in would duplicate them.
+	for _, fh := range fillers {
+		require.Equal(t, 1, occurrences(fh), "filler tx %s must survive move-back exactly once (no duplication)", fh.String())
+	}
+
+	requireCoinbasePlaceholderIntact(t, stp)
 }
 
 // TestRemoveTxsFromSubtreesIntegration tests the function in a more realistic scenario
