@@ -624,11 +624,11 @@ func (u *BlockValidation) start(ctx context.Context) error {
 						attempt := prev.(uint64) + 1
 						u.setMinedRetries.Store(*blockHash, attempt)
 
-						prometheusBlockValidationSetMinedRetries.WithLabelValues(blockHash.String()).Inc()
+						prometheusBlockValidationSetMinedRetries.Inc()
 
 						if attempt >= setMinedMaxRetries {
 							u.logger.Errorf("[BlockValidation:start][%s] manual_intervention_required: setTxMined exceeded %d retries; dropping from setMinedChan. Last error: %s", blockHash.String(), setMinedMaxRetries, err)
-							prometheusBlockValidationSetMinedDrops.WithLabelValues(blockHash.String()).Inc()
+							prometheusBlockValidationSetMinedDrops.Inc()
 							u.setMinedRetries.Delete(*blockHash)
 							return
 						}
@@ -2461,4 +2461,20 @@ func (u *BlockValidation) StopCaches() {
 	u.lastValidatedBlocks.Stop()
 	u.blockExistsCache.Stop()
 	u.subtreeExistsCache.Stop()
+}
+
+// Close releases the resources owned by BlockValidation. DC11: it stops the async
+// invalid-block Kafka producer so its final flush runs during shutdown. The
+// producer's Stop() flush does not honour a deadline, so the owning Server races
+// this Close() against its stop ctx — a wedged broker can't stall shutdown, and
+// the outstanding Stop() finishes the flush later if it can. Guarded and idempotent
+// (producer.Stop() is a no-op once already stopped).
+func (u *BlockValidation) Close() error {
+	if u.invalidBlockKafkaProducer != nil {
+		if err := u.invalidBlockKafkaProducer.Stop(); err != nil {
+			u.logger.Errorf("[BlockValidation] failed to stop invalid block kafka producer gracefully: %v", err)
+		}
+	}
+
+	return nil
 }

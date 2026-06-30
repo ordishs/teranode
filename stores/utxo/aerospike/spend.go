@@ -487,9 +487,12 @@ type keyIgnoreLocked struct {
 }
 
 // useExpressionSpend returns true when the expression-based spend path is safe for
-// the configured store. Multi-UTXO records (utxoBatchSize > 1) require Lua because
-// Aerospike expressions cannot byte-compare list elements, so the offset alone cannot
-// uniquely identify the target UTXO and ListSetOp would mutate the wrong slot.
+// the configured store. It is only implemented and validated for single-UTXO records
+// (utxoBatchSize == 1); multi-UTXO records (utxoBatchSize > 1) continue to use Lua.
+// The expression filter does byte-compare the element at the offset against the
+// expected UTXO hash (see buildSpendFilterExpression), so the single-UTXO path
+// cannot mutate the wrong slot; extending this to multi-UTXO records is unimplemented,
+// not impossible.
 func (s *Store) useExpressionSpend() bool {
 	return s.settings.Aerospike.EnableSpendFilterExpressions && s.utxoBatchSize == 1
 }

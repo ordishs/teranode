@@ -87,6 +87,11 @@ func NewSettings(alternativeContext ...string) *Settings {
 		GlobalBlockHeightRetention: globalBlockHeightRetention,
 		BatcherDrainMode:           getBool("batcher_drainMode", false, alternativeContext...),
 		BatcherBackground:          getBool("batcher_background", true, alternativeContext...),
+		// Keep this default in sync with servicemanager.DefaultStopTimeout (30s).
+		// It cannot reference that constant directly: util/servicemanager
+		// transitively imports settings, so importing it here would create an
+		// import cycle. The struct-tag default ("30s") mirrors this for docs.
+		ServiceManagerStopTimeout: getDuration("service_manager_stopTimeout", 30*time.Second, alternativeContext...),
 
 		ChainCfgParams: params,
 		Policy: &PolicySettings{
@@ -176,6 +181,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
 			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
 			SemaphoreMultiplier:             getFloat64("aerospike_semaphore_multiplier", 1.0, alternativeContext...),
+			OverloadRetryMaxElapsed:         getDuration("aerospike_overload_retry_max_elapsed", 2*time.Minute, alternativeContext...),
+			OverloadRetryBaseBackoff:        getDuration("aerospike_overload_retry_base_backoff", 50*time.Millisecond, alternativeContext...),
+			OverloadRetryMaxBackoff:         getDuration("aerospike_overload_retry_max_backoff", 5*time.Second, alternativeContext...),
 		},
 		Alert: AlertSettings{
 			GenesisKeys:   getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
