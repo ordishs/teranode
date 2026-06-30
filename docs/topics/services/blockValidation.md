@@ -94,9 +94,9 @@ Block validation receives new blocks through two distinct paths:
 
 ##### Optimistic Mining Mode
 
-The `optimisticMining` setting provides an alternative validation strategy that prioritizes block propagation speed over immediate validation completion. This experimental feature reverses the normal validate-then-add sequence.
+The `optimisticMining` setting provides a validation strategy that prioritizes block propagation speed over immediate validation completion. It is **enabled by default** (`blockvalidation_optimistic_mining` defaults to `true`) and reverses the normal validate-then-add sequence.
 
-**Normal Mode (Default):**
+**Normal Mode (validate-then-add):**
 
 ```text
 1. Validate block (subtrees, transactions, proof of work)
@@ -105,7 +105,7 @@ The `optimisticMining` setting provides an alternative validation strategy that 
 4. Notify other services
 ```
 
-**Optimistic Mining Mode:**
+**Optimistic Mining Mode (Default):**
 
 ```text
 1. Add block to blockchain immediately (before full validation)
@@ -166,21 +166,17 @@ The optimistic path is implemented in `ValidateBlock()` (services/blockvalidatio
     - Revalidation retries up to 3 times
     - After retries exhausted, block marked permanently invalid
 
-**When to Use Optimistic Mining:**
+**Disabling Optimistic Mining:**
 
-- **Performance Testing**: Measure maximum throughput without validation bottleneck
-- **Low-Risk Environments**: Test networks where temporary forks acceptable
-- **High-Trust Scenarios**: When block sources are highly trusted (e.g., own miners)
+Optimistic mining is on by default. Where the risk tradeoffs above are unacceptable, it can be turned off:
 
-**NOT Recommended For:**
-
-- **Production Networks**: Risk of temporary chain corruption unacceptable
-- **Public Nodes**: May propagate invalid blocks to network
-- **Financial Applications**: Temporary invalid state could affect transaction processing
+- **Globally**: set `blockvalidation_optimistic_mining` to `false`
+- **Per-block**: via `ValidateBlockOptions.DisableOptimisticMining`
+- **Automatically**: it is always disabled during catchup mode for better reliability
 
 **Future Improvements:**
 
-The optimistic mining feature is experimental and currently disabled by default. Future enhancements may include:
+Future enhancements may include:
 
 - Better rollback mechanisms
 - Invalid block notifications to dependent services
@@ -560,20 +556,15 @@ Effectively, the following validations are performed:
 
 #### 2.2.6. Transaction Re-presentation Detection
 
-The Block Validation service implements a robust mechanism for detecting re-presented transactions using bloom filters. This mechanism, implemented in the `validOrderAndBlessed` function, is critical for preventing double-spending and ensuring transaction integrity in the blockchain.
+The Block Validation service implements a robust mechanism for detecting re-presented (already-mined) transactions during block processing. This mechanism, implemented in the `validOrderAndBlessed` function (`model/Block.go`), is critical for preventing double-spending and ensuring transaction integrity in the blockchain. Detection relies on **exact block-ID set membership** plus an authoritative RPC fallback — there are no probabilistic bloom filters in this path, and therefore no false-positive/false-negative risk.
 
-![bloom_filter_validation.svg](img/plantuml/blockvalidation/bloom_filter_validation.svg)
+##### Chain-Membership Check
 
-##### Bloom Filter Implementation
+To decide whether a transaction's parents already exist on the current chain, Teranode uses an exact set of block-header IDs rather than a probabilistic filter:
 
-Teranode maintains bloom filters for recent blocks to efficiently detect re-presented transactions:
-
-- **Creation**: Each validated block generates a bloom filter containing all of its transaction hashes
-- **Storage**: Bloom filters are stored in both memory (for active validation) and in the subtree store (for persistence)
-- **Retention**: Filters are maintained for a configurable number of recent blocks (`blockvalidation_bloom_filter_retention_size`)
-- **TTL Ordering**: The system enforces a strict TTL (Time-To-Live) ordering: txmetacache < utxo store < bloom filter
-    - This ensures that even if a transaction is pruned from txmetacache, the bloom filter can still detect its re-presentation
-    - The longer retention period for bloom filters provides an extended window for detecting re-presented transactions
+- **Current-chain ID set**: validation builds a map of the current chain's block-header IDs (`currentBlockHeaderIDsMap`, populated from `GetBlockHeaderIDs`). Membership is exact, so a hit is a sound positive.
+- **Old-parent resolution**: parents that resolve to blocks outside the prefetched set are collected per transaction (`oldBlockIDsMap`) and confirmed by the Block Validation service in `checkOldBlockIDs`, which falls back to the authoritative `CheckBlockIsInCurrentChain` RPC for any block ID not found in the set.
+- **In-memory chain-check route**: when `blockchain_use_in_memory_chain_check` is enabled, every decision is deferred to `CheckBlockIsInCurrentChain`, which the store answers from its in-memory off-chain set without a recursive SQL query.
 
 ##### The validOrderAndBlessed Mechanism
 
@@ -586,8 +577,7 @@ The `validOrderAndBlessed` function performs several critical validations during
 
 2. **Re-presented Transaction Detection**:
 
-    - Efficiently checks if transactions have already been mined in the current chain using bloom filters
-    - For potential matches in the bloom filter (which may include false positives), performs definitive verification against the txMetaStore
+    - Checks whether a transaction's parents have already been mined in the current chain via exact block-ID set membership, falling back to the authoritative `CheckBlockIsInCurrentChain` RPC on a set miss
     - Rejects blocks containing transactions that have already been mined in the current chain
 
 3. **Duplicate Input Prevention**:
