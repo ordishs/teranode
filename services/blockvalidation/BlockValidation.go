@@ -457,8 +457,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 							if notification.Type == model.NotificationType_BlockSubtreesSet {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
-								// push block hash to the setMinedChan
-								bv.setMinedChan <- &cHash
+								// push block hash to the setMinedChan (non-blocking; worker is sole drainer)
+								bv.enqueueSetMined(ctx, &cHash)
 							}
 
 							// Listen for BlockMinedUnset notifications (sent by InvalidateBlock RPC)
@@ -466,8 +466,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 							if notification.Type == model.NotificationType_BlockMinedUnset {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockMinedUnset notification: %s", cHash.String())
-								// push block hash to the setMinedChan for immediate processing
-								bv.setMinedChan <- &cHash
+								// push block hash to the setMinedChan for immediate processing (non-blocking)
+								bv.enqueueSetMined(ctx, &cHash)
 							}
 						}
 					}
@@ -643,8 +643,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 						default:
 						}
 
-						// put the block back in the setMinedChan for retry
-						u.setMinedChan <- blockHash
+						// put the block back in the setMinedChan for retry — non-blocking,
+						// because this runs on the worker goroutine that is the sole drainer
+						// of setMinedChan; a blocking self-send into a full channel wedges it.
+						u.enqueueSetMined(ctx, blockHash)
 						return
 					}
 
@@ -745,15 +747,39 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, _ *errgro
 
 	u.logger.Infof("[BlockValidation:start] found %d blocks mined not set, queuing for serial setMined processing", len(blocksMinedNotSet))
 
-	for _, block := range blocksMinedNotSet {
-		blockHash := block.Hash()
-		select {
-		case <-ctx.Done():
-			return
-		case u.setMinedChan <- blockHash:
-			// Queued for the setMinedChan worker. Worker dedups via MinedSet/tryClaim, so
-			// re-queuing a block that's already in flight or already completed is harmless.
+	// Enqueue the backlog from a background goroutine so start() is never blocked. This
+	// runs during start() BEFORE the setMinedChan worker is launched, and the backlog
+	// (GetBlocksMinedNotSet has no SQL LIMIT) can exceed the channel buffer, so a blocking
+	// send on the caller's goroutine would deadlock boot. One goroutine feeds the worker at
+	// its drain rate (not one per over-buffer block); the worker dedups via MinedSet/tryClaim.
+	go func() {
+		for _, block := range blocksMinedNotSet {
+			select {
+			case <-ctx.Done():
+				return
+			case u.setMinedChan <- block.Hash():
+			}
 		}
+	}()
+}
+
+// enqueueSetMined schedules blockHash for the setMinedChan worker without ever blocking
+// the caller. The worker is the sole drainer of setMinedChan, so a blocking send would
+// wedge mined finalization — most acutely from the worker's own retry path, where a
+// blocking self-send into a full channel deadlocks the one goroutine that drains it. A
+// direct send is attempted first; if the buffer is full the send is completed from a
+// short-lived goroutine that also honours ctx cancellation. The worker dedups via the
+// MinedSet/tryClaim guards, so a re-queued or reordered hash is harmless.
+func (u *BlockValidation) enqueueSetMined(ctx context.Context, blockHash *chainhash.Hash) {
+	select {
+	case u.setMinedChan <- blockHash:
+	default:
+		go func() {
+			select {
+			case <-ctx.Done():
+			case u.setMinedChan <- blockHash:
+			}
+		}()
 	}
 }
 
@@ -1375,7 +1401,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
 			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
-			u.setMinedChan <- block.Header.HashPrevBlock
+			u.enqueueSetMined(ctx, block.Header.HashPrevBlock)
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
 				// Give up, the parent block isn't being fully validated
