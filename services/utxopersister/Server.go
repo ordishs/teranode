@@ -571,6 +571,91 @@ func (s *Server) processNextBlock(ctx context.Context) (time.Duration, error) {
 	return 0, s.writeLastHeight(ctx, s.lastHeight)
 }
 
+// BuildUTXOSetToHeight performs a one-shot consolidation of the per-block
+// utxo-additions/utxo-deletions delta files into a single cumulative utxo-set,
+// from startHeight (0 = genesis) up to endHeight, then returns. Unlike the
+// continuous service loop (processNextBlock) it ignores the confirmation
+// window, builds the exact requested height, and never deletes an existing
+// set. It writes lastProcessed.dat only when updateLastProcessed is true.
+func (s *Server) BuildUTXOSetToHeight(ctx context.Context, startHeight, endHeight uint32, updateLastProcessed bool) error {
+	// Select a header source (store preferred, client fallback), mirroring the
+	// consolidator's own store-or-client selection.
+	var hdrs headerIfc
+
+	switch {
+	case s.blockchainStore != nil:
+		hdrs = s.blockchainStore
+	case s.blockchainClient != nil:
+		hdrs = s.blockchainClient
+	default:
+		return errors.NewProcessingError("[UTXOPersister] no blockchain source available to resolve block headers")
+	}
+
+	// Resolve headers for [from .. endHeight]; from = startHeight when building
+	// on top of an existing set (so we also learn the base block hash), else 1.
+	from := uint32(1)
+	if startHeight > 0 {
+		from = startHeight
+	}
+
+	headers, metas, err := hdrs.GetBlockHeadersByHeight(ctx, from, endHeight)
+	if err != nil {
+		return errors.NewProcessingError("[UTXOPersister] error getting block headers for range %d..%d", from, endHeight, err)
+	}
+
+	hashByHeight := make(map[uint32]*chainhash.Hash, len(headers))
+	for i, h := range headers {
+		hashByHeight[metas[i].Height] = h.Hash()
+	}
+
+	// Determine the seed (base set) hash.
+	var seedHash *chainhash.Hash
+	if startHeight == 0 {
+		seedHash = s.settings.ChainCfgParams.GenesisHash
+	} else {
+		seedHash = hashByHeight[startHeight]
+	}
+
+	// Consolidate the range on top of the seed and write the new set.
+	c := NewConsolidator(s.logger, s.settings, s.blockchainStore, s.blockchainClient, s.blockStore, seedHash)
+
+	if err := c.ConsolidateBlockRange(ctx, startHeight+1, endHeight); err != nil {
+		return errors.NewProcessingError("[UTXOPersister] error consolidating block range %d..%d", startHeight+1, endHeight, err)
+	}
+
+	us, err := GetUTXOSet(ctx, s.logger, s.settings, s.blockStore, seedHash)
+	if err != nil {
+		return errors.NewProcessingError("[UTXOPersister] error getting UTXOSet handle for seed %s", seedHash.String(), err)
+	}
+
+	if err := us.CreateUTXOSet(ctx, c); err != nil {
+		return errors.NewProcessingError("[UTXOPersister] error creating utxo-set for height %d", endHeight, err)
+	}
+
+	targetHash := hashByHeight[endHeight]
+
+	// Write the utxo-headers file when a full blockchain store is available
+	// (always the case in direct mode; skipped for client-only setups, matching
+	// processNextBlock's handling).
+	if s.blockchainStore != nil {
+		if err := WriteHeadersToStore(ctx, s.logger, s.settings, s.blockStore, s.blockchainStore, targetHash, endHeight); err != nil {
+			s.logger.Warnf("[UTXOPersister] error writing headers file for height %d: %v", endHeight, err)
+		}
+	} else {
+		s.logger.Warnf("[UTXOPersister] no blockchain store available; skipping utxo-headers write for height %d", endHeight)
+	}
+
+	if updateLastProcessed {
+		if err := s.writeLastHeight(ctx, endHeight); err != nil {
+			return errors.NewStorageError("[UTXOPersister] error writing lastProcessed height %d", endHeight, err)
+		}
+	}
+
+	s.logger.Infof("[UTXOPersister] Built utxo-set for height %d (%s) from start-height %d, updateLastProcessed=%t", endHeight, targetHash.String(), startHeight, updateLastProcessed)
+
+	return nil
+}
+
 // readLastHeight reads the last processed block height from storage.
 // It attempts to retrieve the height from a special file in the block store.
 // Returns the height as uint32 and any error encountered.
