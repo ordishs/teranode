@@ -234,6 +234,12 @@ func TestBuildUTXOSetToHeight_RejectsBadArguments(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no blockchain source")
 
+	// nil block store, with otherwise-valid arguments and a header source
+	s3 := &Server{logger: ulogger.TestLogger{}, settings: tSettings, blockchainClient: &blockchain.Mock{}, stats: gocore.NewStat("t")}
+	err = s3.BuildUTXOSetToHeight(ctx, 0, 3, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "block store is not initialized")
+
 	_ = headers
 	_ = metas
 }

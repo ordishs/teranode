@@ -7,6 +7,7 @@
 //
 // Functions:
 //   - RunUtxoPersister: The main entry point for initializing and running the UTXO persister service.
+//   - RunUtxoPersisterToHeight: A one-shot entry point that builds the UTXO set up to a specific height and returns.
 //
 // Side effects:
 //
