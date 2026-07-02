@@ -178,8 +178,8 @@ github.com/bsv-blockchain/go-bn v1.1.4 h1:mEOqX7NwBScGbxq5icxbDI0GOQYtjJBz+xC27x
 github.com/bsv-blockchain/go-bn v1.1.4/go.mod h1:qzHqHkPqXc3uDSoFmHsD8uxgkr/POzU8kpIH4Jm/AcM=
 github.com/bsv-blockchain/go-bt/v2 v2.6.7 h1:PrtzDw38VcwM8cnpuxaj0/J5+ZsUsaxdUDD5VeS+mD8=
 github.com/bsv-blockchain/go-bt/v2 v2.6.7/go.mod h1:vv8YoWugxOwZvPAqmNoMwQmhvH6kKUMNTdJhdUv/bak=
-github.com/bsv-blockchain/go-chaincfg v1.5.8 h1:zhmi42r71mAqPChhSVggzzxaseTvLqC+zipyL2fAN0g=
-github.com/bsv-blockchain/go-chaincfg v1.5.8/go.mod h1:n/Q8aGScTgydZ2Bsjfic7v8ulHBIpgI0WVyqE5mFMxU=
+github.com/bsv-blockchain/go-chaincfg v1.6.0 h1:zeZbYqT8qzG6P4GK5hWVjiwaD95itF4qH56Wemve3dI=
+github.com/bsv-blockchain/go-chaincfg v1.6.0/go.mod h1:vapmGFrdTNUxV19XQ6B84gPKqKMPJTJe56D5+TPzDrc=
 github.com/bsv-blockchain/go-lockfree-queue v1.0.0 h1:rizOsTImw2Gk/iSTQRHqB+2OcJWBl5qN6pbIHqDWxRw=
 github.com/bsv-blockchain/go-lockfree-queue v1.0.0/go.mod h1:NS0Zfkaz8G3jDQNNr1rtvjeH45rxK7pVH4iV7xy4o4U=
 github.com/bsv-blockchain/go-p2p-message-bus v0.1.17 h1:StMpAjUQIY9Zx3sfw0+7SWgtUb5YeOLfPdE5Pzhyvas=
@@ -192,8 +192,8 @@ github.com/bsv-blockchain/go-subtree v1.4.2 h1:T6a6r051eTAuYs8D01O8MM8wzRnfkhush
 github.com/bsv-blockchain/go-subtree v1.4.2/go.mod h1:ef+NCE9gION7YIOHdguW3thOlIyyuuxrfDEwv0Ywc3Q=
 github.com/bsv-blockchain/go-tx-map v1.4.1 h1:rY1yuI8O2Ul3ThRBq2l073+oKvLxyXHhKWylZ5G1yf4=
 github.com/bsv-blockchain/go-tx-map v1.4.1/go.mod h1:0k6O94B3SiWhqu8g8JYWMEHRX1tiHsmKQKi7aATcJuM=
-github.com/bsv-blockchain/go-wire v1.2.9 h1:tgCK+INJO/oXT4my7vlfG3pP4LVzuw1Zt0fntAS3jRA=
-github.com/bsv-blockchain/go-wire v1.2.9/go.mod h1:eLiSuzVgwx201OuVvgsVo1x7e36PKMY9vINTixM8zzQ=
+github.com/bsv-blockchain/go-wire v1.2.10 h1:41yQjAkoyK0LMJJHm6Q2tmQ+rYlMT5+LwhX1EQvdJto=
+github.com/bsv-blockchain/go-wire v1.2.10/go.mod h1:qctUCBnZtsoM/e7CfE4UBYCLJSoS+mdXdXpz4Qxbmxo=
 github.com/bsv-blockchain/testcontainers-aerospike-go v0.4.0 h1:/sMNDs+FE9xyXeOyGtnT9d5IeEP1IGizgWUaGwzdg0M=
 github.com/bsv-blockchain/testcontainers-aerospike-go v0.4.0/go.mod h1:ptKddSWHGMWA5Nt7BOUsXwF8qXTUmhw60006I77uKEU=
 github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd h1:R/opQEbFEy9JGkIguV40SvRY1uliPX8ifOvi6ICsFCw=
@@ -945,8 +945,8 @@ github.com/opencontainers/selinux v1.13.1 h1:A8nNeceYngH9Ow++M+VVEwJVpdFmrlxsN22
 github.com/opencontainers/selinux v1.13.1/go.mod h1:S10WXZ/osk2kWOYKy1x2f/eXF5ZHJoUs8UU/2caNRbg=
 github.com/ordishs/go-bitcoin v1.0.88 h1:sfqBOda6HbEx2Ums4l+ZrYQZablt7cTYfsYJqE9J0oA=
 github.com/ordishs/go-bitcoin v1.0.88/go.mod h1:v3amNoOpGHOROlsisXHKsBbsAK2+J2kAhHBbyxgltRA=
-github.com/ordishs/gocore v1.0.81 h1:5egJfLOVrdnK6es2ED1SbXVfEazGSMkpvo1bvvKO8Nc=
-github.com/ordishs/gocore v1.0.81/go.mod h1:8/PDn0aIq7/AQcrGBXHE1rkw8bkd33bwgCo2SXDq09s=
+github.com/ordishs/gocore v1.0.82 h1:jkfvIN4viAYJfKX6gEhuIPVvOn6cWMt0LhN15V5JoiY=
+github.com/ordishs/gocore v1.0.82/go.mod h1:8/PDn0aIq7/AQcrGBXHE1rkw8bkd33bwgCo2SXDq09s=
 github.com/orisano/pixelmatch v0.0.0-20220722002657-fb0b55479cde/go.mod h1:nZgzbfBr3hhjoZnS66nKrHmduYNpc34ny7RK4z5/HM0=
 github.com/outcaste-io/ristretto v0.2.3 h1:AK4zt/fJ76kjlYObOeNwh4T3asEuaCmp26pOvUOL9w0=
 github.com/outcaste-io/ristretto v0.2.3/go.mod h1:W8HywhmtlopSB1jeMg3JtdIhf+DYkLAr0VN/s4+MHac=
