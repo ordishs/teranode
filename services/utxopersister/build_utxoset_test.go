@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/ordishs/gocore"
@@ -367,4 +369,105 @@ func TestBuildUTXOSetToHeight_StartFromExistingSet(t *testing.T) {
 	exists, err := store.Exists(ctx, byH[2][:], fileformat.FileTypeUtxoSet)
 	require.NoError(t, err)
 	require.True(t, exists, "base set at start-height must not be deleted")
+}
+
+// storeChainBlock builds and stores a single valid successor block on the
+// given sqlitememory blockchain store, linking HashPrevBlock to prevHash.
+// Mirrors services/blockchain/median_time_past_test.go's createTestBlockAtHeight:
+// StoreBlock does not verify proof-of-work, so fixed Bits/Nonce values are fine
+// as long as HashPrevBlock correctly chains to the real previous block hash.
+func storeChainBlock(t *testing.T, ctx context.Context, blockchainStore blockchain_store.Store, prevHash *chainhash.Hash, height uint32) *chainhash.Hash {
+	t.Helper()
+
+	coinbaseTx := bt.NewTx()
+	require.NoError(t, coinbaseTx.From("0000000000000000000000000000000000000000000000000000000000000000", 0xffffffff, "", 0))
+
+	heightBytes := []byte{0x03, byte(height & 0xff), byte((height >> 8) & 0xff), byte((height >> 16) & 0xff)}
+	coinbaseTx.Inputs[0].UnlockingScript = bscript.NewFromBytes(heightBytes)
+	coinbaseTx.Inputs[0].SequenceNumber = 0xffffffff
+	require.NoError(t, coinbaseTx.AddP2PKHOutputFromAddress("mrs6FYWPcb441b4qfcEPyvLvzj64WHtwCU", 5000000000))
+
+	merkleRoot := chainhash.HashH(coinbaseTx.Bytes())
+	header := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  prevHash,
+		HashMerkleRoot: &merkleRoot,
+		Timestamp:      1231006505 + height,
+		Bits:           model.NBit{0xff, 0xff, 0x00, 0x1d}, // mainnet genesis bits, PoW is not checked by StoreBlock
+		Nonce:          height,
+	}
+
+	subtreeHash := chainhash.HashH([]byte(fmt.Sprintf("subtree-%d", height)))
+
+	block := &model.Block{
+		Header:           header,
+		CoinbaseTx:       coinbaseTx,
+		Subtrees:         []*chainhash.Hash{&subtreeHash},
+		TransactionCount: 1,
+		SizeInBytes:      1000,
+	}
+
+	_, _, err := blockchainStore.StoreBlock(ctx, block, "")
+	require.NoError(t, err)
+
+	return header.Hash()
+}
+
+// TestBuildUTXOSetToHeight_DirectModeWritesHeaders exercises the real
+// direct-mode production path (blockchainStore != nil), which always runs
+// WriteHeadersToStore. This is the path that panicked in production: the
+// utxo-headers ".sha256" sidecar write used an unregistered fileformat type,
+// so fileformat.NewHeader panicked on every direct-mode run. The blob store
+// must be a real FILE store here (memory.Set ignores WithSkipHeader, so the
+// fix can't be proven against it) - only the file backend actually honours
+// the skip-header option added to WriteHeadersToStore's Set call.
+func TestBuildUTXOSetToHeight_DirectModeWritesHeaders(t *testing.T) {
+	ctx := context.Background()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+
+	fileURL, err := url.Parse("file://" + t.TempDir() + "?disableDAH=true")
+	require.NoError(t, err)
+
+	blockStore, err := blob.NewStore(ulogger.TestLogger{}, fileURL)
+	require.NoError(t, err)
+
+	bcURL, err := url.Parse("sqlitememory:///")
+	require.NoError(t, err)
+
+	// A real sqlitememory blockchain store; genesis is auto-inserted by
+	// NewStore, matching tSettings.ChainCfgParams.
+	blockchainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, bcURL, tSettings)
+	require.NoError(t, err)
+
+	const numBlocks = uint32(3)
+
+	prevHash := genesis
+	for h := uint32(1); h <= numBlocks; h++ {
+		prevHash = storeChainBlock(t, ctx, blockchainStore, prevHash, h)
+	}
+
+	headers, _, err := blockchainStore.GetBlockHeadersByHeight(ctx, 1, numBlocks)
+	require.NoError(t, err)
+	require.Len(t, headers, int(numBlocks))
+
+	for i, hdr := range headers {
+		height := uint32(i + 1) //nolint:gosec // i bounded by numBlocks (3), no overflow risk
+		stageBlockDeltas(t, ctx, tSettings, blockStore, hdr.Hash(), height, p2pkhTx(t, byte(0x10+height), uint64(height)*1000))
+	}
+
+	s, err := NewDirect(ctx, ulogger.TestLogger{}, tSettings, blockStore, blockchainStore)
+	require.NoError(t, err)
+
+	require.NoError(t, s.BuildUTXOSetToHeight(ctx, 0, numBlocks, false))
+
+	tipHash := headers[numBlocks-1].Hash()
+
+	exists, err := blockStore.Exists(ctx, tipHash[:], fileformat.FileTypeUtxoSet)
+	require.NoError(t, err)
+	require.True(t, exists, "utxo-set file must be written")
+
+	exists, err = blockStore.Exists(ctx, tipHash[:], fileformat.FileTypeUtxoHeaders)
+	require.NoError(t, err)
+	require.True(t, exists, "utxo-headers file must be written")
 }

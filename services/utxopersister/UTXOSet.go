@@ -935,7 +935,7 @@ func WriteHeadersToStore(ctx context.Context, logger ulogger.Logger, settings *s
 
 	hashData := fmt.Sprintf("%x  %s\n", hasher.Sum(nil), tipHash.String()+".utxo-headers")
 
-	if err = blobStore.Set(ctx, tipHash[:], fileformat.FileTypeUtxoHeaders+".sha256", []byte(hashData), options.WithAllowOverwrite(true)); err != nil {
+	if err = blobStore.Set(ctx, tipHash[:], fileformat.FileTypeUtxoHeaders+".sha256", []byte(hashData), options.WithAllowOverwrite(true), options.WithSkipHeader(true)); err != nil {
 		return errors.NewStorageError("error writing hash file", err)
 	}
 
