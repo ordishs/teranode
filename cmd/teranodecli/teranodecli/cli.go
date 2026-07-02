@@ -201,8 +201,29 @@ func Start(args []string, version, commit string) {
 				logger, tSettings, *kafkaURL, *txid, *namespace, *set, *statsInterval)
 		}
 	case "utxopersister":
+		endHeight := cmd.FlagSet.Uint("end-height", 0,
+			"Build the UTXO set up to this block height and exit (one-shot). 0 = run the service.")
+		startHeight := cmd.FlagSet.Uint("start-height", 0,
+			"Start the one-shot build on top of the existing utxo-set at this height (0 = genesis). Requires --end-height.")
+		updateLastProcessed := cmd.FlagSet.Bool("update-last-processed", false,
+			"After a one-shot build, write lastProcessed.dat = end-height so a later service start resumes there.")
+
 		cmd.Execute = func(args []string) error {
+			if *endHeight > 0 {
+				if *startHeight >= *endHeight {
+					return errors.NewProcessingError("--start-height (%d) must be less than --end-height (%d)", *startHeight, *endHeight)
+				}
+
+				return utxopersister.RunUtxoPersisterToHeight(logger, tSettings,
+					uint32(*startHeight), uint32(*endHeight), *updateLastProcessed)
+			}
+
+			if *startHeight > 0 || *updateLastProcessed {
+				return errors.NewProcessingError("--start-height / --update-last-processed require --end-height")
+			}
+
 			utxopersister.RunUtxoPersister(logger, tSettings)
+
 			return nil
 		}
 	case "seeder":
