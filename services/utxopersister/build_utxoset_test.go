@@ -11,12 +11,14 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -204,4 +206,159 @@ func TestBuildUTXOSetToHeight_UpdatesLastProcessedWhenAsked(t *testing.T) {
 	h, err := s.readLastHeight(ctx)
 	require.NoError(t, err)
 	require.Equal(t, uint32(2), h)
+}
+
+func TestBuildUTXOSetToHeight_RejectsBadArguments(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+
+	headers, metas, _ := buildChainHeaders(t, genesis, 3)
+
+	// endHeight < 1
+	s0 := New(ctx, ulogger.TestLogger{}, tSettings, store, &blockchain.Mock{})
+	err := s0.BuildUTXOSetToHeight(ctx, 0, 0, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "end height")
+
+	// startHeight >= endHeight
+	s1 := New(ctx, ulogger.TestLogger{}, tSettings, store, &blockchain.Mock{})
+	err = s1.BuildUTXOSetToHeight(ctx, 3, 3, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "start height")
+
+	// no header source at all
+	s2 := &Server{logger: ulogger.TestLogger{}, settings: tSettings, blockStore: store, stats: gocore.NewStat("t")}
+	err = s2.BuildUTXOSetToHeight(ctx, 0, 3, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no blockchain source")
+
+	_ = headers
+	_ = metas
+}
+
+func TestBuildUTXOSetToHeight_ChainTooShort(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+
+	// Chain only reaches height 2, but caller requests 3.
+	headers, metas, byH := buildChainHeaders(t, genesis, 2)
+	stageBlockDeltas(t, ctx, tSettings, store, byH[1], 1, p2pkhTx(t, 0x11, 1000))
+	stageBlockDeltas(t, ctx, tSettings, store, byH[2], 2, p2pkhTx(t, 0x22, 2000))
+
+	s, _ := newBuilderServer(t, store, headers, metas, 1, 3)
+
+	err := s.BuildUTXOSetToHeight(ctx, 0, 3, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "only reaches height 2")
+}
+
+func TestBuildUTXOSetToHeight_MissingDeltasFailsBeforeWriting(t *testing.T) {
+	ctx := context.Background()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+	headers, metas, byH := buildChainHeaders(t, genesis, 3)
+
+	// Missing utxo-additions (block 3 not staged at all).
+	t.Run("missing additions", func(t *testing.T) {
+		store := memory.New()
+		stageBlockDeltas(t, ctx, tSettings, store, byH[1], 1, p2pkhTx(t, 0x11, 1000))
+		stageBlockDeltas(t, ctx, tSettings, store, byH[2], 2, p2pkhTx(t, 0x22, 2000))
+
+		s, _ := newBuilderServer(t, store, headers, metas, 1, 3)
+		err := s.BuildUTXOSetToHeight(ctx, 0, 3, false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "utxo-additions")
+
+		exists, err := store.Exists(ctx, byH[3][:], fileformat.FileTypeUtxoSet)
+		require.NoError(t, err)
+		require.False(t, exists, "no set should be written when the range is incomplete")
+	})
+
+	// Missing utxo-deletions specifically (delete just that file after staging).
+	t.Run("missing deletions", func(t *testing.T) {
+		store := memory.New()
+		stageBlockDeltas(t, ctx, tSettings, store, byH[1], 1, p2pkhTx(t, 0x11, 1000))
+		stageBlockDeltas(t, ctx, tSettings, store, byH[2], 2, p2pkhTx(t, 0x22, 2000))
+		stageBlockDeltas(t, ctx, tSettings, store, byH[3], 3, p2pkhTx(t, 0x33, 3000))
+		require.NoError(t, store.Del(ctx, byH[2][:], fileformat.FileTypeUtxoDeletions))
+
+		s, _ := newBuilderServer(t, store, headers, metas, 1, 3)
+		err := s.BuildUTXOSetToHeight(ctx, 0, 3, false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "utxo-deletions")
+
+		exists, err := store.Exists(ctx, byH[3][:], fileformat.FileTypeUtxoSet)
+		require.NoError(t, err)
+		require.False(t, exists)
+	})
+}
+
+func TestBuildUTXOSetToHeight_MissingBaseSet(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+
+	headers, metas, byH := buildChainHeaders(t, genesis, 3)
+	stageBlockDeltas(t, ctx, tSettings, store, byH[3], 3, p2pkhTx(t, 0x33, 3000))
+
+	// Request start-height 2 with no set@2 present.
+	s, _ := newBuilderServer(t, store, headers, metas, 2, 3)
+	err := s.BuildUTXOSetToHeight(ctx, 2, 3, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no utxo-set found at start-height 2")
+	_ = byH
+}
+
+func TestBuildUTXOSetToHeight_StartFromExistingSet(t *testing.T) {
+	ctx := context.Background()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+	headers, metas, byH := buildChainHeaders(t, genesis, 3)
+
+	tx1 := p2pkhTx(t, 0x11, 1000)
+	tx2 := p2pkhTx(t, 0x22, 2000)
+	tx3 := p2pkhTx(t, 0x33, 3000)
+
+	// Reference: single-pass genesis -> 3.
+	refStore := memory.New()
+	stageBlockDeltas(t, ctx, tSettings, refStore, byH[1], 1, tx1)
+	stageBlockDeltas(t, ctx, tSettings, refStore, byH[2], 2, tx2)
+	stageBlockDeltas(t, ctx, tSettings, refStore, byH[3], 3, tx3)
+	refS, _ := newBuilderServer(t, refStore, headers, metas, 1, 3)
+	require.NoError(t, refS.BuildUTXOSetToHeight(ctx, 0, 3, false))
+	want := readSetUTXOs(t, ctx, tSettings, refStore, byH[3])
+
+	// Incremental: genesis -> 2, then 2 -> 3.
+	store := memory.New()
+	stageBlockDeltas(t, ctx, tSettings, store, byH[1], 1, tx1)
+	stageBlockDeltas(t, ctx, tSettings, store, byH[2], 2, tx2)
+	stageBlockDeltas(t, ctx, tSettings, store, byH[3], 3, tx3)
+
+	h012, m012, _ := buildChainHeaders(t, genesis, 2)
+	s1, _ := newBuilderServer(t, store, h012, m012, 1, 2)
+	require.NoError(t, s1.BuildUTXOSetToHeight(ctx, 0, 2, false))
+
+	// s2 resolves headers twice: BuildUTXOSetToHeight fetches [2..3] to learn
+	// the base hash and run the pre-flight, and ConsolidateBlockRange
+	// independently fetches [3..3]. Stub both ranges with correct slices.
+	// buildChainHeaders returns index 0 = height 1, so headers[1:3] = heights
+	// 2,3 and headers[2:3] = height 3.
+	mock2 := &blockchain.Mock{}
+	mock2.On("GetBlockHeadersByHeight", mock.Anything, uint32(2), uint32(3)).Return(headers[1:3], metas[1:3], nil)
+	mock2.On("GetBlockHeadersByHeight", mock.Anything, uint32(3), uint32(3)).Return(headers[2:3], metas[2:3], nil)
+	s2 := New(ctx, ulogger.TestLogger{}, tSettings, store, mock2)
+	require.NoError(t, s2.BuildUTXOSetToHeight(ctx, 2, 3, false))
+
+	got := readSetUTXOs(t, ctx, tSettings, store, byH[3])
+	require.Equal(t, want, got, "incremental 0->2->3 must equal single-pass 0->3")
+
+	// Base set at height 2 must be preserved (not deleted).
+	exists, err := store.Exists(ctx, byH[2][:], fileformat.FileTypeUtxoSet)
+	require.NoError(t, err)
+	require.True(t, exists, "base set at start-height must not be deleted")
 }

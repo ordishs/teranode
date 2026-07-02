@@ -578,6 +578,18 @@ func (s *Server) processNextBlock(ctx context.Context) (time.Duration, error) {
 // window, builds the exact requested height, and never deletes an existing
 // set. It writes lastProcessed.dat only when updateLastProcessed is true.
 func (s *Server) BuildUTXOSetToHeight(ctx context.Context, startHeight, endHeight uint32, updateLastProcessed bool) error {
+	if endHeight < 1 {
+		return errors.NewProcessingError("[UTXOPersister] end height must be >= 1, got %d", endHeight)
+	}
+
+	if startHeight >= endHeight {
+		return errors.NewProcessingError("[UTXOPersister] start height %d must be less than end height %d", startHeight, endHeight)
+	}
+
+	if s.blockStore == nil {
+		return errors.NewStorageError("[UTXOPersister] block store is not initialized")
+	}
+
 	// Select a header source (store preferred, client fallback), mirroring the
 	// consolidator's own store-or-client selection.
 	var hdrs headerIfc
@@ -608,12 +620,55 @@ func (s *Server) BuildUTXOSetToHeight(ctx context.Context, startHeight, endHeigh
 		hashByHeight[metas[i].Height] = h.Hash()
 	}
 
-	// Determine the seed (base set) hash.
+	if _, ok := hashByHeight[endHeight]; !ok {
+		var maxAvailable uint32
+		for h := range hashByHeight {
+			if h > maxAvailable {
+				maxAvailable = h
+			}
+		}
+
+		return errors.NewProcessingError("[UTXOPersister] requested end-height %d but active chain only reaches height %d", endHeight, maxAvailable)
+	}
+
 	var seedHash *chainhash.Hash
+
 	if startHeight == 0 {
 		seedHash = s.settings.ChainCfgParams.GenesisHash
 	} else {
 		seedHash = hashByHeight[startHeight]
+		if seedHash == nil {
+			return errors.NewProcessingError("[UTXOPersister] could not resolve block hash at start-height %d", startHeight)
+		}
+
+		exists, err := s.blockStore.Exists(ctx, seedHash[:], fileformat.FileTypeUtxoSet)
+		if err != nil {
+			return errors.NewStorageError("[UTXOPersister] error checking base utxo-set at start-height %d (%s)", startHeight, seedHash.String(), err)
+		}
+
+		if !exists {
+			return errors.NewProcessingError("[UTXOPersister] no utxo-set found at start-height %d (%s) - build it first", startHeight, seedHash.String())
+		}
+	}
+
+	// Pre-flight: require BOTH delta files for every block in
+	// [startHeight+1 .. endHeight]. Fail before writing anything on any gap.
+	for height := startHeight + 1; height <= endHeight; height++ {
+		hash := hashByHeight[height]
+		if hash == nil {
+			return errors.NewProcessingError("[UTXOPersister] could not resolve block hash at height %d", height)
+		}
+
+		for _, ft := range []fileformat.FileType{fileformat.FileTypeUtxoAdditions, fileformat.FileTypeUtxoDeletions} {
+			exists, err := s.blockStore.Exists(ctx, hash[:], ft)
+			if err != nil {
+				return errors.NewStorageError("[UTXOPersister] error checking %s for block %d (%s)", ft, height, hash.String(), err)
+			}
+
+			if !exists {
+				return errors.NewProcessingError("[UTXOPersister] requested end-height %d but block %d (%s) is missing its %s file", endHeight, height, hash.String(), ft)
+			}
+		}
 	}
 
 	// Consolidate the range on top of the seed and write the new set.
