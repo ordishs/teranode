@@ -231,7 +231,7 @@ func Start(args []string, version, commit string) {
 		hash := cmd.FlagSet.String("hash", "", "Hash of the UTXO set / headers to process.")
 		skipHeaders := cmd.FlagSet.Bool("skipHeaders", false, "Skip processing headers.")
 		skipUTXOs := cmd.FlagSet.Bool("skipUTXOs", false, "Skip processing UTXOs.")
-		force := cmd.FlagSet.Bool("force", false, "Force processing even if lastProcessed.dat exists.")
+		force := cmd.FlagSet.Bool("force", false, "Force processing even if lastProcessed.dat or BlockAssembler state already exists.")
 		cmd.Execute = func(args []string) error {
 			if *inputDir == "" {
 				return errors.NewProcessingError("Please provide an inputDir")

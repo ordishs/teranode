@@ -1282,19 +1282,12 @@ func (b *BlockAssembler) initState(ctx context.Context) error {
 //   - uint32: Current block height
 //   - error: Any error encountered during state retrieval
 func (b *BlockAssembler) GetState(ctx context.Context) (*model.BlockHeader, uint32, error) {
-	state, err := b.blockchainClient.GetState(ctx, "BlockAssembler")
+	state, err := b.blockchainClient.GetState(ctx, StateKey)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	bestBlockHeight := binary.LittleEndian.Uint32(state[:4])
-
-	bestBlockHeader, err := model.NewBlockHeaderFromBytes(state[4:])
-	if err != nil {
-		return nil, 0, err
-	}
-
-	return bestBlockHeader, bestBlockHeight, nil
+	return DecodeState(state)
 }
 
 // SetState persists the current state of the block assembler to the blockchain.
@@ -1310,15 +1303,9 @@ func (b *BlockAssembler) SetState(ctx context.Context) error {
 		return errors.NewError("bestBlockHeader is nil")
 	}
 
-	blockHeaderBytes := blockHeader.Bytes()
-
-	state := make([]byte, 4+len(blockHeaderBytes))
-	binary.LittleEndian.PutUint32(state[:4], blockHeight)
-	state = append(state[:4], blockHeaderBytes...)
-
 	b.logger.Debugf("[BlockAssembler] setting state: %d: %s", blockHeight, blockHeader.Hash())
 
-	return b.blockchainClient.SetState(ctx, "BlockAssembler", state)
+	return b.blockchainClient.SetState(ctx, StateKey, EncodeState(blockHeader, blockHeight))
 }
 
 func (b *BlockAssembler) SetStateChangeCh(ch chan BestBlockInfo) {
