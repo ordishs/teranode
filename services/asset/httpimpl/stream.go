@@ -38,20 +38,26 @@ import (
 //
 // # Caller contract
 //
-// streamOrAbort always returns nil to its echo caller, even on streaming
-// failure — once we hijack the connection we own it, and any further
-// writes from echo's after-handler middleware would either fail or escape
-// our control. Returning nil to echo signals "response already finalised,
-// don't touch it." The error from io.Copy is consumed inside this helper
-// (an abrupt hijack + close is sufficient signalling to the client, which
-// will surface the truncation as io.ErrUnexpectedEOF in its body parse).
+// On the happy path, and on a streaming failure where the hijack succeeds,
+// streamOrAbort returns nil to its echo caller — once we hijack the
+// connection we own it, and any further writes from echo's after-handler
+// middleware would either fail or escape our control. Returning nil to
+// echo signals "response already finalised, don't touch it." The error
+// from io.Copy is consumed inside this helper (an abrupt hijack + close
+// is sufficient signalling to the client, which will surface the
+// truncation as io.ErrUnexpectedEOF in its body parse).
 //
-// The Hijacker assertion succeeds in production: echo's *Response wraps
-// the standard library's http.ResponseWriter, which implements Hijacker
-// on both HTTP/1.x and HTTP/2 (via http2.responseWriter). If for any
-// reason the cast fails, we fall back to letting echo's normal error
-// path run — this is strictly safer than panicking, even if it means
-// the original cache-corruption bug can re-occur on that exotic path.
+// # HTTP/2 limitation
+//
+// Hijacking is only supported on HTTP/1.x. On HTTP/2, echo's
+// Response.Hijack (which delegates to http.ResponseController.Hijack)
+// returns http.ErrNotSupported — it does not panic — and we fall through
+// to returning the io.Copy error. The response is already committed at
+// that point, so echo's error handler only logs it; but the connection is
+// closed cleanly and the cache-bypass guarantee does NOT hold on h2. In
+// production the asset service sits behind an HTTP/1.1 nginx, so the
+// hijack path is the one that runs; only a client (or caching proxy)
+// speaking h2 directly to the asset service hits the fallback.
 func streamOrAbort(c echo.Context, code int, contentType string, r io.Reader) error {
 	h := c.Response().Header()
 	h.Set(echo.HeaderContentType, contentType)
@@ -71,9 +77,9 @@ func streamOrAbort(c echo.Context, code int, contentType string, r io.Reader) er
 		return nil
 	}
 
-	// Hijack unsupported — fall back to surfacing the io.Copy error so
-	// echo can run its normal error path. In this case the cache-bypass
-	// guarantee no longer holds, but this branch should never fire under
-	// the standard echo + net/http stack in production.
+	// Hijack unsupported (HTTP/2 — see the doc comment) — fall back to
+	// surfacing the io.Copy error so echo logs it. The response is already
+	// committed, so echo's error handler won't write to it; the cache-bypass
+	// guarantee does not hold on this path.
 	return copyErr
 }

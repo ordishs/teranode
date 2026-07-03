@@ -229,29 +229,6 @@ func (m *MockStore) ProcessExpiredPreservations(ctx context.Context, currentHeig
 	return args.Error(0)
 }
 
-// MockIterator implements utxo.UnminedTxIterator for testing
-type MockIterator struct {
-	mock.Mock
-}
-
-func (m *MockIterator) Next(ctx context.Context) ([]*utxo.UnminedTransaction, error) {
-	args := m.Called(ctx)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-	return args.Get(0).([]*utxo.UnminedTransaction), args.Error(1)
-}
-
-func (m *MockIterator) Err() error {
-	args := m.Called()
-	return args.Error(0)
-}
-
-func (m *MockIterator) Close() error {
-	args := m.Called()
-	return args.Error(0)
-}
-
 // Helper functions for creating test data
 func createTestHash(nonce byte) *chainhash.Hash {
 	hash := &chainhash.Hash{}
@@ -592,7 +569,7 @@ func TestGetUnminedTxIterator(t *testing.T) {
 	mockStore := &MockStore{}
 	store := New(context.Background(), logger, mockStore).(*Store)
 
-	mockIterator := &MockIterator{}
+	mockIterator := &utxo.MockUnminedTxIterator{}
 	expectedErr := errors.NewError("iterator error")
 
 	mockStore.On("GetUnminedTxIterator").Return(mockIterator, expectedErr)
@@ -1065,7 +1042,7 @@ func TestGetUnminedTxIteratorPassthrough(t *testing.T) {
 	mockStore := &MockStore{}
 	store := New(context.Background(), logger, mockStore).(*Store)
 
-	mockIterator := &MockIterator{}
+	mockIterator := &utxo.MockUnminedTxIterator{}
 	mockStore.On("GetUnminedTxIterator").Return(mockIterator, nil)
 
 	iterator, err := store.GetUnminedTxIterator()

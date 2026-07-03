@@ -5081,6 +5081,11 @@ func TestBlock_EmptyBlock_DiskMapDirs(t *testing.T) {
 			require.NoError(t, err)
 			require.Zero(t, block.TransactionCount)
 
+			// checkDuplicateTransactions allocates block.txMap (mmap-backed
+			// DiskTxMapUint64 when dirs are set); release it on all paths so
+			// the mmap files/fds are freed and TempDir cleanup stays reliable.
+			defer block.releaseTxMap()
+
 			ctx := context.Background()
 			logger := ulogger.TestLogger{}
 			dirs := tc.dirs(t)

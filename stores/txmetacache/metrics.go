@@ -183,7 +183,6 @@ func initPrometheusMetrics() {
 // 2. Performance metrics:
 //   - hits: Number of successful retrievals from the cache
 //   - misses: Number of failed retrievals that had to fall back to the underlying store
-//   - hit_old_tx: Count of cache hits for transactions deemed too old to use
 //
 // 3. Throughput metrics:
 //   - insertions: Total number of entries added to the cache since startup

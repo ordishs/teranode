@@ -3,7 +3,6 @@ package httpimpl
 import (
 	"bytes"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,15 +19,12 @@ import (
 // supplied error on the next Read. Used to drive streamOrAbort's
 // failure path with a deterministic mid-stream error.
 type errReader struct {
-	prefix    []byte
-	err       error
-	consumed  bool
-	readCalls int
+	prefix   []byte
+	err      error
+	consumed bool
 }
 
 func (e *errReader) Read(p []byte) (int, error) {
-	e.readCalls++
-
 	if !e.consumed {
 		n := copy(p, e.prefix)
 		e.consumed = true
@@ -172,8 +168,3 @@ func TestStreamOrAbort_FailureConnIsActuallyClosed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "still alive", string(body2))
 }
-
-// ensureNetConnSentinel keeps the imports used so the file's intent is
-// explicit — net.Conn is what Hijack returns, and httptest.NewServer
-// gives us a real TCP listener the server runs against.
-var _ net.Conn = (net.Conn)(nil)
