@@ -374,7 +374,7 @@ The system accepts new blocks before completing full validation, provisionally a
 
 ### Already-Mined / Chain-Membership Check
 
-To detect re-presented (already-mined) transactions, the Block Validation Service checks whether a transaction's parents already exist on the current chain using **exact block-ID set membership**, not a probabilistic filter. Validation builds a set of the current chain's block-header IDs (from `GetBlockHeaderIDs`); parents that fall outside this prefetched set are confirmed via the authoritative `CheckBlockIsInCurrentChain` RPC. Because membership is exact there are no false positives or false negatives in this path. See `checkOldBlockIDs` and `validOrderAndBlessed` for details.
+Two exact (non-probabilistic) checks cover parent availability and re-presented transactions. During `Block.Valid()`, `validOrderAndBlessed` verifies that each transaction's parents already exist on the current chain using **exact block-ID set membership**: validation builds a bounded window of recent current-chain block-header IDs, and parents that fall outside this prefetched set are confirmed via the authoritative `CheckBlockIsInCurrentChain` RPC (see `checkOldBlockIDs` and `validOrderAndBlessed`). The rejection of transactions that have *themselves* already been mined on the current chain happens in `model.UpdateTxMinedStatus` during the set-mined phase — a fast path against a map of current-chain block IDs, with a `CheckBlockIsAncestorOfBlock` RPC slow path for older block IDs. Because membership is exact in both paths there are no false positives or false negatives.
 
 ## Service Configuration
 

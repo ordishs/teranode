@@ -290,7 +290,7 @@ The catchup process maintains detailed metrics on peer behavior to detect and mi
 
 The system detects and records:
 
-1. **Secret Mining**: Common ancestor more than `secret_mining_threshold` blocks behind (default: 10)
+1. **Secret Mining**: Common ancestor more than `blockvalidation_secret_mining_threshold` blocks behind (default: coinbase maturity − 1, i.e. 99)
 2. **Coinbase Maturity Violation**: Fork depth exceeds coinbase maturity (default: 100 blocks)
 3. **Invalid Block Propagation**: Blocks that fail consensus validation (PoW, merkle root, timestamps)
 4. **Checkpoint Mismatch**: Peer provides chain with incorrect checkpoint hashes
@@ -556,15 +556,15 @@ Effectively, the following validations are performed:
 
 #### 2.2.6. Transaction Re-presentation Detection
 
-The Block Validation service implements a robust mechanism for detecting re-presented (already-mined) transactions during block processing. This mechanism, implemented in the `validOrderAndBlessed` function (`model/Block.go`), is critical for preventing double-spending and ensuring transaction integrity in the blockchain. Detection relies on **exact block-ID set membership** plus an authoritative RPC fallback — there are no probabilistic bloom filters in this path, and therefore no false-positive/false-negative risk.
+The Block Validation service detects re-presented (already-mined) transactions during block processing through two related mechanisms. During `Block.Valid()`, the `validOrderAndBlessed` function (`model/Block.go`) verifies **parent chain-membership**: each transaction's parents must either appear earlier in the same block or already be mined on the current chain, and blocks whose transactions have unknown or forked-off parents are rejected. The rejection of transactions that have *themselves* already been mined on the current chain happens after block validation, in `model.UpdateTxMinedStatus` (invoked from the Block Validation set-mined path): a fast path compares each transaction's existing block IDs against a map of current-chain block IDs, with a `CheckBlockIsAncestorOfBlock` RPC slow path for older block IDs. Both mechanisms rely on **exact block-ID set membership** plus an authoritative RPC fallback — there are no probabilistic bloom filters in either path, and therefore no false-positive/false-negative risk.
 
 ##### Chain-Membership Check
 
-To decide whether a transaction's parents already exist on the current chain, Teranode uses an exact set of block-header IDs rather than a probabilistic filter:
+To decide whether a transaction's parents already exist on the current chain (the `validOrderAndBlessed` side of the detection), Teranode uses an exact set of block-header IDs rather than a probabilistic filter:
 
-- **Current-chain ID set**: validation builds a map of the current chain's block-header IDs (`currentBlockHeaderIDsMap`, populated from `GetBlockHeaderIDs`). Membership is exact, so a hit is a sound positive.
-- **Old-parent resolution**: parents that resolve to blocks outside the prefetched set are collected per transaction (`oldBlockIDsMap`) and confirmed by the Block Validation service in `checkOldBlockIDs`, which falls back to the authoritative `CheckBlockIsInCurrentChain` RPC for any block ID not found in the set.
-- **In-memory chain-check route**: when `blockchain_use_in_memory_chain_check` is enabled, Block Validation holds no local prefetched ID set and defers every distinct parent-block-ID set to the authoritative `CheckBlockIsInCurrentChain`. The store applies `maxBlockID` as an in-memory upper-bound reject for uncommitted / too-new IDs, then confirms the remaining committed candidates in SQL — an `on_main_chain` flag query, with the recursive `parent_id` CTE as the fallback on the about-to-reject path and while the on-chain set is rebuilding.
+- **Current-chain ID set**: validation builds a map of the current chain's block-header IDs (`currentBlockHeaderIDsMap`). The IDs come from `GetBlockHeaderIDs` on the optimistic-mining path and from `GetBlockHeaders` metadata on the normal and revalidation paths; in every case the set is a bounded window of recent headers (100 by default), not the whole chain. Membership is exact, so a hit is a sound positive.
+- **Old-parent resolution**: parents that resolve to blocks outside the prefetched set are collected per transaction (`oldBlockIDsMap`) and confirmed by the Block Validation service in `checkOldBlockIDs`, which prefetches a window of up to 10,000 recent current-chain block-header IDs via `GetBlockHeaderIDs`. Because that window is truncated, any block ID not found in it falls back to the authoritative `CheckBlockIsInCurrentChain` RPC — the bounded window is the reason the fallback exists.
+- **In-memory chain-check route**: when `blockchain_use_in_memory_chain_check` is enabled, Block Validation holds no local prefetched ID set and defers every distinct parent-block-ID set to the authoritative `CheckBlockIsInCurrentChain`. The store applies `maxBlockID` as an in-memory upper-bound reject for uncommitted / too-new IDs, then confirms the remaining committed candidates in SQL — an `on_main_chain` flag query, with the recursive `parent_id` CTE as the fallback on the about-to-reject path and while the store's main-chain state (the `on_main_chain` flags and off-chain block-ID set) is rebuilding.
 
 ##### The validOrderAndBlessed Mechanism
 
@@ -575,15 +575,15 @@ The `validOrderAndBlessed` function performs several critical validations during
     - Ensures child transactions appear after their parent transactions within the same block
     - For each transaction, verifies that all of its parent transactions either appear earlier in the same block or exist in a previous block on the current chain
 
-2. **Re-presented Transaction Detection**:
+2. **Parent Chain-Membership Validation**:
 
     - Checks whether a transaction's parents have already been mined in the current chain via exact block-ID set membership, falling back to the authoritative `CheckBlockIsInCurrentChain` RPC on a set miss
-    - Rejects blocks containing transactions that have already been mined in the current chain
+    - Rejects blocks containing transactions whose parents are neither earlier in the block nor on the current chain
+    - Note: transactions that have *themselves* already been mined are rejected separately, in `model.UpdateTxMinedStatus` during the set-mined phase (see above)
 
 3. **Duplicate Input Prevention**:
 
     - Tracks all inputs being spent within the block to detect duplicate spends
-    - If a transaction is found to be already mined in another block on the same chain, the new block is marked as invalid
     - Ensures no two transactions in the block spend the same input
 
 4. **Orphaned Transaction Prevention**:
@@ -591,7 +591,7 @@ The `validOrderAndBlessed` function performs several critical validations during
     - Verifies that parent transactions of each transaction either exist in the current block (before the child) or in a previous block on the current chain
     - Prevents situations where transactions depend on parents that don't exist or aren't accessible
 
-This comprehensive validation mechanism operates with high concurrency (configurable via `block_validOrderAndBlessedConcurrency`) to maintain performance while ensuring the integrity of the blockchain by preventing double-spends and transaction re-presentations.
+This comprehensive validation mechanism operates with high concurrency (configurable via `block_validOrderAndBlessedConcurrency`) to maintain performance while ensuring the integrity of the blockchain by preventing in-block double-spends and enforcing parent availability; re-presented transactions are caught by the separate `UpdateTxMinedStatus` check described above.
 
 #### 2.2.7. Fork Management and Chain Reorganization
 
@@ -743,7 +743,7 @@ The Block Validation service implements comprehensive peer quality tracking to d
 
 The service detects potential secret mining attacks during catchup by checking if:
 
-- Common ancestor is more than `blockvalidation_secret_mining_threshold` blocks behind current tip (default: 10)
+- Common ancestor is more than `blockvalidation_secret_mining_threshold` blocks behind current tip (default: coinbase maturity − 1, i.e. 99)
 - Peer withheld blocks to build a secret chain
 - Fork depth exceeds expected values for honest mining
 
