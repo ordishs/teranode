@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 
 	"github.com/bsv-blockchain/teranode/cmd/aerospikekafkaconnector"
 	"github.com/bsv-blockchain/teranode/cmd/aerospikereader"
@@ -201,9 +202,9 @@ func Start(args []string, version, commit string) {
 				logger, tSettings, *kafkaURL, *txid, *namespace, *set, *statsInterval)
 		}
 	case "utxopersister":
-		endHeight := cmd.FlagSet.Uint("end-height", 0,
+		endHeight := uint32Flag(cmd.FlagSet, "end-height", 0,
 			"Build the UTXO set up to this block height and exit (one-shot). 0 = run the service.")
-		startHeight := cmd.FlagSet.Uint("start-height", 0,
+		startHeight := uint32Flag(cmd.FlagSet, "start-height", 0,
 			"Start the one-shot build on top of the existing utxo-set at this height (0 = genesis). Requires --end-height.")
 		updateLastProcessed := cmd.FlagSet.Bool("update-last-processed", false,
 			"After a one-shot build, write lastProcessed.dat = end-height so a later service start resumes there.")
@@ -215,7 +216,7 @@ func Start(args []string, version, commit string) {
 				}
 
 				return utxopersister.RunUtxoPersisterToHeight(logger, tSettings,
-					uint32(*startHeight), uint32(*endHeight), *updateLastProcessed)
+					*startHeight, *endHeight, *updateLastProcessed)
 			}
 
 			if *startHeight > 0 || *updateLastProcessed {
@@ -582,4 +583,32 @@ func formatSatoshis(satoshis uint64) string {
 	}
 
 	return string(result)
+}
+
+// uint32Value is a flag.Value that parses into a uint32, rejecting values
+// outside the uint32 range at parse time rather than silently truncating.
+type uint32Value uint32
+
+func (u *uint32Value) Set(s string) error {
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return err
+	}
+
+	*u = uint32Value(n)
+
+	return nil
+}
+
+func (u *uint32Value) String() string {
+	return strconv.FormatUint(uint64(*u), 10)
+}
+
+// uint32Flag registers a uint32-typed flag on fs and returns a pointer to its value.
+func uint32Flag(fs *flag.FlagSet, name string, value uint32, usage string) *uint32 {
+	p := new(uint32)
+	*p = value
+	fs.Var((*uint32Value)(p), name, usage)
+
+	return p
 }
