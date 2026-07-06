@@ -1092,8 +1092,8 @@ func TestCatchup(t *testing.T) {
 		// Mock GetBlockHeight to return our current height
 		mockUTXOStore.On("GetBlockHeight").Return(currentHeight)
 
-		// Local chain carries far more validated work than the deep fork offers,
-		// so the deep fork with no extra work is genuine secret mining.
+		// Local chain carries far more validated work than the deep fork offers, and the
+		// depth trigger reads its tip from this same best header (height = currentHeight).
 		mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).Return(
 			&model.BlockHeader{},
 			&model.BlockHeaderMeta{Height: currentHeight, ChainWork: new(big.Int).SetInt64(1_000_000).Bytes()},
@@ -1111,8 +1111,9 @@ func TestCatchup(t *testing.T) {
 			ChainWork: new(big.Int).SetInt64(1_000).Bytes(),
 		}
 
-		// Peer offers no additional work beyond the ancestor: shorter-work deep chain.
-		err := server.checkSecretMiningFromCommonAncestor(ctx, blockUpTo, "", "http://test-peer", commonAncestorHash, commonAncestorMeta, nil)
+		// Peer offers a deep fork whose few blocks add negligible work: a shorter-work deep chain.
+		offered := testhelpers.CreateTestHeaders(t, 5)
+		err := server.checkSecretMiningFromCommonAncestor(ctx, blockUpTo, "", "http://test-peer", commonAncestorHash, commonAncestorMeta, offered)
 
 		// Should return an error because the deep fork carries less work than our chain
 		require.Error(t, err)
@@ -1266,6 +1267,20 @@ func TestCheckSecretMiningWorkGating(t *testing.T) {
 		require.Contains(t, err.Error(), "secretly mined chain")
 		require.True(t, rec.maliciousCalled(), "a withheld shorter-work deep chain must be flagged malicious")
 		require.Equal(t, "peer-bad", rec.peer())
+	})
+
+	t.Run("deep fork with no offered headers aborts without flagging malicious", func(t *testing.T) {
+		rec := &recordingP2PClient{}
+
+		// Local chain is heavier, but with no offered headers we cannot weigh the candidate
+		// chain: uncertainty must abort without penalising the peer, not flag it malicious.
+		srv, ancestorHash, ancestorMeta := newServer(t, big.NewInt(1_000_000), rec)
+
+		err := srv.checkSecretMiningFromCommonAncestor(context.Background(), blockUpTo, "peer-empty", "http://empty-peer", ancestorHash, ancestorMeta, nil)
+
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), "secretly mined chain")
+		require.False(t, rec.maliciousCalled(), "an unweighable fork must not penalise the peer")
 	})
 
 	t.Run("chainwork lookup failure aborts without flagging malicious", func(t *testing.T) {
