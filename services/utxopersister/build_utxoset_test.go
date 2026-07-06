@@ -494,3 +494,69 @@ func TestBuildUTXOSetToHeight_DirectModeWritesHeaders(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists, "utxo-headers file must be written")
 }
+
+// TestBuildUTXOSetToHeight_HeaderWriteFailureIsFatal pins that a failure writing
+// the utxo-headers file is fatal for the one-shot builder (returns an error),
+// rather than the warn-and-continue that processNextBlock uses. The one-shot
+// has no retry loop and the headers file is a required half of the seed, so
+// swallowing the error would exit 0 with an incomplete, unseedable snapshot.
+// The failure is induced by pre-staging the utxo-headers file so
+// WriteHeadersToStore's FileStorer collides with an "already exists" error.
+func TestBuildUTXOSetToHeight_HeaderWriteFailureIsFatal(t *testing.T) {
+	ctx := context.Background()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+
+	fileURL, err := url.Parse("file://" + t.TempDir() + "?disableDAH=true")
+	require.NoError(t, err)
+
+	blockStore, err := blob.NewStore(ulogger.TestLogger{}, fileURL)
+	require.NoError(t, err)
+
+	bcURL, err := url.Parse("sqlitememory:///")
+	require.NoError(t, err)
+
+	blockchainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, bcURL, tSettings)
+	require.NoError(t, err)
+
+	const numBlocks = uint32(3)
+
+	prevHash := genesis
+	for h := uint32(1); h <= numBlocks; h++ {
+		prevHash = storeChainBlock(t, ctx, blockchainStore, prevHash, h)
+	}
+
+	headers, _, err := blockchainStore.GetBlockHeadersByHeight(ctx, 1, numBlocks)
+	require.NoError(t, err)
+	require.Len(t, headers, int(numBlocks))
+
+	for i, hdr := range headers {
+		height := uint32(i + 1) //nolint:gosec // i bounded by numBlocks (3), no overflow risk
+		stageBlockDeltas(t, ctx, tSettings, blockStore, hdr.Hash(), height, p2pkhTx(t, byte(0x10+height), uint64(height)*1000))
+	}
+
+	tipHash := headers[numBlocks-1].Hash()
+
+	// Pre-stage the utxo-headers file so WriteHeadersToStore's FileStorer fails
+	// with "already exists" (FileStorer.NewFileStorer refuses to overwrite).
+	require.NoError(t, blockStore.Set(ctx, tipHash[:], fileformat.FileTypeUtxoHeaders, []byte("preexisting")))
+
+	s, err := NewDirect(ctx, ulogger.TestLogger{}, tSettings, blockStore, blockchainStore)
+	require.NoError(t, err)
+
+	err = s.BuildUTXOSetToHeight(ctx, 0, numBlocks, true)
+	require.Error(t, err, "a utxo-headers write failure must be fatal for the one-shot builder")
+	require.Contains(t, err.Error(), "utxo-headers")
+
+	// The utxo-set was written before the header write, so it exists — but the
+	// seed is incomplete, which is exactly why the error is surfaced.
+	exists, err := blockStore.Exists(ctx, tipHash[:], fileformat.FileTypeUtxoSet)
+	require.NoError(t, err)
+	require.True(t, exists, "utxo-set is written before the header step")
+
+	// The lastProcessed marker must NOT have advanced past a failed build, even
+	// though updateLastProcessed was requested.
+	h, err := s.readLastHeight(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), h, "lastProcessed must not advance when the seed is incomplete")
+}

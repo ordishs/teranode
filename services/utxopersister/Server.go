@@ -704,12 +704,17 @@ func (s *Server) BuildUTXOSetToHeight(ctx context.Context, startHeight, endHeigh
 
 	targetHash := hashByHeight[endHeight]
 
-	// Write the utxo-headers file when a full blockchain store is available
-	// (always the case in direct mode; skipped for client-only setups, matching
-	// processNextBlock's handling).
+	// Write the utxo-headers file. In direct mode (always the case for the
+	// one-shot builder, which RunUtxoPersisterToHeight gates on a configured
+	// blockchain_store) the headers file is a required half of the seed
+	// deliverable that cmd/seeder consumes. Unlike processNextBlock — which runs
+	// in a loop and retries on the next tick — this one-shot has no retry, so a
+	// header-write failure is fatal: returning an error stops the CLI exiting 0
+	// with a utxo-set but no utxo-headers (an incomplete, unseedable snapshot),
+	// and also prevents the lastProcessed marker below from advancing past it.
 	if s.blockchainStore != nil {
 		if err := WriteHeadersToStore(ctx, s.logger, s.settings, s.blockStore, s.blockchainStore, targetHash, endHeight); err != nil {
-			s.logger.Warnf("[UTXOPersister] error writing headers file for height %d: %v", endHeight, err)
+			return errors.NewStorageError("[UTXOPersister] failed to write utxo-headers for height %d (%s) - the utxo-set was written but the seed is incomplete; delete the utxo-set to rebuild", endHeight, targetHash.String(), err)
 		}
 	} else {
 		s.logger.Warnf("[UTXOPersister] no blockchain store available; skipping utxo-headers write for height %d", endHeight)
