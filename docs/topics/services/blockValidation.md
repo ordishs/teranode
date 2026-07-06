@@ -564,7 +564,7 @@ To decide whether a transaction's parents already exist on the current chain, Te
 
 - **Current-chain ID set**: validation builds a map of the current chain's block-header IDs (`currentBlockHeaderIDsMap`, populated from `GetBlockHeaderIDs`). Membership is exact, so a hit is a sound positive.
 - **Old-parent resolution**: parents that resolve to blocks outside the prefetched set are collected per transaction (`oldBlockIDsMap`) and confirmed by the Block Validation service in `checkOldBlockIDs`, which falls back to the authoritative `CheckBlockIsInCurrentChain` RPC for any block ID not found in the set.
-- **In-memory chain-check route**: when `blockchain_use_in_memory_chain_check` is enabled, every decision is deferred to `CheckBlockIsInCurrentChain`, which the store answers from its in-memory off-chain set without a recursive SQL query.
+- **In-memory chain-check route**: when `blockchain_use_in_memory_chain_check` is enabled, Block Validation holds no local prefetched ID set and defers every distinct parent-block-ID set to the authoritative `CheckBlockIsInCurrentChain`. The store applies `maxBlockID` as an in-memory upper-bound reject for uncommitted / too-new IDs, then confirms the remaining committed candidates in SQL — an `on_main_chain` flag query, with the recursive `parent_id` CTE as the fallback on the about-to-reject path and while the on-chain set is rebuilding.
 
 ##### The validOrderAndBlessed Mechanism
 
