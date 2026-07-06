@@ -1010,6 +1010,13 @@ func (s *Store) handleIndividualErrors(errors map[int]LuaErrorInfo, batchByKey [
 
 // createSpendError creates an error for a specific spend
 func (s *Store) createSpendError(errMsg LuaErrorInfo, batchItem *batchSpend, txID *chainhash.Hash) error {
+	// Guard against a nil batch item / spend before the branches below
+	// dereference batchItem.spend (and txID). Return an error rather than
+	// panicking; see TestCreateSpendErrorHandlesNilBatchItem.
+	if batchItem == nil || batchItem.spend == nil {
+		return errors.NewStorageError("[SPEND_BATCH_LUA] cannot create spend error for nil batch item: %s", errMsg.Message)
+	}
+
 	switch errMsg.ErrorCode {
 	case LuaErrorCodeSpent:
 		if errMsg.SpendingData != "" {
