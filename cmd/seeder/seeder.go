@@ -97,7 +97,7 @@ func usage(msg string) {
 //
 //nolint:gocognit // Requires refactoring to reduce cognitive complexity
 func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir string, hash string,
-	skipHeaders bool, skipUTXOs bool, force bool) {
+	skipHeaders bool, skipUTXOs bool, force bool) error {
 	profilerAddr := appSettings.ProfilerAddr
 	if profilerAddr != "" {
 		go func() {
@@ -170,6 +170,7 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 	// store is per-handle, and concurrent handles would race on schema creation.
 	var (
 		blockchainStore blockchain.Store
+		headerErr       error
 		utxoErr         error
 		utxoTip         *utxoSetTip
 	)
@@ -198,7 +199,9 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 
 			// Process the headers
 			if err := processHeaders(ctx, logger, blockchainStore, headerFile); err != nil {
+				headerErr = err
 				logger.Errorf("Failed to process headers: %v", err)
+
 				return
 			}
 
@@ -232,17 +235,29 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 
 	wg.Wait()
 
+	if headerErr != nil {
+		return errors.NewProcessingError("seeder failed to process headers", headerErr)
+	}
+
+	if utxoErr != nil {
+		return errors.NewProcessingError("seeder failed to process UTXOs", utxoErr)
+	}
+
 	// Persist the BlockAssembler checkpoint only after the UTXO set has been
 	// imported successfully. The checkpoint reflects the UTXO store's
 	// completeness (block assembly is the sole creator of coinbase UTXOs), so it
 	// must never be advanced when UTXOs were skipped or failed. When UTXOs were
 	// skipped because lastProcessed.dat already existed, utxoTip is nil and any
-	// existing checkpoint is left untouched.
-	if !skipUTXOs && utxoErr == nil && utxoTip != nil {
+	// existing checkpoint is left untouched. A failure here must be fatal: the
+	// UTXO set is imported but the node would otherwise start with no checkpoint
+	// and a plain re-run skips the (now-complete) UTXO pass, never retrying it.
+	if !skipUTXOs && utxoTip != nil {
 		if err := writeBlockAssemblerState(ctx, logger, blockchainStore, utxoTip); err != nil {
-			logger.Errorf("Failed to set BlockAssembler state: %v", err)
+			return errors.NewProcessingError("seeder failed to set BlockAssembler state", err)
 		}
 	}
+
+	return nil
 }
 
 // processHeaders reads the UTXO headers from a file and stores them in the blockchain store.
