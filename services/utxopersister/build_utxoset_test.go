@@ -415,12 +415,9 @@ func storeChainBlock(t *testing.T, ctx context.Context, blockchainStore blockcha
 
 // TestBuildUTXOSetToHeight_DirectModeWritesHeaders exercises the real
 // direct-mode production path (blockchainStore != nil), which always runs
-// WriteHeadersToStore. This is the path that panicked in production: the
-// utxo-headers ".sha256" sidecar write used an unregistered fileformat type,
-// so fileformat.NewHeader panicked on every direct-mode run. The blob store
-// must be a real FILE store here (memory.Set ignores WithSkipHeader, so the
-// fix can't be proven against it) - only the file backend actually honours
-// the skip-header option added to WriteHeadersToStore's Set call.
+// WriteHeadersToStore, and asserts it writes both the utxo-set and its
+// utxo-headers file. The blob store is a real FILE store so the store's own
+// checksum sidecar handling is exercised on the same path production uses.
 func TestBuildUTXOSetToHeight_DirectModeWritesHeaders(t *testing.T) {
 	ctx := context.Background()
 	tSettings := test.CreateBaseTestSettings(t)
