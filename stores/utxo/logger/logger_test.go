@@ -505,23 +505,50 @@ func TestSpend(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
+// TestUnspend proves the decorator forwards flagAsLocked unchanged (#1154).
+// Dropping it and hardcoding false defeats the SQL fix on the ?logging=true path
+// (a no-flag rollback would still write locked=false) and inverts
+// ProcessConflicting's Unspend(..., true) lock-set into a lock-clear.
 func TestUnspend(t *testing.T) {
-	logger := ulogger.TestLogger{}
-	mockStore := &MockStore{}
-	store := New(context.Background(), logger, mockStore).(*Store)
-
 	ctx := context.Background()
 	spends := []*utxo.Spend{createTestSpend(1), createTestSpend(2)}
 	expectedErr := errors.NewError("unspend error")
 
-	// Note: The implementation always passes false as the third argument (ignoring variadic parameter)
-	// The mock receives it as []bool{false} due to variadic expansion
-	mockStore.On("Unspend", ctx, spends, []bool{false}).Return(expectedErr)
+	t.Run("no flag is forwarded as no flag", func(t *testing.T) {
+		mockStore := &MockStore{}
+		store := New(ctx, ulogger.TestLogger{}, mockStore).(*Store)
 
-	err := store.Unspend(ctx, spends, true) // flagAsLocked is ignored in implementation
+		mockStore.On("Unspend", ctx, spends, []bool(nil)).Return(expectedErr)
 
-	assert.Equal(t, expectedErr, err)
-	mockStore.AssertExpectations(t)
+		err := store.Unspend(ctx, spends)
+
+		assert.Equal(t, expectedErr, err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("explicit true is forwarded unchanged", func(t *testing.T) {
+		mockStore := &MockStore{}
+		store := New(ctx, ulogger.TestLogger{}, mockStore).(*Store)
+
+		mockStore.On("Unspend", ctx, spends, []bool{true}).Return(expectedErr)
+
+		err := store.Unspend(ctx, spends, true)
+
+		assert.Equal(t, expectedErr, err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("explicit false is forwarded unchanged", func(t *testing.T) {
+		mockStore := &MockStore{}
+		store := New(ctx, ulogger.TestLogger{}, mockStore).(*Store)
+
+		mockStore.On("Unspend", ctx, spends, []bool{false}).Return(expectedErr)
+
+		err := store.Unspend(ctx, spends, false)
+
+		assert.Equal(t, expectedErr, err)
+		mockStore.AssertExpectations(t)
+	})
 }
 
 func TestDelete(t *testing.T) {

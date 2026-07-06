@@ -195,7 +195,7 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.3
 	github.com/bsv-blockchain/go-alert-system v0.1.6
-	github.com/bsv-blockchain/go-batcher/v2 v2.0.4
+	github.com/bsv-blockchain/go-batcher/v2 v2.0.6
 	github.com/bsv-blockchain/go-bc v1.1.5
 	github.com/bsv-blockchain/go-bn v1.1.4
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
@@ -383,7 +383,7 @@ require (
 	github.com/polydawn/refmt v0.89.1-0.20231129105047-37766d95467a // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/prometheus/client_model v0.6.2
-	github.com/prometheus/common v0.68.0 // indirect
+	github.com/prometheus/common v0.68.1 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/webtransport-go v0.10.0 // indirect

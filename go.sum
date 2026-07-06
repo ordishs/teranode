@@ -170,8 +170,8 @@ github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv5 h1:GNsn4PLzhoU8Vm5P
 github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv5/go.mod h1:t4MjZ6nitI84mr/KhpPGFCCeCT4+y4hq0di8qOHIIGk=
 github.com/bsv-blockchain/go-alert-system v0.1.6 h1:pXJqJZVJw4ha46CircxOhcV0iNzohf2nt1l4O3TNtSI=
 github.com/bsv-blockchain/go-alert-system v0.1.6/go.mod h1:3Pwm4O0GcGiYFuofRml7UEWBWt0a4kKLCsvisyOpQps=
-github.com/bsv-blockchain/go-batcher/v2 v2.0.4 h1:u3mEx4W8rufC3W/G3MlJ8Al0pnYsKHe0CZwZAhk6lqs=
-github.com/bsv-blockchain/go-batcher/v2 v2.0.4/go.mod h1:7Q3E4JR2+HT1Bi007hTs9W8FTDISMYGOiBGTMBW4ZDo=
+github.com/bsv-blockchain/go-batcher/v2 v2.0.6 h1:YqiS+ZjCPpiytVEQ1A/famVrBW+pGGww10lkKMsa3Rw=
+github.com/bsv-blockchain/go-batcher/v2 v2.0.6/go.mod h1:h0taeDYa4L6iQ57WvpVPuKLlsrRF72+7Lk85ouSKoC0=
 github.com/bsv-blockchain/go-bc v1.1.5 h1:G9hioz7yz6ARS5YHYJhA4c0xCU5EnRm6PsjDM8C6DTA=
 github.com/bsv-blockchain/go-bc v1.1.5/go.mod h1:g0ZjqK5pNMvgIQpeN0QXchAKEzl15ro3Fm0LG/8PFyI=
 github.com/bsv-blockchain/go-bn v1.1.4 h1:mEOqX7NwBScGbxq5icxbDI0GOQYtjJBz+xC27xwWQFI=
@@ -1019,8 +1019,8 @@ github.com/prometheus/client_golang v1.23.2/go.mod h1:Tb1a6LWHB3/SPIzCoaDXI4I8UH
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
 github.com/prometheus/client_model v0.6.2 h1:oBsgwpGs7iVziMvrGhE53c/GrLUsZdHnqNwqPLxwZyk=
 github.com/prometheus/client_model v0.6.2/go.mod h1:y3m2F6Gdpfy6Ut/GBsUqTWZqCUvMVzSfMLjcu6wAwpE=
-github.com/prometheus/common v0.68.0 h1:8rQJvQmYltsR2L7h8Zw0Iyj8WYNNmpwikoQTZXwfVeA=
-github.com/prometheus/common v0.68.0/go.mod h1:4soH+U8yJSROk7OJ//hmTiWKsxapv6zRGgTt3keN8gQ=
+github.com/prometheus/common v0.68.1 h1:omjRRl4QP4komogpXuhfeOiisQg7xdy8VM1UY+pStaY=
+github.com/prometheus/common v0.68.1/go.mod h1:ZzL3f6u94qUxh9p+tJTrF+FvBS1XXbbRAZCQkytAL0Y=
 github.com/prometheus/procfs v0.20.1 h1:XwbrGOIplXW/AU3YhIhLODXMJYyC1isLFfYCsTEycfc=
 github.com/prometheus/procfs v0.20.1/go.mod h1:o9EMBZGRyvDrSPH1RqdxhojkuXstoe4UlK79eF5TGGo=
 github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=

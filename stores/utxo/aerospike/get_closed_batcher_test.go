@@ -18,6 +18,10 @@ func (closedGetBatcher) Put(*batchGetItem, ...int) {}
 func (closedGetBatcher) PutCtx(context.Context, *batchGetItem, ...int) {
 	panic("send on closed channel")
 }
+func (closedGetBatcher) PutBatch([]*batchGetItem, ...int) {}
+func (closedGetBatcher) PutBatchCtx(context.Context, []*batchGetItem, ...int) {
+	panic("send on closed channel")
+}
 func (closedGetBatcher) Trigger()                      {}
 func (closedGetBatcher) SetDrainMode(bool)             {}
 func (closedGetBatcher) SetTickInterval(time.Duration) {}
@@ -70,19 +74,25 @@ type sendOnClosedBatcher[T any] struct{}
 
 func (sendOnClosedBatcher[T]) Put(*T, ...int)                     { panic("send on closed channel") }
 func (sendOnClosedBatcher[T]) PutCtx(context.Context, *T, ...int) { panic("send on closed channel") }
-func (sendOnClosedBatcher[T]) Trigger()                           {}
-func (sendOnClosedBatcher[T]) SetDrainMode(bool)                  {}
-func (sendOnClosedBatcher[T]) SetTickInterval(time.Duration)      {}
-func (sendOnClosedBatcher[T]) Close()                             {}
+func (sendOnClosedBatcher[T]) PutBatch([]*T, ...int)              { panic("send on closed channel") }
+func (sendOnClosedBatcher[T]) PutBatchCtx(context.Context, []*T, ...int) {
+	panic("send on closed channel")
+}
+func (sendOnClosedBatcher[T]) Trigger()                      {}
+func (sendOnClosedBatcher[T]) SetDrainMode(bool)             {}
+func (sendOnClosedBatcher[T]) SetTickInterval(time.Duration) {}
+func (sendOnClosedBatcher[T]) Close()                        {}
 
 type okBatcher[T any] struct{}
 
-func (okBatcher[T]) Put(*T, ...int)                     {}
-func (okBatcher[T]) PutCtx(context.Context, *T, ...int) {}
-func (okBatcher[T]) Trigger()                           {}
-func (okBatcher[T]) SetDrainMode(bool)                  {}
-func (okBatcher[T]) SetTickInterval(time.Duration)      {}
-func (okBatcher[T]) Close()                             {}
+func (okBatcher[T]) Put(*T, ...int)                            {}
+func (okBatcher[T]) PutCtx(context.Context, *T, ...int)        {}
+func (okBatcher[T]) PutBatch([]*T, ...int)                     {}
+func (okBatcher[T]) PutBatchCtx(context.Context, []*T, ...int) {}
+func (okBatcher[T]) Trigger()                                  {}
+func (okBatcher[T]) SetDrainMode(bool)                         {}
+func (okBatcher[T]) SetTickInterval(time.Duration)             {}
+func (okBatcher[T]) Close()                                    {}
 
 // TestSafeBatcherPut_RecoversSendOnClosed locks the shared guard used by the
 // spend / locked / outpoint / get enqueue paths: a send-on-closed-channel panic
