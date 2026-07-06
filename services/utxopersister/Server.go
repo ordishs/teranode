@@ -590,6 +590,21 @@ func (s *Server) BuildUTXOSetToHeight(ctx context.Context, startHeight, endHeigh
 		return errors.NewStorageError("[UTXOPersister] block store is not initialized")
 	}
 
+	// When asked to advance the resume marker, refuse to rewind it below the
+	// height the service has already reached. Rewinding would make the service
+	// re-consolidate already-built sets on restart and error-loop on the
+	// existing set files. Check up front, before doing any build work.
+	if updateLastProcessed {
+		existing, err := s.readLastHeight(ctx)
+		if err != nil {
+			return errors.NewStorageError("[UTXOPersister] error reading existing lastProcessed height", err)
+		}
+
+		if endHeight < existing {
+			return errors.NewProcessingError("[UTXOPersister] refusing to rewind lastProcessed from %d to %d; delete lastProcessed.dat to override", existing, endHeight)
+		}
+	}
+
 	// Select a header source (store preferred, client fallback), mirroring the
 	// consolidator's own store-or-client selection.
 	var hdrs headerIfc

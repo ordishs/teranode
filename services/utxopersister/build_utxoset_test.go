@@ -210,6 +210,32 @@ func TestBuildUTXOSetToHeight_UpdatesLastProcessedWhenAsked(t *testing.T) {
 	require.Equal(t, uint32(2), h)
 }
 
+func TestBuildUTXOSetToHeight_RefusesToRewindLastProcessed(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	tSettings := test.CreateBaseTestSettings(t)
+	genesis := tSettings.ChainCfgParams.GenesisHash
+
+	headers, metas, byH := buildChainHeaders(t, genesis, 2)
+	stageBlockDeltas(t, ctx, tSettings, store, byH[1], 1, p2pkhTx(t, 0x11, 1000))
+	stageBlockDeltas(t, ctx, tSettings, store, byH[2], 2, p2pkhTx(t, 0x22, 2000))
+
+	s, _ := newBuilderServer(t, store, headers, metas, 1, 2)
+
+	// The service has already advanced its resume marker to height 5.
+	require.NoError(t, s.writeLastHeight(ctx, 5))
+
+	// A one-shot build to a lower height that also asks to advance the marker
+	// must be refused up front, and must leave the marker untouched.
+	err := s.BuildUTXOSetToHeight(ctx, 0, 2, true)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "refusing to rewind")
+
+	h, err := s.readLastHeight(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(5), h)
+}
+
 func TestBuildUTXOSetToHeight_RejectsBadArguments(t *testing.T) {
 	ctx := context.Background()
 	store := memory.New()
