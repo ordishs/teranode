@@ -10,7 +10,7 @@ point instead of syncing from genesis.
 The seed is keyed by a block hash. For this seed the tip is:
 
 ```
-000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88
+000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a
 ```
 
 | File | Contents |
@@ -69,10 +69,10 @@ Copy the seed files to `/tmp` (the directory the seeder reads from), then run th
 seeder pointing `-inputDir` at `/tmp` and `-hash` at the seed's tip hash:
 
 ```bash
-cp seeds/tstn/000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88.* /tmp/
+cp seeds/tstn/000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a.* /tmp/
 SETTINGS_CONTEXT=tstn ./teranode-cli seeder \
   -inputDir /tmp \
-  -hash 000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88
+  -hash 000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a
 ```
 
 `-inputDir` can be any directory that holds the `<hash>.utxo-headers` and
@@ -102,15 +102,15 @@ Validate them before importing to rule out truncation or corruption in transit:
 
 ```bash
 cd /tmp
-shasum -a 256 -c 000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88.utxo-set.sha256
-shasum -a 256 -c 000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88.utxo-headers.sha256
+shasum -a 256 -c 000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a.utxo-set.sha256
+shasum -a 256 -c 000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a.utxo-headers.sha256
 ```
 
 Expected output:
 
 ```
-000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88.utxo-set: OK
-000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88.utxo-headers: OK
+000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a.utxo-set: OK
+000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a.utxo-headers: OK
 ```
 
 If either check does not print `OK`, the file is damaged — re-fetch it and do not
@@ -124,7 +124,7 @@ targets:
 
 ```bash
 SETTINGS_CONTEXT=tstn ./teranode-cli filereader \
-  /tmp/000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88.utxo-set
+  /tmp/000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a.utxo-set
 ```
 
 For this seed the UTXO-set file reports:
@@ -132,16 +132,16 @@ For this seed the UTXO-set file reports:
 ```
 file type:                 utxo-set
 
-block hash:                000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88
+block hash:                000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a
 block height:              300
-previous block hash:       000000000d843108d6b9b47b679f3d4a38fd9fec2559c27090ecce84a6dda724
+previous block hash:       0000000014fbdef445c999082474c542d3cd721bcef283d0624fbf3b0143d6d7
 ```
 
 And the headers file:
 
 ```bash
 SETTINGS_CONTEXT=tstn ./teranode-cli filereader \
-  /tmp/000000007816d70ab70ef0c70cfedec376acbe9a633927bdd3ad283224bf1a88.utxo-headers
+  /tmp/000000000c130c0bdbb5177ff69b7cc160a74401ec30f874ea7321a708de387a.utxo-headers
 ```
 
 ```
