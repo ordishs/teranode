@@ -307,13 +307,6 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 	}
 }
 
-func lockedBatchItemAt(batch []*batchLocked, idx int) *batchLocked {
-	if idx < 0 || idx >= len(batch) {
-		return nil
-	}
-	return batch[idx]
-}
-
 func describeLockedBatchItem(batchItem *batchLocked) string {
 	if batchItem == nil {
 		return "<nil>"

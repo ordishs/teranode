@@ -109,13 +109,6 @@ func describeChainHash(hash *chainhash.Hash) string {
 	return hash.String()
 }
 
-func describeChainHashAt(hashes []*chainhash.Hash, idx int) string {
-	if idx < 0 || idx >= len(hashes) {
-		return "<unknown>"
-	}
-	return describeChainHash(hashes[idx])
-}
-
 func describeUTXOSpend(spend *utxo.Spend) string {
 	if spend == nil {
 		return "<nil>"
