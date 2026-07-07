@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
-	"strings"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -128,24 +127,16 @@ func TestProductionSeedIsConsumerReadable(t *testing.T) {
 
 	acc := muhash.New()
 
-	var parsed int
-
-	for {
+	// The producer wrote exactly len(wrappers) records, so read that many
+	// directly — no need to infer end-of-stream from a read error.
+	for range wrappers {
 		w, err := NewUTXOWrapperFromReader(ctx, r)
-		if err == io.EOF || (err != nil && strings.Contains(err.Error(), "unexpected EOF")) {
-			break
-		}
-
 		require.NoError(t, err)
 
 		for _, u := range w.UTXOs {
 			acc.Add(utxoseed.Element(w.TxID, u.Index, w.Height, w.Coinbase, u.Value, u.Script))
 		}
-
-		parsed++
 	}
-
-	require.Equal(t, len(wrappers), parsed, "consumer must recover every wrapper the producer wrote")
 	require.Equal(t, sc.Checkpoint.SetHash, acc.Digest(),
 		"MuHash folded over the producer's streamed UTXOs must equal the signed set hash")
 	require.Equal(t, independentDigest(wrappers), acc.Digest(),

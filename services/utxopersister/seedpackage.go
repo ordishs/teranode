@@ -67,36 +67,6 @@ func BuildSeedPackage(ctx context.Context, store blob.Store, r io.Reader, height
 	return nil
 }
 
-// ReadSeedPackage reassembles the UTXO-set body from a seed package, verifying
-// each chunk's content hash and length against the manifest.
-func ReadSeedPackage(ctx context.Context, store blob.Store, blockHash chainhash.Hash) ([]byte, error) {
-	m, err := readManifest(ctx, store, blockHash)
-	if err != nil {
-		return nil, err
-	}
-
-	var out []byte
-
-	for i, ref := range m.Chunks {
-		chunk, err := getChunk(ctx, store, ref.Hash)
-		if err != nil {
-			return nil, err
-		}
-
-		if uint32(len(chunk)) != ref.Size {
-			return nil, errors.NewProcessingError("chunk %d size %d, manifest says %d", i, len(chunk), ref.Size)
-		}
-
-		if got := sha256.Sum256(chunk); got != ref.Hash {
-			return nil, errors.NewProcessingError("chunk %d content hash mismatch", i)
-		}
-
-		out = append(out, chunk...)
-	}
-
-	return out, nil
-}
-
 // StreamSeedPackage reassembles the UTXO-set body into w, in manifest order,
 // verifying each chunk's content hash and length as it goes. Unlike
 // ReadSeedPackage it never holds the whole set in memory.

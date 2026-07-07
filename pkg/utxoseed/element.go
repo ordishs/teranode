@@ -23,7 +23,17 @@ const CommitmentVersion uint32 = 1
 // txid is written in chainhash internal byte order. coinbase occupies the
 // least-significant bit of the height word, so height must be < 2^31; higher
 // values would overflow the shift and alias distinct UTXOs to the same element.
+//
+// Height >= 2^31 cannot arise from seed data: every caller derives height as
+// encodedHeight>>1 from a uint32, bounded to [0, 2^31-1]. The panic therefore
+// guards only a direct programmer error (passing an out-of-range height), never
+// untrusted input — an assertion on a frozen-format invariant, not a runtime
+// failure path.
 func Element(txid chainhash.Hash, vout, height uint32, coinbase bool, value uint64, script []byte) []byte {
+	if height >= 1<<31 {
+		panic("utxoseed: height >= 2^31 overflows the commitment height word")
+	}
+
 	buf := make([]byte, 0, 32+4+4+8+4+len(script))
 	buf = append(buf, txid[:]...)
 	buf = binary.LittleEndian.AppendUint32(buf, vout)

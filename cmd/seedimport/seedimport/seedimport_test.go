@@ -8,8 +8,10 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/pkg/muhash"
@@ -20,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -188,18 +191,11 @@ func TestLoadTrustedKeysErrorsOnInvalidPubKey(t *testing.T) {
 	require.Error(t, err)
 }
 
-// buildSeed writes a utxo-set body (header|wrappers|footer) into a memory blob
-// store as a seed package + signed checkpoint. Returns the store, block hash,
-// and the trusted (compressed) pubkey that signed the checkpoint.
-func buildSeed(t *testing.T, wrappers []*utxopersister.UTXOWrapper, height uint32) (*memory.Memory, chainhash.Hash, []byte) {
-	t.Helper()
-
-	ctx := context.Background()
-	store := memory.New()
-
-	blockHash := chainhash.HashH([]byte("seed-h"))
-	prevHash := chainhash.HashH([]byte("seed-prev"))
-
+// frameSeedBody frames a utxo-set body (blockHash|height|prevHash header,
+// wrappers, then a txCount|utxoCount footer). footerTxs/footerUTXOs are written
+// verbatim so a test can inject a footer that disagrees with the wrappers; it
+// also returns the MuHash over the actual wrappers.
+func frameSeedBody(blockHash, prevHash chainhash.Hash, height uint32, wrappers []*utxopersister.UTXOWrapper, footerTxs, footerUTXOs uint64) ([]byte, [32]byte) {
 	var body []byte
 	body = append(body, blockHash[:]...)
 
@@ -210,10 +206,8 @@ func buildSeed(t *testing.T, wrappers []*utxopersister.UTXOWrapper, height uint3
 
 	acc := muhash.New()
 
-	var utxoCount uint64
 	for _, w := range wrappers {
 		body = append(body, w.Bytes()...)
-		utxoCount += uint64(len(w.UTXOs))
 
 		for _, u := range w.UTXOs {
 			acc.Add(utxoseed.Element(w.TxID, u.Index, w.Height, w.Coinbase, u.Value, u.Script))
@@ -221,11 +215,20 @@ func buildSeed(t *testing.T, wrappers []*utxopersister.UTXOWrapper, height uint3
 	}
 
 	var footer [16]byte
-	binary.LittleEndian.PutUint64(footer[0:8], uint64(len(wrappers)))
-	binary.LittleEndian.PutUint64(footer[8:16], utxoCount)
+	binary.LittleEndian.PutUint64(footer[0:8], footerTxs)
+	binary.LittleEndian.PutUint64(footer[8:16], footerUTXOs)
 	body = append(body, footer[:]...)
 
-	setHash := acc.Digest()
+	return body, acc.Digest()
+}
+
+// packageAndSignSeed writes body into a memory blob store as a seed package plus
+// a checkpoint signed over setHash, and returns the store and trusted pubkey.
+func packageAndSignSeed(t *testing.T, blockHash chainhash.Hash, height uint32, body []byte, setHash [32]byte) (*memory.Memory, []byte) {
+	t.Helper()
+
+	ctx := context.Background()
+	store := memory.New()
 
 	cfg := seedpack.Config{Min: 16, Max: 256, Mask: (1 << 6) - 1}
 	require.NoError(t, utxopersister.BuildSeedPackage(ctx, store, bytes.NewReader(body), height, blockHash, setHash, cfg))
@@ -238,7 +241,28 @@ func buildSeed(t *testing.T, wrappers []*utxopersister.UTXOWrapper, height uint3
 
 	require.NoError(t, store.Set(ctx, blockHash[:], fileformat.FileTypeSeedCheckpoint, sc.Serialize(), options.WithAllowOverwrite(true)))
 
-	return store, blockHash, priv.PubKey().Compressed()
+	return store, priv.PubKey().Compressed()
+}
+
+// buildSeed writes a utxo-set body (header|wrappers|footer) into a memory blob
+// store as a seed package + signed checkpoint. Returns the store, block hash,
+// and the trusted (compressed) pubkey that signed the checkpoint.
+func buildSeed(t *testing.T, wrappers []*utxopersister.UTXOWrapper, height uint32) (*memory.Memory, chainhash.Hash, []byte) {
+	t.Helper()
+
+	blockHash := chainhash.HashH([]byte("seed-h"))
+	prevHash := chainhash.HashH([]byte("seed-prev"))
+
+	var utxoCount uint64
+	for _, w := range wrappers {
+		utxoCount += uint64(len(w.UTXOs))
+	}
+
+	body, setHash := frameSeedBody(blockHash, prevHash, height, wrappers, uint64(len(wrappers)), utxoCount)
+
+	store, key := packageAndSignSeed(t, blockHash, height, body, setHash)
+
+	return store, blockHash, key
 }
 
 func sampleWrappers() []*utxopersister.UTXOWrapper {
@@ -362,6 +386,75 @@ func TestRunRejectsTamperedSet(t *testing.T) {
 
 	cfg := Config{SeedStore: seedStore, UTXOStore: newTestUTXOStore(t), Lookup: stubLookup{id: 1, height: 101, onMain: true}, TrustedKeys: [][]byte{trustedKey}, BlockHash: blockHash, NetworkMagic: testNetMagic}
 	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg))
+}
+
+func TestRunRejectsFooterMismatchAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+
+	wrappers := sampleWrappers()
+	blockHash := chainhash.HashH([]byte("seed-h"))
+	prevHash := chainhash.HashH([]byte("seed-prev"))
+
+	// Frame a body whose footer declares one more tx than was actually written.
+	// The wrappers (and therefore the set hash) are valid, so streamLoad loads
+	// them all and only then fails footer validation — exercising both the
+	// footer check and rollback on a streamLoad error (before the set-hash gate).
+	body, setHash := frameSeedBody(blockHash, prevHash, 101, wrappers, uint64(len(wrappers)+1), 999)
+	seedStore, trustedKey := packageAndSignSeed(t, blockHash, 101, body, setHash)
+
+	utxoStore := newTestUTXOStore(t)
+
+	cfg := Config{SeedStore: seedStore, UTXOStore: utxoStore, Lookup: stubLookup{id: 7, height: 101, onMain: true}, TrustedKeys: [][]byte{trustedKey}, BlockHash: blockHash, NetworkMagic: testNetMagic}
+
+	err := Run(ctx, ulogger.TestLogger{}, cfg)
+	require.Error(t, err, "a footer disagreeing with the loaded set must fail")
+	require.Contains(t, err.Error(), "footer")
+
+	for _, w := range wrappers {
+		txid := w.TxID
+		_, err := utxoStore.Get(ctx, &txid)
+		require.Error(t, err, "record for %s should have been rolled back", txid.String())
+	}
+}
+
+// failingCreateStore wraps a utxo.Store and fails Create after failAfter
+// successful calls, to exercise rollback on a mid-stream load error.
+type failingCreateStore struct {
+	utxo.Store
+
+	failAfter int
+	calls     int
+}
+
+func (s *failingCreateStore) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
+	s.calls++
+	if s.calls > s.failAfter {
+		return nil, errors.NewStorageError("injected store failure on create #%d", s.calls)
+	}
+
+	return s.Store.Create(ctx, tx, blockHeight, opts...)
+}
+
+func TestRunRollsBackOnMidStreamLoadError(t *testing.T) {
+	ctx := context.Background()
+
+	wrappers := sampleWrappers() // two wrappers, loaded in order
+	seedStore, blockHash, trustedKey := buildSeed(t, wrappers, 101)
+
+	base := newTestUTXOStore(t)
+	utxoStore := &failingCreateStore{Store: base, failAfter: 1} // first Create ok, second fails
+
+	cfg := Config{SeedStore: seedStore, UTXOStore: utxoStore, Lookup: stubLookup{id: 7, height: 101, onMain: true}, TrustedKeys: [][]byte{trustedKey}, BlockHash: blockHash, NetworkMagic: testNetMagic}
+
+	require.Error(t, Run(ctx, ulogger.TestLogger{}, cfg), "a mid-stream store failure must fail the import")
+
+	// The first wrapper was created before the failure; rollback must delete it,
+	// leaving no orphaned records for a retry to collide with.
+	for _, w := range wrappers {
+		txid := w.TxID
+		_, err := base.Get(ctx, &txid)
+		require.Error(t, err, "record for %s must have been rolled back", txid.String())
+	}
 }
 
 func TestRunRejectsUnsupportedCommitmentVersion(t *testing.T) {

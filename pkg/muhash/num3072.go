@@ -27,18 +27,19 @@ func mulMod(a, b *big.Int) *big.Int {
 func numToBytes(x *big.Int) []byte {
 	be := x.FillBytes(make([]byte, numBytes)) // big-endian, left zero-padded
 	le := make([]byte, numBytes)
-	for i := 0; i < numBytes; i++ {
+	for i := range numBytes {
 		le[i] = be[numBytes-1-i]
 	}
 	return le
 }
 
-// elementToNum maps arbitrary data to a group element in [0, modulus).
-// Construction: key = SHA256(data); generate a numBytes-long ChaCha20 keystream
-// under that key with an all-zero 12-byte nonce and counter 0; interpret the
-// keystream as a little-endian integer reduced mod modulus. This construction
-// is frozen — changing it changes every commitment.
-func elementToNum(data []byte) *big.Int {
+// elementKeystream writes the frozen numBytes-long element keystream for data
+// into dst (which must be exactly numBytes): key = SHA256(data); ChaCha20
+// keystream under that key with an all-zero 12-byte nonce and counter 0. dst is
+// zeroed first, so its prior contents are irrelevant. This construction is
+// frozen — changing it changes every commitment. It is the single source of the
+// element bytes for both elementToNum and the hot-path fold.
+func elementKeystream(dst, data []byte) {
 	key := sha256.Sum256(data)
 
 	var nonce [12]byte
@@ -49,20 +50,39 @@ func elementToNum(data []byte) *big.Int {
 		panic(err)
 	}
 
+	for i := range dst {
+		dst[i] = 0
+	}
+
+	c.XORKeyStream(dst, dst) // dst is zero-filled, so output is the raw keystream
+}
+
+// leToNum sets out to the little-endian integer in le reduced mod modulus,
+// using beScratch (len(le)) as reversal space. le and beScratch must not alias.
+func leToNum(out *big.Int, le, beScratch []byte) {
+	for i := range le {
+		beScratch[len(le)-1-i] = le[i]
+	}
+
+	out.SetBytes(beScratch)
+	out.Mod(out, modulus)
+}
+
+// elementToNum maps arbitrary data to a group element in [0, modulus). It
+// allocates; the set-wide hot path uses reused scratch instead (see mulElement).
+func elementToNum(data []byte) *big.Int {
 	buf := make([]byte, numBytes)
-	c.XORKeyStream(buf, buf) // buf is zero-filled, so output is the raw keystream
+	elementKeystream(buf, data)
 
 	return bytesToNum(buf)
 }
 
 // bytesToNum interprets a little-endian byte slice as an integer reduced mod modulus.
 func bytesToNum(le []byte) *big.Int {
-	be := make([]byte, len(le))
-	for i := range le {
-		be[len(le)-1-i] = le[i]
-	}
-	x := new(big.Int).SetBytes(be)
-	return x.Mod(x, modulus)
+	out := new(big.Int)
+	leToNum(out, le, make([]byte, len(le)))
+
+	return out
 }
 
 // sha256Sum is a thin wrapper so muhash.go need not import crypto/sha256 directly.

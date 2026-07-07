@@ -10,6 +10,23 @@ func TestEmptyDigestDeterministic(t *testing.T) {
 	require.Equal(t, New().Digest(), New().Digest())
 }
 
+func BenchmarkAdd(b *testing.B) {
+	m := New()
+
+	var data [40]byte
+
+	b.ReportAllocs()
+
+	i := 0
+	for b.Loop() {
+		data[0] = byte(i)
+		data[1] = byte(i >> 8)
+		data[2] = byte(i >> 16)
+		m.Add(data[:])
+		i++
+	}
+}
+
 func TestAddThenRemoveReturnsToEmpty(t *testing.T) {
 	empty := New().Digest()
 

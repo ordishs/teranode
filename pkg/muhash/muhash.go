@@ -13,23 +13,52 @@ import (
 type MuHash3072 struct {
 	numerator   *big.Int // product of added elements
 	denominator *big.Int // product of removed elements
+
+	// Scratch reused across Add/Remove so the set-wide hot path (one call per
+	// UTXO over a 10^8-10^9 element set) does not allocate a group element,
+	// keystream buffer, and reversal buffer per element. Safe to share because
+	// MuHash3072 is single-threaded per the concurrency contract above.
+	elem  *big.Int
+	ksBuf []byte // element keystream (little-endian)
+	beBuf []byte // big-endian reversal of ksBuf
+}
+
+// newAccumulator returns a MuHash3072 with numerator/denominator set to acc
+// values of 1 and scratch buffers allocated.
+func newAccumulator() *MuHash3072 {
+	return &MuHash3072{
+		numerator:   big.NewInt(1),
+		denominator: big.NewInt(1),
+		elem:        new(big.Int),
+		ksBuf:       make([]byte, numBytes),
+		beBuf:       make([]byte, numBytes),
+	}
 }
 
 // New returns an accumulator representing the empty set.
 func New() *MuHash3072 {
-	return &MuHash3072{numerator: big.NewInt(1), denominator: big.NewInt(1)}
+	return newAccumulator()
+}
+
+// mulElement folds data's group element into acc in place, reusing scratch.
+func (m *MuHash3072) mulElement(acc *big.Int, data []byte) {
+	elementKeystream(m.ksBuf, data)
+	leToNum(m.elem, m.ksBuf, m.beBuf)
+
+	acc.Mul(acc, m.elem)
+	acc.Mod(acc, modulus)
 }
 
 // Add inserts data into the multiset.
 func (m *MuHash3072) Add(data []byte) {
-	m.numerator = mulMod(m.numerator, elementToNum(data))
+	m.mulElement(m.numerator, data)
 }
 
 // Remove deletes data from the multiset. Removing an element that was never
 // added is well-defined (it becomes a denominator factor) and is exactly
 // cancelled by a later Add of the same element.
 func (m *MuHash3072) Remove(data []byte) {
-	m.denominator = mulMod(m.denominator, elementToNum(data))
+	m.mulElement(m.denominator, data)
 }
 
 // Digest returns the 32-byte commitment: SHA256 of the little-endian encoding
@@ -57,8 +86,9 @@ func FromBytes(b []byte) (*MuHash3072, error) {
 		return nil, fmt.Errorf("muhash: expected %d bytes, got %d", 2*numBytes, len(b))
 	}
 
-	return &MuHash3072{
-		numerator:   bytesToNum(b[:numBytes]),
-		denominator: bytesToNum(b[numBytes:]),
-	}, nil
+	m := newAccumulator()
+	m.numerator = bytesToNum(b[:numBytes])
+	m.denominator = bytesToNum(b[numBytes:])
+
+	return m, nil
 }

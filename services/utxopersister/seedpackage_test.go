@@ -53,9 +53,9 @@ func TestSeedPackageRoundTrip(t *testing.T) {
 
 	require.NoError(t, BuildSeedPackage(ctx, store, bytes.NewReader(body), 700000, blockHash, setHash, testChunkCfg()))
 
-	got, err := ReadSeedPackage(ctx, store, blockHash)
-	require.NoError(t, err)
-	require.Equal(t, body, got)
+	var got bytes.Buffer
+	require.NoError(t, StreamSeedPackage(ctx, store, blockHash, &got))
+	require.Equal(t, body, got.Bytes())
 }
 
 func TestSeedPackageDetectsChunkCorruption(t *testing.T) {
@@ -73,7 +73,8 @@ func TestSeedPackageDetectsChunkCorruption(t *testing.T) {
 	bad := make([]byte, int(m.Chunks[0].Size))
 	require.NoError(t, overwriteChunk(ctx, store, m.Chunks[0].Hash, bad))
 
-	_, err = ReadSeedPackage(ctx, store, blockHash)
+	var got bytes.Buffer
+	err = StreamSeedPackage(ctx, store, blockHash, &got)
 	require.Error(t, err, "reassembly must reject a chunk whose content hash no longer matches")
 }
 

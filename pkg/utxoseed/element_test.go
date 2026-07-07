@@ -44,3 +44,17 @@ func TestElementDistinctByVout(t *testing.T) {
 	b := Element(txid, 1, 1, false, 100, nil)
 	require.NotEqual(t, hex.EncodeToString(a), hex.EncodeToString(b))
 }
+
+func TestElementAcceptsMaxValidHeight(t *testing.T) {
+	var txid chainhash.Hash
+	// 2^31 - 1 is the largest height that fits the (height<<1 | coinbase) word.
+	require.NotPanics(t, func() { Element(txid, 0, (1<<31)-1, true, 1, nil) })
+}
+
+func TestElementPanicsOnHeightOverflow(t *testing.T) {
+	var txid chainhash.Hash
+	// height >= 2^31 would overflow height<<1 and alias distinct UTXOs; the
+	// commitment invariant is enforced with a panic (unreachable from seed data,
+	// where height is always encodedHeight>>1 of a uint32).
+	require.Panics(t, func() { Element(txid, 0, 1<<31, false, 1, nil) })
+}

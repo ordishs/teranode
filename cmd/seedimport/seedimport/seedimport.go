@@ -2,10 +2,11 @@
 package seedimport
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
-	"strings"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -23,15 +24,21 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
-// maxOutputsPerTx bounds the synthesized output slice. Seed data is unverified
-// until the post-load set-hash check, so a hostile seed could carry an absurd
-// vout index; without this bound make([]*bt.Output, maxVout+1) could OOM before
-// the integrity gate is reached. No real transaction approaches this many outputs.
-const maxOutputsPerTx = 1 << 24
+// maxVoutIndex bounds the highest vout index a seed wrapper may carry. The UTXO
+// store maps an output's position in tx.Outputs to its vout, so a UTXO at vout V
+// requires a length-(V+1) slice — placement is positional and cannot be packed
+// densely without corrupting vouts. Seed data is unverified until the post-load
+// set-hash check, so without this bound a hostile wrapper claiming vout ~2^32
+// would force make([]*bt.Output, maxVout+1) to allocate ~32 GB before the
+// integrity gate is reached. The ceiling is generous (no real transaction has
+// this many outputs) but caps a single wrapper's transient allocation at ~128 MB,
+// and wrappers are processed one at a time so it does not accumulate.
+const maxVoutIndex = 1 << 24
 
 // wrapperToTx synthesizes a partial transaction carrying only the surviving
 // outputs of a UTXOWrapper. Inputs are empty; Outputs are sparse (nil at vouts
-// that were already spent). The real txid is set via SetTxHash so any internal
+// that were already spent) because the store keys each output by its slice
+// index = vout. The real txid is set via SetTxHash so any internal
 // TxIDChainHash() call is correct; Create is additionally given WithTXID.
 func wrapperToTx(w *utxopersister.UTXOWrapper) (*bt.Tx, error) {
 	maxVout := uint32(0)
@@ -41,8 +48,8 @@ func wrapperToTx(w *utxopersister.UTXOWrapper) (*bt.Tx, error) {
 		}
 	}
 
-	if maxVout >= maxOutputsPerTx {
-		return nil, errors.NewProcessingError("wrapper %s vout %d exceeds bound %d", w.TxID.String(), maxVout, maxOutputsPerTx)
+	if maxVout >= maxVoutIndex {
+		return nil, errors.NewProcessingError("wrapper %s vout %d exceeds bound %d", w.TxID.String(), maxVout, maxVoutIndex)
 	}
 
 	tx := bt.NewTx()
@@ -201,8 +208,13 @@ func Run(ctx context.Context, logger ulogger.Logger, cfg Config) error {
 		return errors.NewProcessingError("height mismatch: checkpoint %d, chain %d", sc.Checkpoint.Height, height)
 	}
 
+	// streamLoad returns every UTXO it created even on failure, so a mid-stream
+	// error (store write, truncation, corrupt chunk) rolls back the partial set
+	// rather than orphaning it — a re-run would otherwise hit duplicate-create
+	// errors against the leftover records.
 	created, digest, err := streamLoad(ctx, cfg, blockID)
 	if err != nil {
+		rollback(ctx, logger, cfg.UTXOStore, created)
 		return err
 	}
 
@@ -235,7 +247,14 @@ func verifyAgainstTrusted(sc *seedcheckpoint.SignedCheckpoint, trusted [][]byte,
 	return errors.NewProcessingError("checkpoint not signed by any trusted authority key (or signed for a different network)")
 }
 
-func streamLoad(ctx context.Context, cfg Config, blockID uint32) ([]chainhash.Hash, [32]byte, error) {
+// seedFooterLen is the trailing footer written by CreateUTXOSet after the last
+// UTXOWrapper: txCount(8 LE) | utxoCount(8 LE).
+const seedFooterLen = 16
+
+// streamLoad reassembles the seed body, loads every surviving UTXO, and returns
+// the recomputed set digest. It returns the txids it created on every path
+// (including errors) so the caller can roll back a partial load.
+func streamLoad(ctx context.Context, cfg Config, blockID uint32) (created []chainhash.Hash, digest [32]byte, err error) {
 	pr, pw := io.Pipe()
 
 	// Closing the read end on every return path unblocks the writer goroutine
@@ -246,44 +265,87 @@ func streamLoad(ctx context.Context, cfg Config, blockID uint32) ([]chainhash.Ha
 		pw.CloseWithError(utxopersister.StreamSeedPackage(ctx, cfg.SeedStore, cfg.BlockHash, pw))
 	}()
 
+	// bufio lets us Peek the stream to tell "another wrapper follows" from "the
+	// trailing footer" structurally, instead of classifying a read error by its
+	// message text.
+	br := bufio.NewReader(pr)
+
 	acc := muhash.New()
 
-	var created []chainhash.Hash
-
 	var hdr [68]byte
-	if _, err := io.ReadFull(pr, hdr[:]); err != nil {
-		return nil, [32]byte{}, errors.NewProcessingError("reading seed header", err)
+	if _, err := io.ReadFull(br, hdr[:]); err != nil {
+		return created, [32]byte{}, errors.NewProcessingError("reading seed header", err)
 	}
 
 	var currentHash chainhash.Hash
 	copy(currentHash[:], hdr[0:32])
 
 	if currentHash != cfg.BlockHash {
-		return nil, [32]byte{}, errors.NewProcessingError("seed body block hash does not match requested block")
+		return created, [32]byte{}, errors.NewProcessingError("seed body block hash does not match requested block")
 	}
 
+	var utxoCount uint64
+
 	for {
-		w, err := utxopersister.NewUTXOWrapperFromReader(ctx, pr)
-		if err == io.EOF || (err != nil && strings.Contains(err.Error(), "unexpected EOF")) {
+		// A UTXOWrapper is always larger than the seedFooterLen-byte footer, so
+		// if fewer than seedFooterLen+1 bytes remain we have reached the footer
+		// (or a truncated tail). This avoids matching io.ErrUnexpectedEOF by
+		// substring, which teranode's errors package cannot distinguish from a
+		// genuine mid-stream read error carrying the same text.
+		if _, perr := br.Peek(seedFooterLen + 1); perr != nil {
+			if !errors.Is(perr, io.EOF) && !errors.Is(perr, io.ErrUnexpectedEOF) {
+				// A real stream error (e.g. a corrupt chunk), not end-of-stream.
+				return created, [32]byte{}, perr
+			}
+
+			if err := validateFooter(br, uint64(len(created)), utxoCount); err != nil {
+				return created, [32]byte{}, err
+			}
+
 			break
 		}
 
+		w, err := utxopersister.NewUTXOWrapperFromReader(ctx, br)
 		if err != nil {
-			return nil, [32]byte{}, err
+			return created, [32]byte{}, err
 		}
 
 		for _, u := range w.UTXOs {
 			acc.Add(utxoseed.Element(w.TxID, u.Index, w.Height, w.Coinbase, u.Value, u.Script))
+			utxoCount++
 		}
 
 		if err := loadWrapper(ctx, cfg.UTXOStore, w, blockID); err != nil {
-			return nil, [32]byte{}, err
+			return created, [32]byte{}, err
 		}
 
 		created = append(created, w.TxID)
 	}
 
 	return created, acc.Digest(), nil
+}
+
+// validateFooter consumes the trailing footer and confirms it matches the set
+// actually loaded, then that nothing follows it. A count mismatch means the body
+// was truncated or tampered before the (more expensive) set-hash check.
+func validateFooter(r io.Reader, wantTxs, wantUTXOs uint64) error {
+	var footer [seedFooterLen]byte
+	if _, err := io.ReadFull(r, footer[:]); err != nil {
+		return errors.NewProcessingError("seed body truncated: cannot read %d-byte footer", seedFooterLen, err)
+	}
+
+	if _, err := io.ReadFull(r, make([]byte, 1)); err != io.EOF {
+		return errors.NewProcessingError("seed body has trailing bytes after footer")
+	}
+
+	gotTxs := binary.LittleEndian.Uint64(footer[0:8])
+	gotUTXOs := binary.LittleEndian.Uint64(footer[8:16])
+
+	if gotTxs != wantTxs || gotUTXOs != wantUTXOs {
+		return errors.NewProcessingError("seed footer mismatch: footer declares %d txs / %d utxos, loaded %d / %d", gotTxs, gotUTXOs, wantTxs, wantUTXOs)
+	}
+
+	return nil
 }
 
 func rollback(ctx context.Context, logger ulogger.Logger, store utxo.Store, created []chainhash.Hash) {
