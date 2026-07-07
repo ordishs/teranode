@@ -12,7 +12,7 @@ require (
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260526081552-cdfa7814ee5d
 	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv5
 	github.com/bsv-blockchain/go-bt/v2 v2.6.7
-	github.com/bsv-blockchain/go-chaincfg v1.5.8
+	github.com/bsv-blockchain/go-chaincfg v1.6.0
 	github.com/bsv-blockchain/go-sdk v1.2.24
 	github.com/bsv-blockchain/go-subtree v1.4.2
 	github.com/bsv-blockchain/testcontainers-aerospike-go v0.4.0
@@ -38,7 +38,7 @@ require (
 	github.com/mrz1836/go-datastore v1.2.6
 	github.com/mrz1836/go-logger v1.0.4
 	github.com/multiformats/go-multiaddr v0.16.1
-	github.com/ordishs/gocore v1.0.81
+	github.com/ordishs/gocore v1.0.82
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.33.0
 	github.com/segmentio/encoding v0.4.0 // indirect
@@ -202,7 +202,7 @@ require (
 	github.com/bsv-blockchain/go-p2p-message-bus v0.1.17
 	github.com/bsv-blockchain/go-safe-conversion v1.2.0
 	github.com/bsv-blockchain/go-tx-map v1.4.1
-	github.com/bsv-blockchain/go-wire v1.2.9
+	github.com/bsv-blockchain/go-wire v1.2.10
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
