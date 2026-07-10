@@ -1572,39 +1572,62 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 	return nil
 }
 
-// executeBatchCleanupCombined sends parent UDF updates and child record
-// deletions in a SINGLE Aerospike BatchOperate call. Halves the round-trip
-// count vs the two-call path. Only safe when defensive mode is off (because
-// the defensive safety check has an implicit ordering dependency between
-// parent.deletedChildren writes and child record deletions).
-func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[string]*parentUpdateInfo, keys []*aerospike.Key) error {
-	if len(updates) == 0 && len(keys) == 0 {
-		return nil
+// buildParentUpdateRecords builds the addDeletedChildren parent-update batch
+// records on the mod-teranode path: it prefers the injected native-op builder
+// (buildAddDeletedChildrenRecord → native subOpAddDeletedChildren) and falls back
+// to a direct Lua NewBatchUDF. Callers must only invoke it when the mod-teranode
+// path is active (buildAddDeletedChildrenRecord != nil || luaPackage != ""); it
+// is shared by the combined and two-call cleanup paths so the two never diverge.
+func (s *Service) buildParentUpdateRecords(updates map[string]*parentUpdateInfo) []aerospike.BatchRecordIfc {
+	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
+	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates))
+
+	for _, info := range updates {
+		childHashList := make([]interface{}, 0, len(info.childHashes))
+		for _, childHash := range info.childHashes {
+			childHashList = append(childHashList, childHash.String())
+		}
+
+		if s.buildAddDeletedChildrenRecord != nil {
+			batchRecords = append(batchRecords, s.buildAddDeletedChildrenRecord(batchUDFPolicy, info.key, childHashList))
+		} else {
+			batchRecords = append(batchRecords, aerospike.NewBatchUDF(
+				batchUDFPolicy,
+				info.key,
+				s.luaPackage,
+				"addDeletedChildren",
+				aerospike.NewValue(childHashList),
+			))
+		}
 	}
 
-	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates)+len(keys))
+	return batchRecords
+}
 
-	// Parent updates: prefer Lua UDF (silent on missing parents — no
-	// KEY_NOT_FOUND noise in client metrics) and fall back to a plain
-	// BatchWrite+MapPutItems if no Lua package is configured.
-	parentEnd := 0
-	useUDF := s.luaPackage != ""
+// buildCombinedCleanupRecords builds the batch records for the single-round-trip
+// combined cleanup: parent updates in [0, parentEnd) followed by child deletions
+// in [parentEnd, len).
+//
+// Parent updates prefer the injected native-op builder
+// (buildAddDeletedChildrenRecord → native subOpAddDeletedChildren), fall back to
+// a direct Lua NewBatchUDF, and finally to a plain MapPutItems BatchWrite when
+// neither mod-teranode path is configured. This mirrors executeBatchParentUpdates:
+// keying the choice purely on luaPackage (the old behaviour) ignored the native
+// builder and left the pruner emitting batch_sub_udf on native-op deployments
+// with defensive mode off.
+//
+// parentUsesModTeranode reports whether the parent-update records carry a
+// mod-teranode SUCCESS-map response (native or UDF, both silent on missing
+// parents) rather than the plain BatchWrite path (missing parent → KEY_NOT_FOUND).
+// The caller uses it to parse the batch results.
+func (s *Service) buildCombinedCleanupRecords(updates map[string]*parentUpdateInfo, keys []*aerospike.Key) (batchRecords []aerospike.BatchRecordIfc, parentEnd int, parentUsesModTeranode bool) {
+	batchRecords = make([]aerospike.BatchRecordIfc, 0, len(updates)+len(keys))
+
+	parentUsesModTeranode = s.buildAddDeletedChildrenRecord != nil || s.luaPackage != ""
+
 	if len(updates) > 0 {
-		if useUDF {
-			batchUDFPolicy := aerospike.NewBatchUDFPolicy()
-			for _, info := range updates {
-				childHashList := make([]interface{}, 0, len(info.childHashes))
-				for _, childHash := range info.childHashes {
-					childHashList = append(childHashList, childHash.String())
-				}
-				batchRecords = append(batchRecords, aerospike.NewBatchUDF(
-					batchUDFPolicy,
-					info.key,
-					s.luaPackage,
-					"addDeletedChildren",
-					aerospike.NewValue(childHashList),
-				))
-			}
+		if parentUsesModTeranode {
+			batchRecords = append(batchRecords, s.buildParentUpdateRecords(updates)...)
 		} else {
 			batchWritePolicy := aerospike.NewBatchWritePolicy()
 			batchWritePolicy.RecordExistsAction = aerospike.UPDATE_ONLY
@@ -1619,6 +1642,7 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 			}
 		}
 	}
+
 	parentEnd = len(batchRecords)
 
 	// Child deletions — TTL touch (utxoSetTTL=true) or hard delete.
@@ -1637,6 +1661,21 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 			}
 		}
 	}
+
+	return batchRecords, parentEnd, parentUsesModTeranode
+}
+
+// executeBatchCleanupCombined sends parent updates and child record deletions in
+// a SINGLE Aerospike BatchOperate call. Halves the round-trip count vs the
+// two-call path. Only safe when defensive mode is off (because the defensive
+// safety check has an implicit ordering dependency between parent.deletedChildren
+// writes and child record deletions).
+func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[string]*parentUpdateInfo, keys []*aerospike.Key) error {
+	if len(updates) == 0 && len(keys) == 0 {
+		return nil
+	}
+
+	batchRecords, parentEnd, parentUsesModTeranode := s.buildCombinedCleanupRecords(updates, keys)
 
 	if len(batchRecords) == 0 {
 		return nil
@@ -1671,8 +1710,10 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 		if i < parentEnd {
 			// Parent update result
 			if batchRec.Err != nil {
-				// BatchWrite path surfaces missing parents as KEY_NOT_FOUND
-				if !useUDF && batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+				// Plain MapPutItems BatchWrite path surfaces missing parents as
+				// KEY_NOT_FOUND; the mod-teranode paths (native + UDF) handle
+				// missing parents server-side and never surface it here.
+				if !parentUsesModTeranode && batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
 					parentNotFound++
 					continue
 				}
@@ -1682,32 +1723,30 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 				parentErrors++
 				continue
 			}
-			// UDF path returns a SUCCESS/ERROR map in the record bins
-			if useUDF && batchRec.Record != nil && batchRec.Record.Bins != nil {
+			// mod-teranode paths (native + UDF) return a SUCCESS/ERROR map in the
+			// record bins; the UDF path yields map[interface{}]interface{} and the
+			// native-op dispatcher yields map[string]interface{}.
+			if parentUsesModTeranode && batchRec.Record != nil && batchRec.Record.Bins != nil {
 				if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
-					if respMap, ok := resp.(map[interface{}]interface{}); ok {
-						if status, ok := respMap["status"].(string); ok {
-							switch status {
-							case "OK":
-								parentSuccess++
-							case "ERROR":
-								if errCode, ok := respMap["errorCode"].(string); ok && errCode == "TX_NOT_FOUND" {
-									parentNotFound++
-								} else {
-									parentErrors++
-									// UDF-path errors don't carry an
-									// aerospike.Error; synthesise one
-									// describing the UDF response so the
-									// returned error chain isn't empty.
-									if firstParentErr == nil {
-										errCode, _ := respMap["errorCode"].(string)
-										errMsg, _ := respMap["errorMessage"].(string)
-										firstParentErr = errors.NewProcessingError("UDF parent update returned ERROR (code=%q, message=%q)", errCode, errMsg)
-									}
+					if status, errCode, errMsg, ok := addDeletedChildrenStatus(resp); ok {
+						switch status {
+						case "OK":
+							parentSuccess++
+						case "ERROR":
+							if errCode == "TX_NOT_FOUND" {
+								parentNotFound++
+							} else {
+								parentErrors++
+								// UDF-path errors don't carry an
+								// aerospike.Error; synthesise one
+								// describing the UDF response so the
+								// returned error chain isn't empty.
+								if firstParentErr == nil {
+									firstParentErr = errors.NewProcessingError("UDF parent update returned ERROR (code=%q, message=%q)", errCode, errMsg)
 								}
 							}
-							continue
 						}
+						continue
 					}
 				}
 			}
@@ -1796,30 +1835,7 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 // records are handled server-side, avoiding KEY_NOT_FOUND noise in Aerospike
 // client metrics.
 func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[string]*parentUpdateInfo) error {
-	batchUDFPolicy := aerospike.NewBatchUDFPolicy()
-	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates))
-
-	for _, info := range updates {
-		childHashList := make([]interface{}, 0, len(info.childHashes))
-		for _, childHash := range info.childHashes {
-			childHashList = append(childHashList, childHash.String())
-		}
-
-		var record aerospike.BatchRecordIfc
-		if s.buildAddDeletedChildrenRecord != nil {
-			record = s.buildAddDeletedChildrenRecord(batchUDFPolicy, info.key, childHashList)
-		} else {
-			record = aerospike.NewBatchUDF(
-				batchUDFPolicy,
-				info.key,
-				s.luaPackage,
-				"addDeletedChildren",
-				aerospike.NewValue(childHashList),
-			)
-		}
-
-		batchRecords = append(batchRecords, record)
-	}
+	batchRecords := s.buildParentUpdateRecords(updates)
 
 	select {
 	case <-ctx.Done():
@@ -1849,24 +1865,21 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 			if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
 				// The UDF path returns map[interface{}]interface{}; the native-op
 				// dispatcher decodes the same Lua-style response as
-				// map[string]interface{}. Normalise to the former so the rest of
-				// the handler reads as before.
-				respMap, ok := normaliseAddDeletedChildrenResponse(resp)
-				if ok {
-					if status, ok := respMap["status"].(string); ok {
-						switch status {
-						case "OK":
-							successCount++
-						case "ERROR":
-							if errCode, ok := respMap["errorCode"].(string); ok && errCode == "TX_NOT_FOUND" {
-								notFoundCount++
-							} else {
-								s.logger.Errorf("Parent update Lua error for key %v: %v", batchRec.Key, respMap)
-								errorCount++
-							}
+				// map[string]interface{}. addDeletedChildrenStatus reads both
+				// shapes without copying the map.
+				if status, errCode, _, ok := addDeletedChildrenStatus(resp); ok {
+					switch status {
+					case "OK":
+						successCount++
+					case "ERROR":
+						if errCode == "TX_NOT_FOUND" {
+							notFoundCount++
+						} else {
+							s.logger.Errorf("Parent update Lua error for key %v: code=%q", batchRec.Key, errCode)
+							errorCount++
 						}
-						continue
 					}
+					continue
 				}
 			}
 		}
@@ -1889,22 +1902,32 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 	return nil
 }
 
-// normaliseAddDeletedChildrenResponse converts both response shapes the
-// addDeletedChildren mod-teranode op may return (legacy UDF path:
-// map[interface{}]interface{}; native-op path: map[string]interface{}) into
-// a single interface-keyed map. Returns false if the value isn't either.
-func normaliseAddDeletedChildrenResponse(v interface{}) (map[interface{}]interface{}, bool) {
-	switch m := v.(type) {
+// addDeletedChildrenStatus reads the status / errorCode / errorMessage fields
+// from the SUCCESS map returned by the addDeletedChildren mod-teranode op,
+// without allocating a copy of the map (this runs once per parent update on the
+// per-block cleanup hot path). Both response shapes are handled: the legacy UDF
+// path yields map[interface{}]interface{}; the native-op dispatcher yields
+// map[string]interface{}.
+//
+// ok reports that resp is one of those two map shapes AND carries a string
+// "status" field — matching the old two-step (normalise + status type-assert)
+// guard, so callers fall through to their default success handling unchanged
+// when the response has no parseable status.
+func addDeletedChildrenStatus(resp interface{}) (status, errorCode, errorMessage string, ok bool) {
+	switch m := resp.(type) {
 	case map[interface{}]interface{}:
-		return m, true
+		status, ok = m["status"].(string)
+		errorCode, _ = m["errorCode"].(string)
+		errorMessage, _ = m["errorMessage"].(string)
 	case map[string]interface{}:
-		out := make(map[interface{}]interface{}, len(m))
-		for k, val := range m {
-			out[k] = val
-		}
-		return out, true
+		status, ok = m["status"].(string)
+		errorCode, _ = m["errorCode"].(string)
+		errorMessage, _ = m["errorMessage"].(string)
+	default:
+		return "", "", "", false
 	}
-	return nil, false
+
+	return status, errorCode, errorMessage, ok
 }
 
 // executeBatchParentUpdatesBatchWrite is the fallback when Lua UDF is not configured.
