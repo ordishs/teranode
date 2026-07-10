@@ -1,0 +1,33 @@
+// Copyright 2015-2020 Aerospike, Inc.
+//
+// Portions may be licensed to Aerospike, Inc. under one or more contributor
+// license agreements.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not
+// use this file except in compliance with the License. You may obtain a copy of
+// the License at http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+//! Types and methods used for long running status queries.
+#![allow(clippy::missing_errors_doc)]
+
+pub use self::drop_index_task::DropIndexTask;
+pub use self::execute_task::ExecuteTask;
+pub use self::index_task::IndexTask;
+pub use self::register_task::RegisterTask;
+pub use self::task::Status;
+pub use self::task::Task;
+pub use self::udf_remove_task::UdfRemoveTask;
+
+mod drop_index_task;
+mod execute_task;
+mod index_task;
+mod register_task;
+#[allow(clippy::module_inception)]
+mod task;
+mod udf_remove_task;

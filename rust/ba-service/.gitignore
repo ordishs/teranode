@@ -1,0 +1,4 @@
+/target
+healthcheck/hc
+stage2check/stage2check
+fullcheck/fullcheck

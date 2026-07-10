@@ -1,0 +1,78 @@
+// Copyright 2015-2018 Aerospike, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub mod admin_command;
+pub mod batch_attr;
+pub mod batch_operate_command;
+pub mod buffer;
+pub mod delete_command;
+pub mod execute_udf_command;
+pub mod exists_command;
+pub mod info_command;
+pub mod operate_command;
+pub mod particle_type;
+pub mod query_command;
+pub mod read_command;
+pub mod scan_command;
+pub mod server_command;
+pub mod single_command;
+pub mod stream_command;
+pub mod touch_command;
+pub mod write_command;
+
+mod field_type;
+
+use std::sync::Arc;
+
+pub use self::batch_attr::BatchAttr;
+pub use self::batch_operate_command::BatchOperateCommand;
+pub use self::delete_command::DeleteCommand;
+pub use self::execute_udf_command::ExecuteUDFCommand;
+pub use self::exists_command::ExistsCommand;
+pub use self::info_command::Message;
+pub use self::operate_command::OperateCommand;
+pub use self::particle_type::ParticleType;
+pub use self::query_command::QueryCommand;
+pub use self::read_command::ReadCommand;
+pub use self::scan_command::ScanCommand;
+pub use self::server_command::ServerCommand;
+pub use self::single_command::SingleCommand;
+pub use self::stream_command::StreamCommand;
+pub use self::touch_command::TouchCommand;
+pub use self::write_command::WriteCommand;
+
+use crate::cluster::Node;
+use crate::errors::{Error, Result};
+use crate::net::Connection;
+
+// Command interface describes all commands available
+#[async_trait::async_trait]
+pub trait Command {
+    fn hint(&self) -> u8;
+    async fn write_timeout(&mut self, conn: &mut Connection) -> Result<()>;
+    async fn prepare_buffer(&mut self, conn: &mut Connection) -> Result<()>;
+    async fn get_node(&mut self) -> Result<Arc<Node>>;
+    async fn parse_result(&mut self, conn: &mut Connection) -> Result<()>;
+    async fn write_buffer(&mut self, conn: &mut Connection) -> Result<()>;
+    fn can_retry(&mut self) -> bool;
+    fn can_recover_connection(&mut self) -> bool;
+}
+
+pub const fn keep_connection(err: &Error) -> bool {
+    matches!(err, Error::ServerError(_, _, _) | Error::Timeout(_))
+}
+
+pub const fn is_network_error(err: &Error) -> bool {
+    matches!(err, Error::Connection(_) | Error::Timeout(_))
+}

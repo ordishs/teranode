@@ -1,0 +1,182 @@
+// Copyright 2015-2020 Aerospike, Inc.
+//
+// Portions may be licensed to Aerospike, Inc. under one or more contributor
+// license agreements.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not
+// use this file except in compliance with the License. You may obtain a copy of
+// the License at http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+//! Functions used to create database operations used in the client's `operate()` method.
+
+pub mod bitwise;
+pub(crate) mod cdt;
+pub mod cdt_context;
+pub mod exp;
+pub mod hll;
+pub mod lists;
+pub mod maps;
+pub mod scalar;
+
+use self::cdt::CdtOperation;
+pub use self::lists::{ListOrderType, ListPolicy, ListReturnType, ListSortFlags, ListWriteFlags};
+pub use self::maps::{MapOrder, MapPolicy, MapReturnType, MapWriteFlags, MapWriteMode};
+pub use self::scalar::*;
+
+use crate::commands::buffer::Buffer;
+use crate::commands::ParticleType;
+pub use crate::operations::cdt_context::CdtContext;
+use crate::operations::exp::ExpOperation;
+use crate::Result;
+use crate::Value;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OperationType {
+    Read = 1,
+    Write = 2,
+    CdtRead = 3,
+    CdtWrite = 4,
+    Incr = 5,
+    ExpRead = 7,
+    ExpWrite = 8,
+    Append = 9,
+    Prepend = 10,
+    Touch = 11,
+    BitRead = 12,
+    BitWrite = 13,
+    Delete = 14,
+    HllRead = 15,
+    HllWrite = 16,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum OperationData {
+    None,
+    Value(Value),
+    CdtListOp(CdtOperation),
+    CdtMapOp(CdtOperation),
+    CdtBitOp(CdtOperation),
+    HLLOp(CdtOperation),
+    EXPOp(ExpOperation),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum OperationBin {
+    None,
+    All,
+    Name(String),
+}
+
+/// Database operation definition. This data type is used in the client's `operate()` method.
+#[derive(Clone, Debug)]
+pub struct Operation {
+    // OpType determines type of operation.
+    pub(crate) op: OperationType,
+
+    // CDT context for nested types
+    pub(crate) ctx: Vec<CdtContext>,
+
+    // BinName (Optional) determines the name of bin used in operation.
+    pub(crate) bin: OperationBin,
+
+    // BinData determines bin value used in operation.
+    pub(crate) data: OperationData,
+}
+
+impl Operation {
+    pub(crate) const fn is_write(&self) -> bool {
+        matches!(
+            self.op,
+            OperationType::Write
+                | OperationType::CdtWrite
+                | OperationType::Incr
+                | OperationType::ExpWrite
+                | OperationType::Append
+                | OperationType::Prepend
+                | OperationType::Touch
+                | OperationType::BitWrite
+                | OperationType::Delete
+                | OperationType::HllWrite
+        )
+    }
+
+    pub(crate) fn estimate_size(&self) -> Result<usize> {
+        let mut size: usize = 0;
+        size += match &self.bin {
+            OperationBin::Name(bin) => bin.len(),
+            OperationBin::None | OperationBin::All => 0,
+        };
+        size += match &self.data {
+            OperationData::None => 0,
+            OperationData::Value(value) => value.estimate_size()?,
+            OperationData::EXPOp(ref exp_op) => exp_op.estimate_size()?,
+            OperationData::CdtListOp(ref cdt_op)
+            | OperationData::CdtMapOp(ref cdt_op)
+            | OperationData::CdtBitOp(ref cdt_op)
+            | OperationData::HLLOp(ref cdt_op) => cdt_op.estimate_size(&self.ctx)?,
+        };
+
+        Ok(size)
+    }
+
+    pub(crate) fn write_to(&self, buffer: &mut Buffer) -> Result<usize> {
+        let mut size: usize = 0;
+
+        // remove the header size from the estimate
+        let op_size = self.estimate_size()?;
+
+        size += buffer.write_u32(op_size as u32 + 4);
+        size += buffer.write_u8(self.op as u8);
+
+        match &self.data {
+            OperationData::None => {
+                size += self.write_op_header_to(buffer, ParticleType::NULL as u8);
+            }
+            OperationData::Value(value) => {
+                size += self.write_op_header_to(buffer, value.particle_type() as u8);
+                size += value.write_to(buffer)?;
+            }
+            OperationData::CdtListOp(ref cdt_op)
+            | OperationData::CdtMapOp(ref cdt_op)
+            | OperationData::CdtBitOp(ref cdt_op)
+            | OperationData::HLLOp(ref cdt_op) => {
+                size += self.write_op_header_to(buffer, cdt_op.particle_type() as u8);
+                size += cdt_op.write_to(buffer, &self.ctx)?;
+            }
+            OperationData::EXPOp(ref exp) => {
+                size += self.write_op_header_to(buffer, ParticleType::BLOB as u8);
+                size += exp.write_to(buffer)?;
+            }
+        }
+
+        Ok(size)
+    }
+
+    pub(crate) fn write_op_header_to(&self, buffer: &mut Buffer, particle_type: u8) -> usize {
+        let mut size = buffer.write_u8(particle_type);
+        size += buffer.write_u8(0);
+        match &self.bin {
+            OperationBin::Name(bin) => {
+                size += buffer.write_u8(bin.len() as u8);
+                size += buffer.write_str(bin);
+            }
+            OperationBin::None | OperationBin::All => {
+                size += buffer.write_u8(0);
+            }
+        }
+        size
+    }
+
+    /// Set the context of the operation. Required for nested structures
+    #[must_use]
+    pub fn context(mut self, ctx: Vec<CdtContext>) -> Self {
+        self.ctx = ctx;
+        self
+    }
+}

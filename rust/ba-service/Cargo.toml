@@ -1,0 +1,45 @@
+[package]
+name = "ba-service"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Gate 2 — native Rust Block Assembly service. Generates gRPC types from the
+# CANONICAL protos in place (model/model.proto + blockassembly_api.proto),
+# read-only. The Go implementation is never modified.
+
+[dependencies]
+tonic = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# The Gate 1 native subtree engine (validated byte-identical to go-subtree).
+ba-subtree-bench = { path = "../ba-subtree-bench" }
+hex = "0.4"
+url = "2"
+# gocore's Rust counterpart: settings.conf/settings_local.conf discovery,
+# env-first precedence, SETTINGS_CONTEXT fallback, ${KEY} interpolation.
+rustcore = { git = "https://github.com/ordishs/rustcore", tag = "v0.1.1" }
+# Base58check decoding of miner wallet addresses for coinbase output scripts.
+bs58 = { version = "0.5", features = ["check"] }
+# Upstream Aerospike client (proven interoperable in rust/aerospike-compat-spike).
+# Default features include "async" + "rt-tokio"; mirror the spike exactly.
+aerospike = "=2.1.0"
+# Async query results come back as a futures::Stream (RecordStream); StreamExt
+# drives them. Pinned to the version the aerospike client already resolves.
+futures = "0.3"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# VENDORED PATCH: aerospike-core 2.1.0 with one fix — the node-version parser
+# accepts 3-part build strings (the bsv-blockchain aerospike-server fork reports
+# `8.0.0`; upstream's strict 4-part regex rejected every node, so the client
+# could never validate the seed host). See ru../patches/aerospike-core.
+[patch.crates-io]
+aerospike-core = { path = "../patches/aerospike-core" }

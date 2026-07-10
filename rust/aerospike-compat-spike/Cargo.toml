@@ -1,0 +1,22 @@
+[package]
+name = "aerospike-compat-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Throwaway Gate 0 spike: verify the upstream Rust aerospike client interoperates
+# with Teranode's Aerospike UTXO store (key digest, bin schema, Lua UDFs).
+# Dependencies are added incrementally as each task needs them.
+
+[dependencies]
+aerospike = "=2.1.0"
+
+# Same vendored patch the service uses: aerospike-core 2.1.0 with the node-version
+# parser accepting the bsv-blockchain fork's 3-part build string (else seed
+# validation fails against the live fork server).
+[patch.crates-io]
+aerospike-core = { path = "../patches/aerospike-core" }
+
+[dev-dependencies]
+testcontainers = "0.27"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
