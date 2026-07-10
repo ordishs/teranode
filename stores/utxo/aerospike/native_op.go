@@ -112,11 +112,28 @@ func (s *Store) teranodeBatchRecord(
 				subOp, err)
 			return s.teranodeBatchUDFRecord(udfPolicy, udfPackage, key, udfFnName, args)
 		}
-		// Reuse the Store's shared BatchWritePolicy (allocated once in
-		// initNativeTeranodeOps). The Aerospike client only reads from the
-		// policy during BatchOperate, and no caller mutates it after init.
+		// Reuse the Store's shared filterless BatchWritePolicy (allocated once
+		// in initNativeTeranodeOps) on the hot path. The Aerospike client only
+		// reads from the policy during BatchOperate, and no caller mutates it
+		// after init.
+		writePolicy := s.nativeOpBatchWritePolicy
+
+		// Carry a caller-supplied server-side FilterExpression onto the native
+		// write so filtered-out records are skipped server-side exactly as on
+		// the UDF path. PreserveTransactions sets the deleteAtHeight/preserveUntil
+		// eligibility gate here; without carrying it the native path would write
+		// preserveUntil to every record — including the partially-spent parents
+		// the gate deliberately excludes. Allocate a per-call copy only when a
+		// filter is actually present (today only subOpPreserveUntil), leaving the
+		// shared filterless policy for the hot spend/setMined/locked ops.
+		if udfPolicy != nil && udfPolicy.FilterExpression != nil {
+			wp := *s.nativeOpBatchWritePolicy
+			wp.FilterExpression = udfPolicy.FilterExpression
+			writePolicy = &wp
+		}
+
 		return aerospike.NewBatchWrite(
-			s.nativeOpBatchWritePolicy,
+			writePolicy,
 			key,
 			aerospike.TeranodeModifyOp(nativeOpResultBin, payload),
 		)
