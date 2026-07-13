@@ -178,13 +178,27 @@ func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment in
 			}
 		}
 
+		// Parse the SUCCESS bin via ParseLuaMapResponse rather than a bare
+		// map[interface{}]interface{} assertion: subOpIncrementSpentExtraRec is
+		// not fenced, so with native ops enabled the response is decoded through
+		// msgpack and can be a map[string]interface{} (or a reflection fallback),
+		// which a concrete-type assertion would panic on. ParseLuaMapResponse
+		// tolerates every map shape both transports produce (see teranode.go).
 		response := batchRecords[i].BatchRec().Record
-		if response != nil && response.Bins != nil {
-			successMap := response.Bins[LuaSuccess.String()].(map[interface{}]interface{})
-			status, ok := successMap["status"].(string)
-			if !ok || status != "OK" {
-				aggErr = errors.Join(aggErr, errors.NewProcessingError(successMap["message"].(string)))
-			}
+		if response == nil || response.Bins == nil || response.Bins[LuaSuccess.String()] == nil {
+			continue
+		}
+
+		rawResponse := response.Bins[LuaSuccess.String()]
+
+		parsed, perr := s.ParseLuaMapResponse(rawResponse)
+		if perr != nil {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] failed to parse response bin %q (value %s): %s", describeChainHash(txids[i]), LuaSuccess.String(), describeAerospikeValue(rawResponse), perr.Error(), perr))
+			continue
+		}
+
+		if parsed.Status != LuaStatusOK {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] incrementSpentExtraRecs returned %s: %s", describeChainHash(txids[i]), parsed.Status, parsed.Message))
 		}
 	}
 
