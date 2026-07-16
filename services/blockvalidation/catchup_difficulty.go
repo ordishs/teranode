@@ -110,9 +110,10 @@ func validateHeaderChainDifficulty(tSettings *settings.Settings, anchor *model.B
 	}
 
 	// median3 returns the median-by-time of the three headers ending at idx, mirroring
-	// stores/blockchain/sql getMedianBlock (which sorts the block plus its two ancestors).
+	// stores/blockchain/sql getMedianBlock. Order candidates oldest-first (depth DESC in
+	// the store) so the unstable sort's tie-break matches the store path exactly.
 	median3 := func(idx int) *model.SuitableBlock {
-		s := []*model.SuitableBlock{suitable(idx), suitable(idx - 1), suitable(idx - 2)}
+		s := []*model.SuitableBlock{suitable(idx - 2), suitable(idx - 1), suitable(idx)}
 		util.SortForDifficultyAdjustment(s)
 
 		return s[1]
