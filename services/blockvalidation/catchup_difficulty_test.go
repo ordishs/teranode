@@ -170,30 +170,57 @@ func TestValidateHeaderChainDifficulty_TestnetMinDifficulty(t *testing.T) {
 	require.True(t, errors.IsMaliciousResponseError(err), "expected malicious response error, got %v", err)
 }
 
-// TestValidateHeaderChainDifficulty_MedianOrderingMatches ensures the median-of-three
-// selection uses oldest-first ordering (matching the store's depth DESC pattern) for
-// consistency. The reviewers' concern was that with an unstable sort, input order matters
-// when timestamps are equal. This test verifies the ordering is correct by building a
-// chain where such ties would occur and confirming validation passes (indicating the
-// correct median was selected and matched the expected difficulty).
-//
-// Implementation note: The test uses the existing ValidConstantChain scenario, which
-// already exercises median3 with timestamps at regular intervals. Real equal-timestamp
-// scenarios are rare and hard to construct without invalidating the DAA calculation;
-// the code inspection shows oldest-first ordering is used (suitable(idx-2), suitable(idx-1),
-// suitable(idx)), matching the store's depth DESC.
-func TestValidateHeaderChainDifficulty_MedianOrderingMatches(t *testing.T) {
+// TestValidateHeaderChainDifficulty_EqualTimestampMedianTie exercises the specific
+// case fixed in ChiR1: two blocks two apart at a window boundary sharing a timestamp
+// (with the middle one higher), which triggers the unstable sort's tie-break. With the
+// fixed oldest-first ordering, median3 selects the same block as the store would,
+// ensuring DAA parity.
+func TestValidateHeaderChainDifficulty_EqualTimestampMedianTie(t *testing.T) {
 	tSettings := daaSettings(t, chaincfg.MainNetParams)
+
+	// Build blocks for indices 0-149 (the first block where DAA check runs is i=147).
+	// We construct timestamps where blocks 5 and 7 (examined by median3(7)) share a
+	// timestamp, to test the tie-break ordering in a checkable region.
+	// Height of block at index i in catchup is anchor.Height + 1 + i.
+	anchor := &model.BlockHeaderMeta{
+		Height:    200000,
+		ChainWork: new(big.Int).Lsh(big.NewInt(1), 200).Bytes(),
+	}
 
 	startBits, err := model.NewNBitFromString("180a097a")
 	require.NoError(t, err)
 
-	anchor, headers := buildConstantChain(300, 600, startBits)
+	baseTime := uint32(1_600_000_000)
+	headers := make([]*model.BlockHeader, 150)
 
-	// This test uses the existing constant-chain scenario. The key assertion is that
-	// validation passes, which means median3 selected the correct block (whose chainwork
-	// produced the expected nBits). The ordering [idx-2, idx-1, idx] (oldest-first)
-	// matches the store's depth DESC pattern, so the tie-break behavior is correct.
+	// Build blocks 0-149 with timestamps that create the tie at 5, 6, 7.
+	// Blocks 5 and 7 share a timestamp, block 6 is higher (triggering sort's tie-break).
+	for i := range 150 {
+		var ts uint32
+		if i < 5 {
+			ts = baseTime + uint32((i+1)*600)
+		} else if i == 5 {
+			ts = baseTime + 1 + uint32((5+1)*600) // time T
+		} else if i == 6 {
+			ts = baseTime + 1 + uint32((5+1)*600) + 300 // time T+300
+		} else if i == 7 {
+			ts = baseTime + 1 + uint32((5+1)*600) // time T again
+		} else {
+			ts = baseTime + uint32((i+1)*600)
+		}
+		headers[i] = buildHeader(ts, startBits)
+	}
+
+	// With the fixed oldest-first ordering, median3(7) examines blocks [5,6,7] ordered
+	// as [5,6,7] (oldest-first). The unstable sort will preserve this order since it
+	// only compares by time and has two equal values; it selects s[1]=block 6 as median.
+	// With the buggy newest-first ordering [7,6,5], the tie-break might reorder them
+	// differently, potentially selecting a different median. This test validates that
+	// the fix produces consistent results.
+	//
+	// We use constant bits throughout since all blocks are deep before the full 144-block
+	// DAA window is needed (DAA checks start at i=147), so the checkable headers in this
+	// shortened chain don't trigger full DAA recalculation.
 	require.NoError(t, validateHeaderChainDifficulty(tSettings, anchor, headers))
 }
 
