@@ -85,6 +85,14 @@ type Block struct {
 	// blockvalidation service sets this (via SetNodeAllocator); model-internal
 	// callers leave it nil and behaviour matches legacy make() allocation.
 	nodeAllocator subtreepkg.NodeAllocator
+	// checkpointConfirmedAncestor records whether this block is provably on the main
+	// chain that has already reached and matched the highest hardcoded checkpoint. It is
+	// the caller-supplied ancestry predicate that, together with store fast-path support,
+	// gates the below-checkpoint coinbase no-inflation skip in checkBlockRewardAndFees.
+	// Only the blockvalidation service sets it (via SetCheckpointConfirmedAncestor); it
+	// defaults false so any caller that does not set it gets full no-inflation enforcement
+	// (fail-safe).
+	checkpointConfirmedAncestor bool
 }
 
 // SetNodeAllocator installs a caller-supplied allocator that
@@ -105,6 +113,16 @@ func (b *Block) NodeAllocator() subtreepkg.NodeAllocator {
 	return b.nodeAllocator
 }
 
+// SetCheckpointConfirmedAncestor records whether this block is provably part of the
+// main chain that has already reached and matched the highest hardcoded checkpoint.
+// Only the blockvalidation service sets this (from BlockValidation.checkpointConfirmed-
+// Ancestor); it is the caller-supplied ancestry predicate that gates the below-checkpoint
+// coinbase no-inflation skip in checkBlockRewardAndFees. Leaving it unset (false) forces
+// full no-inflation enforcement. Safe to call before any goroutine reads the block.
+func (b *Block) SetCheckpointConfirmedAncestor(v bool) {
+	b.checkpointConfirmedAncestor = v
+}
+
 func NewBlock(header *BlockHeader, coinbase *bt.Tx, subtrees []*chainhash.Hash, transactionCount uint64, sizeInBytes uint64, blockHeight uint32, id uint32) (*Block, error) {
 	return &Block{
 		Header:           header,
@@ -118,7 +136,13 @@ func NewBlock(header *BlockHeader, coinbase *bt.Tx, subtrees []*chainhash.Hash, 
 	}, nil
 }
 
-// NewBlockFromMsgBlock creates a new model.Block from a wire.MsgBlock
+// NewBlockFromMsgBlock creates a new model.Block from a wire.MsgBlock.
+//
+// All non-coinbase transactions are packed into a single subtree sized to the
+// transaction count. This is intended for the genesis block and the small
+// offline/test blocks that are this constructor's only callers; it is NOT
+// subtree-size-limit aware and must not be used to assemble real, full-sized
+// blocks (which split transactions across multiple bounded subtrees).
 func NewBlockFromMsgBlock(msgBlock *wire.MsgBlock, optionalSettings *settings.Settings) (*Block, error) {
 	if msgBlock == nil {
 		return nil, errors.NewInvalidArgumentError("msgBlock is nil")
@@ -182,15 +206,59 @@ func NewBlockFromMsgBlock(msgBlock *wire.MsgBlock, optionalSettings *settings.Se
 	if err = subtree.AddCoinbaseNode(); err != nil {
 		return nil, errors.NewSubtreeError("failed to add coinbase placeholder", err)
 	}
-	// TODO: support more than coinbase tx in the subtree
-	// if txCount > 1 {
-	// 	// loop through the transactions ignoring the first coinbase tx and add them to the subtrees list
 
-	// 	// subtrees = append(subtrees, subtree.RootHash())
-	// }
+	// Add every non-coinbase transaction to the subtree so the resulting block
+	// exposes its full transaction set, not just the coinbase. Without this,
+	// block.Valid() and the block-validation service skip all per-transaction
+	// checks for a block built from a wire.MsgBlock, because they gate those
+	// checks on the block carrying at least one subtree root.
+	//
+	// Transaction input values are not available from a raw (non-extended) block,
+	// so the per-node fee is recorded as 0 here. That is enough to place the
+	// transaction in the subtree and to validate consensus rules that do not depend
+	// on fees (e.g. sequence locks): the subtree-validation/store path recomputes and
+	// rewrites fee metadata when it persists and validates the subtree. Note that
+	// model.Block.Valid()'s block-reward check sums the SubtreeSlices fees directly
+	// and does not recompute them, so validating a block in memory straight from this
+	// constructor is only sound for offline blocks whose coinbase claims no fees
+	// (subsidy only). A single subtree holds the whole block, which is sufficient for
+	// the offline blocks this constructor handles.
+	for i := 1; i < len(msgBlock.Transactions); i++ {
+		// The transaction hash is the canonical double-SHA256 of the wire
+		// serialization, identical to the value the subtree/merkle path expects.
+		hash := msgBlock.Transactions[i].TxHash()
 
-	// Create and return the new Block
-	return NewBlock(header, coinbaseTx, subtrees, txCount, sizeInBytes, 0, 0)
+		txSize, sizeErr := safeconversion.IntToUint64(msgBlock.Transactions[i].SerializeSize())
+		if sizeErr != nil {
+			return nil, errors.NewProcessingError("failed to compute size for transaction %d", i, sizeErr)
+		}
+
+		if addErr := subtree.AddNode(hash, 0, txSize); addErr != nil {
+			return nil, errors.NewSubtreeError("failed to add transaction %d to subtree", i, addErr)
+		}
+	}
+
+	// Only a block that carries transactions beyond the coinbase gets a subtree
+	// root recorded on the block. A coinbase-only block (e.g. the genesis block)
+	// keeps an empty subtree list, preserving the historical behaviour of this
+	// function and its callers.
+	var subtreeSlices []*subtreepkg.Subtree
+
+	if txCount > 1 {
+		subtrees = append(subtrees, subtree.RootHash())
+		subtreeSlices = []*subtreepkg.Subtree{subtree}
+	}
+
+	// Create the new Block. NewBlock never returns an error, so the result is
+	// used directly.
+	block, _ := NewBlock(header, coinbaseTx, subtrees, txCount, sizeInBytes, 0, 0)
+
+	// Retain the in-memory subtree so in-process callers can validate the block
+	// without a subtree-store round trip. This field is not serialised, so it is
+	// dropped when the block is sent over the wire.
+	block.SubtreeSlices = subtreeSlices
+
+	return block, nil
 }
 
 func NewBlockFromBytes(blockBytes []byte) (block *Block, err error) {
@@ -480,6 +548,19 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		return false, errors.NewBlockInvalidError("[BLOCK][%s] block coinbase tx is not a valid coinbase tx", b.String())
 	}
 
+	// 4b. Check that the coinbase scriptSig (unlocking script) length is within consensus bounds.
+	// Parity with bitcoin-sv CheckCoinbase (bad-cb-length): inclusive 2 <= size <= MaxCoinbaseScriptSigSize.
+	// IsCoinbase() above guarantees exactly one input, so Inputs[0] is safe to index; a nil
+	// UnlockingScript is treated as length 0 and fails the lower bound, matching an empty scriptSig.
+	scriptSigLen := 0
+	if us := b.CoinbaseTx.Inputs[0].UnlockingScript; us != nil {
+		scriptSigLen = len(*us)
+	}
+
+	if scriptSigLen < 2 || scriptSigLen > int(settings.ChainCfgParams.MaxCoinbaseScriptSigSize) {
+		return false, errors.NewBlockInvalidError("[BLOCK][%s] bad coinbase length", b.String())
+	}
+
 	// We can only calculate the height from coinbase transactions in block versions 2 and higher
 
 	// https://en.bitcoin.it/wiki/BIP_0034
@@ -501,6 +582,13 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 			return false, errors.NewBlockInvalidError("[BLOCK][%s] block height in coinbase tx (%d) does not match block height in block header (%d)", b.String(), height, b.Height)
 		}
 	}
+
+	// merkleRootChecked records that CheckMerkleRoot (step 8) actually ran and bound
+	// the block body to the header. Block.Valid enforces this as a precondition for
+	// skipping validOrderAndBlessed below the checkpoint (step 12): the skip's safety
+	// rests entirely on that binding, so a caller that did not run it (nil
+	// subtreeStore, or no subtrees) must never take the skip.
+	merkleRootChecked := false
 
 	// only do the subtree checks if we have a subtree store
 	// missing the subtreeStore should only happen when we are validating an internal block
@@ -525,12 +613,22 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		if err = b.CheckMerkleRoot(ctx); err != nil {
 			return false, err
 		}
+
+		merkleRootChecked = true
 	}
 
 	// 9. Check that the total fees of the block are less than or equal to the block reward.
 	// 10. Check that the coinbase transaction includes the correct block reward.
 	if b.Height > 0 {
-		err = b.checkBlockRewardAndFees(settings.ChainCfgParams)
+		// The below-checkpoint fee=0 skip is only tolerated on a store that can actually
+		// produce those blocks (the outpoint-only fast path); every other store keeps full
+		// no-inflation enforcement below the checkpoint. Computed here because model cannot
+		// see the store type directly. checkpointConfirmedAncestor is the caller-supplied
+		// ancestry predicate (SetCheckpointConfirmedAncestor); it defaults false, so a caller
+		// that does not set it gets full enforcement.
+		storeSupportsOutpointOnly := txMetaStore != nil && txMetaStore.SupportsOutpointOnlySpend()
+
+		err = b.checkBlockRewardAndFees(settings.ChainCfgParams, storeSupportsOutpointOnly, b.checkpointConfirmedAncestor)
 		if err != nil {
 			return false, err
 		}
@@ -580,18 +678,33 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 
 	// 12. Check that all transactions are in the valid order and blessed
 	//     Can only be done with a valid texMetaStore passed in
+	//     Skipped for a confirmed-ancestor block below the hardcoded checkpoint on
+	//     the outpoint-only fast path: the checkpoint-anchored chain already
+	//     certifies order/blessing. The integrity floor still runs earlier in this
+	//     function (steps 1-11): PoW and checkDuplicateTransactions unconditionally.
+	//     The skip additionally REQUIRES merkleRootChecked — CheckMerkleRoot (step 8)
+	//     must have run and bound the body to the checkpoint-certified header — so it
+	//     is never taken on a nil-subtreeStore / no-subtree caller where that binding
+	//     is absent (see skipOrderAndBlessedBelowCheckpoint, which shares the fee
+	//     skip's safety contract but additionally requires the
+	//     OutpointOnlyBelowCheckpoint opt-in, so it engages on a subset of the
+	//     fee-skip blocks).
 	if txMetaStore != nil {
-		deps := &validationDependencies{
-			txMetaStore:           txMetaStore,
-			subtreeStore:          subtreeStore,
-			currentChain:          currentChain,
-			currentBlockHeaderIDs: currentBlockHeaderIDs,
-			oldBlockIDsMap:        oldBlockIDsMap,
-			metaRegenerator:       metaRegenerator,
-		}
-		err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency, settings.Block.DiskMapDirs, settings.Block.ParentSpendsCapacityMultiplier)
-		if err != nil {
-			return false, err
+		if merkleRootChecked && b.skipOrderAndBlessedBelowCheckpoint(settings, txMetaStore) {
+			logger.Debugf("[Block:Valid][%s] skipping validOrderAndBlessed for block at height %d at or below hardcoded checkpoint (outpoint-only fast path)", b.String(), b.Height)
+		} else {
+			deps := &validationDependencies{
+				txMetaStore:           txMetaStore,
+				subtreeStore:          subtreeStore,
+				currentChain:          currentChain,
+				currentBlockHeaderIDs: currentBlockHeaderIDs,
+				oldBlockIDsMap:        oldBlockIDsMap,
+				metaRegenerator:       metaRegenerator,
+			}
+			err = b.validOrderAndBlessed(ctx, logger, deps, settings.Block.ValidOrderAndBlessedConcurrency, settings.Block.DiskMapDirs, settings.Block.ParentSpendsCapacityMultiplier)
+			if err != nil {
+				return false, err
+			}
 		}
 	}
 
@@ -627,6 +740,55 @@ func (b *Block) releaseTxMap() {
 	b.txMap = nil
 }
 
+// skipOrderAndBlessedBelowCheckpoint reports whether validOrderAndBlessed may be
+// skipped for this block. It shares the same checkpoint safety contract as the
+// below-checkpoint fee skip in checkBlockRewardAndFees, but adds one conjunct the
+// fee skip deliberately omits — the OutpointOnlyBelowCheckpoint opt-in — so this
+// skip engages on a strict subset of the fee-skip blocks (flag-on only). The fee
+// skip cannot depend on the flag because a fast-path block persists fee=0 and would
+// be wrongly rejected on flag-off revalidation; validOrderAndBlessed has no such
+// hazard (it reads persisted subtree meta and parent existence, not fees), so
+// gating it on the opt-in is safe and strictly more conservative. True only when
+// ALL of the following hold:
+//
+//   - the operator has opted into the below-checkpoint outpoint-only fast path
+//     (OutpointOnlyBelowCheckpoint);
+//   - the UTXO store can actually run that fast path
+//     (txMetaStore.SupportsOutpointOnlySpend()) — the capability check that
+//     replaced the old SQL-store restriction;
+//   - the block is a confirmed ancestor of the pinned checkpoint
+//     (b.checkpointConfirmedAncestor, set only by the blockvalidation service via
+//     SetCheckpointConfirmedAncestor; defaults false). This closes the forward /
+//     optimistic-checkpoint window and the detached-fork-reconsider window that a
+//     height-only gate would leave open;
+//   - the network defines a hardcoded checkpoint and 0 < b.Height <= that
+//     checkpoint.
+//
+// On a confirmed-ancestor block below a hardcoded checkpoint the pinned block
+// hash already certifies transaction order, uniqueness and blessing: a block
+// whose transactions differed in any way would produce a different merkle root
+// and could not carry the checkpoint-anchored header chain. PoW and
+// checkDuplicateTransactions (CVE-2012-2459) run unconditionally. CheckMerkleRoot
+// (step 8) runs only when a subtree store and subtrees are present, so it is NOT
+// unconditional — Block.Valid therefore enforces "CheckMerkleRoot ran"
+// (merkleRootChecked) as a precondition of taking this skip, and never skips
+// validOrderAndBlessed unless the local bytes have been bound to the certified
+// chain. This mirrors the native catchup path (quickValidateBlock), which never
+// runs Valid() below the checkpoint at all. All below-checkpoint gates now share
+// OutpointOnlyEligible/BelowCheckpoint, which excludes height 0 everywhere.
+func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings, txMetaStore utxo.Store) bool {
+	if !b.checkpointConfirmedAncestor {
+		return false
+	}
+
+	var params *chaincfg.Params
+	if tSettings != nil {
+		params = tSettings.ChainCfgParams
+	}
+
+	return OutpointOnlyEligible(tSettings, txMetaStore, params, b.Height)
+}
+
 // https://en.bitcoin.it/wiki/BIP_0034
 // BIP-34 was created to force miners to add the block height to the coinbase tx.
 // This BIP came into effect at block 227,835, which is after the first halving
@@ -634,27 +796,87 @@ func (b *Block) releaseTxMap() {
 // height of the block we are checking for.
 
 // TODO - do this another way, if necessary
-func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params) error {
+func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOutpointOnly, checkpointConfirmedAncestor bool) error {
 	if b.Height == 0 {
 		return nil // Skip this check
 	}
 
+	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) only when ALL
+	// THREE conditions hold: the block is at/below the highest HARDCODED checkpoint, the store
+	// can actually produce the fee=0 subtrees this skip exists to tolerate, and the block is a
+	// confirmed ancestor of the pinned checkpoint. Each condition answers a distinct concern:
+	//
+	//  1. NOT gated on the OutpointOnlyBelowCheckpoint setting. The outpoint-only fast path
+	//     persists subtree fees as 0. A block synced that way must still revalidate on
+	//     reconsiderblock/RevalidateBlock even after the operator restores the default (flag
+	//     off) — a flag-gated skip would recompute coinbaseOutput (subsidy+realFees) >
+	//     subtreeFees(0)+subsidy and wrongly reject a genuinely-valid, checkpoint-pinned block
+	//     as BLOCK_INVALID. The read side cannot distinguish a fast-path fee=0 block from a
+	//     default one, so the skip cannot depend on live config.
+	//  2. GATED on store support (storeSupportsOutpointOnly). On a store that cannot run the
+	//     fast path (Aerospike, or the unconfigured default) real fees are always written, no
+	//     fee=0 block can exist, and there is nothing to tolerate — so full no-inflation
+	//     enforcement is retained. Without this gate the skip would silently disable the check
+	//     on nodes where the feature is a documented no-op. Computed at the Block.Valid call
+	//     site, which holds the store; model cannot see the store type directly.
+	//  3. GATED on confirmed ancestry (checkpointConfirmedAncestor). The skip fires only for a
+	//     block PROVEN to be on the main chain that has already reached and matched the pinned
+	//     checkpoint hash — so the checkpoint transitively commits its coinbase, making the
+	//     arithmetic redundant. This closes the two windows a height-only skip leaves open:
+	//     (a) the forward/optimistic-checkpoint window (a below-checkpoint block validated
+	//     before the chain has reached the pinned hash) and (b) a detached fork block below the
+	//     checkpoint reconsidered via reconsiderblock. In both the predicate is false, so the
+	//     check runs — correctly, because non-fast-path blocks carry real fees. The predicate is
+	//     caller-supplied (BlockValidation.checkpointConfirmedAncestor, threaded via
+	//     SetCheckpointConfirmedAncestor) because it needs blockchain state model cannot see; it
+	//     is fail-safe (any lookup error or ambiguity yields false → the check runs).
+	//
+	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
+	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant
+	// I3); see model/checkpoint.go.
+	if storeSupportsOutpointOnly && checkpointConfirmedAncestor && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
+		return nil
+	}
+
+	// Accumulate with overflow detection. A uint64 wraparound in any of these
+	// sums could make the no-inflation comparison below pass on a block that is
+	// actually inflating supply, so a sum that overflows is itself invalid.
+	// These overflows cannot occur in a valid block (total value is far below
+	// 2^64 satoshis), so this only rejects impossible values and does not change
+	// the result for any real block.
 	coinbaseOutputSatoshis := uint64(0)
+
 	for _, tx := range b.CoinbaseTx.Outputs {
-		coinbaseOutputSatoshis += tx.Satoshis
+		sum := coinbaseOutputSatoshis + tx.Satoshis
+		if sum < coinbaseOutputSatoshis {
+			return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] coinbase output satoshis overflow uint64", b.String())
+		}
+
+		coinbaseOutputSatoshis = sum
 	}
 
 	subtreeFees := uint64(0)
 
 	for i := 0; i < len(b.SubtreeSlices); i++ {
 		subtree := b.SubtreeSlices[i]
-		subtreeFees += subtree.Fees
+
+		sum := subtreeFees + subtree.Fees
+		if sum < subtreeFees {
+			return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] subtree fees overflow uint64", b.String())
+		}
+
+		subtreeFees = sum
 	}
 
 	coinbaseReward := util.GetBlockSubsidyForHeight(b.Height, params)
 
-	if coinbaseOutputSatoshis > subtreeFees+coinbaseReward {
-		return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] coinbase output (%d) is greater than the fees + block subsidy (%d)", b.String(), coinbaseOutputSatoshis, subtreeFees+coinbaseReward)
+	allowedReward := subtreeFees + coinbaseReward
+	if allowedReward < subtreeFees {
+		return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] fees + block subsidy overflow uint64", b.String())
+	}
+
+	if coinbaseOutputSatoshis > allowedReward {
+		return errors.NewBlockInvalidError("[checkBlockRewardAndFees][%s] coinbase output (%d) is greater than the fees + block subsidy (%d)", b.String(), coinbaseOutputSatoshis, allowedReward)
 	}
 
 	return nil
@@ -695,10 +917,16 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 	}
 
 	if len(diskMapDirs) > 0 {
+		// An empty (coinbase-only) block has TransactionCount == 0, but the
+		// mmap-backed table rejects a zero capacity — clamp to 1.
+		filterCapacity := b.TransactionCount
+		if filterCapacity == 0 {
+			filterCapacity = 1
+		}
 		diskMap, diskErr := NewDiskTxMapUint64(DiskTxMapUint64Options{
 			BasePaths:      diskMapDirs,
 			Prefix:         "bv-txmap",
-			FilterCapacity: uint(b.TransactionCount),
+			FilterCapacity: uint(filterCapacity),
 		})
 		if diskErr != nil {
 			return errors.NewProcessingError("[checkDuplicateTransactions][%s] failed to create disk tx map", b.String(), diskErr)
@@ -802,6 +1030,11 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 		parentSpendsCapacityMultiplier = 1
 	}
 	expectedInpoints := b.TransactionCount * parentSpendsCapacityMultiplier
+	if expectedInpoints == 0 {
+		// Empty (coinbase-only) block: TransactionCount == 0, but the
+		// mmap-backed table rejects a zero capacity — clamp to 1.
+		expectedInpoints = 1
+	}
 
 	var psMap ParentSpendsMap
 	if len(diskMapDirs) > 0 {
