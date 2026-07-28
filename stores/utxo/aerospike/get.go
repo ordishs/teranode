@@ -468,7 +468,7 @@ func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.Fie
 }
 
 // putGetBatch enqueues item into the get batcher, converting the
-// "send on closed channel" panic — which go-batcher v2.0.4 raises when Put is
+// "send on closed channel" panic — which go-batcher v2.0.6 raises when Put is
 // called after Close — into a returned error. Store.Close closes the get batcher
 // during shutdown while external callers (e.g. an in-flight block-validation
 // goroutine in checkParentsExistOnChain) may still be calling Get. That race

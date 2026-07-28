@@ -125,14 +125,19 @@ type batcherIfc[T any] interface {
 }
 
 // safeBatcherPutCtx enqueues item into b, converting the "send on closed channel"
-// panic — which go-batcher v2.0.4 raises when Put is called after Close — into a
+// panic — which go-batcher v2.0.6 raises when Put is called after Close — into a
 // returned error. Store.Close closes the batchers during graceful shutdown while
 // external callers (block validation, assembly, …) may still be enqueuing; that
 // race must abort the operation, not crash the process. who labels the call site.
+//
+// The recovered value is pre-formatted with fmt.Sprintf: the runtime's panic
+// value is a runtime.plainError, which implements error, and errors.New consumes
+// a trailing error argument as the wrapped error rather than formatting it —
+// orphaning the %v verb and mislabelling the result as wrapping an UNKNOWN (0).
 func safeBatcherPutCtx[T any](b batcherIfc[T], ctx context.Context, item *T, who string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = errors.NewServiceUnavailableError("[%s] aerospike batcher unavailable (store shutting down): %v", who, r)
+			err = errors.NewServiceUnavailableError("[%s] aerospike batcher unavailable (store shutting down): %v", who, fmt.Sprintf("%v", r))
 		}
 	}()
 
@@ -145,7 +150,7 @@ func safeBatcherPutCtx[T any](b batcherIfc[T], ctx context.Context, item *T, who
 func safeBatcherPut[T any](b batcherIfc[T], item *T, who string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = errors.NewServiceUnavailableError("[%s] aerospike batcher unavailable (store shutting down): %v", who, r)
+			err = errors.NewServiceUnavailableError("[%s] aerospike batcher unavailable (store shutting down): %v", who, fmt.Sprintf("%v", r))
 		}
 	}()
 
