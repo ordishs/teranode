@@ -1,0 +1,138 @@
+package validator
+
+// Tests for the extend/heights-step DAH-evicted-parent grace.
+//
+// The spend step has long tolerated a missing parent when the child itself is
+// already mined and unflagged (see TestValidate_TxNotFoundShortcut). The
+// extend/heights step used to hard-fail on the same condition, so a re-validated
+// mined child whose parent had been DAH-evicted (or lost with a store partition)
+// could never pass extension even though its stored metadata proves prior full
+// validation. These tests pin the parity: the same dahEvictedParentGrace gate
+// must short-circuit the extend step, and must NOT fire for unmined, conflicting
+// or locked children.
+
+import (
+	"context"
+	"testing"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+func makeExtendGraceTxAndParent(t *testing.T) (*bt.Tx, *bt.Tx) {
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("THIS_IS_A_DETERMINISTIC_PRIVATE_KEY"))
+	coinbaseTx := transactions.Create(t,
+		transactions.WithCoinbaseData(100, "/Test miner/"),
+		transactions.WithP2PKHOutputs(1, 50e8, publicKey),
+	)
+	tx := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(coinbaseTx, 0),
+		transactions.WithP2PKHOutputs(1, 1000),
+		transactions.WithChangeOutput(),
+	)
+
+	return tx, coinbaseTx
+}
+
+func setupExtendGraceValidator(t *testing.T, getMetaResult *meta.Data, getMetaErr error) (*Validator, *utxo.MockUtxostore) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	mockStore := &utxo.MockUtxostore{}
+	settings := test.CreateBaseTestSettings(t)
+
+	validator, err := New(ctx, logger, settings, mockStore, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+
+	v := validator.(*Validator)
+
+	// The per-parent lookup during extension / input-height resolution fails:
+	// the parent record is gone from the store.
+	mockStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.NewTxNotFoundError("parent gone"))
+	mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 100, MedianTime: 1000000000})
+
+	if getMetaErr != nil {
+		mockStore.On("GetMeta", mock.Anything, mock.Anything, mock.Anything).Return(getMetaErr)
+	} else {
+		mockStore.On("GetMeta", mock.Anything, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) {
+				data := args.Get(2).(*meta.Data)
+				*data = *getMetaResult
+			}).
+			Return(nil)
+	}
+
+	return v, mockStore
+}
+
+func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
+	t.Run("grace allowed when child mined and not flagged", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1, 2}, Conflicting: false, Locked: false}
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+
+		txMetaData, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.NoError(t, err)
+		require.NotNil(t, txMetaData)
+		require.Equal(t, []uint32{1, 2}, txMetaData.BlockIDs)
+		// The grace must short-circuit BEFORE any spend is attempted: no Spend
+		// expectation is registered, so a Spend call would fail the test.
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("no grace when child not mined", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{}}
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("no grace when child conflicting", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1}, Conflicting: true}
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("no grace when child locked", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1}, Locked: true}
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("no grace when child absent from store", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		v, mockStore := setupExtendGraceValidator(t, nil, errors.NewTxNotFoundError("child not found"))
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+}

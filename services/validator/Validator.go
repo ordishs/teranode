@@ -767,6 +767,12 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// utxoHeights is a slice of block heights for each input
 			// txInpoints is a struct containing the parent tx hashes and the vout indexes of each input
 			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+				if errors.Is(err, errors.ErrTxMissingParent) {
+					if txMeta, blessed := v.dahEvictedParentGrace(ctx, tx, txID); blessed {
+						return txMeta, nil
+					}
+				}
+
 				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
 				span.RecordError(err)
 
@@ -779,6 +785,12 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		// This must be done BEFORE validateTransaction to ensure BIP68 sequence lock validation has the required heights
 		if len(utxoHeights) == 0 {
 			if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+				if errors.Is(err, errors.ErrTxMissingParent) {
+					if txMeta, blessed := v.dahEvictedParentGrace(ctx, tx, txID); blessed {
+						return txMeta, nil
+					}
+				}
+
 				err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
 				span.RecordError(err)
 
@@ -920,21 +932,8 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// create phase can surface ErrTxNotFound (e.g. an internal parent lookup) MUST
 			// NOT let it escape untagged, or a failed create gets misread here as a
 			// DAH-evicted parent and the tx is wrongly treated as blessed.
-			//
-			// The parent transaction was not found. This can legitimately happen when the parent has been DAH-evicted
-			// long after the child was mined. Only short-circuit if the stored metadata confirms prior full validation:
-			//   - tx has been included in at least one block (BlockIDs non-empty), AND
-			//   - tx is NOT marked conflicting, AND
-			//   - tx is NOT locked
-			// Otherwise, surface the original ErrTxNotFound — a "tx exists in store" alone is not proof of validation
-			// (a re-org or DAH window could expose a stale or mid-flight record).
-			txMetaData = &meta.Data{}
-			if metaErr := v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); metaErr == nil {
-				if len(txMetaData.BlockIDs) > 0 && !txMetaData.Conflicting && !txMetaData.Locked {
-					v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
-
-					return txMetaData, nil
-				}
+			if txMeta, blessed := v.dahEvictedParentGrace(decoupledCtx, tx, txID); blessed {
+				return txMeta, nil
 			}
 		}
 
@@ -1049,6 +1048,37 @@ func (v *Validator) twoPhaseCommitTransaction(ctx context.Context, tx *bt.Tx, tx
 	}
 
 	return nil
+}
+
+// dahEvictedParentGrace reports whether a missing-parent failure can be absorbed
+// because the transaction itself is already fully validated and mined.
+//
+// A parent record can legitimately be gone from the UTXO store when it was
+// DAH-evicted (or its partition was lost) long after this child was mined. Only
+// short-circuit if the stored metadata confirms prior full validation:
+//   - tx has been included in at least one block (BlockIDs non-empty), AND
+//   - tx is NOT marked conflicting, AND
+//   - tx is NOT locked
+//
+// Otherwise the caller must surface the original missing-parent error — a "tx
+// exists in store" alone is not proof of validation (a re-org or DAH window
+// could expose a stale or mid-flight record).
+//
+// This is the single source of truth for the grace, shared by the extend/heights
+// step and the spend step so their tolerance for evaporated parents cannot drift.
+func (v *Validator) dahEvictedParentGrace(ctx context.Context, tx *bt.Tx, txID string) (*meta.Data, bool) {
+	txMetaData := &meta.Data{}
+	if metaErr := v.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), txMetaData); metaErr != nil {
+		return nil, false
+	}
+
+	if len(txMetaData.BlockIDs) > 0 && !txMetaData.Conflicting && !txMetaData.Locked {
+		v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
+
+		return txMetaData, true
+	}
+
+	return nil, false
 }
 
 // getUtxoBlockHeightsAndExtendTx returns the block heights for each input of the transaction.
