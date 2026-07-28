@@ -495,12 +495,16 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 // spendCompletionResult is the outcome of resolveSpendCompletions: which
 // spends succeeded, plus a memo of the "does the spending tx already have a
 // record?" lookup so the rollback decision can reuse it (see
-// rollbackPartialSpends).
+// rollbackPartialSpends). spenderExists is bare existence (gates the rollback);
+// spenderBlessed additionally requires the record to be finalized and mined
+// (gates the ErrTxNotFound "already blessed" fallback) — a creating record
+// exists but is never blessed.
 type spendCompletionResult struct {
 	spentSpends []*utxo.Spend
 
 	spenderChecked bool
 	spenderExists  bool
+	spenderBlessed bool
 }
 
 // rollbackPartialSpends undoes the spends that succeeded in a batch that failed
@@ -589,18 +593,32 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 			//
 			// The outcome is memoized on result (both ways) so this lookup happens
 			// at most once per batch and rollbackPartialSpends can reuse it.
+			//
+			// Existence and blessing are distinct questions answered by the same
+			// lookup. Bare existence gates the partial-spend rollback: a record —
+			// even a creating one — means the ref is not dangling. Only a mined,
+			// finalized record proves "already blessed": create-first inverts the
+			// old invariant, since the child now exists (Creating=true) BEFORE its
+			// inputs are spent, so bare existence no longer implies the input was
+			// spent. Requiring !Creating && BlockIDs>0 keeps a mid-flight creating
+			// child from satisfying this fallback (which would otherwise let the
+			// pruner sweep finalize a tx whose input record is absent).
 			if !result.spenderChecked {
-				if _, getErr := s.Get(ctx, tx.TxIDChainHash()); getErr == nil {
-					s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
-
+				if md, getErr := s.Get(ctx, tx.TxIDChainHash(), fields.Creating, fields.BlockIDs); getErr == nil {
 					result.spenderExists = true
 					result.spenderChecked = true
+
+					if !md.Creating && len(md.BlockIDs) > 0 {
+						s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists (mined) in store, assuming already blessed", tx.TxID())
+
+						result.spenderBlessed = true
+					}
 				} else if errors.Is(getErr, errors.ErrTxNotFound) {
 					result.spenderChecked = true
 				}
 			}
 
-			if result.spenderExists {
+			if result.spenderBlessed {
 				spend.Err = nil
 			}
 		}

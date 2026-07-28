@@ -831,6 +831,20 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 				return nil, errors.NewProcessingError("[Validate][%s] failed to get tx meta data from store", txID, err)
 			}
 
+			// Under create-first, ErrTxExists no longer proves the tx was fully validated: a
+			// prior attempt (a TX_LOCKED retry, a crash, or a spend failure) can leave the
+			// record in the tentative "creating" state with its inputs NOT yet spent. Returning
+			// it as validated here would let a block be accepted whose parent outputs are still
+			// unspent — the mirror image of #1214. Roll the record forward before trusting it,
+			// and FAIL CLOSED if the roll-forward cannot complete every input spend.
+			if txMetaData.Creating {
+				if rfErr := utxo.RollForwardCreating(decoupledCtx, v.utxoStore, tx, blockHeight); rfErr != nil {
+					return nil, errors.NewProcessingError("[Validate][%s] tx exists in creating state and roll-forward re-spend did not complete; not treating as validated", txID, rfErr)
+				}
+
+				txMetaData.Creating = false
+			}
+
 			return txMetaData, nil
 		}
 

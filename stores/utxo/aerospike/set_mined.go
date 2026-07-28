@@ -207,6 +207,18 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 
 	thisBlockHeight := s.blockHeight.Load() + 1
 
+	// create-first: both setMined write paths (Lua and filter-expression) erase the
+	// creating/unminedSince bins the pruner sweeper selects on. Complete the roll-forward
+	// of any still-creating record BEFORE anything is cleared, so a crash at any point
+	// leaves the record still discoverable. This is the single funnel to both write paths,
+	// so one pre-flight covers both. Fail-closed: block validation re-runs setMined for the
+	// block if this cannot complete, rather than silently stranding a tentative record.
+	if !minedBlockInfo.UnsetMined && s.settings.UtxoStore.UseCreateFirstOrder {
+		if err := s.rollForwardCreatingBeforeSetMined(ctx, hashes, thisBlockHeight); err != nil {
+			return nil, err
+		}
+	}
+
 	if !minedBlockInfo.UnsetMined && s.settings.Aerospike.EnableSetMinedFilterExpressions {
 		return s.SetMinedMultiWithExpressions(ctx, hashes, minedBlockInfo)
 	}
@@ -660,4 +672,71 @@ func (s *Store) clearLockedOnRecordsMulti(items []lockClearItem) error {
 	}
 
 	return aggErr
+}
+
+// rollForwardCreatingBeforeSetMined completes any still-"creating" record among the
+// to-be-mined hashes BEFORE setMined clears the creating/unminedSince selectors the
+// pruner sweeper relies on. Both setMined write paths erase those bins unconditionally,
+// so once either has run a mid-flight record can never be found again — a tx whose inputs
+// were never spent would be mined and finalized, its parents' outputs left permanently
+// unspent (the #1214 shape). Running the roll-forward first, and FAILING CLOSED on any
+// record it cannot complete, keeps every crash point safe: before finalize the selectors
+// are intact and the sweeper still finds the record; after finalize the record is a
+// correctly-finalized unmined tx and the next block-validation pass re-runs setMined.
+//
+// The pre-flight is cheap on the common path: it batch-reads only the creating flag for
+// the block's hashes (creating records are rare and transient), and does per-tx work only
+// for the few that are actually mid-flight.
+func (s *Store) rollForwardCreatingBeforeSetMined(ctx context.Context, hashes []*chainhash.Hash, blockHeight uint32) error {
+	items := make([]*utxo.UnresolvedMetaData, 0, len(hashes))
+
+	for i, h := range hashes {
+		if h == nil {
+			continue
+		}
+
+		items = append(items, &utxo.UnresolvedMetaData{Hash: *h, Idx: i, Fields: []fields.FieldName{fields.Creating}})
+	}
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	if err := s.BatchDecorate(ctx, items, fields.Creating); err != nil {
+		return errors.NewProcessingError("[setMined] create-first pre-flight: batch read of creating flag failed", err)
+	}
+
+	for _, item := range items {
+		if item.Err != nil {
+			if errors.Is(item.Err, errors.ErrTxNotFound) {
+				continue // nothing to roll forward
+			}
+
+			return errors.NewProcessingError("[setMined] create-first pre-flight: read of %s failed", item.Hash.String(), item.Err)
+		}
+
+		if item.Data == nil || !item.Data.Creating {
+			continue
+		}
+
+		// Mid-flight record: fetch the tx bytes and roll it forward (re-spend + finalize).
+		md, err := s.Get(ctx, &item.Hash, fields.Tx, fields.Creating)
+		if err != nil {
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return errors.NewProcessingError("[setMined] create-first pre-flight: get tx %s failed", item.Hash.String(), err)
+		}
+
+		if !md.Creating || md.Tx == nil {
+			continue // finalized between the batch read and this get
+		}
+
+		if err := utxo.RollForwardCreating(ctx, s, md.Tx, blockHeight); err != nil {
+			return errors.NewProcessingError("[setMined] create-first pre-flight: roll-forward of %s failed", item.Hash.String(), err)
+		}
+	}
+
+	return nil
 }
