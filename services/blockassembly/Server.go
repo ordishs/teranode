@@ -927,6 +927,35 @@ func (ba *BlockAssembly) Stop(ctx context.Context) error {
 // Returns:
 //   - *blockassembly_api.AddTxResponse: Response indicating success
 //   - error: Any error encountered during addition
+//
+// checkIngestBackpressure rejects ingest when the subtree processor's input
+// queue holds more than blockassembly_max_queued_transactions transactions.
+//
+// The queue is otherwise unbounded with a single consumer: a stalled or wedged
+// subtree processor under sustained ingest converts directly into unbounded
+// process memory growth and an OOM kill. Rejecting here propagates
+// back-pressure to the validator (the tx fails validation and the sender sees
+// the node as busy) instead. A limit of <= 0 disables the gate (the
+// pre-existing unbounded behaviour). Returns a THRESHOLD_EXCEEDED error the
+// caller must WrapGRPC.
+func (ba *BlockAssembly) checkIngestBackpressure() error {
+	limit := ba.settings.BlockAssembly.MaxQueuedTransactions
+	if limit <= 0 {
+		return nil
+	}
+
+	queued := ba.blockAssembler.QueueLength()
+	if queued <= limit {
+		return nil
+	}
+
+	if prometheusBlockAssemblyBackpressureRejects != nil {
+		prometheusBlockAssemblyBackpressureRejects.Inc()
+	}
+
+	return errors.NewThresholdExceededError("block assembly ingest queue full: %d queued transactions exceeds limit %d", queued, limit)
+}
+
 func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTxRequest) (resp *blockassembly_api.AddTxResponse, err error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "AddTx",
 		tracing.WithParentStat(ba.stats),
@@ -943,6 +972,10 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 	if len(req.Txid) != 32 {
 		return nil, errors.WrapGRPC(
 			errors.NewProcessingError("invalid txid length: %d for %s", len(req.Txid), util.ReverseAndHexEncodeSlice(req.Txid)))
+	}
+
+	if err = ba.checkIngestBackpressure(); err != nil {
+		return nil, errors.WrapGRPC(err)
 	}
 
 	ba.logger.Debugf("[AddTx] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
@@ -1039,6 +1072,10 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("no tx requests in batch"))
 	}
 
+	if err := ba.checkIngestBackpressure(); err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
+
 	// Build batch arrays — three allocations for the whole batch. Per-tx
 	// TxInpoints values live inline in txInpointsArr so the loop only takes
 	// a pointer (no per-tx heap escape for the TxInpoints struct itself).
@@ -1119,6 +1156,10 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 	defer func() {
 		deferFn()
 	}()
+
+	if err := ba.checkIngestBackpressure(); err != nil {
+		return nil, errors.WrapGRPC(err)
+	}
 
 	// Validate request structure
 	if len(req.TxidsPacked)%32 != 0 {
