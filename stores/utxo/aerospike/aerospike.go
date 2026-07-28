@@ -124,6 +124,36 @@ type batcherIfc[T any] interface {
 	Close()
 }
 
+// safeBatcherPutCtx enqueues item into b, converting the "send on closed channel"
+// panic — which go-batcher v2.0.4 raises when Put is called after Close — into a
+// returned error. Store.Close closes the batchers during graceful shutdown while
+// external callers (block validation, assembly, …) may still be enqueuing; that
+// race must abort the operation, not crash the process. who labels the call site.
+func safeBatcherPutCtx[T any](b batcherIfc[T], ctx context.Context, item *T, who string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.NewServiceUnavailableError("[%s] aerospike batcher unavailable (store shutting down): %v", who, r)
+		}
+	}()
+
+	b.PutCtx(ctx, item)
+
+	return nil
+}
+
+// safeBatcherPut is the Put (no-context) counterpart of safeBatcherPutCtx.
+func safeBatcherPut[T any](b batcherIfc[T], item *T, who string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.NewServiceUnavailableError("[%s] aerospike batcher unavailable (store shutting down): %v", who, r)
+		}
+	}()
+
+	b.Put(item)
+
+	return nil
+}
+
 // Store implements the UTXO store interface using Aerospike.
 // It is thread-safe for concurrent access.
 type Store struct {
