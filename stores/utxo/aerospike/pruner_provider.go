@@ -3,6 +3,7 @@ package aerospike
 import (
 	"sync"
 
+	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	aeropruner "github.com/bsv-blockchain/teranode/stores/utxo/aerospike/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 )
@@ -44,7 +45,13 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 		return prunerServiceInstance, prunerServiceError
 	}
 
-	// Create options for the pruner service
+	// Create options for the pruner service.
+	//
+	// BuildAddDeletedChildrenRecord routes the pruner's per-parent update through
+	// the native-op wrapper (subOpAddDeletedChildren), with transparent UDF
+	// fallback when the cluster does not support wire op 200. This eliminates the
+	// steady stream of batch_sub_udf calls the pruner used to emit even on
+	// native-op-enabled deployments.
 	opts := aeropruner.Options{
 		Logger:        s.logger,
 		Ctx:           s.ctx,
@@ -54,6 +61,16 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 		Set:           s.setName,
 		IndexWaiter:   s,
 		LuaPackage:    LuaPackage,
+		BuildAddDeletedChildrenRecord: func(policy *aerospike.BatchUDFPolicy, key *aerospike.Key, childHashes []interface{}) aerospike.BatchRecordIfc {
+			return s.teranodeBatchRecord(
+				policy,
+				LuaPackage,
+				key,
+				subOpAddDeletedChildren,
+				"addDeletedChildren",
+				childHashes,
+			)
+		},
 	}
 
 	// Create a new pruner service

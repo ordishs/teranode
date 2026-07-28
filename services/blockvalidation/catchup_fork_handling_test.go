@@ -687,7 +687,12 @@ func TestCatchup_NoMinedSetChurnOnRejectedFork(t *testing.T) {
 		mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).
 			Return(false, nil).Maybe()
 
-		// Metadata for the common ancestor.
+		// findCommonAncestor now conveys existence through GetBlockHeader: the common
+		// ancestor resolves to its header+meta, while every fork block (and the target)
+		// must report ErrBlockNotFound so the walk stops at the ancestor and the fork
+		// headers are treated as the peer's offered chain. A permissive catch-all that
+		// returned metadata for the fork blocks would make the whole peer chain look
+		// already-present, leaving zero offered headers for the secret-mining check.
 		mockBlockchainClient.On("GetBlockHeader", mock.Anything, ancestorHeader.Hash()).
 			Return(ancestorHeader, &model.BlockHeaderMeta{Height: ancestorHeight, ID: 1, ChainWork: ancestorChainWork.Bytes()}, nil).Maybe()
 		// Any other header (the peer's fork blocks) is absent from our chain, so
