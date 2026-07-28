@@ -1338,6 +1338,14 @@ func (ps *PropagationServer) processTransactionInternal(ctx context.Context, btT
 		// All transactions entering Teranode can be assumed to be after Genesis activation height
 		// but we pass in no block height, and just use the block height set in the utxo store
 		if _, err = ps.validator.Validate(ctx, btTx, 0); err != nil {
+			// Preserve the THRESHOLD_EXCEEDED code as the OUTERMOST error: WrapGRPC
+			// builds the gRPC status from the outermost code only, and back-pressure
+			// must surface to submitters as ResourceExhausted ("node busy, retry"),
+			// not Internal (a hard reject to ARC-style broadcasters).
+			if errors.Is(err, errors.ErrThresholdExceeded) {
+				return errors.NewThresholdExceededError("[ProcessTransaction][%s] rejected by back-pressure, retry later", btTx.TxID(), err)
+			}
+
 			return errors.NewProcessingError("[ProcessTransaction][%s] failed to validate transaction", btTx.TxID(), err)
 		}
 	}

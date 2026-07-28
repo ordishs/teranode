@@ -48,6 +48,10 @@ var (
 	// final validation completion, including all validation steps and database operations. Units: seconds.
 	prometheusTransactionValidateTotal prometheus.Histogram
 
+	// prometheusValidatorBackpressureRejects counts mempool transactions rejected
+	// pre-validation by the block-assembly back-pressure gate.
+	prometheusValidatorBackpressureRejects prometheus.Counter
+
 	// prometheusTransactionValidate measures the time spent in individual transaction validation steps.
 	// This histogram captures the duration of core validation operations excluding script execution,
 	// such as structure validation, input/output checks, and consensus rule verification. Units: seconds.
@@ -153,6 +157,15 @@ func _initPrometheusMetrics() {
 			Name:      "transactions_validate_total",
 			Help:      "Histogram of total transaction validation",
 			Buckets:   util.MetricsBucketsMicroSeconds,
+		},
+	)
+
+	prometheusValidatorBackpressureRejects = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "validator",
+			Name:      "backpressure_rejects_total",
+			Help:      "Total number of mempool transactions rejected before validation because block assembly's ingest queue exceeded blockassembly_max_queued_transactions. A sustained non-zero rate means the subtree processor is not keeping up or is wedged — investigate before the node exhausts memory.",
 		},
 	)
 

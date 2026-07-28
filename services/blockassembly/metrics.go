@@ -40,7 +40,6 @@ var (
 	prometheusBlockAssemblerSubtreeCreated              prometheus.Counter
 	prometheusBlockAssemblerTransactions                prometheus.Gauge
 	prometheusBlockAssemblerQueuedTransactions          prometheus.Gauge
-	prometheusBlockAssemblyBackpressureRejects          prometheus.Counter
 	prometheusBlockAssemblerSubtrees                    prometheus.Gauge
 	prometheusBlockAssemblerTxMetaGetDuration           prometheus.Histogram
 	prometheusBlockAssemblerReorg                       prometheus.Counter
@@ -209,15 +208,6 @@ func _initPrometheusMetrics() {
 			Subsystem: "blockassembly",
 			Name:      "queued_transactions",
 			Help:      "Number of transactions currently queued in the block assembler subtree processor",
-		},
-	)
-
-	prometheusBlockAssemblyBackpressureRejects = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: "teranode",
-			Subsystem: "blockassembly",
-			Name:      "backpressure_rejects_total",
-			Help:      "Total number of AddTx/AddTxBatch calls rejected because the ingest queue exceeded blockassembly_max_queued_transactions. A sustained non-zero rate means the subtree processor is not keeping up or is wedged — investigate before the node exhausts memory.",
 		},
 	)
 

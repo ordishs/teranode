@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
@@ -43,13 +44,16 @@ func makeExtendGraceTxAndParent(t *testing.T) (*bt.Tx, *bt.Tx) {
 	return tx, coinbaseTx
 }
 
-func setupExtendGraceValidator(t *testing.T, getMetaResult *meta.Data, getMetaErr error) (*Validator, *utxo.MockUtxostore) {
+func setupExtendGraceValidator(t *testing.T, getMetaResult *meta.Data, getMetaErr error, onCurrentChain bool, chainErr error) (*Validator, *utxo.MockUtxostore) {
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}
 	mockStore := &utxo.MockUtxostore{}
 	settings := test.CreateBaseTestSettings(t)
 
-	validator, err := New(ctx, logger, settings, mockStore, nil, nil, nil, nil, nil)
+	blockchainMock := &blockchain.Mock{}
+	blockchainMock.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(onCurrentChain, chainErr).Maybe()
+
+	validator, err := New(ctx, logger, settings, mockStore, nil, nil, nil, nil, blockchainMock)
 	require.NoError(t, err)
 
 	v := validator.(*Validator)
@@ -77,7 +81,7 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 	t.Run("grace allowed when child mined and not flagged", func(t *testing.T) {
 		tx, _ := makeExtendGraceTxAndParent(t)
 		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1, 2}, Conflicting: false, Locked: false}
-		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil, true, nil)
 
 		txMetaData, err := v.validateInternal(context.Background(), tx, 100, &Options{})
 
@@ -92,7 +96,7 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 	t.Run("no grace when child not mined", func(t *testing.T) {
 		tx, _ := makeExtendGraceTxAndParent(t)
 		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{}}
-		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil, true, nil)
 
 		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
 
@@ -104,7 +108,7 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 	t.Run("no grace when child conflicting", func(t *testing.T) {
 		tx, _ := makeExtendGraceTxAndParent(t)
 		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1}, Conflicting: true}
-		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil, true, nil)
 
 		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
 
@@ -116,7 +120,7 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 	t.Run("no grace when child locked", func(t *testing.T) {
 		tx, _ := makeExtendGraceTxAndParent(t)
 		existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1}, Locked: true}
-		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil)
+		v, mockStore := setupExtendGraceValidator(t, existingMeta, nil, true, nil)
 
 		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
 
@@ -127,7 +131,46 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 
 	t.Run("no grace when child absent from store", func(t *testing.T) {
 		tx, _ := makeExtendGraceTxAndParent(t)
-		v, mockStore := setupExtendGraceValidator(t, nil, errors.NewTxNotFoundError("child not found"))
+		v, mockStore := setupExtendGraceValidator(t, nil, errors.NewTxNotFoundError("child not found"), true, nil)
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("no grace when mined block lost a reorg (not on current chain)", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		// BlockIDs alone are not proof of main-chain inclusion: a block that lost
+		// a reorg keeps its stale ID on the tx meta.
+		staleMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1, 2}}
+		v, mockStore := setupExtendGraceValidator(t, staleMeta, nil, false, nil)
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("no grace when current-chain check fails", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		minedMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1, 2}}
+		v, mockStore := setupExtendGraceValidator(t, minedMeta, nil, false, errors.NewServiceError("blockchain unavailable"))
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("no grace without a blockchain client (fail closed)", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		minedMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1, 2}}
+		v, mockStore := setupExtendGraceValidator(t, minedMeta, nil, true, nil)
+		v.blockchainClient = nil
 
 		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
 
