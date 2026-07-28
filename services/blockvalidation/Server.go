@@ -182,6 +182,17 @@ type Server struct {
 	// block can be retried again later if better peers appear.
 	blockCatchupAttempts *ttlcache.Cache[chainhash.Hash, int]
 
+	// blockIncompleteAttempts counts BLOCK_INCOMPLETE processing failures per block
+	// hash within a cooldown window. Once a block reaches
+	// IncompleteBlockMaxRetriesPerBlock the workers stop grinding it (skipped at
+	// dequeue) until the entry's TTL expires, and a single loud
+	// manual_intervention_required escalation is emitted. This bounds the livelock
+	// where a block whose transactions can never be blessed (missing parents,
+	// lost store partition) is retried forever by every worker while the chain tip
+	// stays frozen. TTL window only (no touch-on-hit) so the block is retried again
+	// after the cooldown — the missing data may have become available.
+	blockIncompleteAttempts *ttlcache.Cache[chainhash.Hash, int]
+
 	// stats tracks operational metrics for monitoring and troubleshooting
 	stats *gocore.Stat
 
@@ -379,6 +390,12 @@ func New(
 			// Do not extend the window on reads: the cooldown runs a fixed time from
 			// the first failed attempt, so the enqueue-gate's Get checks cannot keep a
 			// block suppressed forever.
+			ttlcache.WithDisableTouchOnHit[chainhash.Hash, int](),
+		),
+		blockIncompleteAttempts: ttlcache.New[chainhash.Hash, int](
+			ttlcache.WithTTL[chainhash.Hash, int](incompleteBlockCooldown),
+			// Same fixed-window semantics as blockCatchupAttempts: the cooldown runs
+			// from the first BLOCK_INCOMPLETE failure and reads must not extend it.
 			ttlcache.WithDisableTouchOnHit[chainhash.Hash, int](),
 		),
 		adaptiveFetch:       af,
@@ -640,6 +657,10 @@ func (u *Server) Init(ctx context.Context) (err error) {
 	// call Init without initialising it (NewServer always does). Matches Stop().
 	if u.blockCatchupAttempts != nil {
 		go u.blockCatchupAttempts.Start()
+	}
+
+	if u.blockIncompleteAttempts != nil {
+		go u.blockIncompleteAttempts.Start()
 	}
 
 	// Start fork manager cleanup routine
@@ -1100,6 +1121,10 @@ func (u *Server) Stop(ctx context.Context) error {
 	// don't initialise it (NewServer always does). Matches the nil-safe helpers.
 	if u.blockCatchupAttempts != nil {
 		u.blockCatchupAttempts.Stop()
+	}
+
+	if u.blockIncompleteAttempts != nil {
+		u.blockIncompleteAttempts.Stop()
 	}
 
 	// Wait for all background tasks in BlockValidation to complete, bounded by the
@@ -1655,6 +1680,12 @@ func (u *Server) startBlockProcessingSystem(ctx context.Context) {
 	}()
 }
 
+// incompleteBlockCooldown is the fixed window a block spends in cooldown after
+// exhausting its per-block BLOCK_INCOMPLETE retry budget, and therefore also the
+// TTL of the blockIncompleteAttempts cache entries that implement it. After the
+// window the block is retried again (self-healing if the missing data appears).
+const incompleteBlockCooldown = 10 * time.Minute
+
 // blockProcessingWorker is a worker that processes blocks from the priority queue
 func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 	u.logger.Infof("[BlockProcessing] Worker %d started", workerID)
@@ -1668,6 +1699,16 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 			blockFound, status := u.blockPriorityQueue.WaitForBlock(ctx, u.forkManager)
 
 			if status != GetOK {
+				continue
+			}
+
+			// A block that exhausted its BLOCK_INCOMPLETE retry budget is in
+			// cooldown: drop it here instead of grinding it on every worker while
+			// the missing data is provably unavailable. Re-announcements during the
+			// window are cheap (this check is pre-claim); after the window the
+			// escalation-scheduled requeue (or the next announcement) retries it.
+			if u.incompleteAttemptsExhausted(blockFound.hash) {
+				u.logger.Warnf("[BlockProcessing] Block %s in BLOCK_INCOMPLETE cooldown (cap %d); skipping until window expires", blockFound.hash.String(), u.settings.BlockValidation.IncompleteBlockMaxRetriesPerBlock)
 				continue
 			}
 
@@ -1691,6 +1732,10 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 				if prometheusBlockPriorityQueueProcessed != nil {
 					// We don't have the priority here, so we'll use "unknown"
 					prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "failure").Inc()
+				}
+
+				if errors.Is(err, errors.ErrBlockIncomplete) {
+					u.recordIncompleteBlockFailure(ctx, blockFound.hash)
 				}
 
 				// If the error indicates the block couldn't be fetched (network error, malicious node, etc),
@@ -1723,9 +1768,120 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 				if prometheusBlockPriorityQueueProcessed != nil {
 					prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "success").Inc()
 				}
+
+				u.clearIncompleteAttempts(blockFound.hash)
 			}
 		}
 	}
+}
+
+// recordIncompleteBlockFailure counts a BLOCK_INCOMPLETE processing failure
+// toward the per-block cap. When the cap is reached it emits a single
+// manual_intervention_required escalation (log + metric) and schedules one
+// self-requeue for when the cooldown window expires, so recovery does not depend
+// on a peer happening to re-announce the block after the announcement TTL.
+// While the block is in cooldown the dequeue gate (incompleteAttemptsExhausted)
+// keeps the workers off it.
+func (u *Server) recordIncompleteBlockFailure(ctx context.Context, blockHash *chainhash.Hash) {
+	// nil-guarded like the other worker metrics: test fixtures build Server
+	// literals without initPrometheusMetrics.
+	if prometheusBlockValidationIncompleteBlockRetries != nil {
+		prometheusBlockValidationIncompleteBlockRetries.Inc()
+	}
+
+	maxAttempts := u.settings.BlockValidation.IncompleteBlockMaxRetriesPerBlock
+	if maxAttempts <= 0 || u.blockIncompleteAttempts == nil {
+		return
+	}
+
+	attempts := u.recordIncompleteAttempt(blockHash)
+	if attempts != maxAttempts {
+		// Escalate exactly once, at the crossing. Later failures (a race between
+		// workers already past the dequeue gate) must not re-escalate or
+		// re-schedule the requeue.
+		return
+	}
+
+	if prometheusBlockValidationIncompleteBlockEscalations != nil {
+		prometheusBlockValidationIncompleteBlockEscalations.Inc()
+	}
+	u.logger.Errorf("[BlockProcessing] manual_intervention_required: block %s failed with BLOCK_INCOMPLETE %d times; chain tip may be stuck behind it. Entering %s cooldown — check UTXO store health (missing parents / lost partitions) and peer data availability", blockHash.String(), attempts, incompleteBlockCooldown)
+
+	requeueBlock := processBlockFound{
+		hash:    blockHash,
+		baseURL: SourceTypeRetry,
+	}
+
+	timer := time.AfterFunc(incompleteBlockCooldown, func() {
+		if ctx.Err() != nil {
+			return
+		}
+
+		u.blockPriorityQueue.RequeueForRetry(requeueBlock, PriorityDeepFork, 0)
+		u.logger.Infof("[BlockProcessing] BLOCK_INCOMPLETE cooldown expired for block %s; re-queued for retry", blockHash.String())
+	})
+
+	// Cancel the pending requeue on shutdown so a test (or a fast restart) is not
+	// surprised by a timer firing into a stopped queue.
+	go func() {
+		<-ctx.Done()
+		timer.Stop()
+	}()
+}
+
+// recordIncompleteAttempt increments and returns the BLOCK_INCOMPLETE failure
+// count for a block within the current cooldown window. Same fixed-window
+// semantics as recordCatchupAttempt: the window runs from the first failure and
+// repeat failures re-Set with the REMAINING ttl, never a fresh full window. A
+// nil cache degrades to no tracking.
+func (u *Server) recordIncompleteAttempt(blockHash *chainhash.Hash) int {
+	if u.blockIncompleteAttempts == nil {
+		return 0
+	}
+
+	if item := u.blockIncompleteAttempts.Get(*blockHash); item != nil {
+		remaining := time.Until(item.ExpiresAt())
+		if remaining <= 0 {
+			// Item present but at/past expiry (sub-tick race): fall back to the cache
+			// default window. A negative ttl must never reach Set — ttlcache reads
+			// ttl<0 as NoTTL (pins the entry forever); ttl==0 is DefaultTTL.
+			remaining = ttlcache.DefaultTTL
+		}
+
+		n := item.Value() + 1
+		u.blockIncompleteAttempts.Set(*blockHash, n, remaining)
+
+		return n
+	}
+
+	u.blockIncompleteAttempts.Set(*blockHash, 1, ttlcache.DefaultTTL)
+
+	return 1
+}
+
+// clearIncompleteAttempts resets a block's BLOCK_INCOMPLETE failure counter (and
+// its cooldown window). Called on every successful processing of the block so a
+// block that recovers does not carry accumulated failures into a later,
+// unrelated retry. Nil-safe for Server literals in tests.
+func (u *Server) clearIncompleteAttempts(blockHash *chainhash.Hash) {
+	if u.blockIncompleteAttempts != nil {
+		u.blockIncompleteAttempts.Delete(*blockHash)
+	}
+}
+
+// incompleteAttemptsExhausted reports whether a block has reached the per-block
+// BLOCK_INCOMPLETE retry cap and is therefore in its cooldown window. A cap of
+// <= 0 disables the bound (unbounded retries, the pre-existing behaviour). A nil
+// cache reports not-exhausted.
+func (u *Server) incompleteAttemptsExhausted(blockHash *chainhash.Hash) bool {
+	maxAttempts := u.settings.BlockValidation.IncompleteBlockMaxRetriesPerBlock
+	if maxAttempts <= 0 || u.blockIncompleteAttempts == nil {
+		return false
+	}
+
+	item := u.blockIncompleteAttempts.Get(*blockHash)
+
+	return item != nil && item.Value() >= maxAttempts
 }
 
 // processCatchupChItem handles one catchupCh item: it runs catchup for the block
