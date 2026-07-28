@@ -3900,19 +3900,34 @@ func (m *mockSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType
 	return nil, errors.NewBlobNotFoundError("mock error")
 }
 
-// createValidSubtreeMetadata creates valid subtree metadata that won't trigger retries
+// createValidSubtreeMetadata creates valid subtree metadata that won't trigger retries.
+// Non-coinbase nodes get a dummy parent because go-subtree v1.4.0's SubtreeMeta.Serialize
+// rejects empty TxInpoints on non-coinbase entries ("parent tx hashes are not set for node N").
+// The coinbase placeholder at index 0 keeps an empty TxInpoints, matching the on-wire shape.
 func createValidSubtreeMetadata(subtree *subtreepkg.Subtree) ([]byte, error) {
-	// Create SubtreeMeta with proper structure
 	subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
 
-	// Initialize TxInpoints array for all nodes up to Length()
-	for i := 0; i < subtree.Length(); i++ {
-		// Create empty TxInpoints for all nodes (including root)
-		txInpoints := subtreepkg.NewTxInpoints()
-		subtreeMeta.TxInpoints[i] = txInpoints
+	var dummyParent chainhash.Hash
+	dummyParent[0] = 0xde
+
+	dummyInput := &bt.Input{PreviousTxOutIndex: 0}
+	if err := dummyInput.PreviousTxIDAdd(&dummyParent); err != nil {
+		return nil, err
 	}
 
-	// Serialize the metadata
+	dummyInpoints, err := subtreepkg.NewTxInpointsFromInputs([]*bt.Input{dummyInput})
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 0; i < subtree.Length(); i++ {
+		if i == 0 && len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash == *subtreepkg.CoinbasePlaceholderHash {
+			subtreeMeta.TxInpoints[i] = subtreepkg.NewTxInpoints()
+			continue
+		}
+		subtreeMeta.TxInpoints[i] = dummyInpoints
+	}
+
 	return subtreeMeta.Serialize()
 }
 
