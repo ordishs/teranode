@@ -154,10 +154,10 @@ func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment in
 			return errors.NewProcessingError("failed to init new aerospike key for txMeta", err)
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, key, LuaPackage, "incrementSpentExtraRecs",
-			aerospike.NewIntegerValue(increment),
-			aerospike.NewIntegerValue(int(s.effectiveBlockHeight(blockHeight))),
-			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(batchUDFPolicy, LuaPackage, key, subOpIncrementSpentExtraRec, "incrementSpentExtraRecs",
+			increment,
+			int(s.effectiveBlockHeight(blockHeight)),
+			s.settings.GetUtxoStoreBlockHeightRetention(),
 		))
 	}
 
@@ -178,13 +178,27 @@ func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment in
 			}
 		}
 
+		// Parse the SUCCESS bin via ParseLuaMapResponse rather than a bare
+		// map[interface{}]interface{} assertion: subOpIncrementSpentExtraRec is
+		// not fenced, so with native ops enabled the response is decoded through
+		// msgpack and can be a map[string]interface{} (or a reflection fallback),
+		// which a concrete-type assertion would panic on. ParseLuaMapResponse
+		// tolerates every map shape both transports produce (see teranode.go).
 		response := batchRecords[i].BatchRec().Record
-		if response != nil && response.Bins != nil {
-			successMap := response.Bins[LuaSuccess.String()].(map[interface{}]interface{})
-			status, ok := successMap["status"].(string)
-			if !ok || status != "OK" {
-				aggErr = errors.Join(aggErr, errors.NewProcessingError(successMap["message"].(string)))
-			}
+		if response == nil || response.Bins == nil || response.Bins[LuaSuccess.String()] == nil {
+			continue
+		}
+
+		rawResponse := response.Bins[LuaSuccess.String()]
+
+		parsed, perr := s.ParseLuaMapResponse(rawResponse)
+		if perr != nil {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] failed to parse response bin %q (value %s): %s", describeChainHash(txids[i]), LuaSuccess.String(), describeAerospikeValue(rawResponse), perr.Error(), perr))
+			continue
+		}
+
+		if parsed.Status != LuaStatusOK {
+			aggErr = errors.Join(aggErr, errors.NewProcessingError("[IncrementSpentRecordsMulti][%s] incrementSpentExtraRecs returned %s: %s", describeChainHash(txids[i]), parsed.Status, parsed.Message))
 		}
 	}
 
@@ -812,12 +826,12 @@ func (s *Store) createBatchRecords(batchesByKey map[keyIgnoreLocked][]aerospike.
 			useLuaPackage = s.spendLuaPackages[batchKey.hash[0]%uint8(s.settings.Aerospike.SeparateSpendUDFModuleCount)]
 		}
 
-		batchRecords = append(batchRecords, aerospike.NewBatchUDF(batchUDFPolicy, batchKey.key, useLuaPackage, "spendMulti",
-			aerospike.NewValue(batchItems),
-			aerospike.NewValue(batchKey.ignoreConflicting),
-			aerospike.NewValue(batchKey.ignoreLocked),
-			aerospike.NewValue(batchKey.blockHeight),
-			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+		batchRecords = append(batchRecords, s.teranodeBatchRecord(batchUDFPolicy, useLuaPackage, batchKey.key, subOpSpendMulti, "spendMulti",
+			batchItems,
+			batchKey.ignoreConflicting,
+			batchKey.ignoreLocked,
+			batchKey.blockHeight,
+			s.settings.GetUtxoStoreBlockHeightRetention(),
 		))
 		batchRecordKeys = append(batchRecordKeys, batchKey)
 	}
@@ -1019,6 +1033,13 @@ func (s *Store) handleIndividualErrors(errors map[int]LuaErrorInfo, batchByKey [
 
 // createSpendError creates an error for a specific spend
 func (s *Store) createSpendError(errMsg LuaErrorInfo, batchItem *batchSpend, txID *chainhash.Hash) error {
+	// Guard against a nil batch item / spend before the branches below
+	// dereference batchItem.spend (and txID). Return an error rather than
+	// panicking; see TestCreateSpendErrorHandlesNilBatchItem.
+	if batchItem == nil || batchItem.spend == nil {
+		return errors.NewStorageError("[SPEND_BATCH_LUA] cannot create spend error for nil batch item: %s", errMsg.Message)
+	}
+
 	switch errMsg.ErrorCode {
 	case LuaErrorCodeSpent:
 		if errMsg.SpendingData != "" {
@@ -1336,10 +1357,10 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 			continue
 		}
 
-		batchRecords[i] = aerospike.NewBatchUDF(batchUDFPolicy, aeroKey, LuaPackage, "incrementSpentExtraRecs",
-			aerospike.NewIntegerValue(item.increment),
-			aerospike.NewIntegerValue(int(s.effectiveBlockHeight(item.blockHeight))),
-			aerospike.NewValue(s.settings.GetUtxoStoreBlockHeightRetention()),
+		batchRecords[i] = s.teranodeBatchRecord(batchUDFPolicy, LuaPackage, aeroKey, subOpIncrementSpentExtraRec, "incrementSpentExtraRecs",
+			item.increment,
+			int(s.effectiveBlockHeight(item.blockHeight)),
+			s.settings.GetUtxoStoreBlockHeightRetention(),
 		)
 	}
 
