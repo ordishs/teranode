@@ -77,12 +77,15 @@ var (
 	// unbounded Prometheus cardinality (one permanent series per distinct hash
 	// over the node's lifetime). The specific block hash is recorded in the
 	// accompanying log lines for manual repair.
-	prometheusBlockValidationSetMinedRetries        prometheus.Counter
-	prometheusBlockValidationSetMinedDrops          prometheus.Counter
-	prometheusBlockValidationIncompleteBlockRetries prometheus.Counter
+	prometheusBlockValidationSetMinedRetries         prometheus.Counter
+	prometheusBlockValidationSetMinedDrops           prometheus.Counter
+	prometheusBlockValidationSetMinedEnqueueOverflow prometheus.Counter
 
+	// BLOCK_INCOMPLETE retry-cap tracking. Aggregate counters (no per-blockhash
+	// label) for the same cardinality reason as the setMined counters above;
+	// block hashes are in the accompanying log lines.
+	prometheusBlockValidationIncompleteBlockRetries     prometheus.Counter
 	prometheusBlockValidationIncompleteBlockEscalations prometheus.Counter
-	prometheusBlockValidationSetMinedEnqueueOverflow    prometheus.Counter
 
 	// outpoint-only fast-path counter: incremented once per block when the
 	// below-checkpoint outpoint-only path is active (setting on, height ≤ highest

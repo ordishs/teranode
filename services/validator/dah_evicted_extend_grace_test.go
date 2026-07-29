@@ -154,7 +154,7 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 		mockStore.AssertExpectations(t)
 	})
 
-	t.Run("no grace when current-chain check fails", func(t *testing.T) {
+	t.Run("chain-check fault aborts instead of reclassifying as missing parent", func(t *testing.T) {
 		tx, _ := makeExtendGraceTxAndParent(t)
 		minedMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{1, 2}}
 		v, mockStore := setupExtendGraceValidator(t, minedMeta, nil, false, errors.NewServiceError("blockchain unavailable"))
@@ -162,7 +162,24 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
 
 		require.Error(t, err)
-		require.True(t, errors.Is(err, errors.ErrTxMissingParent), "missing-parent error must surface, got: %v", err)
+		// A blockchain-service fault is not a verdict about the transaction: it
+		// must surface as the fault itself, not as "invalid: missing parent"
+		// (which would fail the enclosing block and feed the BLOCK_INCOMPLETE
+		// cap on a transient infrastructure blip).
+		require.False(t, errors.Is(err, errors.ErrTxMissingParent), "fault must not be reported as missing parent, got: %v", err)
+		require.True(t, errors.Is(err, errors.ErrServiceError), "the blockchain fault must surface, got: %v", err)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("store fault on meta read aborts instead of reclassifying", func(t *testing.T) {
+		tx, _ := makeExtendGraceTxAndParent(t)
+		v, mockStore := setupExtendGraceValidator(t, nil, errors.NewStorageError("aerospike timeout"), true, nil)
+
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+
+		require.Error(t, err)
+		require.False(t, errors.Is(err, errors.ErrTxMissingParent), "fault must not be reported as missing parent, got: %v", err)
+		require.True(t, errors.Is(err, errors.ErrStorageError), "the store fault must surface, got: %v", err)
 		mockStore.AssertExpectations(t)
 	})
 

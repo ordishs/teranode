@@ -1995,6 +1995,16 @@ func (ba *BlockAssembly) CheckBlockAssemblyValidateInputs(ctx context.Context, _
 // Returns:
 //   - *blockassembly_api.StateMessage: Detailed state information
 //   - error: Any error encountered while gathering state information
+//
+// GetQueueLength returns only the current subtree-processor queue depth.
+// A single atomic read: no subtree-processor main-loop round-trip, no subtree
+// hash encoding — safe to poll frequently, and it answers even while the main
+// loop is busy with a block movement (unlike GetBlockAssemblyState, whose
+// GetSubtreeHashes leg blocks on that loop).
+func (ba *BlockAssembly) GetQueueLength(_ context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.GetQueueLengthResponse, error) {
+	return &blockassembly_api.GetQueueLengthResponse{QueueLength: ba.blockAssembler.QueueLength()}, nil
+}
+
 func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.StateMessage, error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "GetBlockAssemblyState",
 		tracing.WithParentStat(ba.stats),

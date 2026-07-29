@@ -2056,12 +2056,28 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 // never wrongly invalidate). Only the one state we can prove is caught up
 // authorizes invalidating a floater.
 func (u *BlockValidation) isCaughtUp(ctx context.Context) bool {
+	caughtUp, err := u.caughtUpState(ctx)
+
+	return err == nil && caughtUp
+}
+
+// caughtUpState reports whether the FSM is RUNNING, distinguishing "not caught
+// up" from "could not determine the state". Callers whose safety depends on
+// NOT silently treating a degraded blockchain service as a sync state (e.g.
+// the BLOCK_INCOMPLETE cap, which must stay engaged during exactly the
+// degradation that produces BLOCK_INCOMPLETE storms) branch on the error;
+// isCaughtUp keeps the conservative err==false collapse for the retry paths.
+func (u *BlockValidation) caughtUpState(ctx context.Context) (bool, error) {
 	st, err := u.blockchainClient.GetFSMCurrentState(ctx)
-	if err != nil || st == nil {
-		return false
+	if err != nil {
+		return false, err
 	}
 
-	return *st == blockchain.FSMStateRUNNING
+	if st == nil {
+		return false, errors.NewProcessingError("blockchain FSM state is nil")
+	}
+
+	return *st == blockchain.FSMStateRUNNING, nil
 }
 
 func (u *BlockValidation) markBlockAsInvalid(ctx context.Context, block *model.Block, reason string) error {

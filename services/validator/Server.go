@@ -365,14 +365,34 @@ func (v *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		}
 
 		// should not pass in a height when validating from Kafka, should just be current utxo store height
-		if _, err = v.validator.ValidateWithOptions(ctx, tx, height, options); err != nil {
-			prometheusInvalidTransactions.Inc()
-			v.logger.Errorf("[Validator] Invalid tx: %s", err)
+		for {
+			if _, err = v.validator.ValidateWithOptions(ctx, tx, height, options); err != nil {
+				// Back-pressure shed. This consumer runs WithLogErrorAndMoveOn, so
+				// returning the error would commit the offset and silently DROP a
+				// transaction the submitter was already told was accepted. Wait —
+				// pushing the overload into consumer lag, which is the correct
+				// back-pressure signal on an async path — and retry the same
+				// message; never shed by returning an error from this handler.
+				if errors.Is(err, errors.ErrThresholdExceeded) {
+					v.logger.Debugf("[Validator] block assembly overloaded, delaying kafka tx %s", tx.TxIDChainHash().String())
 
-			return err
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(blockAssemblyQueueMonitorInterval):
+					}
+
+					continue
+				}
+
+				prometheusInvalidTransactions.Inc()
+				v.logger.Errorf("[Validator] Invalid tx: %s", err)
+
+				return err
+			}
+
+			return nil
 		}
-
-		return nil
 	}
 
 	if v.consumerClient != nil {
@@ -910,6 +930,13 @@ func (v *Server) handleSingleTx(ctx context.Context) echo.HandlerFunc {
 		// Process the transaction and return appropriate response
 		response, err := v.validateTransaction(ctx, req)
 		if err != nil {
+			// Back-pressure shed: report "busy, retry later" (429) rather than a
+			// generic failure, so the HTTP fallback path carries the same
+			// retryable signal as the gRPC path's ResourceExhausted.
+			if errors.Is(err, errors.ErrThresholdExceeded) {
+				return c.String(http.StatusTooManyRequests, "[handleSingleTx] node busy: "+err.Error())
+			}
+
 			return c.String(http.StatusInternalServerError, "[handleSingleTx] Failed to process transaction: "+err.Error())
 		}
 

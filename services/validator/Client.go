@@ -455,6 +455,16 @@ func (c *Client) handleValidationError(ctx context.Context, tx *bt.Tx, blockHeig
 		return errors.UnwrapGRPC(err)
 	}
 
+	// ResourceExhausted is overloaded in-band: it is also the gRPC code for the
+	// back-pressure shed (THRESHOLD_EXCEEDED). A shed must surface to the caller
+	// as a retryable rejection — falling back to HTTP here would misdiagnose it
+	// as an oversize transaction and ADD load to the node precisely while it is
+	// shedding. The reconstructed teranode code disambiguates the two meanings.
+	unwrapped := errors.UnwrapGRPC(err)
+	if errors.Is(unwrapped, errors.ErrThresholdExceeded) {
+		return unwrapped
+	}
+
 	// Try HTTP fallback
 	c.logger.Warnf("[ValidateWithOptions][%s] Transaction exceeds gRPC message limit, falling back to validator /tx endpoint: %s",
 		tx.TxID(), st.Message())

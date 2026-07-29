@@ -1460,6 +1460,14 @@ func (ps *PropagationServer) validateTransactionViaHTTP(ctx context.Context, btT
 	// Check response status
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+
+		// 429 is the validator's back-pressure shed: preserve THRESHOLD_EXCEEDED
+		// so the submitter gets ResourceExhausted ("busy, retry") instead of a
+		// terminal ServiceError, matching the gRPC and sync paths.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return errors.NewThresholdExceededError("[ProcessTransaction][%s] validator busy (back-pressure), retry later: %s", btTx.TxID(), string(body))
+		}
+
 		return errors.NewServiceError("[ProcessTransaction][%s] validator /tx endpoint returned non-OK status: %d, body: %s",
 			btTx.TxID(), resp.StatusCode, string(body))
 	}

@@ -5867,6 +5867,10 @@ func (m *mockBlockAssemblyClient) CheckBlockAssemblyValidateInputs(ctx context.C
 func (m *mockBlockAssemblyClient) GetBlockAssemblyState(ctx context.Context) (*blockassembly_api.StateMessage, error) {
 	return nil, nil
 }
+
+func (m *mockBlockAssemblyClient) GetQueueLength(ctx context.Context) (int64, error) {
+	return 0, nil
+}
 func (m *mockBlockAssemblyClient) GetBlockAssemblyBlockCandidate(ctx context.Context) (*model.Block, error) {
 	return nil, nil
 }
