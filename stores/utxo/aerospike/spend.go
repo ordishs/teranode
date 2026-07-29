@@ -437,16 +437,12 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// untouched, since the dispatcher may still be writing to it.
 		result := s.resolveSpendCompletions(ctx, tx, items, true)
 
-		// Same rollback rationale as the normal path below: only roll back
-		// for a genuine validation failure among the spends we know
-		// completed, never for a bare timeout/cancel — the Lua spend script
-		// is idempotent for the same spender, so successful spends can
-		// safely remain and will be silently skipped on retry.
-		if result.rollbackNeeded && len(result.spentSpends) > 0 {
-			if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
-				s.logger.Errorf("error in aerospike unspend (batched mode, after wait error): %v", unspendErr)
-			}
-		}
+		// Roll back the spends we know completed. This path is the strictest case
+		// for the atomicity contract in rollbackPartialSpends: we return nil
+		// spends (the in-flight slots are unsafe to hand back), so the caller has
+		// no handle on the applied spends and could not roll them back itself
+		// even if it wanted to.
+		s.rollbackPartialSpends(tx, result, "batched mode, after wait error")
 
 		// Do NOT return the live spends slice on the abort path: items still
 		// in-flight are owned by the dispatcher goroutine, which will keep
@@ -472,16 +468,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	result := s.resolveSpendCompletions(ctx, tx, items, false)
 
 	if len(spends) != len(result.spentSpends) { // there must have been failures
-		// Only rollback successful spends when the transaction is genuinely invalid
-		// (double-spend, frozen, conflicting, hash mismatch). For transient infrastructure
-		// errors (DEVICE_OVERLOAD, timeout, etc.), skip the rollback — the Lua spend
-		// script is idempotent for the same spender, so successful spends can safely
-		// remain and will be silently skipped on retry.
-		if result.rollbackNeeded {
-			if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
-				s.logger.Errorf("error in aerospike unspend (batched mode): %v", unspendErr)
-			}
-		}
+		s.rollbackPartialSpends(tx, result, "batched mode")
 
 		// Aggregate with a hard cap. The failure count scales with the tx's
 		// input count (a mass DEVICE_OVERLOAD on a 50k-input consolidation tx
@@ -506,17 +493,74 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 }
 
 // spendCompletionResult is the outcome of resolveSpendCompletions: which
-// spends succeeded, and whether rollback is warranted for any completed
-// failure.
+// spends succeeded, plus a memo of the "does the spending tx already have a
+// record?" lookup so the rollback decision can reuse it (see
+// rollbackPartialSpends).
 type spendCompletionResult struct {
-	spentSpends    []*utxo.Spend
-	rollbackNeeded bool
+	spentSpends []*utxo.Spend
+
+	spenderChecked bool
+	spenderExists  bool
+}
+
+// rollbackPartialSpends undoes the spends that succeeded in a batch that failed
+// as a whole, so that no parent is left naming a spender that has no record.
+//
+// It is deliberately NOT gated on the error class. The old policy only rolled
+// back for "genuinely invalid tx" errors (spent/conflicting/frozen/
+// hash-mismatch) and kept partial spends for anything that looked retriable, on
+// the grounds that a retry would re-apply them idempotently. That assumption
+// does not hold: Validate spends the parents BEFORE creating the spending tx's
+// own record, and the callers that see ErrTxLocked / ErrTxNotFound park the tx
+// without guaranteeing a retry (legacy netsync's orphan pool is an expiring
+// map). The surviving spend then names a tx whose record is never created — a
+// dangling ref that makes GetCounterConflictingTxHashes fail with TX_NOT_FOUND
+// and permanently wedges block validation on any later block that spends the
+// same output (#1214).
+//
+// It IS gated on the spending tx having no record. With a record present the ref
+// is not dangling and rolling back would be the harmful move: it would clear a
+// slot a live (possibly mined) tx legitimately owns. That case is reachable
+// because the record-level locked/conflicting checks run before the per-UTXO
+// same-spender idempotency check, so re-validating an existing tx can fail on
+// one parent while succeeding on another.
+//
+// An indeterminate lookup (any error other than "not found") skips the rollback:
+// wrongly clearing a live spender's slot is worse than leaving a ref that the
+// consistency scan can still find.
+func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, phase string) {
+	if len(result.spentSpends) == 0 {
+		return
+	}
+
+	if !result.spenderChecked {
+		if _, getErr := s.Get(context.Background(), tx.TxIDChainHash()); getErr == nil {
+			result.spenderExists = true
+		} else if !errors.Is(getErr, errors.ErrTxNotFound) {
+			s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s) (%s): %v",
+				tx.TxID(), len(result.spentSpends), phase, getErr)
+
+			return
+		}
+
+		result.spenderChecked = true
+	}
+
+	if result.spenderExists {
+		return
+	}
+
+	// Unspend is ownership-checked (teranode.lua only clears spending_data it
+	// still owns), so this can never wipe another tx's spend.
+	if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
+		s.logger.Errorf("error in aerospike unspend (%s): %v", phase, unspendErr)
+	}
 }
 
 // resolveSpendCompletions applies the ErrTxNotFound "already blessed"
 // fallback and conflict-data extraction to each item exactly once, and
-// reports which spends succeeded plus whether any completed spend carries a
-// rollback-triggering error (see needsSpendRollback/isSpendRollbackError).
+// reports which spends succeeded (the set the caller rolls back when the
+// batch as a whole failed).
 //
 // When onlyCompleted is true (the group.Wait abort path), an item whose
 // published flag is still false is skipped without touching its slot: the
@@ -531,8 +575,6 @@ type spendCompletionResult struct {
 func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []*batchSpend, onlyCompleted bool) *spendCompletionResult {
 	result := &spendCompletionResult{spentSpends: make([]*utxo.Spend, 0, len(items))}
 
-	var txAlreadyExists bool
-
 	for _, item := range items {
 		if onlyCompleted && !item.published.Load() {
 			continue
@@ -544,14 +586,22 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 			// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
 			// the utxo store. We can check whether the tx already exists, which means it has been validated and
 			// blessed. In this case we can just clear the error.
-			if txAlreadyExists {
-				// we've previously validated that this tx already exists, no point doing a lookup again or logging anything
-				spend.Err = nil
-			} else if _, getErr := s.Get(ctx, tx.TxIDChainHash()); getErr == nil {
-				s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
+			//
+			// The outcome is memoized on result (both ways) so this lookup happens
+			// at most once per batch and rollbackPartialSpends can reuse it.
+			if !result.spenderChecked {
+				if _, getErr := s.Get(ctx, tx.TxIDChainHash()); getErr == nil {
+					s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
 
+					result.spenderExists = true
+					result.spenderChecked = true
+				} else if errors.Is(getErr, errors.ErrTxNotFound) {
+					result.spenderChecked = true
+				}
+			}
+
+			if result.spenderExists {
 				spend.Err = nil
-				txAlreadyExists = true
 			}
 		}
 
@@ -563,10 +613,6 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 				spend.ConflictingTxID = errSpent.SpendingData.TxID
 			}
 
-			if isSpendRollbackError(spend.Err) {
-				result.rollbackNeeded = true
-			}
-
 			// don't stop processing the rest of the batch, we want to see all errors
 			continue
 		}
@@ -575,35 +621,6 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 	}
 
 	return result
-}
-
-// isSpendRollbackError reports whether err is one of the validation-error
-// types that indicates the transaction is genuinely invalid (as opposed to a
-// transient infrastructure failure). Extracted from needsSpendRollback so
-// resolveSpendCompletions can apply the same predicate to a single error at
-// a time without building a throwaway slice.
-func isSpendRollbackError(err error) bool {
-	return errors.Is(err, errors.ErrSpent) ||
-		errors.Is(err, errors.ErrTxConflicting) ||
-		errors.Is(err, errors.ErrFrozen) ||
-		errors.Is(err, errors.ErrUtxoHashMismatch)
-}
-
-// needsSpendRollback returns true if any spend failed due to a validation error
-// that indicates the transaction is genuinely invalid. Only explicit Lua-level
-// validation failures trigger rollback — infrastructure errors (DEVICE_OVERLOAD,
-// timeout, etc.) do not, because the Lua spend script is idempotent for the
-// same spender and successful spends will be silently skipped on retry.
-func needsSpendRollback(spends []*utxo.Spend) bool {
-	for _, spend := range spends {
-		if spend.Err == nil {
-			continue
-		}
-		if isSpendRollbackError(spend.Err) {
-			return true
-		}
-	}
-	return false
 }
 
 type keyIgnoreLocked struct {

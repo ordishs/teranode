@@ -1480,3 +1480,165 @@ func SpendAndCreateInvalidOptions(t *testing.T, db utxostore.Store) {
 	_, _, err := db.SpendAndCreate(context.Background(), Tx, 1000, utxostore.WithCreateOnly(), utxostore.WithSpendOnly())
 	require.ErrorIs(t, err, errors.ErrInvalidArgument)
 }
+
+// PartialSpendRollback asserts the store's spend atomicity contract: when Spend
+// returns an error, none of the spends that succeeded in that batch may remain
+// applied.
+//
+// Why this is a hard contract and not an optimisation: Validate spends the
+// parents BEFORE it creates the spending tx's own record (Validator.go
+// spendUtxos → CreateInUtxoStore). A surviving partial spend therefore leaves a
+// parent whose spendingData names a tx that has no record and never will —
+// a dangling spender ref. Every reader that walks that ref
+// (GetCounterConflictingTxHashes → GetConflictingChildren) fails with
+// TX_NOT_FOUND, which permanently wedges block validation on any later block
+// that legitimately spends the same output (#1214).
+//
+// The two failure classes covered here are the ones observed in the field: a
+// locked parent and a missing parent. Both are handed to callers that park the
+// tx and never guarantee a retry (legacy netsync's orphan pool is an expiring
+// map), so "the retry will re-apply the spends" does not hold.
+func PartialSpendRollback(t *testing.T, db utxostore.Store) {
+	ctx := context.Background()
+
+	// requireUnspent asserts that parent's output 0 carries no spendingData.
+	requireUnspent := func(t *testing.T, parent *bt.Tx, msg string) {
+		t.Helper()
+
+		utxoHash, err := util.UTXOHashFromOutput(parent.TxIDChainHash(), parent.Outputs[0], 0)
+		require.NoError(t, err)
+
+		resp, err := db.GetSpend(ctx, &utxostore.Spend{
+			TxID:     parent.TxIDChainHash(),
+			Vout:     0,
+			UTXOHash: utxoHash,
+		})
+		require.NoError(t, err)
+		require.Equal(t, int(utxostore.Status_OK), resp.Status, msg)
+		require.Nil(t, resp.SpendingData, msg)
+	}
+
+	// childSpending builds a tx spending output 0 of each given parent.
+	childSpending := func(t *testing.T, payTo uint64, parents ...*bt.Tx) *bt.Tx {
+		t.Helper()
+
+		child := bt.NewTx()
+		for _, parent := range parents {
+			require.NoError(t, child.From(
+				parent.TxIDChainHash().String(), 0,
+				parent.Outputs[0].LockingScript.String(),
+				parent.Outputs[0].Satoshis,
+			))
+		}
+
+		require.NoError(t, child.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", payTo))
+
+		return child
+	}
+
+	t.Run("locked parent rolls back the spend on the good parent", func(t *testing.T) {
+		good := newTestTx(t, 7_100_000)
+		locked := newTestTx(t, 7_200_000)
+
+		_, _, err := db.SpendAndCreate(ctx, good, 1000, utxostore.WithCreateOnly())
+		require.NoError(t, err)
+
+		defer func() { _ = db.Delete(ctx, good.TxIDChainHash()) }()
+
+		_, _, err = db.SpendAndCreate(ctx, locked, 1000, utxostore.WithCreateOnly())
+		require.NoError(t, err)
+
+		defer func() { _ = db.Delete(ctx, locked.TxIDChainHash()) }()
+
+		require.NoError(t, db.SetLocked(ctx, []chainhash.Hash{*locked.TxIDChainHash()}, true))
+
+		child := childSpending(t, 1100, good, locked)
+
+		_, spends, err := db.SpendAndCreate(ctx, child, db.GetBlockHeight()+1, utxostore.WithSpendOnly())
+		require.Error(t, err, "spend must fail while one parent is locked")
+		require.ErrorIs(t, err, errors.ErrUtxoError)
+		require.Len(t, spends, 2)
+		require.NoError(t, spends[0].Err, "the unlocked parent's spend is expected to succeed")
+		require.ErrorIs(t, spends[1].Err, errors.ErrTxLocked)
+
+		requireUnspent(t, good, "partial spend survived a locked-parent failure: parent now names a spender whose record was never created")
+	})
+
+	t.Run("missing parent rolls back the spend on the good parent", func(t *testing.T) {
+		good := newTestTx(t, 7_300_000)
+		missing := newTestTx(t, 7_400_000) // deliberately never Created
+
+		_, _, err := db.SpendAndCreate(ctx, good, 1000, utxostore.WithCreateOnly())
+		require.NoError(t, err)
+
+		defer func() { _ = db.Delete(ctx, good.TxIDChainHash()) }()
+
+		child := childSpending(t, 1200, good, missing)
+
+		_, spends, err := db.SpendAndCreate(ctx, child, db.GetBlockHeight()+1, utxostore.WithSpendOnly())
+		require.Error(t, err, "spend must fail while one parent is absent")
+		require.ErrorIs(t, err, errors.ErrUtxoError)
+		require.Len(t, spends, 2)
+		require.NoError(t, spends[0].Err, "the present parent's spend is expected to succeed")
+		require.ErrorIs(t, spends[1].Err, errors.ErrTxNotFound)
+
+		requireUnspent(t, good, "partial spend survived a missing-parent failure: parent now names a spender whose record was never created")
+	})
+
+	// The rollback is scoped to its purpose: it exists to stop a parent naming a
+	// spender that has no record. When the spender DOES have a record the ref is
+	// not dangling, and rolling back would be the harmful move — it would clear a
+	// slot a live (possibly mined) tx legitimately owns. This is reachable because
+	// the store checks the parent record's locked/conflicting flags BEFORE the
+	// per-UTXO "already spent by the same spender" idempotency check, so
+	// re-validating an existing tx can fail on one parent while succeeding on
+	// another.
+	t.Run("failure does not roll back when the spending tx already has a record", func(t *testing.T) {
+		good := newTestTx(t, 7_500_000)
+		lockedLater := newTestTx(t, 7_600_000)
+
+		_, _, err := db.SpendAndCreate(ctx, good, 1000, utxostore.WithCreateOnly())
+		require.NoError(t, err)
+
+		defer func() { _ = db.Delete(ctx, good.TxIDChainHash()) }()
+
+		_, _, err = db.SpendAndCreate(ctx, lockedLater, 1000, utxostore.WithCreateOnly())
+		require.NoError(t, err)
+
+		defer func() { _ = db.Delete(ctx, lockedLater.TxIDChainHash()) }()
+
+		child := childSpending(t, 1300, good, lockedLater)
+		child.Inputs[0].UnlockingScript = dummyUnlockingScript
+		child.Inputs[1].UnlockingScript = dummyUnlockingScript
+
+		// The child is fully accepted: both parents spent, own record created.
+		_, _, err = db.SpendAndCreate(ctx, child, db.GetBlockHeight()+1)
+		require.NoError(t, err)
+
+		defer func() { _ = db.Delete(ctx, child.TxIDChainHash()) }()
+
+		// One parent then gets locked, and the child is re-validated (duplicate
+		// relay, re-processing of a block, ...).
+		require.NoError(t, db.SetLocked(ctx, []chainhash.Hash{*lockedLater.TxIDChainHash()}, true))
+
+		_, spends, err := db.SpendAndCreate(ctx, child, db.GetBlockHeight()+1, utxostore.WithSpendOnly())
+		require.Error(t, err)
+		require.Len(t, spends, 2)
+		require.NoError(t, spends[0].Err, "the unlocked parent's spend is idempotent for the same spender")
+		require.ErrorIs(t, spends[1].Err, errors.ErrTxLocked)
+
+		utxoHash, err := util.UTXOHashFromOutput(good.TxIDChainHash(), good.Outputs[0], 0)
+		require.NoError(t, err)
+
+		resp, err := db.GetSpend(ctx, &utxostore.Spend{
+			TxID:     good.TxIDChainHash(),
+			Vout:     0,
+			UTXOHash: utxoHash,
+		})
+		require.NoError(t, err)
+		require.Equal(t, int(utxostore.Status_SPENT), resp.Status,
+			"rollback cleared a slot owned by a spender that has a record — the ref was not dangling")
+		require.NotNil(t, resp.SpendingData)
+		require.Equal(t, child.TxIDChainHash().String(), resp.SpendingData.TxID.String())
+	})
+}

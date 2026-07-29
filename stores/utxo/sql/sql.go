@@ -1993,12 +1993,32 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	}
 
 	if len(spends) != len(spentSpends) {
-		// Rollback successful spends when the transaction has genuine validation failures
-		// (double-spend, frozen, conflicting, hash mismatch). For transient errors, skip
-		// rollback — the optimistic locking makes spends idempotent for the same spender.
-		if needsSpendRollback(spends) {
-			if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
-				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+		// Atomicity contract (mirrors aerospike/spend.go rollbackPartialSpends):
+		// roll back the spends that succeeded, whatever the error class of the
+		// ones that failed, so no parent is left naming a spender whose record is
+		// never created (#1214). Keeping partial spends for "retriable" failures
+		// assumed a retry that callers do not guarantee.
+		//
+		// Gated on the spending tx having no record: with a record present the ref
+		// is not dangling and the rollback would instead clear a slot a live tx
+		// legitimately owns. An indeterminate lookup skips the rollback.
+		if len(spentSpends) > 0 {
+			rollback := false
+
+			// context.Background(), like the Unspend below: on the context-cancel
+			// path the request ctx is already dead, and that is exactly a case
+			// where the partial spends must still be cleaned up.
+			var spendingTxExists bool
+			if scanErr := s.db.QueryRowContext(context.Background(), "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
+				s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s): %v", tx.TxID(), len(spentSpends), scanErr)
+			} else {
+				rollback = !spendingTxExists
+			}
+
+			if rollback {
+				if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
+					s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+				}
 			}
 		}
 
@@ -2019,23 +2039,6 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	prometheusUtxoSpend.Add(float64(len(spends)))
 
 	return spends, nil
-}
-
-// needsSpendRollback returns true if any spend failed due to a validation error
-// that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
-func needsSpendRollback(spends []*utxo.Spend) bool {
-	for _, spend := range spends {
-		if spend.Err == nil {
-			continue
-		}
-		if errors.Is(spend.Err, errors.ErrSpent) ||
-			errors.Is(spend.Err, errors.ErrTxConflicting) ||
-			errors.Is(spend.Err, errors.ErrFrozen) ||
-			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) {
-			return true
-		}
-	}
-	return false
 }
 
 // isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)

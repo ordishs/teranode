@@ -304,22 +304,13 @@ func TestTryLockIfNotExistsWithTimeout(t *testing.T) {
 		require.NoError(t, os.WriteFile(lockFilePath, []byte("locked"), 0600))
 		defer os.Remove(lockFilePath)
 
-		// Keep the lock file fresh so it never becomes stale
-		stopRefresh := make(chan struct{})
-		defer close(stopRefresh)
-		go func() {
-			ticker := time.NewTicker(shortQuorumOpTimeout / 4)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-stopRefresh:
-					return
-				case <-ticker.C:
-					now := time.Now()
-					_ = os.Chtimes(lockFilePath, now, now)
-				}
-			}
-		}()
+		// Keep the lock file fresh so it never becomes stale. Staleness is
+		// time.Since(modTime) > timeout, so a modTime in the future keeps the age
+		// negative for the whole run. A refresher goroutine ticking against the
+		// 50ms timeout instead makes this test load-flaky: starve the goroutine
+		// once and the lock ages out, gets treated as stale, and is acquired.
+		fresh := time.Now().Add(time.Hour)
+		require.NoError(t, os.Chtimes(lockFilePath, fresh, fresh))
 
 		ctx := context.Background()
 

@@ -3227,7 +3227,14 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// try to process one last time
 		// passing in block height 0, which will default to utxo store block height in validator
 		if _, err := sm.validationClient.Validate(sm.ctx, orphanTx.tx, 0); err != nil {
-			sm.logger.Debugf("failed to validate orphan transaction when evicting %v: %v", txHash, err)
+			// The tx is now dropped for good: it never validated and nothing will
+			// retry it. Log at WARN with a metric rather than Debugf — this is the
+			// event that hid the #1214 ghost-spender incident for ~40 hours, since a
+			// tx abandoned here has already been through the store's spend path
+			// (repeatedly, with the eviction attempt) and only the store's own
+			// rollback keeps its parents from being left pointing at it.
+			prometheusLegacyNetsyncOrphansAbandoned.Inc()
+			sm.logger.Warnf("orphan transaction %v abandoned after eviction, never validated: %v", txHash, err)
 		} else {
 			sm.logger.Debugf("evicted orphan transaction %v", txHash)
 		}
