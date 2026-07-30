@@ -4514,14 +4514,26 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
-		// Create subtree metadata with parent tx hashes to trigger missing parent logic
-		subtreeMetaSlice, err := createSubtreeMetadataWithParents(subtree, 1, []chainhash.Hash{*tx2Hash})
+		// Node 0 (tx1Hash) spends tx3Hash, which is in neither txMap nor the store, so it
+		// becomes a missing parent. Node 1 (tx2Hash) takes the dummy-parent fallback, which
+		// is seeded below and resolves. Both nodes therefore contribute an entry to
+		// checkParentTxHashes and the group fans out over two parents with mixed outcomes —
+		// the accumulation across nodes that the single-node sibling subtest cannot reach.
+		//
+		// Do not attach a node's own hash here: a same-block parent whose txMap index is not
+		// greater than the child's takes the `continue` branch in checkParentTransactions,
+		// contributing nothing, which leaves the fan-out empty and validateSubtree returning
+		// nil no matter how the store is seeded.
+		subtreeMetaSlice, err := createSubtreeMetadataWithParents(subtree, 0, []chainhash.Hash{*tx3Hash})
 		require.NoError(t, err)
 
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
+		utxoStore := createTestUTXOStore(t)
+		seedDummyParent(t, utxoStore)
+
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
+			txMetaStore:           utxoStore,
 			subtreeStore:          mockStore,
 			currentChain:          []*BlockHeader{},
 			currentBlockHeaderIDs: []uint32{1, 2},
@@ -4534,12 +4546,16 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
-		// This should trigger the parallel parent checking logic:
+		// Exercises the parallel parent checking logic:
 		// if len(checkParentTxHashes) > 0 { ... parentG.Go(...) ... }
 		err = block.validateSubtree(ctx, ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
+		require.ErrorIs(t, err, errors.ErrBlockIncomplete)
 
-		// Test exercises the parallel parent processing logic
-		_ = err // May succeed or fail but exercises the parallel processing
+		// tx3Hash is the parent that must be reported missing; the seeded fallback must not
+		// be, which is what proves the fan-out actually had a resolving member rather than
+		// bailing on node 0 alone.
+		require.Contains(t, err.Error(), tx3Hash.String())
+		require.NotContains(t, err.Error(), dummyParentHash.String())
 	})
 
 	t.Run("single node subtree", func(t *testing.T) {
