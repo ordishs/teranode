@@ -41,6 +41,31 @@ var IndexName, _ = gocore.Config().Get("pruner_IndexName", "pruner_dah_index")
 
 const errParentUpdateOpsFailed = "%d parent update operations failed"
 
+// Wire vocabulary of the addDeletedChildren mod-teranode response. These mirror
+// the constants in teranode.lua (FIELD_STATUS / FIELD_ERROR_CODE / FIELD_MESSAGE,
+// STATUS_OK / STATUS_ERROR, ERROR_CODE_TX_NOT_FOUND) and the store's LuaSuccess
+// bin name; the pruner cannot import the store package (the store imports the
+// pruner), so they are restated here rather than shared.
+const (
+	// luaSuccessBin is the record bin both mod-teranode paths write their
+	// response map into — aerospike.LuaSuccess on the store side.
+	luaSuccessBin = "SUCCESS"
+
+	fieldStatus    = "status"
+	fieldErrorCode = "errorCode"
+	// fieldMessage is the key the producers actually emit (teranode.lua
+	// FIELD_MESSAGE); the store's own parser reads it too.
+	fieldMessage = "message"
+	// fieldErrorMessage is tolerated as an alias so a future producer that emits
+	// it is not silently dropped. No producer emits it today.
+	fieldErrorMessage = "errorMessage"
+
+	statusOK    = "OK"
+	statusError = "ERROR"
+
+	errorCodeTxNotFound = "TX_NOT_FOUND"
+)
+
 // TimeoutError indicates that a query operation timed out or encountered a network error.
 // This error type is used to distinguish retriable timeout errors from other errors.
 type TimeoutError struct {
@@ -110,10 +135,18 @@ type Options struct {
 	// (subOpAddDeletedChildren) when the cluster supports it, with transparent
 	// fallback to the legacy NewBatchUDF call otherwise.
 	//
-	// The policy argument is honoured only by the UDF branch; the native-op
-	// branch synthesises its own write policy. Pass childHashes as the same
+	// The UDF branch honours the policy in full. The native-op branch synthesises
+	// its own write policy but still carries over the policy's FilterExpression
+	// when one is set, so a server-side eligibility gate applies identically on
+	// both paths (the pruner sets no filter today). Pass childHashes as the same
 	// []interface{} payload the legacy path would have wrapped in
 	// aerospike.NewValue (one Lua argument: a list of hex hash strings).
+	//
+	// The implementation must not create the parent record when it is absent —
+	// a missing parent is routine here and the Lua function it replaces returns
+	// TX_NOT_FOUND without writing. It may report that either as a
+	// KEY_NOT_FOUND batch error or as an ERROR/TX_NOT_FOUND response map; the
+	// pruner counts both as a skipped parent.
 	//
 	// When nil, the pruner builds NewBatchUDF directly using LuaPackage
 	// (existing pre-PR-828 behaviour).
@@ -1618,10 +1651,12 @@ func (s *Service) buildParentUpdateRecords(updates map[string]*parentUpdateInfo)
 // builder and left the pruner emitting batch_sub_udf on native-op deployments
 // with defensive mode off.
 //
-// parentUsesModTeranode reports whether the parent-update records carry a
-// mod-teranode SUCCESS-map response (native or UDF, both silent on missing
-// parents) rather than the plain BatchWrite path (missing parent → KEY_NOT_FOUND).
-// The caller uses it to parse the batch results.
+// parentUsesModTeranode reports whether the parent-update records answer with a
+// mod-teranode SUCCESS map (native or UDF) rather than the plain BatchWrite path,
+// which has no response map at all. The caller passes it to
+// classifyParentUpdateResult to select the response contract. It does not imply
+// anything about missing parents: all three paths can report those, the UDF as an
+// ERROR/TX_NOT_FOUND response and the other two as KEY_NOT_FOUND.
 func (s *Service) buildCombinedCleanupRecords(updates map[string]*parentUpdateInfo, keys []*aerospike.Key) (batchRecords []aerospike.BatchRecordIfc, parentEnd int, parentUsesModTeranode bool) {
 	batchRecords = make([]aerospike.BatchRecordIfc, 0, len(updates)+len(keys))
 
@@ -1697,75 +1732,11 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 
 	// Parse results in two regions: [0, parentEnd) are parent updates,
 	// [parentEnd, end) are child deletions.
-	parentSuccess, parentNotFound, parentErrors := 0, 0, 0
-	deleteErrors := 0
-	// firstParentErr captures the first non-KEY_NOT_FOUND failure surfaced
-	// by either path: the aerospike SDK (batchRec.Err) or the UDF
-	// SUCCESS-map "ERROR" status. It is typed as `error` rather than
-	// `aerospike.Error` so the UDF-error branch can synthesise a
-	// descriptive sentinel without faking an aerospike.Error.
-	var firstParentErr error
-	var firstDeleteErr aerospike.Error
+	parentTally := tallyParentUpdateResults(batchRecords[:parentEnd], parentUsesModTeranode)
+	parentSuccess, parentNotFound, parentErrors := parentTally.success, parentTally.notFound, parentTally.failed
+	firstParentErr := parentTally.firstErr
 
-	for i, rec := range batchRecords {
-		batchRec := rec.BatchRec()
-		if i < parentEnd {
-			// Parent update result
-			if batchRec.Err != nil {
-				// Plain MapPutItems BatchWrite path surfaces missing parents as
-				// KEY_NOT_FOUND; the mod-teranode paths (native + UDF) handle
-				// missing parents server-side and never surface it here.
-				if !parentUsesModTeranode && batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
-					parentNotFound++
-					continue
-				}
-				if firstParentErr == nil {
-					firstParentErr = batchRec.Err
-				}
-				parentErrors++
-				continue
-			}
-			// mod-teranode paths (native + UDF) return a SUCCESS/ERROR map in the
-			// record bins; the UDF path yields map[interface{}]interface{} and the
-			// native-op dispatcher yields map[string]interface{}.
-			if parentUsesModTeranode && batchRec.Record != nil && batchRec.Record.Bins != nil {
-				if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
-					if status, errCode, errMsg, ok := addDeletedChildrenStatus(resp); ok {
-						switch status {
-						case "OK":
-							parentSuccess++
-						case "ERROR":
-							if errCode == "TX_NOT_FOUND" {
-								parentNotFound++
-							} else {
-								parentErrors++
-								// UDF-path errors don't carry an
-								// aerospike.Error; synthesise one
-								// describing the UDF response so the
-								// returned error chain isn't empty.
-								if firstParentErr == nil {
-									firstParentErr = errors.NewProcessingError("UDF parent update returned ERROR (code=%q, message=%q)", errCode, errMsg)
-								}
-							}
-						}
-						continue
-					}
-				}
-			}
-			parentSuccess++
-		} else {
-			// Child deletion result — KEY_NOT_FOUND is idempotent success
-			if batchRec.Err != nil {
-				if batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
-					continue
-				}
-				if firstDeleteErr == nil {
-					firstDeleteErr = batchRec.Err
-				}
-				deleteErrors++
-			}
-		}
-	}
+	deleteErrors, firstDeleteErr := tallyChildDeletionResults(batchRecords[parentEnd:])
 
 	if parentErrors > 0 {
 		s.logger.Errorf("Combined cleanup: %d parent update errors (first: %v)", parentErrors, firstParentErr)
@@ -1833,9 +1804,10 @@ func (s *Service) executeBatchParentUpdates(ctx context.Context, updates map[str
 
 // executeBatchParentUpdatesUDF builds the addDeletedChildren parent-update batch
 // using either the native-op wrapper (when Options.BuildAddDeletedChildrenRecord
-// was supplied) or a direct NewBatchUDF fallback. In both cases missing parent
-// records are handled server-side, avoiding KEY_NOT_FOUND noise in Aerospike
-// client metrics.
+// was supplied) or a direct NewBatchUDF fallback. Neither creates a missing
+// parent: the UDF reports it as an ERROR/TX_NOT_FOUND response and the native
+// path as a KEY_NOT_FOUND batch error, and both are counted as skipped rather
+// than failed.
 func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[string]*parentUpdateInfo) error {
 	batchRecords := s.buildParentUpdateRecords(updates)
 
@@ -1851,46 +1823,16 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 		return errors.NewStorageError("batch parent update failed", err)
 	}
 
-	successCount := 0
-	notFoundCount := 0
-	errorCount := 0
-
-	for _, rec := range batchRecords {
-		batchRec := rec.BatchRec()
-		if batchRec.Err != nil {
-			s.logger.Errorf("Parent update error for key %v: %v", batchRec.Key, batchRec.Err)
-			errorCount++
-			continue
-		}
-
-		if batchRec.Record != nil && batchRec.Record.Bins != nil {
-			if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
-				// The UDF path returns map[interface{}]interface{}; the native-op
-				// dispatcher decodes the same Lua-style response as
-				// map[string]interface{}. addDeletedChildrenStatus reads both
-				// shapes without copying the map.
-				if status, errCode, _, ok := addDeletedChildrenStatus(resp); ok {
-					switch status {
-					case "OK":
-						successCount++
-					case "ERROR":
-						if errCode == "TX_NOT_FOUND" {
-							notFoundCount++
-						} else {
-							s.logger.Errorf("Parent update Lua error for key %v: code=%q", batchRec.Key, errCode)
-							errorCount++
-						}
-					}
-					continue
-				}
-			}
-		}
-
-		successCount++
-	}
+	// Both mod-teranode producers answer with a SUCCESS map, so this path is
+	// always classified against the mod-teranode contract.
+	tally := tallyParentUpdateResults(batchRecords, true)
+	successCount, notFoundCount, errorCount := tally.success, tally.notFound, tally.failed
 
 	if errorCount > 0 {
-		return errors.NewStorageError(errParentUpdateOpsFailed, errorCount)
+		s.logger.Errorf("Batch parent update: %d of %d parent updates failed (first: %v)",
+			errorCount, len(batchRecords), tally.firstErr)
+
+		return errors.NewStorageError(errParentUpdateOpsFailed, errorCount, tally.firstErr)
 	}
 
 	if successCount > 0 {
@@ -1904,32 +1846,209 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 	return nil
 }
 
-// addDeletedChildrenStatus reads the status / errorCode / errorMessage fields
-// from the SUCCESS map returned by the addDeletedChildren mod-teranode op,
-// without allocating a copy of the map (this runs once per parent update on the
-// per-block cleanup hot path). Both response shapes are handled: the legacy UDF
-// path yields map[interface{}]interface{}; the native-op dispatcher yields
-// map[string]interface{}.
+// addDeletedChildrenStatus reads the status / errorCode / message fields from the
+// SUCCESS map returned by the addDeletedChildren mod-teranode op, without
+// allocating a copy of the map (this runs once per parent update on the per-block
+// cleanup hot path).
 //
-// ok reports that resp is one of those two map shapes AND carries a string
-// "status" field — matching the old two-step (normalise + status type-assert)
-// guard, so callers fall through to their default success handling unchanged
-// when the response has no parseable status.
+// ok reports that resp was a recognised map shape AND carried a string status
+// field. Callers must treat ok == false as a failure, not as success: the two
+// producers (the Lua UDF and the server-fork native dispatcher) are not pinned to
+// the same response encoding by anything in this repo, so an unreadable response
+// means the parent update's outcome is unknown. See classifyParentUpdateResult.
 func addDeletedChildrenStatus(resp interface{}) (status, errorCode, errorMessage string, ok bool) {
-	switch m := resp.(type) {
-	case map[interface{}]interface{}:
-		status, ok = m["status"].(string)
-		errorCode, _ = m["errorCode"].(string)
-		errorMessage, _ = m["errorMessage"].(string)
-	case map[string]interface{}:
-		status, ok = m["status"].(string)
-		errorCode, _ = m["errorCode"].(string)
-		errorMessage, _ = m["errorMessage"].(string)
-	default:
+	lookup, recognised := addDeletedChildrenFieldLookup(resp)
+	if !recognised {
 		return "", "", "", false
 	}
 
+	status, ok = lookup(fieldStatus)
+	errorCode, _ = lookup(fieldErrorCode)
+
+	// Producers emit "message"; fall back to the "errorMessage" alias only when
+	// "message" is absent or empty.
+	if errorMessage, _ = lookup(fieldMessage); errorMessage == "" {
+		errorMessage, _ = lookup(fieldErrorMessage)
+	}
+
 	return status, errorCode, errorMessage, ok
+}
+
+// addDeletedChildrenFieldLookup returns a string-field accessor over whichever
+// map encoding the response arrived in, or recognised == false when resp is not a
+// map at all.
+//
+// Three shapes are handled. The UDF path yields map[interface{}]interface{}
+// (the aerospike client's unpackMapNormal). map[string]interface{} is accepted
+// because the native dispatcher may decode that way. []aerospike.MapPair is the
+// client's representation of an ordered-map particle (a map CDT carrying the
+// ordered-map ext header) — no producer is known to emit it for this op, but
+// accepting it costs a case and rejecting it would, post-fail-closed, turn a
+// working native deployment into a hard error.
+func addDeletedChildrenFieldLookup(resp interface{}) (lookup func(string) (string, bool), recognised bool) {
+	switch m := resp.(type) {
+	case map[interface{}]interface{}:
+		return func(field string) (string, bool) {
+			v, ok := m[field].(string)
+			return v, ok
+		}, true
+
+	case map[string]interface{}:
+		return func(field string) (string, bool) {
+			v, ok := m[field].(string)
+			return v, ok
+		}, true
+
+	case []aerospike.MapPair:
+		return func(field string) (string, bool) {
+			for _, pair := range m {
+				if key, isString := pair.Key.(string); isString && key == field {
+					v, ok := pair.Value.(string)
+					return v, ok
+				}
+			}
+
+			return "", false
+		}, true
+
+	default:
+		return nil, false
+	}
+}
+
+// parentUpdateTally is the aggregate outcome of a parent-update batch region.
+type parentUpdateTally struct {
+	success  int
+	notFound int
+	failed   int
+	// firstErr is the first failure encountered, typed as `error` rather than
+	// `aerospike.Error` so a synthesised response error can be carried without
+	// faking an aerospike.Error.
+	firstErr error
+}
+
+// tallyParentUpdateResults classifies every record in a parent-update batch
+// region. Shared by the combined single-round-trip path and the defensive-mode
+// two-call path so the two cannot report the same server response differently.
+func tallyParentUpdateResults(batchRecords []aerospike.BatchRecordIfc, usesModTeranode bool) parentUpdateTally {
+	var tally parentUpdateTally
+
+	for _, rec := range batchRecords {
+		outcome, outcomeErr := classifyParentUpdateResult(rec.BatchRec(), usesModTeranode)
+
+		switch outcome {
+		case parentUpdateOK:
+			tally.success++
+
+		case parentUpdateNotFound:
+			tally.notFound++
+
+		default:
+			tally.failed++
+
+			if tally.firstErr == nil {
+				tally.firstErr = outcomeErr
+			}
+		}
+	}
+
+	return tally
+}
+
+// tallyChildDeletionResults counts failed child-record deletions. KEY_NOT_FOUND
+// is idempotent success here — the child is already gone, which is the outcome
+// the deletion was asking for.
+func tallyChildDeletionResults(batchRecords []aerospike.BatchRecordIfc) (deleteErrors int, firstDeleteErr aerospike.Error) {
+	for _, rec := range batchRecords {
+		batchRec := rec.BatchRec()
+
+		if batchRec.Err == nil || batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+			continue
+		}
+
+		if firstDeleteErr == nil {
+			firstDeleteErr = batchRec.Err
+		}
+
+		deleteErrors++
+	}
+
+	return deleteErrors, firstDeleteErr
+}
+
+// parentUpdateOutcome is how a single addDeletedChildren batch record is tallied.
+type parentUpdateOutcome int
+
+const (
+	// parentUpdateOK — the parent's deletedChildren map was updated.
+	parentUpdateOK parentUpdateOutcome = iota
+	// parentUpdateNotFound — the parent record is gone. Never an error for this
+	// op: the parent is normally one the pruner itself already deleted.
+	parentUpdateNotFound
+	// parentUpdateFailed — the update failed, or its outcome could not be read.
+	parentUpdateFailed
+)
+
+// classifyParentUpdateResult maps one parent-update batch record onto the outcome
+// the cleanup counters track. Shared by the combined and two-call paths so the
+// two cannot drift apart again.
+//
+// It fails CLOSED. Any response the pruner cannot read is reported as a failure
+// rather than counted as a silent success, because the caller deletes the child
+// records in the same batch on the strength of this classification — a parent
+// update that silently did not happen is exactly the referential-integrity break
+// the parent-update phase exists to prevent. The store fails closed on the same
+// unknown (ParseLuaMapResponse returns an error); the pruner now matches it.
+//
+// A missing parent reaches us two different ways and is benign in both: as
+// KEY_NOT_FOUND from the policies that require an existing record (the native
+// path's UPDATE_ONLY, the plain MapPutItems fallback), or as an ERROR/TX_NOT_FOUND
+// response from the Lua UDF, which guards on aerospike:exists(rec) instead.
+//
+// usesModTeranode selects the response contract: mod-teranode records (native or
+// UDF) must carry a readable SUCCESS map, whereas the plain MapPutItems BatchWrite
+// has no response map at all and a nil Err is the whole of its success signal.
+func classifyParentUpdateResult(batchRec *aerospike.BatchRecord, usesModTeranode bool) (parentUpdateOutcome, error) {
+	if batchRec.Err != nil {
+		if batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+			return parentUpdateNotFound, nil
+		}
+
+		return parentUpdateFailed, batchRec.Err
+	}
+
+	if !usesModTeranode {
+		return parentUpdateOK, nil
+	}
+
+	if batchRec.Record == nil || batchRec.Record.Bins == nil {
+		return parentUpdateFailed, errors.NewProcessingError("parent update returned no record")
+	}
+
+	resp, ok := batchRec.Record.Bins[luaSuccessBin]
+	if !ok {
+		return parentUpdateFailed, errors.NewProcessingError("parent update returned no %q bin", luaSuccessBin)
+	}
+
+	status, errCode, errMsg, ok := addDeletedChildrenStatus(resp)
+	if !ok {
+		return parentUpdateFailed, errors.NewProcessingError("unreadable parent update response (%T)", resp)
+	}
+
+	switch status {
+	case statusOK:
+		return parentUpdateOK, nil
+
+	case statusError:
+		if errCode == errorCodeTxNotFound {
+			return parentUpdateNotFound, nil
+		}
+
+		return parentUpdateFailed, errors.NewProcessingError("parent update returned ERROR (code=%q, message=%q)", errCode, errMsg)
+
+	default:
+		return parentUpdateFailed, errors.NewProcessingError("parent update returned unknown status %q", status)
+	}
 }
 
 // executeBatchParentUpdatesBatchWrite is the fallback when Lua UDF is not configured.

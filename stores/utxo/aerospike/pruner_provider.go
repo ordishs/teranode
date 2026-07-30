@@ -52,6 +52,16 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 	// fallback when the cluster does not support wire op 200. This eliminates the
 	// steady stream of batch_sub_udf calls the pruner used to emit even on
 	// native-op-enabled deployments.
+	//
+	// A missing parent is the routine case for this op — the parent is normally
+	// one the pruner itself already deleted — so the record must never be created.
+	// initNativeTeranodeOps pins that for every native op by setting the shared
+	// nativeOpBatchWritePolicy to UPDATE_ONLY, matching the Lua addDeletedChildren
+	// this replaces (it returns TX_NOT_FOUND without writing when
+	// aerospike:exists(rec) is false). A resurrected parent would hold only
+	// deletedChildren — no txid, no deleteAtHeight — which the DAH scan could
+	// never reclaim and extractTxHash would fail on. The miss therefore reaches
+	// the pruner as KEY_NOT_FOUND, which it counts as a skipped parent.
 	opts := aeropruner.Options{
 		Logger:        s.logger,
 		Ctx:           s.ctx,
