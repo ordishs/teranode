@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -3909,10 +3910,29 @@ var (
 	dummyParentHash = *dummyParentTx.TxIDChainHash()
 )
 
-// seedDummyParent stores dummyParentTx as mined into block ID 1, so
-// getParentTxMetaBlockIDs resolves it instead of returning BlockIncompleteError.
-// WithCreateOnly is required because dummyParentTx's own input is not in the
-// store; SpendAndCreate is used because utxo.Store exposes it but not Create.
+// oldParentTx is a second, distinct throwaway parent for tests that need to tell
+// which parent was actually checked — pointing a node at dummyParentHash would
+// match the fixture's own fallback and make the assertion blind to a wrong
+// nodeIndex.
+var (
+	oldParentTx   = newTx(98)
+	oldParentHash = *oldParentTx.TxIDChainHash()
+)
+
+// seedParent stores tx as mined into blockID so getParentTxMetaBlockIDs resolves it
+// instead of returning BlockIncompleteError. WithCreateOnly is required because these
+// throwaway parents' own inputs are not in the store; SpendAndCreate is used because
+// utxo.Store exposes it but not Create.
+func seedParent(t *testing.T, store utxo.Store, tx *bt.Tx, blockID uint32) {
+	t.Helper()
+
+	_, _, err := store.SpendAndCreate(context.Background(), tx, blockID,
+		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: blockID, BlockHeight: blockID}),
+		utxo.WithCreateOnly())
+	require.NoError(t, err)
+}
+
+// seedDummyParent stores the fixture's shared dummy parent at block ID 1.
 //
 // BlockID 1 is error-free for both map shapes these tests use: when
 // currentBlockHeaderIDsMap contains 1 the parent is found exactly once, and when
@@ -3921,10 +3941,7 @@ var (
 func seedDummyParent(t *testing.T, store utxo.Store) {
 	t.Helper()
 
-	_, _, err := store.SpendAndCreate(context.Background(), dummyParentTx, 1,
-		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 1, BlockHeight: 1}),
-		utxo.WithCreateOnly())
-	require.NoError(t, err)
+	seedParent(t, store, dummyParentTx, 1)
 }
 
 // dummyInpointsForNode builds a single-input TxInpoints spending dummyParentHash
@@ -4582,8 +4599,10 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
-		// Create subtree metadata with multiple parent hashes (simulate many missing parents)
-		subtreeMetaSlice, err := createSubtreeMetadataWithParents(subtree, 1, []chainhash.Hash{*tx2Hash, *tx3Hash})
+		// Create subtree metadata with multiple parent hashes (simulate many missing parents).
+		// nodeIndex is the subtree's only node: this subtree has length 1, so passing any
+		// other index would silently drop parentHashes and leave nothing to check.
+		subtreeMetaSlice, err := createSubtreeMetadataWithParents(subtree, 0, []chainhash.Hash{*tx2Hash, *tx3Hash})
 		require.NoError(t, err)
 
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
@@ -4602,12 +4621,20 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
-		// This should trigger parallel processing with multiple parent checks
-		// Tests: util.SafeSetLimit(parentG, 1024*32) and multiple parentG.Go() calls
+		// Neither parent is in txMap or the store, so both become missingParentTx entries
+		// and checkParentsExistOnChain fans them out over parentG. A missing parent is the
+		// retryable classification, so the group's first error is BlockIncomplete.
 		err = block.validateSubtree(ctx, ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
+		require.ErrorIs(t, err, errors.ErrBlockIncomplete)
 
-		// Test exercises the errgroup parallel processing with multiple parents
-		_ = err // May succeed or fail but exercises parallel processing
+		// Pin that the supplied parents were the ones checked. Without this the subtest
+		// passes even when nodeIndex misses every node and the fixture's fallback parent
+		// is validated instead — which is what made it vacuous before.
+		require.NotContains(t, err.Error(), dummyParentHash.String(),
+			"parentHashes were dropped; the fallback parent was validated instead")
+		require.True(t,
+			strings.Contains(err.Error(), tx2Hash.String()) || strings.Contains(err.Error(), tx3Hash.String()),
+			"expected the error to name one of the supplied parents, got: %v", err)
 	})
 
 	t.Run("oldBlockIDsMap population", func(t *testing.T) {
@@ -4624,14 +4651,21 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 
 		defer func() { block.txMap = txmap.NewSplitSwissMapUint64(10) }()
 
-		// Create subtree metadata with parent hash
-		subtreeMetaSlice, err := createSubtreeMetadataWithParents(subtree, 1, []chainhash.Hash{*tx2Hash})
+		// The parent must resolve in the store for this path to be reachable, so point the
+		// node at a seeded parent rather than a hash that is nowhere. nodeIndex 0 is the
+		// subtree's only node. oldParentTx rather than the dummy parent, so the block-ID
+		// assertion below can tell the two apart.
+		subtreeMetaSlice, err := createSubtreeMetadataWithParents(subtree, 0, []chainhash.Hash{oldParentHash})
 		require.NoError(t, err)
 
 		mockStore.data[string(subtree.RootHash()[:])] = subtreeMetaSlice
 
+		utxoStore := createTestUTXOStore(t)
+		seedDummyParent(t, utxoStore)
+		seedParent(t, utxoStore, oldParentTx, 5)
+
 		deps := &validationDependencies{
-			txMetaStore:           createTestUTXOStore(t),
+			txMetaStore:           utxoStore,
 			subtreeStore:          mockStore,
 			currentChain:          []*BlockHeader{},
 			currentBlockHeaderIDs: []uint32{10, 11}, // Higher block IDs
@@ -4644,11 +4678,18 @@ func TestBlock_ValidateSubtree_NodeIteration(t *testing.T) {
 			parentSpendsMap:             NewSplitSyncedParentMap(4),
 		}
 
-		// This should test the oldBlockIDsMap.Set() logic when old parent blocks are found
+		// The parent is mined into block 5, which is outside the cached {10, 11} set, so
+		// filterCurrentBlockHeaderIDsMap finds nothing but reports minBlockID 5. That takes
+		// the "defer to the validator" branch, which returns the parent's block IDs instead
+		// of an error and has checkParentsExistOnChain record them against the child tx.
 		err = block.validateSubtree(ctx, ulogger.TestLogger{}, deps, validationCtx, subtree, 0)
+		require.NoError(t, err)
 
-		// Test exercises: deps.oldBlockIDsMap.Set(parentTxStruct.txHash, oldParentBlockIDs)
-		_ = err // Tests oldBlockIDsMap population logic
+		// Block 5 is oldParentTx's; the fixture's fallback parent sits at block 1. Asserting
+		// the exact IDs is what makes this sensitive to nodeIndex dropping the parent list.
+		oldBlockIDs, ok := deps.oldBlockIDsMap.Get(*tx1Hash)
+		require.True(t, ok, "expected oldBlockIDsMap to be populated for the child tx")
+		require.Equal(t, []uint32{5}, oldBlockIDs)
 	})
 }
 
