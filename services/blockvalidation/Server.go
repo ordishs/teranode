@@ -205,6 +205,13 @@ type Server struct {
 	// reads failedSources concurrently with worker-side mutation.
 	blockIncompleteMu sync.Mutex
 
+	// incompleteCooldown overrides incompleteBlockCooldown (the cap's window,
+	// and therefore the blockIncompleteAttempts TTL and the self-requeue delay).
+	// Zero means the constant. Only set by tests, so the real
+	// window-expiry/requeue pairing can be exercised in seconds rather than
+	// with a hand-rolled delay that would not reproduce it.
+	incompleteCooldown time.Duration
+
 	// stats tracks operational metrics for monitoring and troubleshooting
 	stats *gocore.Stat
 
@@ -1692,10 +1699,11 @@ func (u *Server) startBlockProcessingSystem(ctx context.Context) {
 	}()
 }
 
-// incompleteBlockCooldown is the fixed window a block spends in cooldown after
+// incompleteBlockCooldown is the window a block spends in cooldown after
 // exhausting its per-block BLOCK_INCOMPLETE retry budget, and therefore also the
-// TTL of the blockIncompleteAttempts cache entries that implement it. After the
-// window the block is retried again (self-healing if the missing data appears).
+// TTL of the blockIncompleteAttempts cache entries that implement it. At the end
+// of each window the block is re-queued and every previously-failed source is
+// given another turn (self-healing if the missing data appeared meanwhile).
 const incompleteBlockCooldown = 10 * time.Minute
 
 // blockProcessingWorker is a worker that processes blocks from the priority queue
@@ -1725,9 +1733,12 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 			// Record BLOCK_INCOMPLETE failures BEFORE FinishProcessingBlock
 			// releases the per-hash claim, so two workers cannot race the
 			// counter into duplicate escalations. Transient-marked incompletes
-			// (the deliberate catchup-ordering signal: a parent's block still
-			// being absorbed) are the documented-must-retry case and never
-			// count toward the cap.
+			// are the deliberate catchup-ordering signal (a parent's block
+			// still being absorbed while syncing) and never count toward the
+			// cap; the marker is applied only when the FSM says we are NOT
+			// caught up (see validateBlockSubtrees' missing-data branch), so a
+			// persistent local missing-parent in RUNNING — the scaling-incident
+			// failure — still reaches the cap.
 			if err != nil && errors.Is(err, errors.ErrBlockIncomplete) && !errors.IsTransientBlockIncomplete(err) {
 				u.recordIncompleteBlockFailure(ctx, blockFound)
 			}
@@ -1800,6 +1811,13 @@ type incompleteBlockState struct {
 	// requeueArmed latches the self-requeue timer chain so concurrent failures
 	// cannot double-arm it.
 	requeueArmed bool
+
+	// cleared marks the state as retired by a successful validation of the
+	// block. The self-requeue chain owns this pointer rather than looking the
+	// entry up again — its timer necessarily fires after the entry it would
+	// find has expired — so this flag is how it tells "block recovered, stop"
+	// from "window elapsed, retry now".
+	cleared bool
 }
 
 // recordIncompleteBlockFailure counts a BLOCK_INCOMPLETE processing failure
@@ -1874,7 +1892,7 @@ func (u *Server) recordIncompleteBlockFailure(ctx context.Context, blockFound pr
 		prometheusBlockValidationIncompleteBlockEscalations.Inc()
 	}
 
-	u.logger.Errorf("[BlockProcessing] manual_intervention_required: block %s failed with BLOCK_INCOMPLETE %d times (sources: %d); chain tip may be stuck behind it. Suppressing failed sources for %s and retrying once per window — check UTXO store health (missing parents / lost partitions) and peer data availability", blockHash.String(), state.count, len(state.failedSources), incompleteBlockCooldown)
+	u.logger.Errorf("[BlockProcessing] manual_intervention_required: block %s failed with BLOCK_INCOMPLETE %d times (sources: %d); chain tip may be stuck behind it. Suppressing failed sources for %s and retrying once per window — check UTXO store health (missing parents / lost partitions) and peer data availability", blockHash.String(), state.count, len(state.failedSources), u.incompleteCooldownWindow())
 
 	// Preserve the original source so the retry is actually fetchable:
 	// processBlockWithPriority resolves SourceTypeRetry via GetAlternativeSource,
@@ -1894,16 +1912,38 @@ func (u *Server) recordIncompleteBlockFailure(ctx context.Context, blockFound pr
 		peerID:  blockFound.peerID,
 	}
 
-	u.armIncompleteRequeue(ctx, requeueBlock, incompleteBlockCooldown)
+	u.armIncompleteRequeue(ctx, requeueBlock, state, u.incompleteCooldownWindow())
+}
+
+// incompleteCooldownWindow is the cooldown/TTL the BLOCK_INCOMPLETE cap runs
+// with. Overridable per-Server so tests can exercise the real
+// window-expiry/requeue pairing instead of a hand-rolled short delay.
+func (u *Server) incompleteCooldownWindow() time.Duration {
+	if u.incompleteCooldown > 0 {
+		return u.incompleteCooldown
+	}
+
+	return incompleteBlockCooldown
 }
 
 // armIncompleteRequeue schedules the once-per-window retry of a capped block
-// and re-arms itself for the next window for as long as the block is still
+// and re-arms itself for the next window for as long as the block keeps
 // failing. The chain stops when the block validates (clearIncompleteAttempts
-// deletes the state), when the window lapses without further failures (the
-// entry TTL-expires), or on shutdown. No shutdown watchdog: the callback's
-// ctx.Err() check makes a post-shutdown firing a no-op.
-func (u *Server) armIncompleteRequeue(ctx context.Context, requeueBlock processBlockFound, delay time.Duration) {
+// marks the state cleared) or on shutdown. No shutdown watchdog: the
+// callback's ctx.Err() check makes a post-shutdown firing a no-op.
+//
+// The chain deliberately holds the state POINTER rather than re-reading the
+// cache: the entry's TTL and this delay are the same window, and the entry is
+// re-Set just before the timer is armed, so the callback always fires after
+// the entry it would look up has expired. Looking it up would find nothing and
+// stop the chain on its first firing — i.e. never retry at all.
+//
+// Firing means the window elapsed with the block still capped, which is
+// exactly the moment every source deserves another turn, so the recorded
+// failed sources are dropped before the entry is revived. The count and the
+// escalated latch are kept: the block is still capped (so a source that fails
+// again is suppressed again) and the operator is not re-paged every window.
+func (u *Server) armIncompleteRequeue(ctx context.Context, requeueBlock processBlockFound, state *incompleteBlockState, delay time.Duration) {
 	time.AfterFunc(delay, func() {
 		if ctx.Err() != nil {
 			return
@@ -1911,27 +1951,26 @@ func (u *Server) armIncompleteRequeue(ctx context.Context, requeueBlock processB
 
 		u.blockIncompleteMu.Lock()
 
-		item := u.blockIncompleteAttempts.Get(*requeueBlock.hash)
-		if item == nil || item.Value() == nil || item.Value().count < u.settings.BlockValidation.IncompleteBlockMaxRetriesPerBlock {
-			// Block recovered (state cleared on success) or the window lapsed:
-			// stop the retry chain.
-			if item != nil && item.Value() != nil {
-				item.Value().requeueArmed = false
-			}
-
+		if state.cleared {
+			// Block recovered: stop the retry chain.
+			state.requeueArmed = false
 			u.blockIncompleteMu.Unlock()
 
 			return
 		}
 
-		// Keep the state (and its source suppression) alive across the retry.
-		u.blockIncompleteAttempts.Set(*requeueBlock.hash, item.Value(), ttlcache.DefaultTTL)
+		suppressed := len(state.failedSources)
+		state.failedSources = make(map[string]struct{})
+
+		// Revive the window so the cap (and its suppression of sources that
+		// fail the retry) survives into the next one.
+		u.blockIncompleteAttempts.Set(*requeueBlock.hash, state, ttlcache.DefaultTTL)
 		u.blockIncompleteMu.Unlock()
 
 		u.blockPriorityQueue.RequeueForRetry(requeueBlock, PriorityDeepFork, 0)
-		u.logger.Infof("[BlockProcessing] BLOCK_INCOMPLETE cooldown window expired for block %s; re-queued for retry from %s", requeueBlock.hash.String(), requeueBlock.baseURL)
+		u.logger.Infof("[BlockProcessing] BLOCK_INCOMPLETE cooldown window expired for block %s; re-queued for retry from %s and released %d suppressed source(s)", requeueBlock.hash.String(), requeueBlock.baseURL, suppressed)
 
-		u.armIncompleteRequeue(ctx, requeueBlock, incompleteBlockCooldown)
+		u.armIncompleteRequeue(ctx, requeueBlock, state, u.incompleteCooldownWindow())
 	})
 }
 
@@ -1940,9 +1979,18 @@ func (u *Server) armIncompleteRequeue(ctx context.Context, requeueBlock processB
 // successful processing of the block so a block that recovers does not carry
 // accumulated failures into a later, unrelated retry. Nil-safe for Server
 // literals in tests.
+//
+// The state is marked cleared before it is dropped: the self-requeue chain
+// holds the same pointer and uses the flag to distinguish recovery (stop) from
+// the window simply elapsing (retry).
 func (u *Server) clearIncompleteAttempts(blockHash *chainhash.Hash) {
 	if u.blockIncompleteAttempts != nil {
 		u.blockIncompleteMu.Lock()
+
+		if item := u.blockIncompleteAttempts.Get(*blockHash); item != nil && item.Value() != nil {
+			item.Value().cleared = true
+		}
+
 		u.blockIncompleteAttempts.Delete(*blockHash)
 		u.blockIncompleteMu.Unlock()
 	}

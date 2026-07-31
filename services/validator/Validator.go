@@ -11,9 +11,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-batcher/v2"
@@ -146,14 +146,13 @@ type Validator struct {
 	// This client is used to ensure the validator service remains synchronized with the blockchain.
 	blockchainClient blockchain.ClientI
 
-	// blockAssemblyQueueOverloaded is the cached verdict of the block assembly
-	// queue monitor (see monitorBlockAssemblyQueue): true while block assembly's
-	// ingest queue holds more than blockassembly_max_queued_transactions
-	// transactions. Read once per mempool-ingest validation as the back-pressure
-	// gate at the TOP of validateInternal — before any UTXO work — so a reject
-	// never leaves a transaction spent or created. Stays false when the limit is
-	// 0 (gate disabled) or the monitor is not running.
-	blockAssemblyQueueOverloaded atomic.Bool
+	// blockAssemblyQueueMonitor caches whether block assembly's ingest queue
+	// holds more than blockassembly_max_queued_transactions transactions
+	// (a shared blockassembly.QueueMonitor; nil when the limit is disabled).
+	// Consulted once per mempool-ingest validation as the back-pressure gate
+	// in validateInternal — before any UTXO work — so a reject never leaves a
+	// transaction spent or created.
+	blockAssemblyQueueMonitor ingestGate
 
 	// stats tracks validator performance metrics
 	stats *gocore.Stat
@@ -203,7 +202,34 @@ type Validator struct {
 	// goroutines start, and per-tx readers only contend with each other on the read lock.
 	mtpMu    sync.RWMutex
 	mtpStore []uint32
+
+	// graceChainChecks memoises dahEvictedParentGrace's current-chain verdicts,
+	// keyed on the child's block-ID set. The grace fires when a mined child's
+	// parent has been evicted — i.e. while re-validating a block whose
+	// transactions all carry the SAME BlockIDs — so without memoisation every
+	// transaction of that block repeats an identical blockchain round-trip
+	// (gRPC hop plus an indexed lookup, or a recursive parent_id walk on the
+	// reject path) at exactly the moment the node is already degraded.
+	graceChainChecks   map[string]graceChainCheck
+	graceChainChecksMu sync.Mutex
 }
+
+// graceChainCheck is one memoised current-chain verdict.
+type graceChainCheck struct {
+	onCurrentChain bool
+	expires        time.Time
+}
+
+// graceChainCheckTTL bounds how stale a memoised current-chain verdict may be.
+// Deliberately short: the check exists to reject BlockIDs left behind by a lost
+// reorg, so the memo must not outlive a reorg by anything meaningful. A few
+// seconds collapses a whole block's transactions into one round-trip while
+// keeping the staleness window far below the time any reorg takes to settle.
+const graceChainCheckTTL = 5 * time.Second
+
+// graceChainCheckEntries caps the memo so a stream of distinct block-ID sets
+// cannot grow it without bound; expired entries are swept when the cap is hit.
+const graceChainCheckEntries = 1024
 
 // New creates a new Validator instance with the provided configuration.
 // It initializes the validator with the given logger, UTXO store, and Kafka producers.
@@ -235,9 +261,12 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	// Back-pressure: watch block assembly's ingest queue so mempool validation
 	// can shed load BEFORE doing any UTXO work. Only runs when the operator set
-	// a limit and block assembly is in use.
-	if tSettings.BlockAssembly.MaxQueuedTransactions > 0 && !tSettings.BlockAssembly.Disabled && blockAssemblyClient != nil {
-		go v.monitorBlockAssemblyQueue(ctx, blockAssemblyClient, tSettings.BlockAssembly.MaxQueuedTransactions)
+	// a limit and block assembly is in use (NewQueueMonitor returns nil
+	// otherwise, and the gate's Overloaded() check is nil-safe).
+	if !tSettings.BlockAssembly.Disabled {
+		if monitor := blockassembly.NewQueueMonitor(ctx, logger, blockAssemblyClient, tSettings.BlockAssembly.MaxQueuedTransactions); monitor != nil {
+			v.blockAssemblyQueueMonitor = monitor
+		}
 	}
 
 	txmetaKafkaURL := v.settings.Kafka.TxMetaConfig
@@ -281,79 +310,24 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	return v, nil
 }
 
-// blockAssemblyQueueMonitorInterval is how often the back-pressure monitor
-// samples block assembly's queue depth. One lightweight RPC per interval per
-// validator instance; the per-transaction gate itself is a single atomic load.
-const blockAssemblyQueueMonitorInterval = time.Second
+// ingestGate is the back-pressure verdict the validator consults per mempool
+// transaction. Satisfied by *blockassembly.QueueMonitor in production (and by
+// a stub in tests); kept as an interface so the gate can be driven directly
+// without standing up a poller.
+type ingestGate interface {
+	Overloaded() bool
+}
 
-// blockAssemblyQueueMonitorTimeout bounds each queue-depth poll. Deliberately
-// longer than the tick so a slow-but-answering block assembly still produces a
-// verdict rather than a stream of DeadlineExceeded (ticks that fire while a
-// poll is in flight are skipped).
-const blockAssemblyQueueMonitorTimeout = 4 * blockAssemblyQueueMonitorInterval
-
-// blockAssemblyQueueMonitorFailOpenAfter is the number of CONSECUTIVE poll
-// errors after which the monitor clears an overloaded verdict. Keeping the last
-// verdict through a couple of failed polls avoids flapping on a transient
-// blip, but a persistently unreachable block assembly (crash-looping is the
-// realistic case when its queue really did fill) must not leave the validator
-// rejecting every mempool transaction forever on a stale verdict.
-const blockAssemblyQueueMonitorFailOpenAfter = 5
-
-// monitorBlockAssemblyQueue polls block assembly's queue depth (the dedicated
-// GetQueueLength RPC — an atomic read that does NOT round-trip the subtree
-// processor's main loop, so it keeps answering during exactly the block-movement
-// stalls the gate exists for) and caches whether it exceeds limit, for the
-// back-pressure gate in validateInternal. Runs for the service lifetime.
+// IngestOverloaded reports whether block assembly's ingest queue is currently
+// over blockassembly_max_queued_transactions, i.e. whether the back-pressure
+// gate in validateInternal would shed a mempool transaction right now.
 //
-// Failure policy: a poll error keeps the last verdict for up to
-// blockAssemblyQueueMonitorFailOpenAfter consecutive failures, then fails OPEN
-// (verdict cleared, loud warning). Fail-open is safe because if block assembly
-// is truly down the Store() call fails loudly on its own; fail-closed would
-// reject the world on a stale verdict. The polling cadence also means the
-// queue can overshoot the limit by up to one interval of ingest before the
-// gate closes; the limit is a soft bound with bounded overshoot, not an exact
-// cap. That is the price of gating BEFORE the validator spends/creates
-// anything, which is what makes a reject safely retryable.
-func (v *Validator) monitorBlockAssemblyQueue(ctx context.Context, baClient blockassembly.ClientI, limit int64) {
-	ticker := time.NewTicker(blockAssemblyQueueMonitorInterval)
-	defer ticker.Stop()
-
-	consecutiveErrors := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			pollCtx, cancel := context.WithTimeout(ctx, blockAssemblyQueueMonitorTimeout)
-			queueLength, err := baClient.GetQueueLength(pollCtx)
-			cancel()
-
-			if err != nil {
-				consecutiveErrors++
-
-				if consecutiveErrors == blockAssemblyQueueMonitorFailOpenAfter && v.blockAssemblyQueueOverloaded.Swap(false) {
-					v.logger.Warnf("[monitorBlockAssemblyQueue] %d consecutive queue-depth poll failures; failing OPEN (clearing overloaded verdict) — mempool ingest resumes, block assembly Store() errors will surface on their own: %v", consecutiveErrors, err)
-				} else {
-					v.logger.Debugf("[monitorBlockAssemblyQueue] failed to get block assembly queue length (%d consecutive): %v", consecutiveErrors, err)
-				}
-
-				continue
-			}
-
-			consecutiveErrors = 0
-
-			overloaded := queueLength > limit
-			if overloaded != v.blockAssemblyQueueOverloaded.Swap(overloaded) {
-				if overloaded {
-					v.logger.Warnf("[monitorBlockAssemblyQueue] block assembly queue %d exceeds limit %d; shedding mempool ingest until it drains", queueLength, limit)
-				} else {
-					v.logger.Infof("[monitorBlockAssemblyQueue] block assembly queue %d back under limit %d; accepting mempool ingest", queueLength, limit)
-				}
-			}
-		}
-	}
+// Callers that must NOT shed by rejecting — the Kafka consumer, whose submitter
+// already received a 200 from propagation — use this to wait out the overload
+// instead of calling Validate and getting an error they cannot return. Always
+// false when the limit is disabled.
+func (v *Validator) IngestOverloaded() bool {
+	return v.blockAssemblyQueueMonitor != nil && v.blockAssemblyQueueMonitor.Overloaded()
 }
 
 // Close releases the resources the Validator owns: the tx-meta batcher and the
@@ -856,8 +830,10 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	// block validation blessing, announced-subtree validation, legacy sync) is
 	// exempt: those transactions are already committed to a block or subtree,
 	// and refusing them fails valid blocks instead of shedding load. Callers
-	// that skip block assembly entirely have nothing to shed.
-	if v.blockAssemblyQueueOverloaded.Load() && !validationOptions.InBlock && validationOptions.AddTXToBlockAssembly {
+	// that skip block assembly entirely have nothing to shed. SkipBackpressure
+	// carries the one case that must never be shed here: a transaction the node
+	// already acknowledged to its submitter (see Options.SkipBackpressure).
+	if v.IngestOverloaded() && !validationOptions.InBlock && validationOptions.AddTXToBlockAssembly && !validationOptions.SkipBackpressure {
 		if prometheusValidatorBackpressureRejects != nil {
 			prometheusValidatorBackpressureRejects.Inc()
 		}
@@ -1244,7 +1220,7 @@ func (v *Validator) dahEvictedParentGrace(ctx context.Context, tx *bt.Tx, txID s
 		return nil, false, nil
 	}
 
-	onCurrentChain, chainErr := v.blockchainClient.CheckBlockIsInCurrentChain(ctx, txMetaData.BlockIDs)
+	onCurrentChain, checked, chainErr := v.blockIDsOnCurrentChain(ctx, txMetaData.BlockIDs)
 	if chainErr != nil {
 		return nil, false, errors.NewServiceError("[Validate][%s] DAH-evicted-parent grace: current-chain check failed", txID, chainErr)
 	}
@@ -1253,9 +1229,77 @@ func (v *Validator) dahEvictedParentGrace(ctx context.Context, tx *bt.Tx, txID s
 		return nil, false, nil
 	}
 
-	v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined on current chain and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
+	// Log once per block-ID set rather than once per transaction: the grace
+	// fires for every transaction of a block being re-validated, and a per-tx
+	// warning buries the signal it exists to raise.
+	if checked {
+		v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined on current chain and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
+	}
 
 	return txMetaData, true, nil
+}
+
+// blockIDsOnCurrentChain answers dahEvictedParentGrace's current-chain question
+// through a short-lived memo (see graceChainCheckTTL). checked reports whether
+// the answer came from the blockchain service rather than the memo, so the
+// caller can log once per block instead of once per transaction. Errors are
+// never memoised.
+func (v *Validator) blockIDsOnCurrentChain(ctx context.Context, blockIDs []uint32) (onCurrentChain bool, checked bool, err error) {
+	key := blockIDsKey(blockIDs)
+	now := time.Now()
+
+	v.graceChainChecksMu.Lock()
+	if entry, ok := v.graceChainChecks[key]; ok && now.Before(entry.expires) {
+		v.graceChainChecksMu.Unlock()
+
+		return entry.onCurrentChain, false, nil
+	}
+	v.graceChainChecksMu.Unlock()
+
+	onCurrentChain, err = v.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
+	if err != nil {
+		return false, true, err
+	}
+
+	v.graceChainChecksMu.Lock()
+	defer v.graceChainChecksMu.Unlock()
+
+	if v.graceChainChecks == nil {
+		v.graceChainChecks = make(map[string]graceChainCheck)
+	}
+
+	if len(v.graceChainChecks) >= graceChainCheckEntries {
+		for k, entry := range v.graceChainChecks {
+			if !now.Before(entry.expires) {
+				delete(v.graceChainChecks, k)
+			}
+		}
+
+		// Still full of live entries: drop the memo rather than let it grow.
+		if len(v.graceChainChecks) >= graceChainCheckEntries {
+			v.graceChainChecks = make(map[string]graceChainCheck)
+		}
+	}
+
+	v.graceChainChecks[key] = graceChainCheck{onCurrentChain: onCurrentChain, expires: now.Add(graceChainCheckTTL)}
+
+	return onCurrentChain, true, nil
+}
+
+// blockIDsKey builds an order-independent map key for a set of block IDs, so
+// two transactions of the same block share one memo entry regardless of the
+// order the store returned their IDs in.
+func blockIDsKey(blockIDs []uint32) string {
+	sorted := make([]uint32, len(blockIDs))
+	copy(sorted, blockIDs)
+	slices.Sort(sorted)
+
+	key := make([]byte, 0, len(sorted)*4)
+	for _, id := range sorted {
+		key = binary.LittleEndian.AppendUint32(key, id)
+	}
+
+	return string(key)
 }
 
 // getUtxoBlockHeightsAndExtendTx returns the block heights for each input of the transaction.

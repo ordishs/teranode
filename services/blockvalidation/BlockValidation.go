@@ -1697,16 +1697,8 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions: %s", block.Hash().String(), err)
 			}
 
-			// Catchup-state errors: a parent transaction is not yet in our store because we
-			// have not yet absorbed the block that contains it. This is a transient ordering
-			// problem, NOT a consensus violation. Do NOT persist the block as invalid (that
-			// poisons the DB permanently and stalls sync); signal incomplete so catchup
-			// retries another peer. See issue #1031.
 			if errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
-				ctxLogger.Warnf("[ValidateBlock][%s] transient missing-data during subtree validation, will retry: %s", block.Hash().String(), err)
-				// Transient LOCAL ordering gap, not the serving peer's fault: mark it so the
-				// catchup penalty path does not demote an honest (possibly sole-source) peer.
-				return errors.NewBlockIncompleteTransientError("[ValidateBlock][%s] transient missing-data during subtree validation: %s", block.Hash().String(), err)
+				return u.missingSubtreeDataError(ctx, ctxLogger, block, err)
 			}
 
 			return err
@@ -2078,6 +2070,43 @@ func (u *BlockValidation) caughtUpState(ctx context.Context) (bool, error) {
 	}
 
 	return *st == blockchain.FSMStateRUNNING, nil
+}
+
+// missingSubtreeDataError classifies a missing parent/transaction surfaced by
+// subtree validation. It is never a consensus violation, so the block is never
+// persisted invalid (that poisons the DB permanently and stalls sync) — but
+// whose problem it is depends on FSM state, and the transient marker carries
+// that distinction:
+//
+//   - syncing (not RUNNING): a #1031 catchup-ordering gap — the block holding
+//     the parent has not been absorbed yet. Transient: the serving peer is
+//     honest (possibly the sole source ahead) and must not be demoted, and
+//     retrying is exactly the right response, so it must not consume the
+//     per-block BLOCK_INCOMPLETE retry budget either.
+//   - caught up (RUNNING): the data is missing LOCALLY and nothing is going to
+//     supply it on its own. This is the scaling-incident failure — mass
+//     TX_NOT_FOUND on parent lookups after UTXO records were lost — which the
+//     per-block cap exists to bound, so it must be countable.
+//
+// An FSM state that cannot be DETERMINED is treated as caught up: a degraded
+// blockchain service is exactly the condition that produces these storms, and
+// the cap must not silently disable itself then. The cost is that a
+// simultaneous blockchain-service fault during catchup can attribute an
+// ordering gap to the serving peer; that double fault is preferable to an
+// unbounded retry grind with no escalation.
+func (u *BlockValidation) missingSubtreeDataError(ctx context.Context, ctxLogger ulogger.Logger, block *model.Block, err error) error {
+	ctxLogger.Warnf("[ValidateBlock][%s] missing data during subtree validation, will retry: %s", block.Hash().String(), err)
+
+	caughtUp, stateErr := u.caughtUpState(ctx)
+	if stateErr != nil {
+		ctxLogger.Warnf("[ValidateBlock][%s] cannot determine FSM state for missing-data classification (treating as caught up so the retry cap stays engaged): %v", block.Hash().String(), stateErr)
+	}
+
+	if stateErr == nil && !caughtUp {
+		return errors.NewBlockIncompleteTransientError("[ValidateBlock][%s] transient missing-data during subtree validation: %s", block.Hash().String(), err)
+	}
+
+	return errors.NewBlockIncompleteError("[ValidateBlock][%s] missing-data during subtree validation while caught up: %s", block.Hash().String(), err)
 }
 
 func (u *BlockValidation) markBlockAsInvalid(ctx context.Context, block *model.Block, reason string) error {

@@ -36,17 +36,34 @@ import (
 func newIncompleteCapServer(t *testing.T, cap int) *Server {
 	t.Helper()
 
+	return newIncompleteCapServerWithCooldown(t, cap, incompleteBlockCooldown)
+}
+
+// newIncompleteCapServerWithCooldown is newIncompleteCapServer with the cap's
+// window shrunk. The cache TTL and the Server's cooldown are set from the SAME
+// value, exactly as production wires them, so tests that exercise
+// window-expiry behaviour reproduce the real pairing rather than a hand-picked
+// delay against a 10-minute TTL.
+func newIncompleteCapServerWithCooldown(t *testing.T, cap int, cooldown time.Duration) *Server {
+	t.Helper()
+
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.BlockValidation.IncompleteBlockMaxRetriesPerBlock = cap
 
-	return &Server{
-		settings: tSettings,
-		logger:   ulogger.TestLogger{},
+	u := &Server{
+		settings:           tSettings,
+		logger:             ulogger.TestLogger{},
+		incompleteCooldown: cooldown,
 		blockIncompleteAttempts: ttlcache.New[chainhash.Hash, *incompleteBlockState](
-			ttlcache.WithTTL[chainhash.Hash, *incompleteBlockState](incompleteBlockCooldown),
+			ttlcache.WithTTL[chainhash.Hash, *incompleteBlockState](cooldown),
 			ttlcache.WithDisableTouchOnHit[chainhash.Hash, *incompleteBlockState](),
 		),
 	}
+
+	go u.blockIncompleteAttempts.Start()
+	t.Cleanup(u.blockIncompleteAttempts.Stop)
+
+	return u
 }
 
 func bfFrom(h *chainhash.Hash, source string) processBlockFound {
@@ -228,7 +245,7 @@ func TestRecordIncompleteBlockFailure_FSMGate(t *testing.T) {
 func TestRecordIncompleteBlockFailure_RequeueCarriesSource(t *testing.T) {
 	initPrometheusMetrics()
 
-	u := newIncompleteCapServer(t, 1)
+	u := newIncompleteCapServerWithCooldown(t, 1, 200*time.Millisecond)
 	u.blockPriorityQueue = NewBlockPriorityQueue(ulogger.TestLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -238,11 +255,6 @@ func TestRecordIncompleteBlockFailure_RequeueCarriesSource(t *testing.T) {
 	bf := bfFrom(&h, "http://origin-peer")
 
 	u.recordIncompleteBlockFailure(ctx, bf)
-
-	// Force the requeue chain's next firing to be immediate by rewinding the
-	// armed timer: rather than waiting 10 minutes, re-arm with a tiny delay.
-	// The chain's own state checks still run against the real cache entry.
-	u.armIncompleteRequeue(ctx, processBlockFound{hash: &h, baseURL: "http://origin-peer", peerID: "origin-peer"}, 20*time.Millisecond)
 
 	// Peek takes the queue lock (Len does not), so it is the race-safe way to
 	// poll for the AfterFunc's requeue.
@@ -255,14 +267,14 @@ func TestRecordIncompleteBlockFailure_RequeueCarriesSource(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, queued.hash.IsEqual(&h))
 	require.Equal(t, "http://origin-peer", queued.baseURL, "requeue must carry the original source, not a bare retry marker")
-	require.Equal(t, "origin-peer", queued.peerID)
+	require.Equal(t, "http://origin-peer", queued.peerID, "requeue must carry the original peer")
 }
 
 // TestIncompleteRequeueChainStopsOnRecovery verifies the once-per-window retry
 // chain terminates once the block validates (state cleared): the timer fires,
 // finds no capped state, and requeues nothing.
 func TestIncompleteRequeueChainStopsOnRecovery(t *testing.T) {
-	u := newIncompleteCapServer(t, 1)
+	u := newIncompleteCapServerWithCooldown(t, 1, 200*time.Millisecond)
 	u.blockPriorityQueue = NewBlockPriorityQueue(ulogger.TestLogger{})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -273,16 +285,83 @@ func TestIncompleteRequeueChainStopsOnRecovery(t *testing.T) {
 	u.recordIncompleteBlockFailure(ctx, bfFrom(&h, "http://peer"))
 	require.True(t, u.incompleteAttemptsExhausted(&h))
 
-	// Block validates: success path clears the state.
+	// Block validates before the window expires: success clears the state, and
+	// the armed chain must observe that and stop instead of re-queueing.
 	u.clearIncompleteAttempts(&h)
 
-	// Fire the chain quickly: it must observe the cleared state and stop.
-	u.armIncompleteRequeue(ctx, processBlockFound{hash: &h, baseURL: "http://peer"}, 20*time.Millisecond)
-
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(600 * time.Millisecond)
 
 	_, _, ok := u.blockPriorityQueue.Peek()
 	require.False(t, ok, "a recovered block must not be requeued")
+}
+
+// TestIncompleteRequeueFiresAfterWindowExpiry is the regression test for the
+// self-requeue that never fired: the cap re-Sets the cache entry with the
+// cooldown TTL and then arms the retry timer with the SAME duration, so the
+// timer necessarily fires after the entry it used to look up had expired —
+// the chain read a nil entry, concluded "recovered", and stopped without ever
+// re-queueing. The chain must survive its own window and retry the block.
+func TestIncompleteRequeueFiresAfterWindowExpiry(t *testing.T) {
+	initPrometheusMetrics()
+
+	u := newIncompleteCapServerWithCooldown(t, 1, 200*time.Millisecond)
+	u.blockPriorityQueue = NewBlockPriorityQueue(ulogger.TestLogger{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := chainhash.HashH([]byte("incomplete-blk-window-expiry"))
+
+	u.recordIncompleteBlockFailure(ctx, bfFrom(&h, "http://origin-peer"))
+	require.True(t, u.incompleteAttemptsExhausted(&h), "the failure must reach the cap and arm the chain")
+
+	require.Eventually(t, func() bool {
+		_, _, ok := u.blockPriorityQueue.Peek()
+		return ok
+	}, 3*time.Second, 10*time.Millisecond, "the armed chain must re-queue the block when its own window expires")
+
+	queued, _, ok := u.blockPriorityQueue.Peek()
+	require.True(t, ok)
+	require.True(t, queued.hash.IsEqual(&h))
+
+	// …and it must keep going: the cap state is revived each window, so the
+	// block stays capped (no re-page) and the chain re-arms.
+	require.True(t, u.incompleteAttemptsExhausted(&h), "the cap state must survive the retry")
+
+	escalations := testutil.ToFloat64(prometheusBlockValidationIncompleteBlockEscalations)
+
+	time.Sleep(500 * time.Millisecond)
+
+	require.InDelta(t, escalations, testutil.ToFloat64(prometheusBlockValidationIncompleteBlockEscalations), 0.001, "re-queueing every window must not re-page the operator")
+}
+
+// TestIncompleteRequeueReleasesFailedSources pins that a source judged unable
+// to serve a block is re-tested on the next window rather than suppressed for
+// the whole extended lifetime of the cap state. The reason a peer failed
+// (block not absorbed yet, pruned body) is usually temporary, and the
+// cooldown-expiry retry is exactly the moment every source deserves another
+// turn.
+func TestIncompleteRequeueReleasesFailedSources(t *testing.T) {
+	initPrometheusMetrics()
+
+	u := newIncompleteCapServerWithCooldown(t, 1, 500*time.Millisecond)
+	u.blockPriorityQueue = NewBlockPriorityQueue(ulogger.TestLogger{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := chainhash.HashH([]byte("incomplete-blk-source-release"))
+
+	u.recordIncompleteBlockFailure(ctx, bfFrom(&h, "http://peer-a"))
+	require.True(t, u.incompleteSourceSuppressed(&h, "http://peer-a"), "the failing source is suppressed inside the window")
+
+	// The cap must still be in force after the window's retry (state revived),
+	// with the previously-failed source released rather than judged once and
+	// suppressed for the whole extended lifetime of the state.
+	require.Eventually(t, func() bool {
+		return u.incompleteAttemptsExhausted(&h) && !u.incompleteSourceSuppressed(&h, "http://peer-a")
+	}, 3*time.Second, 10*time.Millisecond, "the window's retry must give a previously-failed source another turn")
+	require.True(t, u.incompleteSourceSuppressed(&h, ""), "a sourceless announcement of a capped block is still suppressed")
 }
 
 // TestIncompleteBlockWindowSlidesOnFailure pins the deliberate divergence from

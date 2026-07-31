@@ -675,6 +675,18 @@ func (c *Client) validateTransactionViaHTTP(ctx context.Context, tx *bt.Tx, bloc
 	// Check response status
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+
+		// 429 is the validator's back-pressure shed. Keep it as
+		// THRESHOLD_EXCEEDED so the caller (propagation, which re-wraps
+		// anything else as Internal) can pass a retryable "busy" back to the
+		// submitter instead of a terminal reject. Reached for exactly the
+		// transactions that take this fallback — the oversize ones — because a
+		// transport-level ResourceExhausted carries no error detail to
+		// reconstruct the code from.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return errors.NewThresholdExceededError("[ValidateWithOptions][%s] validator busy (back-pressure), retry later: %s", tx.TxID(), string(body))
+		}
+
 		return errors.NewServiceError("[ValidateWithOptions][%s] validator /tx endpoint returned non-OK status: %d, body: %s",
 			tx.TxID(), resp.StatusCode, string(body))
 	}

@@ -1974,6 +1974,25 @@ func (ba *BlockAssembly) CheckBlockAssemblyValidateInputs(ctx context.Context, _
 	return &blockassembly_api.EmptyMessage{}, nil
 }
 
+// GetQueueLength returns only the current subtree-processor queue depth.
+//
+// A single atomic read: no subtree-processor main-loop round-trip, no subtree
+// hash encoding — safe to poll frequently, and it answers even while the main
+// loop is busy with a block movement (unlike GetBlockAssemblyState, whose
+// GetSubtreeHashes leg blocks on that loop). That is what makes it usable as
+// the back-pressure signal: the stall is exactly when the answer is needed.
+//
+// Parameters:
+//   - _: Context for cancellation (unused)
+//   - _: Empty message request (unused)
+//
+// Returns:
+//   - *blockassembly_api.GetQueueLengthResponse: Current queue depth
+//   - error: Always nil; the signature satisfies the gRPC service contract
+func (ba *BlockAssembly) GetQueueLength(_ context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.GetQueueLengthResponse, error) {
+	return &blockassembly_api.GetQueueLengthResponse{QueueLength: ba.blockAssembler.QueueLength()}, nil
+}
+
 // GetBlockAssemblyState retrieves the current operational state of the block assembly service.
 //
 // This method provides comprehensive diagnostic information about the current state
@@ -1995,16 +2014,6 @@ func (ba *BlockAssembly) CheckBlockAssemblyValidateInputs(ctx context.Context, _
 // Returns:
 //   - *blockassembly_api.StateMessage: Detailed state information
 //   - error: Any error encountered while gathering state information
-//
-// GetQueueLength returns only the current subtree-processor queue depth.
-// A single atomic read: no subtree-processor main-loop round-trip, no subtree
-// hash encoding — safe to poll frequently, and it answers even while the main
-// loop is busy with a block movement (unlike GetBlockAssemblyState, whose
-// GetSubtreeHashes leg blocks on that loop).
-func (ba *BlockAssembly) GetQueueLength(_ context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.GetQueueLengthResponse, error) {
-	return &blockassembly_api.GetQueueLengthResponse{QueueLength: ba.blockAssembler.QueueLength()}, nil
-}
-
 func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.StateMessage, error) {
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "GetBlockAssemblyState",
 		tracing.WithParentStat(ba.stats),

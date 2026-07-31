@@ -196,3 +196,67 @@ func TestValidate_ExtendStepDAHEvictedParentGrace(t *testing.T) {
 		mockStore.AssertExpectations(t)
 	})
 }
+
+// TestExtendGraceChainCheckMemoised pins the per-block collapse of the
+// current-chain check. The grace fires while re-validating a block whose
+// transactions all carry the SAME BlockIDs, so an un-memoised check makes one
+// blockchain round-trip per transaction — a load spike on the blockchain
+// service at exactly the moment the node is degraded, and (since the
+// BLOCK_INCOMPLETE cap now stays engaged when the FSM cannot be read) a
+// self-reinforcing one.
+func TestExtendGraceChainCheckMemoised(t *testing.T) {
+	tx, _ := makeExtendGraceTxAndParent(t)
+	existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{7, 9}, Conflicting: false, Locked: false}
+
+	v, _ := setupExtendGraceValidator(t, existingMeta, nil, true, nil)
+
+	blockchainMock := v.blockchainClient.(*blockchain.Mock)
+
+	for i := 0; i < 5; i++ {
+		txMetaData, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+		require.NoError(t, err)
+		require.NotNil(t, txMetaData)
+	}
+
+	chainChecks := 0
+
+	for _, call := range blockchainMock.Calls {
+		if call.Method == "CheckBlockIsInCurrentChain" {
+			chainChecks++
+		}
+	}
+
+	require.Equal(t, 1, chainChecks, "the current-chain verdict must be computed once per block-ID set, not once per transaction")
+
+	// Order must not defeat the memo: the same set in a different order is the
+	// same question.
+	require.Equal(t, blockIDsKey([]uint32{9, 7}), blockIDsKey([]uint32{7, 9}))
+	require.NotEqual(t, blockIDsKey([]uint32{7, 9}), blockIDsKey([]uint32{7, 10}))
+}
+
+// TestExtendGraceChainCheckErrorsNotMemoised verifies a failed current-chain
+// check is retried rather than cached: a transient blockchain fault must not
+// pin a verdict for the whole memo window.
+func TestExtendGraceChainCheckErrorsNotMemoised(t *testing.T) {
+	tx, _ := makeExtendGraceTxAndParent(t)
+	existingMeta := &meta.Data{Tx: tx, BlockIDs: []uint32{11}, Conflicting: false, Locked: false}
+
+	v, _ := setupExtendGraceValidator(t, existingMeta, nil, false, errors.NewServiceError("blockchain unavailable"))
+
+	blockchainMock := v.blockchainClient.(*blockchain.Mock)
+
+	for i := 0; i < 3; i++ {
+		_, err := v.validateInternal(context.Background(), tx, 100, &Options{})
+		require.Error(t, err)
+	}
+
+	chainChecks := 0
+
+	for _, call := range blockchainMock.Calls {
+		if call.Method == "CheckBlockIsInCurrentChain" {
+			chainChecks++
+		}
+	}
+
+	require.Equal(t, 3, chainChecks, "a failed chain check must not be memoised")
+}
