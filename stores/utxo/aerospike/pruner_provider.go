@@ -81,6 +81,16 @@ func (s *Store) GetPrunerService() (pruner.Service, error) {
 				childHashes,
 			)
 		},
+
+		// Give the pruner the same runtime demotion every other native call site
+		// has. The startup probe samples one partition master, so a mixed-version
+		// cluster can pass it and then reject native writes with PARAMETER_ERROR
+		// on other partitions. The pruner runs every block, making it a likely
+		// first victim; without this it is the one native call site that cannot
+		// trigger the fallback, and its parent updates would keep failing for the
+		// process lifetime. demoteNativeOnUnsupported ignores everything that is
+		// not a PARAMETER_ERROR, so handing it every error is safe.
+		ObserveNativeOpError: s.demoteNativeOnUnsupported,
 	}
 
 	// Create a new pruner service

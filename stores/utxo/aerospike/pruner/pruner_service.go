@@ -152,6 +152,26 @@ type Options struct {
 	// (existing pre-PR-828 behaviour).
 	BuildAddDeletedChildrenRecord func(policy *aerospike.BatchUDFPolicy, key *aerospike.Key, childHashes []interface{}) aerospike.BatchRecordIfc
 
+	// ObserveNativeOpError, when non-nil, is handed every error the parent-update
+	// batch surfaces — per-record and whole-batch alike — for records built by
+	// BuildAddDeletedChildrenRecord.
+	//
+	// The parent Store supplies it so that a PARAMETER_ERROR, which is what an
+	// unpatched aerospike-server returns for the unknown native wire op, demotes
+	// the store to the UDF path exactly as the store's own native call sites do.
+	// The startup probe samples a single partition master, so a mixed-version
+	// cluster (or a node rolled back to a stock build after startup) can pass the
+	// probe and then reject native writes at runtime. Without this the pruner is
+	// the one native call site that cannot trigger that demotion, and since it
+	// runs every block it is a likely first victim — every parent update would
+	// then fail for the process lifetime.
+	//
+	// The pruner does not interpret the error: which codes mean "native
+	// unsupported" is the store's business, and the callback is expected to
+	// filter. Errors from the plain MapPutItems path are not reported, as those
+	// records never travelled the native path.
+	ObserveNativeOpError func(error)
+
 	// Observers is a list of observers to notify when pruning completes
 	Observers []pruner.Observer
 }
@@ -198,6 +218,10 @@ type Service struct {
 	// Optional native-op-aware builder for the addDeletedChildren batch record.
 	// See Options.BuildAddDeletedChildrenRecord for the contract.
 	buildAddDeletedChildrenRecord func(*aerospike.BatchUDFPolicy, *aerospike.Key, []interface{}) aerospike.BatchRecordIfc
+
+	// Optional sink for parent-update errors, letting the store demote itself off
+	// the native path. See Options.ObserveNativeOpError for the contract.
+	observeNativeOpError func(error)
 
 	// Cached field names (avoid repeated String() allocations in hot paths)
 	fieldTxID, fieldUtxos, fieldInputs, fieldDeletedChildren, fieldExternal        string
@@ -344,6 +368,7 @@ func NewService(settings *settings.Settings, opts Options) (*Service, error) {
 		notifier:                       notifier,
 		luaPackage:                     opts.LuaPackage,
 		buildAddDeletedChildrenRecord:  opts.BuildAddDeletedChildrenRecord,
+		observeNativeOpError:           opts.ObserveNativeOpError,
 		queryPolicy:                    queryPolicy,
 		writePolicy:                    writePolicy,
 		batchPolicy:                    batchPolicy,
@@ -1726,13 +1751,18 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 	}
 
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
+		if parentUsesModTeranode {
+			s.reportNativeOpError(err)
+		}
+
 		s.logger.Errorf("Combined cleanup batch failed: %v", err)
+
 		return errors.NewStorageError("combined cleanup batch failed", err)
 	}
 
 	// Parse results in two regions: [0, parentEnd) are parent updates,
 	// [parentEnd, end) are child deletions.
-	parentTally := tallyParentUpdateResults(batchRecords[:parentEnd], parentUsesModTeranode)
+	parentTally := tallyParentUpdateResults(batchRecords[:parentEnd], parentUsesModTeranode, s.observeNativeOpError)
 	parentSuccess, parentNotFound, parentErrors := parentTally.success, parentTally.notFound, parentTally.failed
 	firstParentErr := parentTally.firstErr
 
@@ -1819,13 +1849,15 @@ func (s *Service) executeBatchParentUpdatesUDF(ctx context.Context, updates map[
 	}
 
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
+		s.reportNativeOpError(err)
 		s.logger.Errorf("Batch parent update failed: %v", err)
+
 		return errors.NewStorageError("batch parent update failed", err)
 	}
 
 	// Both mod-teranode producers answer with a SUCCESS map, so this path is
 	// always classified against the mod-teranode contract.
-	tally := tallyParentUpdateResults(batchRecords, true)
+	tally := tallyParentUpdateResults(batchRecords, true, s.observeNativeOpError)
 	successCount, notFoundCount, errorCount := tally.success, tally.notFound, tally.failed
 
 	if errorCount > 0 {
@@ -1916,6 +1948,20 @@ func addDeletedChildrenFieldLookup(resp interface{}) (lookup func(string) (strin
 	}
 }
 
+// reportNativeOpError hands a parent-update failure to the store's native-op
+// error observer, when one was injected. Nil-safe: Options.ObserveNativeOpError
+// is optional, and every pruner test constructs a Service without it.
+//
+// Only call this for records built by buildAddDeletedChildrenRecord — see
+// Options.ObserveNativeOpError.
+func (s *Service) reportNativeOpError(err error) {
+	if s.observeNativeOpError == nil || err == nil {
+		return
+	}
+
+	s.observeNativeOpError(err)
+}
+
 // parentUpdateTally is the aggregate outcome of a parent-update batch region.
 type parentUpdateTally struct {
 	success  int
@@ -1930,10 +1976,22 @@ type parentUpdateTally struct {
 // tallyParentUpdateResults classifies every record in a parent-update batch
 // region. Shared by the combined single-round-trip path and the defensive-mode
 // two-call path so the two cannot report the same server response differently.
-func tallyParentUpdateResults(batchRecords []aerospike.BatchRecordIfc, usesModTeranode bool) parentUpdateTally {
+//
+// observeErr, when non-nil, is handed the raw per-record error before it is
+// classified — see Options.ObserveNativeOpError. Only mod-teranode records are
+// reported: the plain MapPutItems path never travelled the native path, so its
+// errors carry no signal about native support. KEY_NOT_FOUND is reported too;
+// filtering by result code is the observer's job, not the pruner's.
+func tallyParentUpdateResults(batchRecords []aerospike.BatchRecordIfc, usesModTeranode bool, observeErr func(error)) parentUpdateTally {
 	var tally parentUpdateTally
 
 	for _, rec := range batchRecords {
+		if observeErr != nil && usesModTeranode {
+			if recErr := rec.BatchRec().Err; recErr != nil {
+				observeErr(recErr)
+			}
+		}
+
 		outcome, outcomeErr := classifyParentUpdateResult(rec.BatchRec(), usesModTeranode)
 
 		switch outcome {
@@ -2078,8 +2136,12 @@ func (s *Service) executeBatchParentUpdatesBatchWrite(ctx context.Context, updat
 	default:
 	}
 
+	// No reportNativeOpError here: this is the plain MapPutItems fallback, whose
+	// records never travelled the native path, so its failures say nothing about
+	// native-op support.
 	if err := s.client.BatchOperate(s.batchPolicy, batchRecords); err != nil {
 		s.logger.Errorf("Batch parent update failed: %v", err)
+
 		return errors.NewStorageError("batch parent update failed", err)
 	}
 

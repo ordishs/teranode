@@ -286,7 +286,7 @@ func TestTallyParentUpdateResults(t *testing.T) {
 			okRecord(t), okRecord(t), notFoundRecord(t), brokenRecord(t),
 		}
 
-		tally := tallyParentUpdateResults(records, true)
+		tally := tallyParentUpdateResults(records, true, nil)
 
 		require.Equal(t, 2, tally.success)
 		require.Equal(t, 1, tally.notFound)
@@ -298,7 +298,7 @@ func TestTallyParentUpdateResults(t *testing.T) {
 	// the routine shape when the pruner already deleted the parents.
 	t.Run("all-skipped is not a failure", func(t *testing.T) {
 		tally := tallyParentUpdateResults(
-			[]aerospike.BatchRecordIfc{notFoundRecord(t), notFoundRecord(t)}, true)
+			[]aerospike.BatchRecordIfc{notFoundRecord(t), notFoundRecord(t)}, true, nil)
 
 		require.Zero(t, tally.failed)
 		require.Equal(t, 2, tally.notFound)
@@ -310,14 +310,14 @@ func TestTallyParentUpdateResults(t *testing.T) {
 			aerospike.BinMap{"SUCCESS": map[interface{}]interface{}{"status": "FIRST_FAILURE"}})}
 
 		tally := tallyParentUpdateResults(
-			[]aerospike.BatchRecordIfc{unknownStatus, brokenRecord(t)}, true)
+			[]aerospike.BatchRecordIfc{unknownStatus, brokenRecord(t)}, true, nil)
 
 		require.Equal(t, 2, tally.failed)
 		require.ErrorContains(t, tally.firstErr, "FIRST_FAILURE")
 	})
 
 	t.Run("empty region tallies nothing", func(t *testing.T) {
-		tally := tallyParentUpdateResults(nil, true)
+		tally := tallyParentUpdateResults(nil, true, nil)
 
 		require.Zero(t, tally.success)
 		require.Zero(t, tally.notFound)
@@ -353,5 +353,87 @@ func TestTallyChildDeletionResults(t *testing.T) {
 
 		require.Zero(t, deleteErrors)
 		require.Nil(t, firstErr)
+	})
+}
+
+// TestTallyParentUpdateResultsObservesErrors covers the hook that lets the store
+// demote itself off the native path.
+//
+// The pruner is the only native call site that executes its own BatchOperate, so
+// without this it could never trigger demoteNativeOnUnsupported. It runs every
+// block, making it a likely first victim of a mixed-version cluster that passed
+// the single-partition startup probe and then rejects native writes.
+func TestTallyParentUpdateResultsObservesErrors(t *testing.T) {
+	t.Run("per-record errors reach the observer", func(t *testing.T) {
+		var seen []error
+
+		records := []aerospike.BatchRecordIfc{
+			okRecord(t),
+			&aerospike.BatchWrite{BatchRecord: *batchRecordWithErr(t, aerospike.ErrInvalidParam)},
+			notFoundRecord(t),
+		}
+
+		tally := tallyParentUpdateResults(records, true, func(err error) { seen = append(seen, err) })
+
+		// Both failing records are reported; the successful one is not. Filtering
+		// by result code is the store's job, so KEY_NOT_FOUND is passed on too.
+		require.Len(t, seen, 2)
+		require.ErrorIs(t, seen[0], aerospike.ErrInvalidParam)
+		require.Equal(t, 1, tally.success)
+	})
+
+	// The plain MapPutItems fallback never travelled the native path, so its
+	// failures carry no signal about native-op support and must not demote.
+	t.Run("plain BatchWrite path is never observed", func(t *testing.T) {
+		called := false
+
+		records := []aerospike.BatchRecordIfc{
+			&aerospike.BatchWrite{BatchRecord: *batchRecordWithErr(t, aerospike.ErrInvalidParam)},
+		}
+
+		tallyParentUpdateResults(records, false, func(error) { called = true })
+
+		require.False(t, called, "non-mod-teranode records must not reach the native-op observer")
+	})
+
+	t.Run("nil observer is safe", func(t *testing.T) {
+		records := []aerospike.BatchRecordIfc{
+			&aerospike.BatchWrite{BatchRecord: *batchRecordWithErr(t, aerospike.ErrInvalidParam)},
+		}
+
+		require.NotPanics(t, func() { tallyParentUpdateResults(records, true, nil) })
+	})
+
+	t.Run("successful batches report nothing", func(t *testing.T) {
+		called := false
+
+		tallyParentUpdateResults([]aerospike.BatchRecordIfc{okRecord(t)}, true, func(error) { called = true })
+
+		require.False(t, called)
+	})
+}
+
+// TestReportNativeOpError covers the Service-level wrapper's nil guards — every
+// pruner test constructs a Service without an observer.
+func TestReportNativeOpError(t *testing.T) {
+	t.Run("no observer configured", func(t *testing.T) {
+		s := &Service{}
+		require.NotPanics(t, func() { s.reportNativeOpError(aerospike.ErrInvalidParam) })
+	})
+
+	t.Run("nil error is not forwarded", func(t *testing.T) {
+		called := false
+		s := &Service{observeNativeOpError: func(error) { called = true }}
+
+		s.reportNativeOpError(nil)
+		require.False(t, called)
+	})
+
+	t.Run("error is forwarded verbatim", func(t *testing.T) {
+		var got error
+		s := &Service{observeNativeOpError: func(err error) { got = err }}
+
+		s.reportNativeOpError(aerospike.ErrInvalidParam)
+		require.ErrorIs(t, got, aerospike.ErrInvalidParam)
 	})
 }

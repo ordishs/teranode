@@ -119,3 +119,57 @@ func TestPrunerRecordBuildsNativeWriteOrUDF(t *testing.T) {
 		require.Len(t, hashes, len(childHashes))
 	})
 }
+
+// TestPrunerObserverDemotesOnParameterError proves the callback GetPrunerService
+// hands the pruner (s.demoteNativeOnUnsupported) does what the pruner needs of
+// it: a PARAMETER_ERROR from a mixed-version cluster flips the store onto the UDF
+// path, so subsequent addDeletedChildren records are built as Lua UDFs.
+//
+// The pruner runs its own BatchOperate, so it is the one native call site that
+// cannot reach this method directly — Options.ObserveNativeOpError is the bridge.
+func TestPrunerObserverDemotesOnParameterError(t *testing.T) {
+	key := prunerRecordTestKey(t)
+	childHashes := []interface{}{"child"}
+
+	s := nativeStoreWithSharedPolicy(t)
+
+	// Before: native.
+	rec := s.teranodeBatchRecord(aerospike.NewBatchUDFPolicy(), LuaPackage, key,
+		subOpAddDeletedChildren, "addDeletedChildren", childHashes)
+	_, isUDF := rec.(*aerospike.BatchUDF)
+	require.False(t, isUDF, "precondition: the store starts on the native path")
+
+	// The exact callback the provider passes as Options.ObserveNativeOpError.
+	var observe func(error) = s.demoteNativeOnUnsupported
+
+	observe(aerospike.ErrInvalidParam)
+
+	require.False(t, s.useNativeTeranodeOps.Load(), "PARAMETER_ERROR must demote the store")
+
+	// After: UDF, without the pruner knowing anything about result codes.
+	rec = s.teranodeBatchRecord(aerospike.NewBatchUDFPolicy(), LuaPackage, key,
+		subOpAddDeletedChildren, "addDeletedChildren", childHashes)
+	_, isUDF = rec.(*aerospike.BatchUDF)
+	require.True(t, isUDF, "after demotion addDeletedChildren must fall back to the Lua UDF")
+}
+
+// TestPrunerObserverIgnoresUnrelatedErrors is the other half of the contract: the
+// pruner forwards every parent-update error unfiltered, so the observer must not
+// demote on the ordinary ones. KEY_NOT_FOUND in particular is the routine
+// already-deleted-parent case and arrives constantly.
+func TestPrunerObserverIgnoresUnrelatedErrors(t *testing.T) {
+	for name, err := range map[string]error{
+		"key not found": aerospike.ErrKeyNotFound,
+		"timeout":       aerospike.ErrTimeout,
+		"network":       aerospike.ErrNetwork,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := nativeStoreWithSharedPolicy(t)
+
+			s.demoteNativeOnUnsupported(err)
+
+			require.True(t, s.useNativeTeranodeOps.Load(),
+				"%s must not demote the store off the native path", name)
+		})
+	}
+}
