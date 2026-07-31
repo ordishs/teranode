@@ -62,6 +62,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-batcher/v2/completion"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -171,6 +172,7 @@ func (s *Store) IncrementSpentRecordsMulti(txids []*chainhash.Hash, increment in
 	var aggErr error
 	for i := range batchRecords {
 		if recErr := batchRecords[i].BatchRec().Err; recErr != nil {
+			s.demoteNativeOnUnsupported(recErr)
 			if aggErr == nil {
 				aggErr = recErr
 			} else {
@@ -911,6 +913,21 @@ func (s *Store) processSingleBatchResult(ctx context.Context, batchRecord aerosp
 
 // handleBatchError handles errors from batch operations
 func (s *Store) handleBatchError(batchByKey []aerospike.MapValue, batch []*batchSpend, thisBlockHeight uint32, batchID uint64, err error) {
+	s.demoteNativeOnUnsupported(err)
+
+	// UPDATE_ONLY on the native path surfaces a missing parent record as a
+	// per-record KEY_NOT_FOUND instead of the Lua TX_NOT_FOUND status. Map it
+	// to the same TxNotFound error the UDF path produces via createGeneralError
+	// so callers (catch-up sync, orphan handling) keep their error branching.
+	var aErr *aerospike.AerospikeError
+	if errors.As(err, &aErr) && aErr != nil && aErr.ResultCode == types.KEY_NOT_FOUND_ERROR {
+		for _, batchItem := range batchByKey {
+			idx := batchItem["idx"].(int)
+			batch[idx].complete(errors.NewTxNotFoundError("[SPEND_BATCH_LUA][%s] transaction not found, blockHeight %d: %d", batch[idx].spend.TxID.String(), thisBlockHeight, batchID, err))
+		}
+		return
+	}
+
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
 		batch[idx].complete(errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in aerospike spend batch record, blockHeight %d: %d", batch[idx].spend.TxID.String(), thisBlockHeight, batchID, err))
@@ -1160,53 +1177,8 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 		if ret.Signal != "" {
 			switch ret.Signal {
 			case LuaSignalDAHSet:
-				// Only set DAH if BlockHeightRetention is configured (> 0)
-				// When retention is 0, it means "don't use automatic retention"
-				if dah, ok := s.deleteAtHeightFor(blockHeight); ok {
-					// Sanity check: verify all children are actually spent before
-					// setting DAH. The spentExtraRecs counter can drift due to
-					// interrupted rollbacks, so we don't trust it blindly.
-					if ret.ChildCount > 0 {
-						allSpent, verifyErr := s.verifyAllChildrenSpent(ctx, txID, ret.ChildCount)
-						if verifyErr != nil {
-							s.logger.Errorf("[handleExtraRecords][%s] failed to verify children: %v", txID.String(), verifyErr)
-							return verifyErr
-						}
-						if !allSpent {
-							s.logger.Warnf("[handleExtraRecords][%s] spentExtraRecs triggered DAH but not all children are spent — counter drift detected, clearing master DAH", txID.String())
-							// Lua already set DAH on the master record inline.
-							// Clear it since children aren't actually all-spent, and
-							// WAIT for the clear to be applied before returning — the
-							// caller (and its tests) rely on the drifted DAH being
-							// gone once handleExtraRecords returns. The error is
-							// logged but not propagated (best-effort cleanup), which
-							// matches the pre-conversion behaviour that waited on a
-							// per-item errCh and logged without returning it.
-							group := completion.NewGroup(1)
-							item := &batchDAH{
-								txID:           txID,
-								childIdx:       0, // master record
-								deleteAtHeight: 0, // clear DAH
-								group:          group,
-							}
-							if enqueueErr := safeBatcherPutCtx(s.setDAHBatcher, ctx, item, "setDAH"); enqueueErr != nil {
-								item.complete(enqueueErr)
-							}
-
-							if werr := group.Wait(ctx, s.batcherWait); werr != nil {
-								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), werr)
-							} else if item.result != nil {
-								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), item.result)
-							}
-
-							return nil
-						}
-					}
-
-					if err := s.SetDAHForChildRecords(txID, ret.ChildCount, dah); err != nil {
-						return err
-					}
-					// External store DAH is disabled - lifecycle managed by pruner service
+				if err := s.handleDAHSetSignal(ctx, txID, ret.ChildCount, blockHeight); err != nil {
+					return err
 				}
 
 			case LuaSignalDAHUnset:
@@ -1221,6 +1193,64 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 	}
 
 	return nil
+}
+
+// handleDAHSetSignal applies a DAH_SET signal from incrementSpentExtraRecs:
+// verify the children really are all spent (the spentExtraRecs counter can
+// drift after interrupted rollbacks), clear the drifted master DAH when they
+// are not, and otherwise propagate the DAH to the child records. Extracted
+// verbatim from handleExtraRecords.
+func (s *Store) handleDAHSetSignal(ctx context.Context, txID *chainhash.Hash, childCount int, blockHeight uint32) error {
+	// Only set DAH if BlockHeightRetention is configured (> 0)
+	// When retention is 0, it means "don't use automatic retention"
+	dah, ok := s.deleteAtHeightFor(blockHeight)
+	if !ok {
+		return nil
+	}
+
+	// Sanity check: verify all children are actually spent before
+	// setting DAH. The spentExtraRecs counter can drift due to
+	// interrupted rollbacks, so we don't trust it blindly.
+	if childCount > 0 {
+		allSpent, verifyErr := s.verifyAllChildrenSpent(ctx, txID, childCount)
+		if verifyErr != nil {
+			s.logger.Errorf("[handleExtraRecords][%s] failed to verify children: %v", txID.String(), verifyErr)
+			return verifyErr
+		}
+
+		if !allSpent {
+			s.logger.Warnf("[handleExtraRecords][%s] spentExtraRecs triggered DAH but not all children are spent — counter drift detected, clearing master DAH", txID.String())
+			// Lua already set DAH on the master record inline.
+			// Clear it since children aren't actually all-spent, and
+			// WAIT for the clear to be applied before returning — the
+			// caller (and its tests) rely on the drifted DAH being
+			// gone once handleExtraRecords returns. The error is
+			// logged but not propagated (best-effort cleanup), which
+			// matches the pre-conversion behaviour that waited on a
+			// per-item errCh and logged without returning it.
+			group := completion.NewGroup(1)
+			item := &batchDAH{
+				txID:           txID,
+				childIdx:       0, // master record
+				deleteAtHeight: 0, // clear DAH
+				group:          group,
+			}
+			if enqueueErr := safeBatcherPutCtx(s.setDAHBatcher, ctx, item, "setDAH"); enqueueErr != nil {
+				item.complete(enqueueErr)
+			}
+
+			if werr := group.Wait(ctx, s.batcherWait); werr != nil {
+				s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), werr)
+			} else if item.result != nil {
+				s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), item.result)
+			}
+
+			return nil
+		}
+	}
+
+	// External store DAH is disabled - lifecycle managed by pruner service
+	return s.SetDAHForChildRecords(txID, childCount, dah)
 }
 
 // verifyAllChildrenSpent batch-reads all child records and checks if every
@@ -1388,6 +1418,7 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 
 		batchRecord := batchRecordIfc.BatchRec()
 		if batchRecord.Err != nil {
+			s.demoteNativeOnUnsupported(batchRecord.Err)
 			batch[idx].complete(nil, errors.NewStorageError("error in aerospike increment batch record", batchRecord.Err))
 			continue
 		}

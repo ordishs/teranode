@@ -232,8 +232,10 @@ type Store struct {
 	// invocations through the native operate-path (TeranodeModifyOp, wire op
 	// type 200) rather than the legacy UDF path. Both the Aerospike setting
 	// and a server-capability probe (see detectNativeTeranodeOpSupport) must
-	// agree; otherwise calls fall back to UDF transparently. See native_op.go.
-	useNativeTeranodeOps bool
+	// agree; otherwise calls fall back to UDF transparently. Atomic because a
+	// runtime PARAMETER_ERROR demotes it back to false while batch goroutines
+	// read it concurrently (see demoteNativeOnUnsupported in native_op.go).
+	useNativeTeranodeOps atomic.Bool
 
 	// nativeOpBatchWritePolicy is the shared BatchWritePolicy used by every
 	// NewBatchWrite the native-op path constructs in teranodeBatchRecord.
@@ -1180,6 +1182,17 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		}
 
 		if batchRecord.Err != nil {
+			s.demoteNativeOnUnsupported(batchRecord.Err)
+
+			// Missing record: the UDF path reports this as a Lua TX_NOT_FOUND
+			// status, which the switch below deliberately does not count as an
+			// error. Under the native path's UPDATE_ONLY policy the same
+			// condition arrives as a per-record KEY_NOT_FOUND — skip it the
+			// same way.
+			if isKeyNotFound(batchRecord.Err) {
+				continue
+			}
+
 			// FILTERED_OUT: not prune-eligible (no deleteAtHeight and not already preserved) —
 			// a deliberate skip by the eligibility gate, not an error.
 			var aErr *aerospike.AerospikeError

@@ -159,7 +159,7 @@ func TestUnmined(t *testing.T) {
 	store, err := New(ctx, logger, tSettings, aeroURL)
 	require.NoError(t, err)
 	if os.Getenv("AEROSPIKE_EXPECT_NATIVE_OPS") == "true" {
-		require.True(t, store.useNativeTeranodeOps)
+		require.True(t, store.useNativeTeranodeOps.Load())
 	}
 
 	t.Run("check_empty_store", func(t *testing.T) {

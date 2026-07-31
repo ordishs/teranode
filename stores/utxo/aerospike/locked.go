@@ -217,6 +217,16 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 		}
 
 		if batchRec.Err != nil {
+			s.demoteNativeOnUnsupported(batchRec.Err)
+
+			// Native UPDATE_ONLY reports a missing record as KEY_NOT_FOUND;
+			// map it to the TxNotFoundError the UDF path's TX_NOT_FOUND
+			// status produces below.
+			if isKeyNotFound(batchRec.Err) {
+				batchItem.complete(errors.NewTxNotFoundError("transaction not found: %s", describeLockedBatchItem(batchItem), batchRec.Err))
+				continue
+			}
+
 			batchItem.complete(errors.NewProcessingError("[setLocked][%s] batch record failed while setting locked=%t; %s: %s", describeLockedBatchItem(batchItem), lockedBatchSetValue(batchItem), describeAerospikeBatchRecord(batchRecord), batchRec.Err.Error(), batchRec.Err))
 			continue
 		}
@@ -290,6 +300,7 @@ func (s *Store) setLockedBatch(batch []*batchLocked) {
 				}
 
 				if childRecord.BatchRec().Err != nil {
+					s.demoteNativeOnUnsupported(childRecord.BatchRec().Err)
 					childErr[idx] = errors.NewProcessingError("could not write locked child record", childRecord.BatchRec().Err)
 					continue
 				}
