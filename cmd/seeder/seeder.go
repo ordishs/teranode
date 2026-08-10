@@ -568,6 +568,23 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 
 	logger.Infof("All workers finished successfully")
 
+	// Read and validate the footer to ensure the file wasn't truncated
+	footer, err := readUTXOSetFooter(f)
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to read UTXO set footer: %v", err)
+	}
+
+	// Validate that the actual record counts match the footer
+	if footer.txCount != txProcessed {
+		return nil, errors.NewProcessingError("UTXO set footer mismatch: expected %d transactions, got %d", footer.txCount, txProcessed)
+	}
+
+	if footer.utxoCount != utxosProcessed {
+		return nil, errors.NewProcessingError("UTXO set footer mismatch: expected %d UTXOs, got %d", footer.utxoCount, utxosProcessed)
+	}
+
+	logger.Infof("UTXO set footer validated: %d transactions, %d UTXOs", footer.txCount, footer.utxoCount)
+
 	heightStr := fmt.Sprintf("%d\n", height)
 
 	if err = blockStore.Set(ctx, nil, fileformat.FileTypeDat, []byte(heightStr), bloboptions.WithFilename("lastProcessed"), bloboptions.WithNoHashPrefix()); err != nil {
@@ -833,4 +850,35 @@ func formatNumber(n uint64) string {
 	}
 
 	return strings.Join(out, "")
+}
+
+// utxoSetFooter represents the 16-byte footer at the end of a UTXO set file.
+// It contains the total transaction count and UTXO count for validation.
+type utxoSetFooter struct {
+	txCount    uint64
+	utxoCount  uint64
+}
+
+// readUTXOSetFooter reads the 16-byte footer from a UTXO set file.
+// The footer contains txCount (8 bytes) + utxoCount (8 bytes) in little-endian format.
+func readUTXOSetFooter(file *os.File) (*utxoSetFooter, error) {
+	// Seek to 16 bytes from the end
+	_, err := file.Seek(-16, io.SeekEnd)
+	if err != nil {
+		return nil, errors.NewStorageError("failed to seek to UTXO set footer", err)
+	}
+
+	// Read the 16-byte footer
+	footerData := make([]byte, 16)
+	_, err = io.ReadFull(file, footerData)
+	if err != nil {
+		return nil, errors.NewStorageError("failed to read UTXO set footer", err)
+	}
+
+	footer := &utxoSetFooter{
+		txCount:    binary.LittleEndian.Uint64(footerData[0:8]),
+		utxoCount:  binary.LittleEndian.Uint64(footerData[8:16]),
+	}
+
+	return footer, nil
 }
