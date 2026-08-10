@@ -170,7 +170,7 @@ Teranode implements comprehensive observability to monitor system health, perfor
 
 1. **Metrics Collection**: Collects and stores time-series metrics from all services
 2. **Custom Metrics**: Tracks blockchain-specific metrics like transaction throughput, block validation times, UTXO set size
-3. **Alerting**: Configured alerts for system health and performance thresholds
+3. **Alerting-ready**: Metrics expose health, progress, backpressure, and error signals; alert rules and thresholds are deployment-specific and operator-defined
 
 ### OpenTelemetry & Jaeger
 
