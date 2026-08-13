@@ -2485,36 +2485,7 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 		CurrentHash:           currentHeader.Hash().String(),
 		RemoveMapCount:        removeMapLen32,
 		Subtrees:              subtreeHashesStrings,
-		QueueHeadAgeMillis:    ba.blockAssembler.QueueHeadAge().Milliseconds(),
-	}, nil
-}
-
-// GetBlockAssemblyQueueStats returns a slim, atomic-only view of the ingest
-// queue (depth + head-batch age) for high-frequency control reads such as the
-// validator's Kafka backpressure controller. Unlike GetBlockAssemblyState it
-// deliberately does not call GetSubtreeHashes, so it never blocks on the
-// subtree-processor main loop and always returns immediately even while that
-// loop is stalled.
-//
-// The reported double-spend window makes the signal self-describing: the head
-// age structurally includes this process's drain floor, and the reader that
-// subtracts it lives in a different process with its own settings context. It is
-// read from the same setting the drain loop applies, so the description cannot
-// drift from the behaviour it describes.
-//
-// Parameters:
-//   - ctx: Context for cancellation
-//   - _: Empty message request (unused)
-//
-// Returns:
-//   - *blockassembly_api.QueueStatsMessage: Queue depth, head-batch age, the applied double-spend window and the enforced item cap
-//   - error: Always nil; both queue values are atomic loads that cannot fail
-func (ba *BlockAssembly) GetBlockAssemblyQueueStats(_ context.Context, _ *blockassembly_api.EmptyMessage) (*blockassembly_api.QueueStatsMessage, error) {
-	return &blockassembly_api.QueueStatsMessage{
-		QueueCount:              ba.blockAssembler.QueueLength(),
-		QueueHeadAgeMillis:      ba.blockAssembler.QueueHeadAge().Milliseconds(),
-		DoubleSpendWindowMillis: ba.settings.BlockAssembly.DoubleSpendWindow.Milliseconds(),
-		QueueMaxItems:           ba.blockAssembler.QueueMaxItems(),
+		TxIngressFull:         ba.blockAssembler.IsTxIngressFull(),
 	}, nil
 }
 
