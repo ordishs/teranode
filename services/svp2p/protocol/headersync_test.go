@@ -438,6 +438,58 @@ func TestHeaderSync_OnHeadersBatching(t *testing.T) {
 		require.True(t, hs.IsHeadersFirstMode())
 	})
 
+	t.Run("a repeated batch of known headers ends the round instead of looping", func(t *testing.T) {
+		f := newSyncFixture(t, 1)
+
+		cpHash := chainhash.Hash{0xC0}
+		hs, peer := startedSync(t, f, []chaincfg.Checkpoint{{Height: 100000, Hash: &cpHash}})
+
+		batch := minedRun(f.tip(), 3, 220)
+
+		// The first delivery is real progress and earns the next request.
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Len(t, msgs, 1)
+
+		// Replaying it changes nothing: AddHeader reports headers we already
+		// hold as connected, so without the anchor the machine would answer
+		// with the same getheaders for ever. legacy manager.go catches the
+		// replay on its header-list anchor and disconnects the peer.
+		msgs, misbehavior, err = hs.OnHeaders(peer, headersMsg(batch))
+		require.Error(t, err)
+		require.True(t, errors.Is(err, ErrHeadersNoProgress))
+		require.False(t, errors.Is(err, ErrCheckpointMismatch))
+		require.Nil(t, msgs)
+		require.Zero(t, misbehavior)
+
+		// The message must name the height it stalled at and the height the
+		// request went out from.
+		require.Contains(t, err.Error(), "height 4")
+	})
+
+	t.Run("a peer at our own height makes the only progress it can", func(t *testing.T) {
+		f := newSyncFixture(t, 3)
+
+		cpHash := chainhash.Hash{0xC0}
+		hs, peer := startedSync(t, f, []chaincfg.Checkpoint{{Height: 100000, Hash: &cpHash}})
+
+		// The initial getheaders is built from our tip's parent, so a peer at
+		// our height answers with exactly one header: our own tip. That is not
+		// a replay and must not end the round.
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{f.tip()}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Len(t, msgs, 1)
+
+		// The follow-up request runs from our tip, so the peer now has nothing
+		// to send and the exchange ends on the empty batch.
+		msgs, misbehavior, err = hs.OnHeaders(peer, headersMsg(nil))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+	})
+
 	t.Run("a short batch outside the headers-first round asks for nothing more", func(t *testing.T) {
 		f := newSyncFixture(t, 1)
 
@@ -880,14 +932,15 @@ func TestHeaderSync_Checkpoints(t *testing.T) {
 		require.False(t, hs.IsHeadersFirstMode())
 	})
 
-	t.Run("a peer without the sync slot cannot drive the checkpoint state", func(t *testing.T) {
+	t.Run("during a round a peer without the sync slot cannot index headers", func(t *testing.T) {
 		f := newSyncFixture(t, 1)
 
 		batch := minedRun(f.tip(), 3, 1200)
 		wrong := chainhash.Hash{0xDE, 0xAD}
 
 		// The sync slot is held by another peer, so this one is outside the
-		// headers-first round: legacy scopes that round to its sync peer.
+		// headers-first round: legacy scopes that round to its sync peer and
+		// returns early for everyone else.
 		hs, holder := startedSync(t, f, []chaincfg.Checkpoint{{Height: 3, Hash: &wrong}})
 		require.True(t, hs.IsHeadersFirstMode())
 
@@ -902,12 +955,36 @@ func TestHeaderSync_Checkpoints(t *testing.T) {
 		require.Zero(t, misbehavior)
 		require.Nil(t, msgs)
 
-		// Its headers are still indexed — only the checkpoint state is out of
-		// its reach, and the round the sync peer owns is untouched.
+		// Nothing was indexed, so the bystander can neither race the round nor
+		// push our tip past the checkpoint the round is working toward.
 		_, tipHeight := f.idx.Tip()
-		require.Equal(t, int32(4), tipHeight)
+		require.Equal(t, int32(1), tipHeight)
+
+		for _, h := range batch {
+			_, ok := f.idx.Lookup(h.BlockHash())
+			require.False(t, ok)
+		}
+
+		// The round and its checkpoint are untouched.
 		require.True(t, hs.IsHeadersFirstMode())
 		require.True(t, holder.State.fSyncStarted)
+
+		// The announcement still counts: the peer is known to have that block
+		// once we learn of it, so block download can use it later.
+		require.Equal(t, batch[len(batch)-1].BlockHash(), bystander.State.hashLastUnknownBlock)
+
+		// Once the round ends, the same peer's headers index normally — the
+		// restriction is round-scoped, not permanent.
+		hs.PeerDisconnected(holder)
+		require.False(t, hs.IsHeadersFirstMode())
+
+		msgs, misbehavior, err = hs.OnHeaders(bystander, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, tipHeight = f.idx.Tip()
+		require.Equal(t, int32(4), tipHeight)
 	})
 
 	t.Run("findNextHeaderCheckpoint picks the first checkpoint above the height", func(t *testing.T) {
