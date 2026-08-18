@@ -73,6 +73,13 @@
         },
         {
           "linters": [
+            "depguard",
+            "forbidigo"
+          ],
+          "path": "compat/bsvec"
+        },
+        {
+          "linters": [
             "forbidigo"
           ],
           "path": "pkg"
