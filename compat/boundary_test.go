@@ -178,6 +178,8 @@ func loadModulePackages(t *testing.T) []*packages.Package {
 		Dir:   repoRoot(t),
 	}
 
+	// The fence loads with default build tags only, so consumers behind
+	// build tags (e.g., test_txscript, aerospike) would evade it.
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		t.Fatalf("packages.Load: %v", err)
