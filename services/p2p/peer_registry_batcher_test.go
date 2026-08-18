@@ -88,7 +88,7 @@ func TestPeerRegistryBatcher_CoalescesFloodIntoOneBatch(t *testing.T) {
 
 	// Simulate 1000 gossip messages from the same connected peer.
 	for i := 0; i < 1000; i++ {
-		b.enqueueRegister(pid, "", 0, nil, "", true)
+		b.enqueueRegister(pid, "", 0, 0, nil, "", true)
 		b.enqueueLastMessage(pid)
 		b.enqueueBytesReceived(pid, 100)
 	}
@@ -113,8 +113,8 @@ func TestPeerRegistryBatcher_MergesLatestRegistrationData(t *testing.T) {
 	hash1 := chainhash.HashH([]byte("block one"))
 	hash2 := chainhash.HashH([]byte("block two"))
 
-	b.enqueueRegister(pid, "client/1.0", 10, &hash1, "http://hub.example", false)
-	b.enqueueRegister(pid, "", 11, &hash2, "", false)
+	b.enqueueRegister(pid, "client/1.0", 10, 10, &hash1, "http://hub.example", false)
+	b.enqueueRegister(pid, "", 11, 11, &hash2, "", false)
 
 	b.flushOnce(context.Background())
 
@@ -130,13 +130,13 @@ func TestPeerRegistryBatcher_SkipsReassertWithinTTL(t *testing.T) {
 	b, counting, _ := newBatcherWithCountingRegistry()
 	pid := mustNewPeerID(t).String()
 
-	b.enqueueRegister(pid, "", 0, nil, "", true)
+	b.enqueueRegister(pid, "", 0, 0, nil, "", true)
 	b.enqueueLastMessage(pid)
 	b.flushOnce(context.Background())
 
 	// Second round with no new registration data: only the last-message touch
 	// should go out, not another RegisterPeer/UpdateConnectionState.
-	b.enqueueRegister(pid, "", 0, nil, "", true)
+	b.enqueueRegister(pid, "", 0, 0, nil, "", true)
 	b.enqueueLastMessage(pid)
 	b.flushOnce(context.Background())
 
@@ -149,13 +149,13 @@ func TestPeerRegistryBatcher_NewInfoForcesRegister(t *testing.T) {
 	b, counting, reg := newBatcherWithCountingRegistry()
 	pid := mustNewPeerID(t).String()
 
-	b.enqueueRegister(pid, "", 0, nil, "", true)
+	b.enqueueRegister(pid, "", 0, 0, nil, "", true)
 	b.flushOnce(context.Background())
 	require.Equal(t, 1, counting.callCount("RegisterPeer"))
 
 	// A height update (new block announced) must reach the registry on the
 	// next flush even though the peer was registered recently.
-	b.enqueueRegister(pid, "", 42, nil, "", false)
+	b.enqueueRegister(pid, "", 42, 42, nil, "", false)
 	b.flushOnce(context.Background())
 
 	require.Equal(t, 2, counting.callCount("RegisterPeer"))
@@ -167,7 +167,7 @@ func TestPeerRegistryBatcher_ForgetForcesReRegister(t *testing.T) {
 	b, counting, reg := newBatcherWithCountingRegistry()
 	pid := mustNewPeerID(t).String()
 
-	b.enqueueRegister(pid, "", 0, nil, "", true)
+	b.enqueueRegister(pid, "", 0, 0, nil, "", true)
 	b.flushOnce(context.Background())
 	require.Equal(t, 1, counting.callCount("RegisterPeer"))
 
@@ -216,7 +216,7 @@ func TestPeerRegistryBatcher_StopFlushesPending(t *testing.T) {
 	b.start()
 
 	pid := mustNewPeerID(t).String()
-	b.enqueueRegister(pid, "client/1.0", 5, nil, "", true)
+	b.enqueueRegister(pid, "client/1.0", 5, 5, nil, "", true)
 	b.enqueueBytesReceived(pid, 123)
 
 	b.stop(context.Background())
@@ -233,7 +233,7 @@ func TestPeerRegistryBatcher_SynchronousModeFlushesInline(t *testing.T) {
 	b := newPeerRegistryBatcher(context.Background(), ulogger.TestLogger{}, counting, 0)
 
 	pid := mustNewPeerID(t).String()
-	b.enqueueRegister(pid, "", 9, nil, "", false)
+	b.enqueueRegister(pid, "", 9, 9, nil, "", false)
 
 	got, ok := reg.Get(pid)
 	require.True(t, ok, "synchronous mode must flush on enqueue")
@@ -422,8 +422,8 @@ func TestPeerRegistryBatcher_ForgetDuringFlushDoesNotStickAssertState(t *testing
 	other := mustNewPeerID(t).String()
 
 	// Two peers pending so the flush is provably mid-cycle when we interleave.
-	b.enqueueRegister(pid, "", 0, nil, "", true)
-	b.enqueueRegister(other, "", 0, nil, "", true)
+	b.enqueueRegister(pid, "", 0, 0, nil, "", true)
+	b.enqueueRegister(other, "", 0, 0, nil, "", true)
 
 	flushDone := make(chan struct{})
 	go func() {
@@ -508,7 +508,7 @@ func TestPeerRegistryBatcher_StopFlushesAfterParentCtxCancelled(t *testing.T) {
 	b.start()
 
 	pid := mustNewPeerID(t).String()
-	b.enqueueRegister(pid, "client/1.0", 7, nil, "", true)
+	b.enqueueRegister(pid, "client/1.0", 7, 7, nil, "", true)
 
 	cancel()
 	b.stop(context.Background())
@@ -530,8 +530,8 @@ func TestPeerRegistryBatcher_HeightMergeIsMonotonic(t *testing.T) {
 	hashOld := chainhash.HashH([]byte("older block"))
 
 	// Out-of-order enqueue: the higher height arrives first.
-	b.enqueueRegister(pid, "", 42, &hashNew, "", false)
-	b.enqueueRegister(pid, "", 41, &hashOld, "", false)
+	b.enqueueRegister(pid, "", 42, 42, &hashNew, "", false)
+	b.enqueueRegister(pid, "", 41, 41, &hashOld, "", false)
 
 	b.flushOnce(context.Background())
 
@@ -539,6 +539,50 @@ func TestPeerRegistryBatcher_HeightMergeIsMonotonic(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, uint32(42), got.Height, "lower height enqueued later must not win")
 	require.Equal(t, hashNew.String(), got.BlockHash.String(), "hash must stay paired with the winning height")
+}
+
+// TestPeerRegistryBatcher_AdvertisedHeightTracksWinningObservation covers the
+// two merge paths for the raw advertised height: it must follow the winning
+// capped height, and when the cap pins two observations to the same value it
+// must not regress to the lower claim.
+func TestPeerRegistryBatcher_AdvertisedHeightTracksWinningObservation(t *testing.T) {
+	t.Run("follows the higher capped height", func(t *testing.T) {
+		b, _, reg := newBatcherWithCountingRegistry()
+		pid := mustNewPeerID(t).String()
+
+		hashNew := chainhash.HashH([]byte("newer block"))
+		hashOld := chainhash.HashH([]byte("older block"))
+
+		// Out-of-order: the higher capped height (and its raw claim) arrives first.
+		b.enqueueRegister(pid, "", 42, 900_000, &hashNew, "", false)
+		b.enqueueRegister(pid, "", 41, 800_000, &hashOld, "", false)
+
+		b.flushOnce(context.Background())
+
+		got, ok := reg.Get(pid)
+		require.True(t, ok)
+		require.Equal(t, uint32(42), got.Height)
+		require.Equal(t, uint32(900_000), got.AdvertisedHeight,
+			"the raw claim must stay paired with the winning capped height")
+	})
+
+	t.Run("breaks a capped tie on the higher raw claim", func(t *testing.T) {
+		b, _, reg := newBatcherWithCountingRegistry()
+		pid := mustNewPeerID(t).String()
+
+		// Both observations hit the same local+maxLead ceiling, so the capped
+		// height cannot order them. The higher raw claim must survive.
+		b.enqueueRegister(pid, "", 10_100, 800_000, nil, "", false)
+		b.enqueueRegister(pid, "", 10_100, 962_710, nil, "", false)
+
+		b.flushOnce(context.Background())
+
+		got, ok := reg.Get(pid)
+		require.True(t, ok)
+		require.Equal(t, uint32(10_100), got.Height)
+		require.Equal(t, uint32(962_710), got.AdvertisedHeight,
+			"a capped tie must not discard the higher advertised height")
+	})
 }
 
 // TestPeerRegistryBatcher_RequeueOnRegisterFailure verifies that a transient
@@ -550,7 +594,7 @@ func TestPeerRegistryBatcher_RequeueOnRegisterFailure(t *testing.T) {
 	b := newPeerRegistryBatcher(context.Background(), ulogger.TestLogger{}, failing, time.Hour)
 
 	pid := mustNewPeerID(t).String()
-	b.enqueueRegister(pid, "client/1.0", 5, nil, "", true)
+	b.enqueueRegister(pid, "client/1.0", 5, 5, nil, "", true)
 	b.enqueueBytesReceived(pid, 500)
 
 	b.flushOnce(context.Background()) // RegisterPeer fails; batch must be requeued
@@ -601,7 +645,7 @@ func TestPeerRegistryBatcher_RequeueOnMetricsFailure(t *testing.T) {
 	b := newPeerRegistryBatcher(context.Background(), ulogger.TestLogger{}, failing, time.Hour)
 
 	pid := mustNewPeerID(t).String()
-	b.enqueueRegister(pid, "client/1.0", 5, nil, "", true)
+	b.enqueueRegister(pid, "client/1.0", 5, 5, nil, "", true)
 	b.enqueueBytesReceived(pid, 500)
 
 	b.flushOnce(context.Background()) // RegisterPeer succeeds, UpdatePeerMetrics fails
@@ -668,8 +712,8 @@ func TestPeerRegistryBatcher_ReenqueueDuringFlushDoesNotFlushStaleSnapshot(t *te
 
 	first := mustNewPeerID(t).String()
 	second := mustNewPeerID(t).String()
-	b.enqueueRegister(first, "stale/1.0", 10, nil, "", false)
-	b.enqueueRegister(second, "stale/1.0", 10, nil, "", false)
+	b.enqueueRegister(first, "stale/1.0", 10, 10, nil, "", false)
+	b.enqueueRegister(second, "stale/1.0", 10, 10, nil, "", false)
 
 	flushDone := make(chan struct{})
 	go func() {
@@ -686,7 +730,7 @@ func TestPeerRegistryBatcher_ReenqueueDuringFlushDoesNotFlushStaleSnapshot(t *te
 		other = second
 	}
 	b.forget(other)
-	b.enqueueRegister(other, "fresh/2.0", 42, nil, "", false)
+	b.enqueueRegister(other, "fresh/2.0", 42, 42, nil, "", false)
 	blocking.releaseRegister <- struct{}{}
 
 	select {
@@ -729,7 +773,7 @@ func TestPeerRegistryBatcher_StopHonorsBudget(t *testing.T) {
 	b.start()
 
 	pid := mustNewPeerID(t).String()
-	b.enqueueRegister(pid, "", 0, nil, "", true)
+	b.enqueueRegister(pid, "", 0, 0, nil, "", true)
 
 	// Wait until the ticker flush is wedged inside RegisterPeer.
 	recvRegisterEntered(t, blocking.enteredRegister)

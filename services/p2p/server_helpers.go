@@ -74,7 +74,13 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 	s.logger.Infof("[handleBlockTopic] received block %s fromID %s", blockMessage.Hash, blockMessage.PeerID)
 
 	isSelf := s.isOwnMessage(fromID, blockMessage.PeerID)
+	// advertisedHeight is what the peer claimed and is reported as-is to
+	// WebSocket clients. registryHeight is the capped copy: it feeds the peer
+	// registry, which drives sync decisions. Reporting the cap as the peer's
+	// height makes a catching-up node show every peer at localHeight+maxLead.
 	advertisedHeight := blockMessage.Height
+	registryHeight := blockMessage.Height
+
 	if isSelf {
 		hash, err = s.parseHash(blockMessage.Hash, "handleBlockTopic")
 		if err != nil {
@@ -82,7 +88,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 		}
 	} else {
 		var ok bool
-		advertisedHeight, hash, ok = s.sanitizeAdvertisedTip(blockMessage.PeerID, blockMessage.Height, blockMessage.Hash, s.getLocalHeight(ctx))
+		registryHeight, hash, ok = s.sanitizeAdvertisedTip(blockMessage.PeerID, blockMessage.Height, blockMessage.Hash, s.getLocalHeight(ctx))
 		if !ok {
 			return
 		}
@@ -121,7 +127,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 
 	// Store using the originator's peer ID
 	if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
-		s.addPeer(peerID, blockMessage.ClientName, advertisedHeight, hash, blockMessage.DataHubURL)
+		s.addPeer(peerID, blockMessage.ClientName, registryHeight, advertisedHeight, hash, blockMessage.DataHubURL)
 		s.logger.Debugf("[handleBlockTopic] Stored latest block hash %s for peer %s", blockMessage.Hash, peerID)
 	}
 
@@ -601,7 +607,7 @@ func (s *Server) sanitizeAdvertisedTip(peerID string, advertisedHeight uint32, a
 // RegisterPeer RPC, building the PeerInfo struct from libp2p-source data.
 // Used by addPeer / addConnectedPeer / InjectPeerForTesting which previously
 // shared a single Put helper on the local registry.
-func (s *Server) registerPeer(peerID peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
+func (s *Server) registerPeer(peerID peer.ID, clientName string, height, advertisedHeight uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	if s.peerRegistry == nil {
 		return
 	}
@@ -611,6 +617,7 @@ func (s *Server) registerPeer(peerID peer.ID, clientName string, height uint32, 
 		TransportTypeSet: true,
 		ClientName:       clientName,
 		Height:           height,
+		AdvertisedHeight: advertisedHeight,
 		BlockHash:        blockHash,
 		DataHubURL:       dataHubURL,
 	}
@@ -619,21 +626,21 @@ func (s *Server) registerPeer(peerID peer.ID, clientName string, height uint32, 
 	}
 }
 
-func (s *Server) addPeer(peerID peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
+func (s *Server) addPeer(peerID peer.ID, clientName string, height, advertisedHeight uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	if s.registryBatcher != nil {
-		s.registryBatcher.enqueueRegister(peerID.String(), clientName, height, blockHash, dataHubURL, false)
+		s.registryBatcher.enqueueRegister(peerID.String(), clientName, height, advertisedHeight, blockHash, dataHubURL, false)
 		return
 	}
-	s.registerPeer(peerID, clientName, height, blockHash, dataHubURL)
+	s.registerPeer(peerID, clientName, height, advertisedHeight, blockHash, dataHubURL)
 }
 
 // addConnectedPeer adds a peer and marks it as directly connected
-func (s *Server) addConnectedPeer(peerID peer.ID, clientName string, height uint32, blockHash *chainhash.Hash, dataHubURL string) {
+func (s *Server) addConnectedPeer(peerID peer.ID, clientName string, height, advertisedHeight uint32, blockHash *chainhash.Hash, dataHubURL string) {
 	if s.registryBatcher != nil {
-		s.registryBatcher.enqueueRegister(peerID.String(), clientName, height, blockHash, dataHubURL, true)
+		s.registryBatcher.enqueueRegister(peerID.String(), clientName, height, advertisedHeight, blockHash, dataHubURL, true)
 		return
 	}
-	s.registerPeer(peerID, clientName, height, blockHash, dataHubURL)
+	s.registerPeer(peerID, clientName, height, advertisedHeight, blockHash, dataHubURL)
 	if s.peerRegistry == nil {
 		return
 	}
@@ -650,7 +657,7 @@ func (s *Server) InjectPeerForTesting(peerID peer.ID, clientName, dataHubURL str
 		return
 	}
 
-	s.registerPeer(peerID, clientName, height, blockHash, dataHubURL)
+	s.registerPeer(peerID, clientName, height, height, blockHash, dataHubURL)
 	if err := s.peerRegistry.UpdateStorage(s.gCtx, peerID.String(), "full"); err != nil {
 		s.logger.Warnf("[InjectPeerForTesting] UpdateStorage %s failed: %v", peerID, err)
 	}
