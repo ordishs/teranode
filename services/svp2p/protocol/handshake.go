@@ -40,6 +40,13 @@ type HandshakeConfig struct {
 	AllowBlockPriority   bool
 	LocalAddr            *wire.NetAddress
 	RemoteAddr           *wire.NetAddress
+
+	// CheckIncomingNonce mirrors net.cpp CConnman::CheckIncomingNonce: true
+	// if this node itself sent the given nonce on one of its own
+	// connections, meaning the connection is a self-connect. Supplied by
+	// PeerManager as a closure over its node-global nonce registry; nil in
+	// tests that don't exercise self-connection detection.
+	CheckIncomingNonce func(uint64) bool
 }
 
 type PeerInfo struct {
@@ -132,10 +139,19 @@ func (h *Handshake) onVersion(m *wire.MsgVersion) ([]wire.Message, error) {
 		return nil, nil
 	}
 
-	// net_processing.cpp: "Disconnect if we connected to ourself". SVNode
-	// checks on the inbound side via CheckIncomingNonce; we compare against
-	// the nonce this peer sent, which covers both directions.
+	// net_processing.cpp ProcessVersionMessage: "connected to self at %s,
+	// disconnecting". Per-connection compare: catches the case where this
+	// same connection's two ends coincidentally negotiated matching nonces.
 	if m.Nonce == h.cfg.Nonce {
+		return nil, ErrSelfConnection
+	}
+
+	// net.cpp CConnman::CheckIncomingNonce: a real self-connect dials a
+	// separate socket back to this node, so the two ends carry different
+	// per-connection nonces and the compare above never fires. Instead,
+	// check the incoming nonce against every nonce this node has itself
+	// sent on any of its own connections.
+	if h.cfg.CheckIncomingNonce != nil && h.cfg.CheckIncomingNonce(m.Nonce) {
 		return nil, ErrSelfConnection
 	}
 
