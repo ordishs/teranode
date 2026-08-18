@@ -153,6 +153,35 @@ func TestProcessBlockAvailability_PromotesWhenLaterKnown(t *testing.T) {
 	require.Equal(t, chainhash.Hash{}, state.hashLastUnknownBlock)
 }
 
+// TestProcessBlockAvailability_ClearsPendingWithoutPromoting pins the C++
+// structure where the hashLastUnknownBlock clear sits outside the
+// promotion branch: the pending hash resolving to a lower-height node must
+// still clear hashLastUnknownBlock, even though it does not raise
+// pindexBestKnownBlock. A wrong port that moves the clear inside the
+// promotion branch would leave hashLastUnknownBlock set here, and every
+// other test in this file has pindexBestKnownBlock == nil at the moment of
+// promotion, so none of them would catch that regression.
+func TestProcessBlockAvailability_ClearsPendingWithoutPromoting(t *testing.T) {
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	chain := buildChain(t, idx, nc, genesis, 5) // heights 1..5
+	lowerHash := chain[1].BlockHash()           // height 2, resolves but is not better
+
+	state := newPeerSyncState()
+	state.hashLastUnknownBlock = lowerHash
+	state.pindexBestKnownBlock = &HeaderNode{Hash: chain[4].BlockHash(), Height: 5}
+
+	state.processBlockAvailability(idx)
+
+	require.Equal(t, chainhash.Hash{}, state.hashLastUnknownBlock, "pending hash must clear once resolved, regardless of promotion")
+	require.Equal(t, int32(5), state.pindexBestKnownBlock.Height, "pindexBestKnownBlock must not move to a lower-height resolved hash")
+	require.Equal(t, chain[4].BlockHash(), state.pindexBestKnownBlock.Hash)
+}
+
 func TestProcessBlockAvailability_NoOpWhenStillUnknown(t *testing.T) {
 	genesis := testGenesis()
 
