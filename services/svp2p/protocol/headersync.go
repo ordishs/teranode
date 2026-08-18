@@ -21,11 +21,24 @@ const MaxHeadersResults = 2000
 // before it scores misbehavior.
 const MaxUnconnectingHeaders = 10
 
+// MaxBlocksToAnnounce mirrors net_processing.cpp MAX_BLOCKS_TO_ANNOUNCE (8):
+// the size limit that separates a short "we are announcing a block you have
+// not seen" headers message, which earns the gap-filling getheaders, from a
+// bulk batch, which does not.
+const MaxBlocksToAnnounce = 8
+
 // Misbehavior scores for headers processing, from net_processing.cpp.
 const (
 	scoreTooManyHeaders            = 20 // Misbehaving(pfrom, 20, "too-many-headers")
 	scoreNonContinuousHeaders      = 20 // Misbehaving(pfrom, 20, "disconnected headers")
 	scoreTooManyUnconnectedHeaders = 20 // Misbehaving(pfrom, 20, "too-many-unconnected-headers")
+
+	// AcceptBlockHeader fails a header whose parent is not in mapBlockIndex
+	// with state.DoS(10, ..., "prev-blk-not-found"), which net_processing.cpp
+	// applies as Misbehaving(pfrom, nDoS, "invalid header received"). Only a
+	// bulk batch reaches it: a batch shorter than MAX_BLOCKS_TO_ANNOUNCE takes
+	// the gap-filling getheaders path instead.
+	scorePrevBlkNotFound = 10
 
 	// CheckBlockHeader fails a bad proof of work with
 	// state.DoS(50, ..., "high-hash"); net_processing.cpp then applies that
@@ -127,6 +140,12 @@ func NewHeaderSync(cfg HeaderSyncConfig) (*HeaderSync, error) {
 		return nil, errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: chain params are nil")
 	}
 
+	// Without a powLimit the header PoW check would accept any target the peer
+	// claims, so refuse to build a machine that cannot enforce it.
+	if cfg.Params.PowLimit == nil {
+		return nil, errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: chain params carry no powLimit")
+	}
+
 	hs := &HeaderSync{cfg: cfg}
 
 	// legacy netsync manager.go New: the checkpoint list comes from the chain
@@ -136,10 +155,9 @@ func NewHeaderSync(cfg HeaderSyncConfig) (*HeaderSync, error) {
 	}
 
 	// legacy netsync manager.go New: seed nextCheckpoint from our current
-	// height, then resetHeaderState, which leaves headers-first mode off
-	// until a sync actually starts.
-	_, tipHeight := cfg.Index.Tip()
-	hs.nextCheckpoint = hs.findNextHeaderCheckpoint(tipHeight)
+	// height via resetHeaderState, which leaves headers-first mode off until a
+	// sync actually starts.
+	hs.resetHeaderState()
 
 	return hs, nil
 }
@@ -152,6 +170,13 @@ func (hs *HeaderSync) IsHeadersFirstMode() bool { return hs.headersFirstMode }
 // PeerEstablished is the SendMessages event: a peer finished the handshake, so
 // consider starting headers synchronization with it. It returns the initial
 // getheaders, or nothing when this peer must not drive the sync.
+//
+// Peer choice follows net_processing.cpp, which starts with the first eligible
+// candidate that reaches SendMessages. Legacy netsync startSync instead ranks
+// the candidates and picks the one with the greatest advertised height. Ranking
+// needs the whole peer set, which this per-peer machine does not see; if the
+// parity harness shows the first-eligible rule picking poor sync peers,
+// PeerManager can rank candidates before it calls this.
 func (hs *HeaderSync) PeerEstablished(peer *SyncPeer) []wire.Message {
 	if peer == nil || peer.State == nil {
 		return nil
@@ -190,8 +215,27 @@ func (hs *HeaderSync) PeerEstablished(peer *SyncPeer) []wire.Message {
 }
 
 // PeerDisconnected mirrors net_processing.cpp FinalizeNode: a peer that was
-// driving header sync releases the single sync slot when it goes away.
+// driving header sync releases the single sync slot when it goes away, and the
+// header state resets so the next candidate starts a clean round.
 func (hs *HeaderSync) PeerDisconnected(peer *SyncPeer) {
+	hs.releaseSyncPeer(peer)
+}
+
+// SyncPeerTimedOut releases a sync peer that is still connected but has stopped
+// answering, mirroring legacy netsync's sync-peer timeout, which calls
+// resetHeaderState and lets startSync choose another peer. The machine reads no
+// clock: the caller owns the timeout (SVNode measures it in SendMessages
+// against HEADERS_DOWNLOAD_TIMEOUT_BASE), and calls this when it expires. The
+// peer stays connected; only the sync slot and the header state are released.
+func (hs *HeaderSync) SyncPeerTimedOut(peer *SyncPeer) {
+	hs.releaseSyncPeer(peer)
+}
+
+// releaseSyncPeer frees the single sync slot and resets the header state, the
+// FinalizeNode plus resetHeaderState pair. Without the reset,
+// IsHeadersFirstMode stays true with nobody syncing, and nextCheckpoint keeps
+// pointing at the round that died.
+func (hs *HeaderSync) releaseSyncPeer(peer *SyncPeer) {
 	if peer == nil || peer.State == nil || !peer.State.fSyncStarted {
 		return
 	}
@@ -201,6 +245,19 @@ func (hs *HeaderSync) PeerDisconnected(peer *SyncPeer) {
 	if hs.nSyncStarted > 0 {
 		hs.nSyncStarted--
 	}
+
+	hs.resetHeaderState()
+}
+
+// resetHeaderState is legacy netsync manager.go resetHeaderState: leave
+// headers-first mode and re-seed the checkpoint from where our chain now
+// stands. The legacy header list has no counterpart here — HeaderIndex holds
+// the headers already accepted, and they stay valid.
+func (hs *HeaderSync) resetHeaderState() {
+	hs.headersFirstMode = false
+
+	_, tipHeight := hs.cfg.Index.Tip()
+	hs.nextCheckpoint = hs.findNextHeaderCheckpoint(tipHeight)
 }
 
 // OnHeaders is the net_processing.cpp NetMsgType::HEADERS event. It returns
@@ -227,16 +284,24 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 		return nil, 0, nil
 	}
 
-	// net_processing.cpp HEADERS: when the first header's parent is unknown,
-	// ask for the headers that fill the gap instead of accepting an orphan,
-	// and count the event.
-	if _, ok := hs.cfg.Index.Lookup(headers[0].PrevBlock); !ok {
+	// net_processing.cpp HEADERS: when the first header's parent is unknown and
+	// the batch is shorter than MAX_BLOCKS_TO_ANNOUNCE, treat it as a block
+	// announcement that outran us — ask for the headers that fill the gap
+	// instead of accepting an orphan, and count the event. A bulk batch with an
+	// unknown parent falls through to AcceptBlockHeader instead, which fails it
+	// with prev-blk-not-found (see acceptHeaders).
+	if _, ok := hs.cfg.Index.Lookup(headers[0].PrevBlock); !ok && len(headers) < MaxBlocksToAnnounce {
 		peer.nUnconnectingHeaders++
 
 		score := 0
 		if peer.nUnconnectingHeaders%MaxUnconnectingHeaders == 0 {
 			score = scoreTooManyUnconnectedHeaders
 		}
+
+		// net_processing.cpp HEADERS: UpdateBlockAvailability with the last
+		// header of the batch even here, so the peer counts as having that
+		// block once the gap fills.
+		peer.State.updateBlockAvailability(hs.cfg.Index, headers[len(headers)-1].BlockHash())
 
 		return []wire.Message{hs.getHeaders(hs.cfg.Index.Locator())}, score, nil
 	}
@@ -268,6 +333,13 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		reachedCheckpoint bool
 	)
 
+	// The checkpoint round belongs to the peer holding the sync slot. Legacy
+	// netsync scopes the whole headers-first exchange to its single sync peer,
+	// and it is the source for this scheme, so a peer that does not hold the
+	// slot can still have its headers indexed but can neither trip the
+	// checkpoint nor advance the node-global checkpoint state.
+	checkpointRound := hs.headersFirstMode && peer.State.fSyncStarted && hs.nextCheckpoint != nil
+
 	for _, header := range headers {
 		// AcceptBlockHeader calls CheckBlockHeader before the mapBlockIndex
 		// insert; HeaderIndex.AddHeader deliberately carries only the insert,
@@ -281,11 +353,11 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 			return nil, 0, err
 		}
 
-		// Unreachable: the parent of headers[0] was found above and the batch
-		// is continuous, so every header attaches. Stop rather than carry on
-		// with a header that is not in the index.
+		// AcceptBlockHeader: "prev-blk-not-found" → DoS(10). Reachable only for
+		// the first header of a bulk batch whose parent we do not have; the
+		// continuity scan guarantees the rest of the batch attaches.
 		if !connected {
-			break
+			return nil, scorePrevBlkNotFound, nil
 		}
 
 		node, ok := hs.cfg.Index.Lookup(header.BlockHash())
@@ -299,7 +371,7 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		// legacy netsync manager.go handleHeadersMsg: "Verify the header at
 		// the next checkpoint height matches", and disconnect the peer when it
 		// does not. The loop stops at the checkpoint either way.
-		if hs.headersFirstMode && hs.nextCheckpoint != nil && node.Height == hs.nextCheckpoint.Height {
+		if checkpointRound && node.Height == hs.nextCheckpoint.Height {
 			if !node.Hash.IsEqual(hs.nextCheckpoint.Hash) {
 				return nil, 0, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
 					"svp2p: block header at height %d/hash %s does not match expected checkpoint hash %s",
@@ -316,6 +388,11 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		return nil, 0, nil
 	}
 
+	// net_processing.cpp HEADERS: headers that connect clear the unconnecting
+	// counter ("resetting nUnconnectingHeaders (%d -> 0)"), so a peer that was
+	// briefly behind is not scored for it later.
+	peer.nUnconnectingHeaders = 0
+
 	// net_processing.cpp HEADERS: UpdateBlockAvailability with the last header
 	// of the batch.
 	peer.State.updateBlockAvailability(hs.cfg.Index, lastAccepted)
@@ -325,11 +402,19 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		// round of headers up to the checkpoint after it; when none is left,
 		// "Reached the final checkpoint -- switching to normal mode".
 		hs.nextCheckpoint = hs.findNextHeaderCheckpoint(hs.nextCheckpoint.Height)
-		if hs.nextCheckpoint != nil {
-			return []wire.Message{hs.getHeaders(hs.locatorFrom(lastAccepted))}, 0, nil
+		if hs.nextCheckpoint == nil {
+			hs.headersFirstMode = false
 		}
+	}
 
-		hs.headersFirstMode = false
+	// legacy netsync manager.go handleHeadersMsg: while the headers-first round
+	// runs and the checkpoint is not reached yet, "request the next batch of
+	// headers starting from the latest known header and ending with the next
+	// checkpoint" — unconditionally, with no batch-length gate. Without this,
+	// a peer that answers with a short batch below the checkpoint would leave
+	// the round with no outstanding request and no way to resume.
+	if hs.headersFirstMode && peer.State.fSyncStarted {
+		return []wire.Message{hs.getHeaders(hs.locatorFrom(lastAccepted))}, 0, nil
 	}
 
 	// net_processing.cpp HEADERS: "Headers message had its maximum size; the
@@ -345,10 +430,20 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 // checkBlockHeaderPoW is pow.cpp CheckProofOfWork, the cheap per-header check
 // validation.cpp CheckBlockHeader runs: the target the header's own nBits
 // claims must be in range, and the header hash must be at or below it. It
-// needs no ancestor context. The contextual difficulty-adjustment check
-// (ContextualCheckBlockHeader / GetNextWorkRequired) is not carried in Phase
-// 2; while headers-first mode runs, the checkpoint bounds what a peer can feed
-// us, and Phase 3's block validation re-checks every header it accepts.
+// needs no ancestor context.
+//
+// Phase 2 does not carry the contextual difficulty check
+// (ContextualCheckBlockHeader / GetNextWorkRequired), and the bound on that gap
+// is narrower than it looks. Checkpoint enforcement covers only the
+// headers-first round: it applies to the sync peer, up to the next checkpoint.
+// Once the chain passes the final checkpoint — which mainnet already has — the
+// only gate left on a received header is this check, so a peer can feed
+// difficulty-1 headers that cost nothing to grind, and HeaderIndex grows one
+// unbounded map entry per header with no eviction. Phase 3 must close it with
+// one of: the contextual GetNextWorkRequired check, a
+// CheckIndexAgainstCheckpoint port that refuses headers forking below the last
+// checkpoint, or a height/size cap on the index. This is spec §6 header-index
+// hardening, and it is tracked in the Task 5 report.
 func (hs *HeaderSync) checkBlockHeaderPoW(header *wire.BlockHeader) bool {
 	var bits model.NBit
 

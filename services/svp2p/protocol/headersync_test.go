@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"bytes"
+	"encoding/hex"
 	"math/big"
 	"testing"
 
@@ -415,7 +417,7 @@ func TestHeaderSync_OnHeadersBatching(t *testing.T) {
 		require.Equal(t, last, peer.State.pindexBestKnownBlock.Hash)
 	})
 
-	t.Run("a short batch asks for nothing more", func(t *testing.T) {
+	t.Run("a short batch inside the headers-first round still asks for the next one", func(t *testing.T) {
 		f := newSyncFixture(t, 1)
 
 		cpHash := chainhash.Hash{0xC0}
@@ -426,10 +428,30 @@ func TestHeaderSync_OnHeadersBatching(t *testing.T) {
 		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg(batch))
 		require.NoError(t, err)
 		require.Zero(t, misbehavior)
-		require.Nil(t, msgs)
 
-		// The checkpoint is still ahead of us, so catch-up is not over.
+		// legacy manager.go handleHeadersMsg re-requests unconditionally while
+		// the checkpoint is not reached — no batch-length gate. Without the
+		// request the round would stall with nothing outstanding.
+		gh := requireGetHeaders(t, msgs)
+		require.Equal(t, f.idx.LocatorFrom(batch[len(batch)-1].BlockHash()), locatorValues(gh))
+		require.Equal(t, cpHash, gh.HashStop)
 		require.True(t, hs.IsHeadersFirstMode())
+	})
+
+	t.Run("a short batch outside the headers-first round asks for nothing more", func(t *testing.T) {
+		f := newSyncFixture(t, 1)
+
+		// No checkpoints, so the machine never enters headers-first mode and
+		// only the net_processing.cpp full-batch rule applies.
+		hs, peer := startedSync(t, f, nil)
+		require.False(t, hs.IsHeadersFirstMode())
+
+		batch := minedRun(f.tip(), 3, 210)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
 	})
 
 	t.Run("an empty batch is ignored", func(t *testing.T) {
@@ -453,11 +475,70 @@ func TestHeaderSync_OnHeadersBatching(t *testing.T) {
 		require.Nil(t, msgs)
 
 		// net_processing.cpp HEADERS: Misbehaving(pfrom, 20, "too-many-headers").
+		// The wire decoder refuses more than MaxBlockHeadersPerMsg headers, so
+		// a real peer cannot reach this rule over the network; the batch here
+		// is built in-process. The rule is kept because it belongs with the
+		// rest of the HEADERS handling, not because the decoder might miss it.
 		require.Equal(t, 20, misbehavior)
 
 		// Nothing from an over-long batch may reach the index.
 		_, tipHeight := f.idx.Tip()
 		require.Equal(t, int32(1), tipHeight)
+	})
+}
+
+// TestHeaderSync_SyncSlotRelease pins FinalizeNode plus resetHeaderState: the
+// sync slot and the header state must both come back when the sync peer goes
+// away or stops answering.
+func TestHeaderSync_SyncSlotRelease(t *testing.T) {
+	release := []struct {
+		name string
+		call func(hs *HeaderSync, peer *SyncPeer)
+	}{
+		{"disconnect", func(hs *HeaderSync, peer *SyncPeer) { hs.PeerDisconnected(peer) }},
+		{"timeout", func(hs *HeaderSync, peer *SyncPeer) { hs.SyncPeerTimedOut(peer) }},
+	}
+
+	for _, tc := range release {
+		t.Run(tc.name+" resets header state and frees the slot", func(t *testing.T) {
+			f := newSyncFixture(t, 1)
+
+			cpHash := chainhash.Hash{0xC0}
+			hs, peer := startedSync(t, f, []chaincfg.Checkpoint{{Height: 100000, Hash: &cpHash}})
+			require.True(t, hs.IsHeadersFirstMode())
+
+			tc.call(hs, peer)
+
+			// legacy manager.go resetHeaderState: the mode goes off with the
+			// peer that was driving it, so IsHeadersFirstMode cannot stay true
+			// with nobody syncing.
+			require.False(t, hs.IsHeadersFirstMode())
+			require.False(t, peer.State.fSyncStarted)
+
+			// The freed slot must be usable by the next candidate, and the
+			// checkpoint re-seeds for the fresh round.
+			next := fullNodePeer("5.6.7.8:8333")
+			gh := requireGetHeaders(t, hs.PeerEstablished(next))
+			require.Equal(t, cpHash, gh.HashStop)
+			require.True(t, hs.IsHeadersFirstMode())
+		})
+	}
+
+	t.Run("releasing a peer that never held the slot changes nothing", func(t *testing.T) {
+		f := newSyncFixture(t, 1)
+
+		cpHash := chainhash.Hash{0xC0}
+		hs, holder := startedSync(t, f, []chaincfg.Checkpoint{{Height: 100000, Hash: &cpHash}})
+
+		bystander := fullNodePeer("9.9.9.9:8333")
+		hs.PeerDisconnected(bystander)
+		hs.SyncPeerTimedOut(bystander)
+
+		require.True(t, hs.IsHeadersFirstMode())
+		require.True(t, holder.State.fSyncStarted)
+
+		// The slot is still taken, so a new candidate is not asked.
+		require.Nil(t, hs.PeerEstablished(fullNodePeer("5.6.7.8:8333")))
 	})
 }
 
@@ -520,6 +601,75 @@ func TestHeaderSync_OnHeadersMisbehavior(t *testing.T) {
 
 		_, tipHeight := f.idx.Tip()
 		require.Equal(t, int32(2), tipHeight)
+
+		// net_processing.cpp HEADERS: UpdateBlockAvailability runs on this path
+		// too, with the last header of the batch. It is unknown to us, so it
+		// lands in hashLastUnknownBlock.
+		require.Equal(t, orphans[len(orphans)-1].BlockHash(), peer.State.hashLastUnknownBlock)
+	})
+
+	t.Run("a bulk unconnecting batch scores prev-blk-not-found instead of gap-filling", func(t *testing.T) {
+		f := newSyncFixture(t, 2)
+		hs, peer := startedSync(t, f, nil)
+
+		orphanRoot := syncGenesis()
+		orphanRoot.Nonce += 11
+
+		for !testMeetsTarget(orphanRoot) {
+			orphanRoot.Nonce++
+		}
+
+		// MAX_BLOCKS_TO_ANNOUNCE headers is one too many for the announcement
+		// path, so net_processing.cpp lets AcceptBlockHeader fail it with
+		// DoS(10, "prev-blk-not-found") instead of asking for the gap.
+		orphans := minedRun(orphanRoot, MaxBlocksToAnnounce, 550)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg(orphans))
+		require.NoError(t, err)
+		require.Nil(t, msgs)
+		require.Equal(t, 10, misbehavior)
+
+		// The unconnecting counter belongs to the announcement path only.
+		require.Zero(t, peer.nUnconnectingHeaders)
+
+		_, tipHeight := f.idx.Tip()
+		require.Equal(t, int32(2), tipHeight)
+	})
+
+	t.Run("headers that connect reset the unconnecting counter", func(t *testing.T) {
+		f := newSyncFixture(t, 2)
+		hs, peer := startedSync(t, f, nil)
+
+		orphanRoot := syncGenesis()
+		orphanRoot.Nonce += 13
+
+		for !testMeetsTarget(orphanRoot) {
+			orphanRoot.Nonce++
+		}
+
+		orphans := minedRun(orphanRoot, 2, 600)
+
+		// One short of the score threshold.
+		for i := 1; i < MaxUnconnectingHeaders; i++ {
+			_, misbehavior, err := hs.OnHeaders(peer, headersMsg(orphans))
+			require.NoError(t, err)
+			require.Zero(t, misbehavior)
+		}
+
+		// net_processing.cpp HEADERS: "resetting nUnconnectingHeaders (%d ->
+		// 0)" once a batch connects.
+		good := minedRun(f.tip(), 1, 650)
+
+		_, misbehavior, err := hs.OnHeaders(peer, headersMsg(good))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Zero(t, peer.nUnconnectingHeaders)
+
+		// The next unconnecting batch is the first of a new run, not the tenth
+		// of the old one, so it must not score.
+		_, misbehavior, err = hs.OnHeaders(peer, headersMsg(orphans))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
 	})
 
 	t.Run("a header failing proof of work scores 50 and is not accepted", func(t *testing.T) {
@@ -548,7 +698,9 @@ func TestHeaderSync_OnHeadersMisbehavior(t *testing.T) {
 		// target: the hash meets its claimed target, but the target itself is
 		// out of range. pow.cpp CheckProofOfWork rejects on
 		// bnTarget > powLimit before it ever compares the hash.
-		hs, err := NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: &chaincfg.MainNetParams})
+		mainnet := chaincfg.MainNetParams
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: &mainnet})
 		require.NoError(t, err)
 
 		peer := fullNodePeer("1.2.3.4:8333")
@@ -580,6 +732,51 @@ func TestHeaderSync_OnHeadersMisbehavior(t *testing.T) {
 	})
 }
 
+// TestCheckBlockHeaderPoW_MainnetVector runs the PoW check against a real
+// mainnet header rather than a ground test header, so the byte order of both
+// the hash and the compact target is pinned against the live chain and not
+// against this file's own helpers.
+func TestCheckBlockHeaderPoW_MainnetVector(t *testing.T) {
+	// The mainnet genesis header, 80 bytes on the wire: version, null prev
+	// hash, merkle root, timestamp, nBits 0x1d00ffff, nonce.
+	const genesisHex = "01000000" +
+		"0000000000000000000000000000000000000000000000000000000000000000" +
+		"3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a" +
+		"29ab5f49" + "ffff001d" + "1dac2b7c"
+
+	raw, err := hex.DecodeString(genesisHex)
+	require.NoError(t, err)
+
+	var header wire.BlockHeader
+	require.NoError(t, header.Deserialize(bytes.NewReader(raw)))
+
+	// If the vector were wrong in any byte, this would not be the hash the
+	// chain params carry.
+	require.Equal(t, *chaincfg.MainNetParams.GenesisHash, header.BlockHash())
+	require.Equal(t, testHardBits, header.Bits)
+
+	idx, err := NewHeaderIndex(&header)
+	require.NoError(t, err)
+
+	mainnet := chaincfg.MainNetParams
+
+	hs, err := NewHeaderSync(HeaderSyncConfig{Index: idx, Params: &mainnet})
+	require.NoError(t, err)
+
+	require.True(t, hs.checkBlockHeaderPoW(&header))
+
+	// Same header, different nonce: the work is gone and the check must say so.
+	// Grinding to a definite failure keeps the row deterministic.
+	broken := header
+	broken.Nonce++
+
+	for testMeetsTarget(&broken) {
+		broken.Nonce++
+	}
+
+	require.False(t, hs.checkBlockHeaderPoW(&broken))
+}
+
 // TestHeaderSync_Checkpoints pins the headers-first-to-next-checkpoint scheme
 // carried from legacy netsync manager.go.
 func TestHeaderSync_Checkpoints(t *testing.T) {
@@ -601,6 +798,13 @@ func TestHeaderSync_Checkpoints(t *testing.T) {
 		require.True(t, errors.Is(err, ErrCheckpointMismatch))
 		require.Nil(t, msgs)
 		require.Zero(t, misbehavior)
+
+		// errors.Is matches by code alone, so pin the rendered message too: it
+		// must name the offending height, the hash we got, and the checkpoint
+		// hash we wanted.
+		require.Contains(t, err.Error(), "height 3")
+		require.Contains(t, err.Error(), batch[1].BlockHash().String())
+		require.Contains(t, err.Error(), wrong.String())
 	})
 
 	t.Run("matching a checkpoint asks for headers up to the next one", func(t *testing.T) {
@@ -676,6 +880,36 @@ func TestHeaderSync_Checkpoints(t *testing.T) {
 		require.False(t, hs.IsHeadersFirstMode())
 	})
 
+	t.Run("a peer without the sync slot cannot drive the checkpoint state", func(t *testing.T) {
+		f := newSyncFixture(t, 1)
+
+		batch := minedRun(f.tip(), 3, 1200)
+		wrong := chainhash.Hash{0xDE, 0xAD}
+
+		// The sync slot is held by another peer, so this one is outside the
+		// headers-first round: legacy scopes that round to its sync peer.
+		hs, holder := startedSync(t, f, []chaincfg.Checkpoint{{Height: 3, Hash: &wrong}})
+		require.True(t, hs.IsHeadersFirstMode())
+
+		bystander := fullNodePeer("5.6.7.8:8333")
+		require.Nil(t, hs.PeerEstablished(bystander))
+		require.False(t, bystander.State.fSyncStarted)
+
+		msgs, misbehavior, err := hs.OnHeaders(bystander, headersMsg(batch))
+
+		// The same batch would have disconnected the sync peer at height 3.
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		// Its headers are still indexed — only the checkpoint state is out of
+		// its reach, and the round the sync peer owns is untouched.
+		_, tipHeight := f.idx.Tip()
+		require.Equal(t, int32(4), tipHeight)
+		require.True(t, hs.IsHeadersFirstMode())
+		require.True(t, holder.State.fSyncStarted)
+	})
+
 	t.Run("findNextHeaderCheckpoint picks the first checkpoint above the height", func(t *testing.T) {
 		f := newSyncFixture(t, 0)
 
@@ -728,5 +962,13 @@ func TestNewHeaderSync_Validation(t *testing.T) {
 	require.Error(t, err)
 
 	_, err = NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: nil})
+	require.Error(t, err)
+
+	// Params without a powLimit would let the header PoW check accept any
+	// target a peer claims.
+	noLimit := chaincfg.MainNetParams
+	noLimit.PowLimit = nil
+
+	_, err = NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: &noLimit})
 	require.Error(t, err)
 }
