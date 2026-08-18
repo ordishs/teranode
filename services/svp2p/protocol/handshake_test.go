@@ -82,6 +82,39 @@ func TestSelfConnectionDetected(t *testing.T) {
 	require.ErrorIs(t, err, ErrSelfConnection)
 }
 
+func TestSelfConnectionViaNonceRegistry(t *testing.T) {
+	// net.cpp CConnman::CheckIncomingNonce: a real self-connect carries a
+	// different nonce per connection, so the per-connection compare above
+	// never fires — this is the registry check that covers it.
+	tests := []struct {
+		name       string
+		inRegistry bool
+	}{
+		{name: "nonce hits the registry", inRegistry: true},
+		{name: "nonce absent from registry", inRegistry: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := outboundConfig()
+			cfg.CheckIncomingNonce = func(uint64) bool { return tt.inRegistry }
+
+			h := NewHandshake(cfg)
+			_ = h.Initial()
+
+			reply, err := h.OnMessage(remoteVersion(9999))
+
+			if tt.inRegistry {
+				require.ErrorIs(t, err, ErrSelfConnection)
+				require.Empty(t, reply)
+			} else {
+				require.NoError(t, err)
+				require.NotEmpty(t, reply)
+			}
+		})
+	}
+}
+
 func TestObsoleteVersionRejected(t *testing.T) {
 	h := NewHandshake(outboundConfig())
 	_ = h.Initial()

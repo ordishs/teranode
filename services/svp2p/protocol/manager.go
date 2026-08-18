@@ -204,6 +204,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 			AllowBlockPriority:   m.tSettings.Legacy.AllowBlockPriority,
 			LocalAddr:            netAddressOf(nc.LocalAddr()),
 			RemoteAddr:           netAddressOf(nc.RemoteAddr()),
+			CheckIncomingNonce:   m.hasSentNonce,
 		},
 		Conn:         conn,
 		Logger:       m.logger,
@@ -239,6 +240,23 @@ func (m *PeerManager) newNonce() uint64 {
 	}
 
 	return nonce
+}
+
+// hasSentNonce mirrors net.cpp CConnman::CheckIncomingNonce: true if this
+// node itself generated the given nonce for one of its own connections
+// (inbound or outbound), meaning an incoming VERSION carrying it proves a
+// self-connect.
+func (m *PeerManager) hasSentNonce(nonce uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, n := range m.nonces {
+		if n == nonce {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (m *PeerManager) ListenAddrs() []string {
