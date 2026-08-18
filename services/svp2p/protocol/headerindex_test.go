@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -67,8 +69,8 @@ func TestNewHeaderIndex(t *testing.T) {
 
 		n, ok := idx.Lookup(hash)
 		require.True(t, ok)
-		require.Equal(t, int32(0), n.height)
-		require.Nil(t, n.prev)
+		require.Equal(t, int32(0), n.Height)
+		require.Equal(t, chainhash.Hash{}, n.ParentHash)
 	})
 
 	t.Run("rejects a nil genesis header", func(t *testing.T) {
@@ -159,7 +161,7 @@ func TestAddHeader_SideChainDoesNotMoveTipUnlessLonger(t *testing.T) {
 
 	n, ok := idx.Lookup(sideTip.BlockHash())
 	require.True(t, ok)
-	require.Equal(t, int32(4), n.height)
+	require.Equal(t, int32(4), n.Height)
 
 	tipHash, tipHeight = idx.Tip()
 	require.Equal(t, mainTip.BlockHash(), tipHash)
@@ -240,10 +242,36 @@ func heightsOf(t *testing.T, idx *HeaderIndex, hashes []chainhash.Hash) []int32 
 	for i, h := range hashes {
 		n, ok := idx.Lookup(h)
 		require.True(t, ok)
-		heights[i] = n.height
+		heights[i] = n.Height
 	}
 
 	return heights
+}
+
+func TestLookup_ParentHashWalksOneStepAtATime(t *testing.T) {
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	// chain[0] is height 1, chain[1] is height 2; chain[0]'s parent is genesis.
+	chain := buildChain(t, idx, nc, genesis, 2)
+
+	// A consumer in another package can walk toward genesis using only the
+	// exported HeaderNode: look up a hash, then look up its ParentHash.
+	n, ok := idx.Lookup(chain[1].BlockHash())
+	require.True(t, ok)
+	require.Equal(t, chain[0].BlockHash(), n.ParentHash)
+
+	parent, ok := idx.Lookup(n.ParentHash)
+	require.True(t, ok)
+	require.Equal(t, genesis.BlockHash(), parent.ParentHash)
+
+	grandparent, ok := idx.Lookup(parent.ParentHash)
+	require.True(t, ok)
+	require.Equal(t, genesis.BlockHash(), grandparent.Hash)
+	require.Equal(t, chainhash.Hash{}, grandparent.ParentHash) // genesis has no parent
 }
 
 func TestLocatorFrom_UnknownHashReturnsNil(t *testing.T) {
@@ -267,13 +295,13 @@ func TestAncestor(t *testing.T) {
 	t.Run("finds an ancestor at a lower height", func(t *testing.T) {
 		n, ok := idx.Ancestor(tip.BlockHash(), 2)
 		require.True(t, ok)
-		require.Equal(t, chain[1].BlockHash(), n.hash) // height 2 is chain[1]
+		require.Equal(t, chain[1].BlockHash(), n.Hash) // height 2 is chain[1]
 	})
 
 	t.Run("returns itself at its own height", func(t *testing.T) {
 		n, ok := idx.Ancestor(tip.BlockHash(), 5)
 		require.True(t, ok)
-		require.Equal(t, tip.BlockHash(), n.hash)
+		require.Equal(t, tip.BlockHash(), n.Hash)
 	})
 
 	t.Run("rejects a height above the node", func(t *testing.T) {
@@ -290,4 +318,104 @@ func TestAncestor(t *testing.T) {
 		_, ok := idx.Ancestor(chainhash.Hash{0xCC}, 0)
 		require.False(t, ok)
 	})
+}
+
+// TestHeaderIndex_ConcurrentReadsDuringWrites is the documented exception to
+// the project's default of avoiding t.Parallel()/goroutines in tests: it
+// specifically exercises the "safe for concurrent reads under one mutex"
+// contract by running several readers against a concurrent writer under
+// -race.
+//
+// testify's require.* calls t.FailNow, which the testing package forbids
+// calling from any goroutine but the test's own; so the writer and readers
+// below record outcomes into plain values instead of asserting inline, and
+// every require.* call happens back on the test's own goroutine after
+// wg.Wait() has joined all of them.
+func TestHeaderIndex_ConcurrentReadsDuringWrites(t *testing.T) {
+	genesis := testGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	const chainLen = 500
+
+	// Precompute the chain so the writer goroutine's loop body is just the
+	// AddHeader call under test, not hashing.
+	nc := &nonceCounter{}
+	headers := make([]*wire.BlockHeader, 0, chainLen)
+	prev := genesis
+
+	for i := 0; i < chainLen; i++ {
+		h := childOf(prev, nc.take())
+		headers = append(headers, h)
+		prev = h
+	}
+
+	var wg sync.WaitGroup
+
+	done := make(chan struct{})
+	addErrs := make([]error, chainLen)
+	addConnected := make([]bool, chainLen)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		defer close(done)
+
+		for i, h := range headers {
+			connected, addErr := idx.AddHeader(h)
+			addErrs[i] = addErr
+			addConnected[i] = connected
+		}
+	}()
+
+	// Readers hammer every read method concurrently with the writer. Tip's
+	// returned hash must always resolve via Lookup and Ancestor at its own
+	// height, at every point in the walk: AddHeader only ever appends nodes,
+	// so this invariant holds under any interleaving.
+	var readerInconsistent atomic.Bool
+
+	const readerCount = 8
+
+	for i := 0; i < readerCount; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				hash, height := idx.Tip()
+
+				if _, ok := idx.Lookup(hash); !ok {
+					readerInconsistent.Store(true)
+				}
+
+				if _, ok := idx.Ancestor(hash, height); !ok {
+					readerInconsistent.Store(true)
+				}
+
+				_ = idx.Locator()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	for i := range addErrs {
+		require.NoError(t, addErrs[i])
+		require.True(t, addConnected[i])
+	}
+
+	require.False(t, readerInconsistent.Load(), "a concurrent reader observed an inconsistent index")
+
+	hash, height := idx.Tip()
+	require.Equal(t, headers[len(headers)-1].BlockHash(), hash)
+	require.Equal(t, int32(chainLen), height)
 }
