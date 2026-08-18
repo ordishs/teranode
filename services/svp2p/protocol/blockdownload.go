@@ -96,13 +96,23 @@ type BlockDownloader struct {
 	inFlight map[chainhash.Hash]*SyncPeer
 
 	// haveData ports CBlockIndex::getStatus().hasData(): the blocks whose full
-	// data we hold. SVNode reads it from the block index; this machine has no
-	// block store, so it records what it was told arrived through BlockReceived
-	// and drops each entry once our own active chain covers it, which is the
-	// durable record from then on. A block we hold from an earlier run and
-	// never saw arrive this session is therefore re-requested; that costs one
-	// redundant download, which SVNode also tolerates elsewhere.
-	haveData map[chainhash.Hash]struct{}
+	// data we hold, mapped to their height so the watermark prune below can
+	// find them. SVNode reads this from the block index; this machine has no
+	// block store, so it records what it was told arrived through BlockReceived.
+	//
+	// A block we hold from an earlier run and never saw arrive this session is
+	// therefore re-requested; that costs one redundant download, which SVNode
+	// also tolerates elsewhere.
+	//
+	// Entries are dropped by height watermark, not by the download walk: see
+	// pruneHaveData for why the walk cannot do it and what the height rule
+	// costs.
+	haveData map[chainhash.Hash]int32
+
+	// haveDataWatermark is the highest active-chain tip height haveData has
+	// been pruned against. It keeps the prune O(1) while our chain stands
+	// still, which is every call but the ones that follow a new block.
+	haveDataWatermark int32
 
 	// lastTipHeight is the header index tip height at the previous stall check.
 	// It is how CheckStall observes headers-first progress without reading a
@@ -135,9 +145,39 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 		idx:           idx,
 		hs:            hs,
 		inFlight:      make(map[chainhash.Hash]*SyncPeer),
-		haveData:      make(map[chainhash.Hash]struct{}),
+		haveData:      make(map[chainhash.Hash]int32),
 		lastTipHeight: tipHeight,
 	}, nil
+}
+
+// pruneHaveData drops every recorded block at or below the active chain tip,
+// because from that height down our own chain is the record of what we hold and
+// the download walk never looks below its last-common block anyway.
+//
+// The prune has to key on height rather than on chain membership. The obvious
+// rule — drop a block once the walk sees our chain covering it — never fires in
+// the steady state: the walk starts above the last-common block and every
+// "nothing interesting" return happens before it. That left one entry per
+// received block for the lifetime of the process, roughly one per block of a
+// mainnet IBD.
+//
+// The cost of the height rule is that a block on an abandoned fork below the
+// tip is dropped too, so if a peer offers that fork again we download the block
+// a second time. That is the same redundant-download class the field note
+// already accepts, and it is bounded by how much forking a peer can cause,
+// whereas the leak it replaces was not bounded at all.
+func (bd *BlockDownloader) pruneHaveData(activeTipHeight int32) {
+	if activeTipHeight <= bd.haveDataWatermark {
+		return
+	}
+
+	bd.haveDataWatermark = activeTipHeight
+
+	for hash, height := range bd.haveData {
+		if height <= activeTipHeight {
+			delete(bd.haveData, hash)
+		}
+	}
 }
 
 // FindNextBlocksToDownload is the net_processing.cpp function of the same name:
@@ -152,6 +192,10 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 // until headers-first ends. Those peers take the "nothing interesting" return
 // below and cost one map lookup, which is the behaviour the plan expects.
 func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip HeaderNode, count int) (blocks []HeaderNode, staller *SyncPeer) {
+	// Before any of the early returns below: our chain moving on is what makes
+	// recorded blocks droppable, and most calls take one of those returns.
+	bd.pruneHaveData(activeTip.Height)
+
 	if peer == nil || peer.State == nil || count <= 0 {
 		return nil, nil
 	}
@@ -209,10 +253,18 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 	// The chainActive.Contains(pindex) test, made O(1). Every block the walk
 	// below visits is on the peer's branch, so it is on our active chain
 	// exactly when it is at or below the height where the two branches part.
-	forkHeight := int32(-1)
-	if fork, forkOK := lastCommonAncestor(bd.idx, activeTip, *best); forkOK {
-		forkHeight = fork.Height
+	//
+	// A failure here means activeTip is not a header this index holds, so we
+	// cannot tell which blocks are already ours. Carrying on would treat every
+	// one of them as missing and re-request the whole branch, so refuse instead
+	// — the same answer the bootstrap above gives when it cannot place
+	// activeTip.
+	fork, forkOK := lastCommonAncestor(bd.idx, activeTip, *best)
+	if !forkOK {
+		return nil, nil
 	}
+
+	forkHeight := fork.Height
 
 	// "Never fetch further than the best block we know the peer has, or more
 	// than BLOCK_DOWNLOAD_WINDOW + 1 beyond the last linked block we have in
@@ -246,11 +298,6 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 		inActiveChain := node.Height <= forkHeight
 
 		_, have := bd.haveData[node.Hash]
-		if have && inActiveChain {
-			// Our own chain now covers this block, so it needs no separate
-			// record. See the haveData field note.
-			delete(bd.haveData, node.Hash)
-		}
 
 		// "update pindexLastCommonBlock as long as all ancestors are already
 		// downloaded, or if it's already part of our chain (and therefore don't
@@ -460,7 +507,13 @@ func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode)
 // when the download failed or the block was rejected, so the data is not
 // recorded as held.
 func (bd *BlockDownloader) BlockReceived(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
-	bd.haveData[hash] = struct{}{}
+	// The height is what makes the entry prunable later. A block whose header
+	// this index does not hold is not recorded at all: the download walk only
+	// ever visits indexed headers, so the entry could never be read, and
+	// without a height it could never be dropped either.
+	if node, known := bd.idx.Lookup(hash); known {
+		bd.haveData[hash] = node.Height
+	}
 
 	if peer != nil && peer.State != nil {
 		// legacy netsync manager.go handleBlockMsg: a delivered block refreshes
@@ -502,7 +555,9 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash)
 	return true
 }
 
-// IsInFlight is BlockDownloadTracker::IsInFlight.
+// IsInFlight is BlockDownloadTracker::IsInFlight. Like every method here it
+// reads shared state and requires the caller to already hold PeerManager's
+// sync-state mutex; it is a plain map read, not a synchronized one.
 func (bd *BlockDownloader) IsInFlight(hash chainhash.Hash) bool {
 	_, busy := bd.inFlight[hash]
 
@@ -510,11 +565,13 @@ func (bd *BlockDownloader) IsInFlight(hash chainhash.Hash) bool {
 }
 
 // BlocksInFlight reports how many blocks are in flight across all peers.
+// Requires the caller to hold PeerManager's sync-state mutex.
 func (bd *BlockDownloader) BlocksInFlight() int { return len(bd.inFlight) }
 
 // TxInvsReceived reports how many tx inventory announcements have arrived.
 // Decision 1 defers the tx path to Phase 3; this is the counter that stands in
-// for it until then.
+// for it until then. Requires the caller to hold PeerManager's sync-state
+// mutex: the counter is deliberately not atomic, like every other field here.
 func (bd *BlockDownloader) TxInvsReceived() uint64 { return bd.txInvsReceived }
 
 // PeerDisconnected is BlockDownloadTracker::ClearPeer, the block-download half
@@ -558,6 +615,13 @@ func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
 //
 // Tx invs are counted and nothing else — Decision 1 defers the tx path to
 // Phase 3.
+//
+// On error the message list is nil, never partial. C++ scores the bad entry and
+// carries on through the rest of the batch, but it is setting fDisconnect while
+// it does so; here the error means the caller must drop the peer, and messages
+// queued for a peer we are about to drop are not worth sending. Availability
+// updates made for the entries already processed do stand — they are state, not
+// output, and they were valid when they were made.
 func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Message, error) {
 	if peer == nil || peer.State == nil || msg == nil {
 		return nil, nil
@@ -615,8 +679,8 @@ func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Messa
 			// net_processing.cpp: "Got invalid inv type %d from peer=%d" →
 			// pfrom->fDisconnect = true. C++ finishes the loop first; there is
 			// nothing worth doing for a peer we are about to drop, so this
-			// returns straight away.
-			return msgs, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+			// returns straight away and discards what it had queued.
+			return nil, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
 				"svp2p: unsupported inv type %d", uint32(inv.Type), ErrProtocolViolation)
 		}
 	}
@@ -670,13 +734,30 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 //
 // Progress means one of two things, and only the sync peer has a clock at all:
 //   - a block was delivered (legacy's own trigger, refreshed in BlockReceived);
-//   - the header index tip rose while a headers-first round was running.
+//   - the header index tip rose while a headers-first round was running and
+//     this peer had no block download outstanding to be judged on instead.
 //
-// The second source is this port's, not legacy's: legacy refreshes
-// lastBlockTime on delivered blocks only, so a peer feeding us a long run of
-// headers with no block yet to fetch would be rotated as if it were silent.
-// Observing the tip costs nothing, needs no extra call site, and is scoped to
-// headers-first rounds, which Task 5 restricts to the sync peer.
+// That second source is this port's, and it is a deliberate departure from a
+// choice legacy made on purpose. legacy netsync manager.go handleCheckSyncPeer
+// (see the headers-first branch at lines 1043-1049) suppresses only the network
+// speed check during headers-first mode and states that it still checks
+// last-block-time "so stalled peers get rotated even during headers-first".
+// Since lastBlockTime is refreshed on delivered blocks alone, that rotates a
+// peer feeding us a long run of headers with no block yet to fetch. This port
+// treats header progress as a stall substitute in exactly that case.
+//
+// Two limits keep the departure narrow, and the first is why the
+// nBlocksInFlight guard below exists. Header progress is only allowed to stand
+// in for block progress when there is no block progress to judge: a peer
+// sitting on in-flight blocks is measured on those blocks, so it cannot hold
+// the sync slot by trickling headers while withholding what we asked it for.
+// Second, the refresh is scoped to headers-first rounds, which Task 5 restricts
+// to the sync peer.
+//
+// The tip is an imperfect witness even so: HeaderIndex is also fed by the
+// blockchain-service subscription, so a rise can come from our own node rather
+// than from this peer. That can only ever delay a rotation, never cause a wrong
+// one, and only while the node is genuinely advancing.
 func (bd *BlockDownloader) CheckStall(peer *SyncPeer, nowMicros int64) StallAction {
 	if peer == nil || peer.State == nil {
 		return StallActionNone
@@ -698,7 +779,7 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, nowMicros int64) StallActi
 	if _, tipHeight := bd.idx.Tip(); tipHeight > bd.lastTipHeight {
 		bd.lastTipHeight = tipHeight
 
-		if bd.hs.IsHeadersFirstMode() {
+		if bd.hs.IsHeadersFirstMode() && state.nBlocksInFlight == 0 {
 			state.nLastProgressTime = nowMicros
 		}
 	}

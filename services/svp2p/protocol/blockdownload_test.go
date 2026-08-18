@@ -322,6 +322,78 @@ func TestSendGetDataBlocks_InTransitCapHoldsAtSixteen(t *testing.T) {
 	require.Equal(t, MaxBlocksInTransitPerPeer, peer.State.nBlocksInFlight)
 }
 
+// TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip pins the
+// haveData watermark. Without it every received block stays recorded for the
+// lifetime of the process, because the download walk starts above the last
+// common block and the steady-state calls return before ever reaching it.
+func TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip(t *testing.T) {
+	f := newDownloadFixture(t, 40)
+	peer := f.peerAt(t, "1.2.3.4:8333", 40)
+
+	// Our chain is still at genesis while 20 blocks arrive.
+	activeTip := f.node(t, 0)
+
+	blocks, _ := f.bd.FindNextBlocksToDownload(peer, activeTip, 20)
+	require.Len(t, blocks, 20)
+
+	for _, b := range blocks {
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, b))
+		require.True(t, f.bd.BlockReceived(peer, b.Hash, testNow))
+	}
+
+	require.Equal(t, 20, len(f.bd.haveData), "every delivered block is recorded until our chain covers it")
+
+	// Our chain connects the first 12 of them.
+	f.bd.FindNextBlocksToDownload(peer, f.node(t, 12), MaxBlocksInTransitPerPeer)
+
+	require.Equal(t, 8, len(f.bd.haveData), "everything at or below the active tip must be dropped")
+
+	for h := 13; h <= 20; h++ {
+		require.Contains(t, f.bd.haveData, f.node(t, h).Hash, "blocks above the active tip are still ours to remember")
+	}
+
+	// The whole run connects.
+	f.bd.FindNextBlocksToDownload(peer, f.node(t, 20), MaxBlocksInTransitPerPeer)
+	require.Empty(t, f.bd.haveData)
+
+	// A steady-state call that returns early must still prune: this peer has
+	// nothing interesting, which is the path that made the leak unbounded.
+	idle := fullNodePeer("9.9.9.9:8333")
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 25)))
+	require.True(t, f.bd.BlockReceived(peer, f.node(t, 25).Hash, testNow))
+	require.Len(t, f.bd.haveData, 1)
+
+	f.bd.FindNextBlocksToDownload(idle, f.node(t, 25), MaxBlocksInTransitPerPeer)
+	require.Empty(t, f.bd.haveData, "the prune must run before the nothing-interesting return")
+}
+
+// TestFindNextBlocksToDownload_RefusesAnActiveTipOutsideTheIndex pins the
+// contract that activeTip must be a header this index holds. Guessing would
+// mean treating our own blocks as missing and re-requesting the whole branch.
+func TestFindNextBlocksToDownload_RefusesAnActiveTipOutsideTheIndex(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+
+	stranger := HeaderNode{Hash: chainhash.Hash{0xFE}, Height: 4}
+
+	t.Run("on the bootstrap path", func(t *testing.T) {
+		blocks, staller := f.bd.FindNextBlocksToDownload(peer, stranger, MaxBlocksInTransitPerPeer)
+
+		require.Empty(t, blocks)
+		require.Nil(t, staller)
+	})
+
+	t.Run("on the steady-state path, with last-common already set", func(t *testing.T) {
+		known := f.node(t, 2)
+		peer.State.pindexLastCommonBlock = &known
+
+		blocks, staller := f.bd.FindNextBlocksToDownload(peer, stranger, MaxBlocksInTransitPerPeer)
+
+		require.Empty(t, blocks, "an unplaceable active tip must not re-request the branch")
+		require.Nil(t, staller)
+	})
+}
+
 // TestSendGetDataBlocks_SkipsAPeerThatCannotServeBlocks pins the C++ !fClient
 // gate, which this port reads through isSyncCandidate.
 func TestSendGetDataBlocks_SkipsAPeerThatCannotServeBlocks(t *testing.T) {
@@ -462,6 +534,45 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 		// The clock restarted from the observation, not from testNow.
 		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, advanced+micros(MaxLastBlockTime)))
 		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, advanced+micros(MaxLastBlockTime)+1))
+	})
+
+	// Header progress may only stand in for block progress when there is no
+	// block download to judge instead. A peer that trickles headers while
+	// sitting on everything we asked it for is withholding blocks, and must
+	// still be rotated.
+	t.Run("header progress does not excuse a peer withholding blocks", func(t *testing.T) {
+		f := newDownloadFixture(t, MaxBlocksInTransitPerPeer+4)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, f.hs.PeerEstablished(peer), 1)
+		require.True(t, f.hs.IsHeadersFirstMode())
+
+		best := f.node(t, MaxBlocksInTransitPerPeer+4)
+		peer.State.pindexBestKnownBlock = &best
+
+		msgs := f.bd.SendGetDataBlocks(peer, f.node(t, 0), testNow)
+		require.Len(t, msgs, 1)
+		require.Equal(t, MaxBlocksInTransitPerPeer, peer.State.nBlocksInFlight)
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow))
+
+		// The peer keeps the header round moving but delivers no block.
+		prev := f.chain[len(f.chain)-1]
+		for i := uint32(0); i < 3; i++ {
+			header := childOf(prev, 5000+i)
+
+			connected, err := f.idx.AddHeader(header)
+			require.NoError(t, err)
+			require.True(t, connected)
+
+			prev = header
+
+			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow+micros(time.Duration(i+1)*time.Second)))
+		}
+
+		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, testNow+micros(MaxLastBlockTime)+1),
+			"headers must not hold the sync slot while the peer sits on in-flight blocks")
+		require.False(t, peer.State.fSyncStarted)
 	})
 }
 

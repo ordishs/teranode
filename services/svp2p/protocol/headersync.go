@@ -244,9 +244,14 @@ func (hs *HeaderSync) PeerDisconnected(peer *SyncPeer) {
 // SyncPeerTimedOut releases a sync peer that is still connected but has stopped
 // answering, mirroring legacy netsync's sync-peer timeout, which calls
 // resetHeaderState and lets startSync choose another peer. The machine reads no
-// clock: the caller owns the timeout (SVNode measures it in SendMessages
-// against HEADERS_DOWNLOAD_TIMEOUT_BASE), and calls this when it expires. The
-// peer stays connected; only the sync slot and the header state are released.
+// clock: the caller owns the timeout and calls this when it expires — see
+// BlockDownloader.CheckStall, which is that caller. There is no SVNode rule
+// behind it. Bitcoin Core times a headers round out against
+// HEADERS_DOWNLOAD_TIMEOUT_BASE, but this SVNode fork never took that constant;
+// it relies on the peer being disconnected or its in-flight blocks timing out,
+// neither of which fires during a silent headers-first round. The timeout is
+// therefore the Teranode rotation carried from legacy netsync. The peer stays
+// connected; only the sync slot and the header state are released.
 func (hs *HeaderSync) SyncPeerTimedOut(peer *SyncPeer) {
 	hs.releaseSyncPeer(peer)
 }
