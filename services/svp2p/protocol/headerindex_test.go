@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -318,6 +320,170 @@ func TestAncestor(t *testing.T) {
 		_, ok := idx.Ancestor(chainhash.Hash{0xCC}, 0)
 		require.False(t, ok)
 	})
+}
+
+// naivePrevWalk walks pprev links directly from n, the pre-skiplist algorithm
+// this task replaces. It is the test's independent authority for what
+// Ancestor and the pskip pointers should compute, so it must not call
+// ancestorLocked or share any logic with it.
+func naivePrevWalk(n *node, height int32) (*node, bool) {
+	if height < 0 || height > n.height {
+		return nil, false
+	}
+
+	for n.height > height {
+		if n.prev == nil {
+			return nil, false
+		}
+
+		n = n.prev
+	}
+
+	return n, true
+}
+
+// sampleHeightsFor returns a deterministic set of heights to probe against a
+// chain of length maxHeight: the boundaries (0, 1, height-1, height), every
+// power of two up to maxHeight, and several heights spread across the range
+// by dividing maxHeight by small primes.
+func sampleHeightsFor(maxHeight int32) []int32 {
+	set := map[int32]struct{}{
+		0: {}, 1: {}, maxHeight - 1: {}, maxHeight: {},
+	}
+
+	for p := int32(1); p <= maxHeight; p *= 2 {
+		set[p] = struct{}{}
+	}
+
+	for _, prime := range []int32{3, 5, 7, 11, 13, 17, 19, 23, 29, 31} {
+		set[maxHeight/prime] = struct{}{}
+	}
+
+	heights := make([]int32, 0, len(set))
+
+	for h := range set {
+		if h >= 0 && h <= maxHeight {
+			heights = append(heights, h)
+		}
+	}
+
+	sort.Slice(heights, func(i, j int) bool { return heights[i] < heights[j] })
+
+	return heights
+}
+
+// TestAncestor_DeepChainMatchesNaiveWalk builds a 100_000-header chain (the
+// depth this task's brief measured at testnet, where the pprev-only walk
+// costs hours of pure pointer-chasing over a full IBD) and cross-checks
+// idx.Ancestor, which is now skiplist-accelerated, against naivePrevWalk at
+// many heights: both must agree at every sampled height, and both must
+// reject out-of-range heights identically.
+func TestAncestor_DeepChainMatchesNaiveWalk(t *testing.T) {
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	const chainLen = 100_000
+
+	chain := buildChain(t, idx, nc, genesis, chainLen)
+	tip := chain[len(chain)-1]
+
+	idx.mu.Lock()
+	tipNode := idx.nodes[tip.BlockHash()]
+	idx.mu.Unlock()
+	require.Equal(t, int32(chainLen), tipNode.height)
+
+	for _, h := range sampleHeightsFor(chainLen) {
+		h := h
+
+		t.Run(fmt.Sprintf("height=%d", h), func(t *testing.T) {
+			want, wantOK := naivePrevWalk(tipNode, h)
+
+			got, gotOK := idx.Ancestor(tip.BlockHash(), h)
+
+			require.Equal(t, wantOK, gotOK)
+
+			if wantOK {
+				require.Equal(t, want.hash, got.Hash)
+				require.Equal(t, want.height, got.Height)
+			}
+		})
+	}
+
+	_, ok := idx.Ancestor(tip.BlockHash(), chainLen+1)
+	require.False(t, ok, "height above the tip must be rejected")
+
+	_, ok = idx.Ancestor(tip.BlockHash(), -1)
+	require.False(t, ok, "a negative height must be rejected")
+}
+
+// TestSkipPointer_MatchesGetSkipHeightRecurrence checks every node's pskip
+// against the block_index.cpp BuildSkipNL recurrence directly: pskip must be
+// exactly the node at height getSkipHeight(n.height), reached by walking
+// pprev from n.prev — the same computation BuildSkipNL performs at insert
+// time via pprev->GetAncestor(GetSkipHeight(nHeight)).
+func TestSkipPointer_MatchesGetSkipHeightRecurrence(t *testing.T) {
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	const chainLen = 5_000
+
+	chain := buildChain(t, idx, nc, genesis, chainLen)
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	genesisNode := idx.nodes[genesis.BlockHash()]
+	require.Nil(t, genesisNode.skip, "genesis has no pprev, so BuildSkipNL leaves pskip nil")
+
+	for _, h := range chain {
+		n := idx.nodes[h.BlockHash()]
+
+		wantHeight := getSkipHeight(n.height)
+
+		want, ok := naivePrevWalk(n.prev, wantHeight)
+		require.True(t, ok, "height %d must be reachable from the parent of height %d", wantHeight, n.height)
+
+		require.NotNil(t, n.skip, "node at height %d must have a skip pointer", n.height)
+		require.Equal(t, want.hash, n.skip.hash)
+		require.Equal(t, wantHeight, n.skip.height)
+	}
+}
+
+// TestGetSkipHeight checks the recurrence itself against block_index.cpp
+// GetSkipHeight (block_index.cpp:22-33) for known inputs, independent of any
+// tree structure.
+func TestGetSkipHeight(t *testing.T) {
+	tests := []struct {
+		height int32
+		want   int32
+	}{
+		{0, 0},
+		{1, 0},
+		{2, 0},
+		{3, 1},
+		{4, 0},
+		{5, 1},
+		{6, 4},
+		{7, 1},
+		{8, 0},
+		{9, 1},
+		{10, 8},
+		{1023, 1017},
+		{1024, 0},
+		{1025, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("height=%d", tc.height), func(t *testing.T) {
+			require.Equal(t, tc.want, getSkipHeight(tc.height))
+		})
+	}
 }
 
 // TestHeaderIndex_ConcurrentReadsDuringWrites is the documented exception to

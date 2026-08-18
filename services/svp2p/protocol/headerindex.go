@@ -8,8 +8,9 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// node mirrors chain.h CBlockIndex: pprev links to the parent and nHeight is
-// the height above genesis. Teranode's blockchain service stays the
+// node mirrors block_index.h CBlockIndex: pprev links to the parent, pskip
+// is the skiplist shortcut set once at insert time, and nHeight is the
+// height above genesis. Teranode's blockchain service stays the
 // authoritative header store (spec §11); this tree is a rebuildable,
 // in-memory cache scoped to protocol decisions (locators, best-known-block,
 // download scheduling) that must not sit on a per-message gRPC call.
@@ -17,7 +18,31 @@ type node struct {
 	hash   chainhash.Hash
 	header wire.BlockHeader
 	prev   *node // CBlockIndex::pprev
+	skip   *node // CBlockIndex::pskip
 	height int32 // CBlockIndex::nHeight
+}
+
+// invertLowestOne mirrors block_index.cpp InvertLowestOne (block_index.cpp:18-20):
+// turn the lowest '1' bit in the binary representation of n into a '0'.
+func invertLowestOne(n int32) int32 {
+	return n & (n - 1)
+}
+
+// getSkipHeight mirrors block_index.cpp GetSkipHeight (block_index.cpp:22-33):
+// compute what height to jump back to with the node's skip pointer
+// (CBlockIndex::pskip). Any number strictly lower than height is acceptable,
+// but this expression performs well in simulations (max 110 steps to go back
+// up to 2**18 blocks).
+func getSkipHeight(height int32) int32 {
+	if height < 2 {
+		return 0
+	}
+
+	if height&1 != 0 {
+		return invertLowestOne(invertLowestOne(height-1)) + 1
+	}
+
+	return invertLowestOne(height)
 }
 
 // HeaderNode is the exported, immutable snapshot of a node returned by
@@ -113,6 +138,7 @@ func (idx *HeaderIndex) AddHeader(header *wire.BlockHeader) (connected bool, err
 		prev:   parent,
 		height: parent.height + 1,
 	}
+	n.skip = buildSkipLocked(n)
 
 	idx.nodes[hash] = n
 
@@ -149,9 +175,8 @@ func (idx *HeaderIndex) Lookup(hash chainhash.Hash) (HeaderNode, bool) {
 }
 
 // Ancestor returns the predecessor of hash at height, mirroring
-// CBlockIndex::GetAncestor. Phase 2 walks pprev links directly rather than
-// porting SVNode's skiplist; the tree is small enough that this is not a
-// hot path.
+// CBlockIndex::GetAncestor (block_index.cpp:81-105) via the skiplist descent
+// in ancestorLocked.
 func (idx *HeaderIndex) Ancestor(hash chainhash.Hash, height int32) (HeaderNode, bool) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -169,26 +194,64 @@ func (idx *HeaderIndex) Ancestor(hash chainhash.Hash, height int32) (HeaderNode,
 	return exportNode(anc), true
 }
 
-// ancestorLocked walks pprev links from n down to height. The nil guard on
-// n.prev is defensive: given the genesis-rooted invariant documented on
-// HeaderIndex, every node's chain reaches the height-0 node before prev
-// ever goes nil, so this should be unreachable. It exists so a violated
-// invariant fails the call (ok == false) instead of panicking on a nil
-// dereference.
+// ancestorLocked mirrors block_index.cpp CBlockIndex::GetAncestor
+// (block_index.cpp:81-105): descend via the skip pointer whenever it lands
+// at-or-after the target height and isn't worse than falling back to pprev,
+// otherwise step pprev once. This is the same decision order and heuristic
+// condition as the source, in the same order. The nil guard on walk.prev
+// replaces the source's `assert(pindexWalk->pprev)`: given the
+// genesis-rooted invariant documented on HeaderIndex, every node's chain
+// reaches the height-0 node before prev ever goes nil, so this should be
+// unreachable. It exists so a violated invariant fails the call (ok ==
+// false) instead of panicking on a nil dereference.
 func ancestorLocked(n *node, height int32) (*node, bool) {
 	if height < 0 || height > n.height {
 		return nil, false
 	}
 
-	for n.height > height {
-		if n.prev == nil {
-			return nil, false
-		}
+	walk := n
+	heightWalk := n.height
 
-		n = n.prev
+	for heightWalk > height {
+		heightSkip := getSkipHeight(heightWalk)
+		heightSkipPrev := getSkipHeight(heightWalk - 1)
+
+		if walk.skip != nil &&
+			(heightSkip == height ||
+				(heightSkip > height &&
+					!(heightSkipPrev < heightSkip-2 && heightSkipPrev >= height))) {
+			// Only follow pskip if pprev->pskip isn't better than pskip->pprev.
+			walk = walk.skip
+			heightWalk = heightSkip
+		} else {
+			if walk.prev == nil {
+				return nil, false
+			}
+
+			walk = walk.prev
+			heightWalk--
+		}
 	}
 
-	return n, true
+	return walk, true
+}
+
+// buildSkipLocked mirrors block_index.cpp CBlockIndex::BuildSkipNL
+// (block_index.cpp:107-112): pskip = pprev->GetAncestor(GetSkipHeight(nHeight)).
+// Called once at insert time, under idx.mu, after n.prev and n.height are
+// set and before n is published into idx.nodes; genesis has no prev, so it
+// keeps pskip nil, matching the source's `if (pprev)` guard.
+func buildSkipLocked(n *node) *node {
+	if n.prev == nil {
+		return nil
+	}
+
+	skip, ok := ancestorLocked(n.prev, getSkipHeight(n.height))
+	if !ok {
+		return nil
+	}
+
+	return skip
 }
 
 // Locator builds a block locator for the current tip.
