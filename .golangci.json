@@ -88,6 +88,13 @@
         },
         {
           "linters": [
+            "depguard",
+            "forbidigo"
+          ],
+          "path": "compat/txscript"
+        },
+        {
+          "linters": [
             "forbidigo"
           ],
           "path": "pkg"
