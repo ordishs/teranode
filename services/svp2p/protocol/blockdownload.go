@@ -1,0 +1,727 @@
+package protocol
+
+import (
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
+)
+
+// BlockDownloadWindow mirrors validation.h DEFAULT_BLOCK_DOWNLOAD_WINDOW
+// (1024): how far past the last block we have in common with a peer we are
+// willing to schedule downloads. SVNode makes it configurable with
+// -blockdownloadwindow; Phase 2 carries the default as a constant.
+const BlockDownloadWindow = 1024
+
+// MaxBlocksInTransitPerPeer mirrors validation.h
+// MAX_BLOCKS_IN_TRANSIT_PER_PEER (16): the number of blocks we may have in
+// flight from one peer at a time.
+const MaxBlocksInTransitPerPeer = 16
+
+// BlockStallingTimeout mirrors validation.h DEFAULT_BLOCK_STALLING_TIMEOUT
+// (10 seconds): how long a peer may hold the head of the download window
+// before we disconnect it. SVNode makes it configurable with
+// -blockstallingtimeout; Phase 2 carries the default as a constant.
+const BlockStallingTimeout = 10 * time.Second
+
+// MaxLastBlockTime carries legacy netsync manager.go maxLastBlockTime
+// (60 * 3 seconds): how long the sync peer may make no progress before
+// Teranode rotates it. This is not an SVNode rule — see the source note on
+// CheckStall.
+const MaxLastBlockTime = 180 * time.Second
+
+// microsPerSecond mirrors the net_processing.cpp MICROS_PER_SECOND used by
+// every GetTimeMicros comparison this file ports.
+const microsPerSecond = int64(time.Second / time.Microsecond)
+
+// StallAction is what a periodic stall check decided about one peer. The
+// machine performs no teardown itself: it reports what the caller must do, the
+// same contract HeaderSync.OnHeaders uses for its disconnect errors.
+type StallAction int
+
+const (
+	// StallActionNone means the peer is healthy; do nothing.
+	StallActionNone StallAction = iota
+
+	// StallActionDisconnect means the peer stalled block download past
+	// BlockStallingTimeout. The caller must disconnect it and then call
+	// PeerDisconnected on both this machine and HeaderSync.
+	StallActionDisconnect
+
+	// StallActionRotateSyncPeer means the sync peer made no progress for
+	// MaxLastBlockTime. The sync slot and the peer's in-flight blocks are
+	// already released when this returns; the peer stays connected and the
+	// caller must choose a new sync peer (HeaderSync.PeerEstablished on a
+	// candidate).
+	StallActionRotateSyncPeer
+)
+
+func (a StallAction) String() string {
+	switch a {
+	case StallActionNone:
+		return "none"
+	case StallActionDisconnect:
+		return "disconnect"
+	case StallActionRotateSyncPeer:
+		return "rotate-sync-peer"
+	default:
+		return "unknown"
+	}
+}
+
+// BlockDownloader is the net_processing.cpp block download scheduler: the
+// FindNextBlocksToDownload window walk, the BlockDownloadTracker in-flight
+// map, the INV handler's block half, and the stall rules. It performs no I/O
+// and reads no clock: every event returns the messages the caller must send
+// plus a decision, and every timestamp arrives as a parameter in microseconds
+// since the Unix epoch, the unit SVNode's GetTimeMicros uses.
+//
+// Locking: BlockDownloader carries no lock of its own. Like peerSyncState and
+// HeaderSync, every method assumes the caller already holds PeerManager's
+// shared sync-state mutex — this package's port of cs_main. Lock order in this
+// package is peer lock, then manager lock.
+type BlockDownloader struct {
+	idx *HeaderIndex
+	hs  *HeaderSync
+
+	// inFlight is the BlockDownloadTracker mMapBlocksInFlight port, mapping a
+	// block hash to the peer we requested it from. SVNode holds a multimap so a
+	// stalling block can be fetched from several peers at once; that parallel
+	// fetch is gated on per-peer bandwidth measurements
+	// (IsBlockDownloadStallingFromPeer), which this port has no source for, so
+	// Phase 2 requests each block from exactly one peer. The nodeStaller
+	// mechanism that names the peer holding up the window is kept, so a peer
+	// that sits on a block is disconnected rather than raced.
+	inFlight map[chainhash.Hash]*SyncPeer
+
+	// haveData ports CBlockIndex::getStatus().hasData(): the blocks whose full
+	// data we hold. SVNode reads it from the block index; this machine has no
+	// block store, so it records what it was told arrived through BlockReceived
+	// and drops each entry once our own active chain covers it, which is the
+	// durable record from then on. A block we hold from an earlier run and
+	// never saw arrive this session is therefore re-requested; that costs one
+	// redundant download, which SVNode also tolerates elsewhere.
+	haveData map[chainhash.Hash]struct{}
+
+	// lastTipHeight is the header index tip height at the previous stall check.
+	// It is how CheckStall observes headers-first progress without reading a
+	// clock or being told about it — see the source note there.
+	lastTipHeight int32
+
+	// txInvsReceived counts tx inventory announcements. Decision 1 defers the
+	// whole tx path to Phase 3, so Phase 2 counts and logs them and does
+	// nothing else. Guarded by the caller's sync-state mutex like every other
+	// field here, so it needs no atomic.
+	txInvsReceived uint64
+}
+
+// NewBlockDownloader builds a downloader over the header index and the
+// headers-first machine that shares it. The HeaderSync reference is what lets
+// a rotation release the sync slot in the same step it releases the peer's
+// downloads.
+func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, error) {
+	if idx == nil {
+		return nil, errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: header index is nil")
+	}
+
+	if hs == nil {
+		return nil, errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: header sync is nil")
+	}
+
+	_, tipHeight := idx.Tip()
+
+	return &BlockDownloader{
+		idx:           idx,
+		hs:            hs,
+		inFlight:      make(map[chainhash.Hash]*SyncPeer),
+		haveData:      make(map[chainhash.Hash]struct{}),
+		lastTipHeight: tipHeight,
+	}, nil
+}
+
+// FindNextBlocksToDownload is the net_processing.cpp function of the same name:
+// "Update pindexLastCommonBlock and add not-in-flight missing successors to
+// vBlocks, until it has at most count entries." activeTip is our own best chain
+// tip, the chainActive counterpart, which the caller reads from Teranode's
+// blockchain service. staller is the peer whose in-flight blocks are the only
+// reason this peer cannot fetch anything, the C++ nodeStaller out-parameter.
+//
+// During IBD exactly one peer — the sync peer — has a useful
+// pindexBestKnownBlock; every other peer has only parked a hashLastUnknownBlock
+// until headers-first ends. Those peers take the "nothing interesting" return
+// below and cost one map lookup, which is the behaviour the plan expects.
+func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip HeaderNode, count int) (blocks []HeaderNode, staller *SyncPeer) {
+	if peer == nil || peer.State == nil || count <= 0 {
+		return nil, nil
+	}
+
+	state := peer.State
+
+	// "Make sure pindexBestKnownBlock is up to date, we'll need it."
+	state.processBlockAvailability(bd.idx)
+
+	best := state.pindexBestKnownBlock
+	if best == nil {
+		// "This peer has nothing interesting."
+		return nil, nil
+	}
+
+	// C++ compares nChainWork against nMinimumChainWork and against our own
+	// tip's work. The header index tracks height instead (spec §6, Phase 2
+	// simplification), so this is the same "not better than what we already
+	// have" test against Height. nMinimumChainWork has no height counterpart
+	// and is not carried.
+	if best.Height < activeTip.Height {
+		// "This peer has nothing interesting."
+		return nil, nil
+	}
+
+	if state.pindexLastCommonBlock == nil {
+		// "Bootstrap quickly by guessing a parent of our best tip is the
+		// forking point. Guessing wrong in either direction is not a problem."
+		height := best.Height
+		if activeTip.Height < height {
+			height = activeTip.Height
+		}
+
+		anchor, ok := bd.idx.Ancestor(activeTip.Hash, height)
+		if !ok {
+			return nil, nil
+		}
+
+		state.pindexLastCommonBlock = &anchor
+	}
+
+	// "If the peer reorganized, our previous pindexLastCommonBlock may not be
+	// an ancestor of its current tip anymore. Go back enough to fix that."
+	common, ok := lastCommonAncestor(bd.idx, *state.pindexLastCommonBlock, *best)
+	if !ok {
+		return nil, nil
+	}
+
+	state.pindexLastCommonBlock = &common
+
+	if common.Hash.IsEqual(&best.Hash) {
+		return nil, nil
+	}
+
+	// The chainActive.Contains(pindex) test, made O(1). Every block the walk
+	// below visits is on the peer's branch, so it is on our active chain
+	// exactly when it is at or below the height where the two branches part.
+	forkHeight := int32(-1)
+	if fork, forkOK := lastCommonAncestor(bd.idx, activeTip, *best); forkOK {
+		forkHeight = fork.Height
+	}
+
+	// "Never fetch further than the best block we know the peer has, or more
+	// than BLOCK_DOWNLOAD_WINDOW + 1 beyond the last linked block we have in
+	// common with this peer. The +1 is so we can detect stalling, namely if we
+	// would be able to download that next block if the window were 1 larger."
+	windowEnd := common.Height + BlockDownloadWindow
+
+	maxHeight := best.Height
+	if windowEnd+1 < maxHeight {
+		maxHeight = windowEnd + 1
+	}
+
+	branch, ok := bd.branchBetween(*best, common.Height+1, maxHeight)
+	if !ok {
+		return nil, nil
+	}
+
+	var (
+		waitingFor *SyncPeer
+		// contiguous ports the GetChainTx() guard on the pindexLastCommonBlock
+		// advance. C++ reads nChainTx, which is non-zero only once every
+		// ancestor has data, so the last-common block never jumps over a hole
+		// in the download. Tracking the unbroken run from the start of the walk
+		// is the same rule: the walk starts at the block after the current
+		// last-common, which we have by definition.
+		contiguous = true
+	)
+
+	for i := range branch {
+		node := branch[i]
+		inActiveChain := node.Height <= forkHeight
+
+		_, have := bd.haveData[node.Hash]
+		if have && inActiveChain {
+			// Our own chain now covers this block, so it needs no separate
+			// record. See the haveData field note.
+			delete(bd.haveData, node.Hash)
+		}
+
+		// "update pindexLastCommonBlock as long as all ancestors are already
+		// downloaded, or if it's already part of our chain (and therefore don't
+		// need it even if pruned)."
+		if have || inActiveChain {
+			if contiguous {
+				advanced := node
+				state.pindexLastCommonBlock = &advanced
+			}
+
+			continue
+		}
+
+		contiguous = false
+
+		if holder, busy := bd.inFlight[node.Hash]; busy {
+			// "This is the first already-in-flight block."
+			if waitingFor == nil {
+				waitingFor = holder
+			}
+
+			continue
+		}
+
+		// The C++ FetchBlock lambda, inlined. SVNode also drops blocks above
+		// chainActive.Height() + GetBlockDownloadLowerWindow(), a disk-usage
+		// limiter on a separate config knob; it is not carried here.
+		if node.Height > windowEnd {
+			// "We reached the end of the window."
+			if len(blocks) == 0 && waitingFor != nil && waitingFor != peer {
+				// "We aren't able to fetch anything, but we would be if the
+				// download window was one larger."
+				staller = waitingFor
+			}
+
+			break
+		}
+
+		blocks = append(blocks, node)
+
+		if len(blocks) == count {
+			break
+		}
+	}
+
+	return blocks, staller
+}
+
+// branchBetween returns the nodes on best's branch at heights from..to
+// inclusive, in ascending height order.
+//
+// C++ walks this range with CBlockIndex::GetAncestor in chunks of 128 and then
+// follows pprev backwards inside each chunk, because its skiplist makes one
+// GetAncestor cost about a hundred pointer steps. HeaderIndex.Ancestor is a
+// plain pprev walk with no skiplist (see its own note), so calling it once per
+// height would be O(window x depth) — quadratic in the depth of the chain. One
+// Ancestor call to the top of the range plus ParentHash steps down through it
+// is O(depth + window) instead, and takes the index lock once for the long walk
+// rather than once per step.
+func (bd *BlockDownloader) branchBetween(best HeaderNode, from, to int32) ([]HeaderNode, bool) {
+	if to < from {
+		return nil, false
+	}
+
+	node, ok := bd.idx.Ancestor(best.Hash, to)
+	if !ok {
+		return nil, false
+	}
+
+	branch := make([]HeaderNode, 0, to-from+1)
+
+	for {
+		branch = append(branch, node)
+
+		if node.Height == from {
+			break
+		}
+
+		parent, found := bd.idx.Lookup(node.ParentHash)
+		if !found {
+			// Defensive: unreachable given the genesis-rooted invariant on
+			// HeaderIndex, since from is at least 1 here.
+			return nil, false
+		}
+
+		node = parent
+	}
+
+	for i, j := 0, len(branch)-1; i < j; i, j = i+1, j-1 {
+		branch[i], branch[j] = branch[j], branch[i]
+	}
+
+	return branch, true
+}
+
+// lastCommonAncestor is chain.cpp LastCommonAncestor: walk the higher of the
+// two nodes down to the other's height, then step both back together until
+// they meet. The genesis-rooted invariant on HeaderIndex guarantees they meet.
+func lastCommonAncestor(idx *HeaderIndex, a, b HeaderNode) (HeaderNode, bool) {
+	var ok bool
+
+	if a.Height > b.Height {
+		if a, ok = idx.Ancestor(a.Hash, b.Height); !ok {
+			return HeaderNode{}, false
+		}
+	} else if b.Height > a.Height {
+		if b, ok = idx.Ancestor(b.Hash, a.Height); !ok {
+			return HeaderNode{}, false
+		}
+	}
+
+	for !a.Hash.IsEqual(&b.Hash) {
+		if a.Height == 0 {
+			// Defensive: unreachable, both chains terminate at the same
+			// genesis node.
+			return HeaderNode{}, false
+		}
+
+		if a, ok = idx.Lookup(a.ParentHash); !ok {
+			return HeaderNode{}, false
+		}
+
+		if b, ok = idx.Lookup(b.ParentHash); !ok {
+			return HeaderNode{}, false
+		}
+	}
+
+	return a, true
+}
+
+// SendGetDataBlocks is the net_processing.cpp SendMessages helper of the same
+// name: schedule up to MAX_BLOCKS_IN_TRANSIT_PER_PEER blocks from this peer,
+// mark them in flight, and start the stall clock of whatever peer is holding
+// the window shut. The caller drives it for each peer on its send pass.
+func (bd *BlockDownloader) SendGetDataBlocks(peer *SyncPeer, activeTip HeaderNode, nowMicros int64) []wire.Message {
+	if peer == nil || peer.State == nil {
+		return nil
+	}
+
+	// C++ gates on !pto->fClient && (fFetch || !IsInitialBlockDownload()) —
+	// "this peer can serve us blocks". isSyncCandidate is the reading of that
+	// predicate this port already made in Task 5, including the regtest
+	// exception, so it is reused rather than restated.
+	if !bd.hs.isSyncCandidate(peer) {
+		return nil
+	}
+
+	state := peer.State
+	if state.nBlocksInFlight >= MaxBlocksInTransitPerPeer {
+		return nil
+	}
+
+	blocks, staller := bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer-state.nBlocksInFlight)
+
+	getData := wire.NewMsgGetDataSizeHint(uint(len(blocks)))
+
+	for i := range blocks {
+		hash := blocks[i].Hash
+
+		if err := getData.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash)); err != nil {
+			// Unreachable at this size: the batch is capped at 16 and the
+			// message limit is MaxInvPerMsg. Stop rather than mark a block in
+			// flight we are not going to ask for.
+			break
+		}
+
+		// net_processing.cpp: "Requesting block %s (%d) peer=%d".
+		bd.MarkBlockAsInFlight(peer, blocks[i])
+	}
+
+	// Checked after the marking, as C++ does: staller is only ever set when the
+	// batch came back empty, so nBlocksInFlight is unchanged in that case.
+	if state.nBlocksInFlight == 0 && staller != nil && staller.State != nil && staller.State.nStallingSince == 0 {
+		// net_processing.cpp: "Stall started (current speed %d) peer=%d".
+		staller.State.nStallingSince = nowMicros
+	}
+
+	if len(getData.InvList) == 0 {
+		return nil
+	}
+
+	return []wire.Message{getData}
+}
+
+// MarkBlockAsInFlight is BlockDownloadTracker::MarkBlockAsInFlight. It reports
+// false when the block is already in flight, the C++ short-circuit for the same
+// block from the same node — extended to any node, since Phase 2 fetches each
+// block from exactly one peer (see the inFlight field note).
+func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode) bool {
+	if peer == nil || peer.State == nil {
+		return false
+	}
+
+	if _, busy := bd.inFlight[block.Hash]; busy {
+		return false
+	}
+
+	bd.inFlight[block.Hash] = peer
+	peer.State.nBlocksInFlight++
+
+	return true
+}
+
+// BlockReceived is BlockDownloadTracker::MarkBlockAsReceived: the block's data
+// arrived from peer and we now hold it. It reports whether the block was
+// actually in flight from that peer. The caller must use BlockFailed instead
+// when the download failed or the block was rejected, so the data is not
+// recorded as held.
+func (bd *BlockDownloader) BlockReceived(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
+	bd.haveData[hash] = struct{}{}
+
+	if peer != nil && peer.State != nil {
+		// legacy netsync manager.go handleBlockMsg: a delivered block refreshes
+		// the sync peer's rotation clock. See the source note on CheckStall.
+		peer.State.nLastProgressTime = nowMicros
+	}
+
+	return bd.removeFromFlight(peer, hash)
+}
+
+// BlockFailed is BlockDownloadTracker::MarkBlockAsFailed: the download was
+// cancelled, timed out, or the block was rejected. The block goes back on
+// offer to any peer, including this one.
+func (bd *BlockDownloader) BlockFailed(peer *SyncPeer, hash chainhash.Hash) bool {
+	delete(bd.haveData, hash)
+
+	return bd.removeFromFlight(peer, hash)
+}
+
+// removeFromFlight is BlockDownloadTracker::removeFromBlockMapNL. It only fires
+// for the peer the block was requested from, matching the C++ getBlockFromNodeNL
+// lookup by node.
+func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash) bool {
+	holder, busy := bd.inFlight[hash]
+	if !busy || holder != peer {
+		return false
+	}
+
+	delete(bd.inFlight, hash)
+
+	if holder.State != nil {
+		if holder.State.nBlocksInFlight > 0 {
+			holder.State.nBlocksInFlight--
+		}
+
+		holder.State.nStallingSince = 0
+	}
+
+	return true
+}
+
+// IsInFlight is BlockDownloadTracker::IsInFlight.
+func (bd *BlockDownloader) IsInFlight(hash chainhash.Hash) bool {
+	_, busy := bd.inFlight[hash]
+
+	return busy
+}
+
+// BlocksInFlight reports how many blocks are in flight across all peers.
+func (bd *BlockDownloader) BlocksInFlight() int { return len(bd.inFlight) }
+
+// TxInvsReceived reports how many tx inventory announcements have arrived.
+// Decision 1 defers the tx path to Phase 3; this is the counter that stands in
+// for it until then.
+func (bd *BlockDownloader) TxInvsReceived() uint64 { return bd.txInvsReceived }
+
+// PeerDisconnected is BlockDownloadTracker::ClearPeer, the block-download half
+// of net_processing.cpp FinalizeNode: everything the peer was downloading goes
+// back on offer and its download state resets. The caller must also call
+// HeaderSync.PeerDisconnected, which releases the sync slot.
+func (bd *BlockDownloader) PeerDisconnected(peer *SyncPeer) {
+	bd.clearPeer(peer)
+}
+
+// clearPeer releases every block in flight from peer and resets its download
+// bookkeeping. It is also legacy netsync manager.go clearRequestedState, which
+// the sync-peer rotation runs before choosing another peer.
+func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
+	if peer == nil {
+		return
+	}
+
+	for hash, holder := range bd.inFlight {
+		if holder == peer {
+			delete(bd.inFlight, hash)
+		}
+	}
+
+	if peer.State != nil {
+		peer.State.nBlocksInFlight = 0
+		peer.State.nStallingSince = 0
+		peer.State.pindexLastCommonBlock = nil
+	}
+}
+
+// OnInv is the net_processing.cpp NetMsgType::INV event. It returns the
+// messages to send back and an error only when the peer must be disconnected.
+//
+// Block invs update availability and, for a block whose header we do not have,
+// ask for headers rather than the block itself: "since headers-announcements
+// are now the primary method of announcement on the network, and since, in the
+// case that a node fell back to inv we probably have a reorg which we should
+// get the headers for first, we now only provide a getheaders response here.
+// When we receive the headers, we will then ask for the blocks we need."
+//
+// Tx invs are counted and nothing else — Decision 1 defers the tx path to
+// Phase 3.
+func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Message, error) {
+	if peer == nil || peer.State == nil || msg == nil {
+		return nil, nil
+	}
+
+	var (
+		msgs      []wire.Message
+		requested map[chainhash.Hash]struct{}
+	)
+
+	for _, inv := range msg.InvList {
+		if inv == nil {
+			continue
+		}
+
+		switch inv.Type {
+		case wire.InvTypeBlock:
+			// net_processing.cpp: "got block inv: %s %s peer=%d".
+			peer.State.updateBlockAvailability(bd.idx, inv.Hash)
+
+			// AlreadyHave(MSG_BLOCK) is IsBlockKnown, a mapBlockIndex lookup:
+			// a block we already have a header for needs no getheaders.
+			if _, known := bd.idx.Lookup(inv.Hash); known {
+				continue
+			}
+
+			if bd.IsInFlight(inv.Hash) {
+				continue
+			}
+
+			// A narrow deviation: C++ answers every inv entry on its own, so a
+			// hash repeated inside one message draws one getheaders per copy.
+			// Nothing about our state changes between them, so the copies are
+			// identical and wasted. One per message is enough.
+			if _, dup := requested[inv.Hash]; dup {
+				continue
+			}
+
+			if requested == nil {
+				requested = make(map[chainhash.Hash]struct{})
+			}
+
+			requested[inv.Hash] = struct{}{}
+
+			// net_processing.cpp: "getheaders (%d) %s to peer=%d", where the
+			// height is that of the best header the locator was built from.
+			msgs = append(msgs, bd.getHeadersFor(inv.Hash))
+
+		case wire.InvTypeTx:
+			// net_processing.cpp: "got txn inv: %s %s txnsrc peer=%d". Phase 2
+			// stops here (Decision 1).
+			bd.txInvsReceived++
+
+		default:
+			// net_processing.cpp: "Got invalid inv type %d from peer=%d" →
+			// pfrom->fDisconnect = true. C++ finishes the loop first; there is
+			// nothing worth doing for a peer we are about to drop, so this
+			// returns straight away.
+			return msgs, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+				"svp2p: unsupported inv type %d", uint32(inv.Type), ErrProtocolViolation)
+		}
+	}
+
+	return msgs, nil
+}
+
+// getHeadersFor builds the inv-answering getheaders: a locator from our best
+// header, stopping at the announced hash. This is chainActive.GetLocator with
+// mapBlockIndex.GetBestHeader, and unlike HeaderSync's getheaders it never
+// carries a checkpoint hashStop — the stop here is the block the peer just
+// announced.
+func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeaders {
+	msg := wire.NewMsgGetHeaders()
+	msg.ProtocolVersion = wire.ProtocolVersion
+
+	locator := bd.idx.Locator()
+	for i := range locator {
+		hash := locator[i]
+		msg.BlockLocatorHashes = append(msg.BlockLocatorHashes, &hash)
+	}
+
+	msg.HashStop = stop
+
+	return msg
+}
+
+// CheckStall is the periodic timer event, driven per peer by the caller. It
+// reads no clock: nowMicros arrives as a parameter. It carries two rules from
+// two different sources.
+//
+// The first is net_processing.cpp DetectStalling: a peer whose nStallingSince
+// clock has run past BlockStallingTimeout is holding the head of the download
+// window and is disconnected. C++ additionally re-arms that clock instead of
+// disconnecting when the peer is still delivering bytes at a healthy rate
+// (IsBlockDownloadStallingFromPeer); this port has no per-peer bandwidth meter,
+// so it always takes the disconnect branch — the branch C++ takes for a peer
+// delivering nothing. The bound on that gap is narrow: nStallingSince is only
+// ever set on a peer that is blocking the window, and any block it delivers
+// clears it (see removeFromFlight).
+//
+// The second is the Teranode sync-peer rotation, carried from legacy netsync
+// manager.go handleCheckSyncPeer and maxLastBlockTime (PR 1067). It is a
+// licensed deviation from SVNode, which has no such rule: SVNode keeps a sync
+// peer until it disconnects or its in-flight blocks time out. It also closes a
+// gap the SVNode rule leaves open here. During headers-first sync no block need
+// ever be in flight, so nStallingSince never starts and DetectStalling can
+// never fire; a peer that simply stops answering getheaders would hold the
+// single sync slot for ever. The rotation catches it, because its progress
+// clock is not refreshed by anything the silent peer does.
+//
+// Progress means one of two things, and only the sync peer has a clock at all:
+//   - a block was delivered (legacy's own trigger, refreshed in BlockReceived);
+//   - the header index tip rose while a headers-first round was running.
+//
+// The second source is this port's, not legacy's: legacy refreshes
+// lastBlockTime on delivered blocks only, so a peer feeding us a long run of
+// headers with no block yet to fetch would be rotated as if it were silent.
+// Observing the tip costs nothing, needs no extra call site, and is scoped to
+// headers-first rounds, which Task 5 restricts to the sync peer.
+func (bd *BlockDownloader) CheckStall(peer *SyncPeer, nowMicros int64) StallAction {
+	if peer == nil || peer.State == nil {
+		return StallActionNone
+	}
+
+	state := peer.State
+
+	if state.nStallingSince != 0 && state.nStallingSince < nowMicros-microsPerSecond*int64(BlockStallingTimeout/time.Second) {
+		// net_processing.cpp: "Peer=%d is stalling block download (current
+		// speed %d), disconnecting".
+		return StallActionDisconnect
+	}
+
+	// legacy netsync handleCheckSyncPeer only ever examines the sync peer.
+	if !state.fSyncStarted {
+		return StallActionNone
+	}
+
+	if _, tipHeight := bd.idx.Tip(); tipHeight > bd.lastTipHeight {
+		bd.lastTipHeight = tipHeight
+
+		if bd.hs.IsHeadersFirstMode() {
+			state.nLastProgressTime = nowMicros
+		}
+	}
+
+	// legacy seeds lastBlockTime when it elects the sync peer; seeding on the
+	// first check instead keeps the machine free of an extra election call and
+	// costs at most one tick of the rotation window.
+	if state.nLastProgressTime == 0 {
+		state.nLastProgressTime = nowMicros
+
+		return StallActionNone
+	}
+
+	if nowMicros-state.nLastProgressTime <= microsPerSecond*int64(MaxLastBlockTime/time.Second) {
+		return StallActionNone
+	}
+
+	// legacy netsync handleCheckSyncPeer: "sync peer %s is stalled due to %s,
+	// updating sync peer" → clearRequestedState then updateSyncPeer.
+	bd.clearPeer(peer)
+	bd.hs.SyncPeerTimedOut(peer)
+
+	state.nLastProgressTime = nowMicros
+
+	return StallActionRotateSyncPeer
+}

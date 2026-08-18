@@ -7,10 +7,9 @@ import (
 // peerSyncState is the net_processing.cpp CNodeState port: per-peer sync
 // bookkeeping consumed by headers-first sync (Task 5) and block download
 // scheduling (Task 6). Phase 2 keeps only the fields those two consumers
-// need; the rest of CNodeState (pindexLastCommonBlock,
-// pindexBestHeaderSent, nUnconnectingHeaders, and the block-download
-// bookkeeping beyond the in-flight count) is not carried here and is a
-// later-phase candidate if a consumer needs it.
+// need; the rest of CNodeState (pindexBestHeaderSent, nUnconnectingHeaders,
+// and the block-download bookkeeping beyond the in-flight count) is not
+// carried here and is a later-phase candidate if a consumer needs it.
 //
 // Locking: peerSyncState carries no lock of its own. SVNode guards the
 // equivalent mapNodeState entries with cs_main; this port's plan (spec §11,
@@ -38,6 +37,16 @@ type peerSyncState struct {
 	// IsNull().
 	hashLastUnknownBlock chainhash.Hash
 
+	// pindexLastCommonBlock mirrors CNodeState::pindexLastCommonBlock: the last
+	// block on this peer's branch that we already have, which is where block
+	// download resumes and where the download window starts. nil mirrors the
+	// C++ nullptr and makes FindNextBlocksToDownload bootstrap it from our own
+	// chain. Like pindexBestKnownBlock this is a HeaderNode value snapshot, not
+	// a live pointer into the index tree, so pointer equality against a fresh
+	// Lookup result is meaningless; compare Hash. Populated and consumed by
+	// block download scheduling (Task 6); not touched here.
+	pindexLastCommonBlock *HeaderNode
+
 	// nBlocksInFlight mirrors CNodeState::nBlocksInFlight: the number of
 	// blocks currently being downloaded from this peer. Populated and
 	// consumed by block download scheduling (Task 6); not touched here.
@@ -53,6 +62,14 @@ type peerSyncState struct {
 	// epoch, or 0 when not stalling. Populated and consumed by block download
 	// scheduling (Task 6); not touched here.
 	nStallingSince int64
+
+	// nLastProgressTime has no CNodeState counterpart. It carries legacy
+	// netsync manager.go syncPeerState.lastBlockTime, the clock the Teranode
+	// sync-peer rotation measures against maxLastBlockTime (PR 1067), in
+	// microseconds since the Unix epoch. 0 means no progress has been observed
+	// yet; the first stall check seeds it. Populated and consumed by block
+	// download scheduling (Task 6); not touched here.
+	nLastProgressTime int64
 }
 
 // newPeerSyncState returns a zero-value peerSyncState: no best known block,
