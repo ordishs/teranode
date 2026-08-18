@@ -13,6 +13,13 @@ import (
 // ErrBlockStreamClosed is returned by TxReader once the stream is closed.
 var ErrBlockStreamClosed = errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: block stream is closed")
 
+// minTxPayloadBytes is the smallest byte count a serialized transaction can
+// occupy: version 4 + input count varint 1 + output count varint 1 +
+// nLockTime 4. It mirrors minTxPayload in go-wire msg_tx.go, which
+// maxTxPerBlock in msg_block.go uses to bound the transaction count on the
+// buffered decode path.
+const minTxPayloadBytes = 10
+
 // wireHeader is the 24 byte message header, kept raw so a non-block message
 // can be replayed into go-wire's own framing path unchanged.
 type wireHeader struct {
@@ -103,10 +110,13 @@ func newBlockStream(r io.Reader, length uint64, pver uint32) (*BlockStream, erro
 		return b, err
 	}
 
-	// Every transaction occupies at least one payload byte, so a count above
-	// the unread remainder is impossible. Reject it here rather than let a
-	// consumer size an allocation from a peer-supplied number.
-	if count > uint64(b.lr.N) { //nolint:gosec // lr.N is non-negative
+	// Bound the count the way the buffered path does. go-wire rejects above
+	// maxTxPerBlock, which is MaxBlockPayload/minTxPayload; here the divisor
+	// applies to the unread remainder of this payload, so the bound is
+	// tighter than the buffered path's and never looser. Consumers size
+	// their ingest from TxCount, so this must not admit a number the
+	// buffered path would have refused.
+	if count > uint64(b.lr.N)/minTxPayloadBytes { //nolint:gosec // lr.N is non-negative
 		return b, errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
 			"svp2p: block declares %d transactions in %d remaining payload bytes", count, b.lr.N)
 	}
