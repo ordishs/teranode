@@ -13,7 +13,9 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-var ErrSendQueueFull = errors.New(errors.ERR_ERROR, "svp2p: send queue full")
+// ErrSendQueueFull carries its own code because the teranode errors package
+// matches errors.Is by code, and callers distinguish this condition.
+var ErrSendQueueFull = errors.New(errors.ERR_THRESHOLD_EXCEEDED, "svp2p: send queue full")
 
 type Config struct {
 	Net             wire.BitcoinNet
