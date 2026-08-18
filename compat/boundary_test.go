@@ -72,25 +72,17 @@ var allowlist = []allowlistEntry{
 func TestBoundary(t *testing.T) {
 	pkgs := loadModulePackages(t)
 
-	table := []struct {
-		name       string
-		fencedPath string
-	}{
-		{"txscript", legacyRoot + "/txscript"},
-		{"bsvutil", legacyRoot + "/bsvutil"},
-		{"bsvec", legacyRoot + "/bsvec"},
-	}
-
-	for _, tc := range table {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			violations := findViolations(pkgs, tc.fencedPath)
+	for _, fencedPath := range fencedPaths {
+		fencedPath := fencedPath
+		name := strings.TrimPrefix(fencedPath, legacyRoot+"/")
+		t.Run(name, func(t *testing.T) {
+			violations := findViolations(pkgs, fencedPath)
 			if len(violations) == 0 {
 				return
 			}
 
 			var b strings.Builder
-			fmt.Fprintf(&b, "found %d new consumer(s) importing %s directly (or a subpackage of it):\n", len(violations), tc.fencedPath)
+			fmt.Fprintf(&b, "found %d new consumer(s) importing %s directly (or a subpackage of it):\n", len(violations), fencedPath)
 			for _, v := range violations {
 				fmt.Fprintf(&b, "  %s imports %s\n", v.pkgID, v.importPath)
 			}
