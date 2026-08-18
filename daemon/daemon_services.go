@@ -1158,6 +1158,14 @@ func (d *Daemon) startLegacyService(
 
 	d.daemonStores.retainClient(blockassemblyClient)
 
+	peerRegistryClient, err := d.daemonStores.GetPeerRegistryClient(ctx, createLogger(serviceLegacy), appSettings, "")
+	if err != nil {
+		// Non-fatal: the legacy service runs without dashboard peer visibility.
+		createLogger(serviceLegacy).Warnf("[Legacy] peer registry client unavailable: %v", err)
+
+		peerRegistryClient = nil
+	}
+
 	// Add the Legacy service to the ServiceManager
 	return d.ServiceManager.AddService(serviceLegacyFormal, legacy.New(
 		createLogger(serviceLegacy),
@@ -1170,6 +1178,7 @@ func (d *Daemon) startLegacyService(
 		subtreeValidationClient,
 		blockValidationClient,
 		blockassemblyClient,
+		peerRegistryClient,
 	))
 }
 

@@ -27,6 +27,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -115,6 +116,11 @@ type Server struct {
 	// blockAssemblyClient handles block assembly operations
 	// Used for mining and block template generation
 	blockAssemblyClient *blockassembly.Client
+
+	// peerRegistry mirrors connected legacy peers into the centralized peer
+	// registry for dashboard visibility. It is nil when the registry is
+	// unavailable, which disables the mirror without affecting the service.
+	peerRegistry blockchain.PeerRegistryClientI
 }
 
 // New creates and returns a new Server instance with the provided dependencies.
@@ -135,6 +141,7 @@ type Server struct {
 //   - subtreeValidation: Interface to the subtree validation service
 //   - blockValidation: Interface to the block validation service
 //   - blockAssemblyClient: Client for the block assembly service (used for mining)
+//   - peerRegistry: Client for the centralized peer registry (dashboard visibility; may be nil)
 //
 // Returns a properly configured Server instance that is ready to be initialized and started.
 func New(logger ulogger.Logger,
@@ -147,6 +154,7 @@ func New(logger ulogger.Logger,
 	subtreeValidation subtreevalidation.Interface,
 	blockValidation blockvalidation.Interface,
 	blockAssemblyClient *blockassembly.Client,
+	peerRegistry blockchain.PeerRegistryClientI,
 ) *Server {
 	initPrometheusMetrics()
 
@@ -162,7 +170,77 @@ func New(logger ulogger.Logger,
 		subtreeValidation:   subtreeValidation,
 		blockValidation:     blockValidation,
 		blockAssemblyClient: blockAssemblyClient,
+		peerRegistry:        peerRegistry,
 	}
+}
+
+// legacyPeerSnapshots adapts the internal peer list to the registry sync view.
+// A nil return means the internal server could not answer, and the caller must
+// not read that as "no peers connected". An empty slice does mean "no peers".
+func (s *Server) legacyPeerSnapshots() []peerSnapshot {
+	if s.server == nil {
+		return nil
+	}
+
+	serverPeers := s.server.getPeers()
+	if serverPeers == nil {
+		return nil
+	}
+
+	var syncPeerID int32
+	if s.server.syncManager != nil {
+		syncPeerID = s.server.syncManager.SyncPeerID()
+	}
+
+	snapshots := make([]peerSnapshot, 0, len(serverPeers))
+
+	for _, sp := range serverPeers {
+		if sp == nil || sp.Peer == nil {
+			continue
+		}
+
+		// Secondary multistream peers share their primary's address and are not
+		// tracked in the main peer lists. Skip them so one connection produces
+		// one registry entry.
+		if sp.Peer.IsStreamPeer() {
+			continue
+		}
+
+		addr := sp.Addr()
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			s.logger.Debugf("[LegacyPeerRegistry] skipping peer with unusable address %q: %v", addr, err)
+			continue
+		}
+
+		var height uint32
+		if lastBlock := sp.LastBlock(); lastBlock > 0 {
+			height = uint32(lastBlock)
+		}
+
+		snapshots = append(snapshots, peerSnapshot{
+			id:            legacyRegistryID(addr),
+			addr:          addr,
+			userAgent:     sp.UserAgent(),
+			height:        height,
+			bytesSent:     sp.BytesSent(),
+			bytesReceived: sp.BytesReceived(),
+			lastRecv:      sp.LastRecv(),
+			legacy: blockchain.LegacyPeerInfo{
+				Inbound:         sp.Inbound(),
+				ProtocolVersion: sp.ProtocolVersion(),
+				ServiceFlags:    uint64(sp.Services()),
+				PingMicros:      sp.LastPingMicros(),
+				TimeOffsetSecs:  sp.TimeOffset(),
+				StartingHeight:  sp.StartingHeight(),
+				// Peer IDs come from an atomic counter that starts at 1, so a
+				// zero syncPeerID (no sync peer) can never match a real peer.
+				IsSyncPeer:    syncPeerID != 0 && sp.ID() == syncPeerID,
+				TimeConnected: sp.TimeConnected(),
+			},
+		})
+	}
+
+	return snapshots
 }
 
 // Health performs health checks on the server and its dependencies.
@@ -647,6 +725,13 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// Start periodic peer statistics logging
 	go s.logPeerStats(ctx)
 	s.logger.Infof("[Legacy Server] Started peer statistics logging")
+
+	if s.settings.Legacy.PeerRegistryEnabled && s.peerRegistry != nil {
+		registrySync := newPeerRegistrySync(s.logger, s.settings, s.peerRegistry, s.legacyPeerSnapshots)
+		go registrySync.run(ctx)
+	} else {
+		s.logger.Infof("[Legacy Server] Peer registry mirror disabled")
+	}
 
 	apiKey := s.settings.GRPCAdminAPIKey
 	if apiKey == "" {
