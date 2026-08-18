@@ -62,23 +62,56 @@ func blockPayload(t *testing.T, blk *wire.MsgBlock) []byte {
 	return buf.Bytes()
 }
 
-// writeRawFrame writes a message frame with a caller-chosen payload so tests
-// can declare a length the payload does not honour.
-func writeRawFrame(t *testing.T, w io.Writer, magic wire.BitcoinNet, cmd string, payload []byte) {
-	t.Helper()
+func payloadChecksum(payload []byte) [4]byte {
+	var c [4]byte
 
-	var hdr [wire.MessageHeaderSize]byte
+	copy(c[:], chainhash.DoubleHashB(payload)[0:4])
+
+	return c
+}
+
+// frameHeader builds a 24 byte message header from parts, so a test can
+// declare a length or a checksum the payload does not honour. It returns
+// bytes rather than writing, because a peer that rejects the frame hangs up
+// mid-write and the writing goroutine must not call require.
+func frameHeader(magic wire.BitcoinNet, cmd string, declaredLen uint32, checksum [4]byte) []byte {
+	hdr := make([]byte, wire.MessageHeaderSize)
 
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(magic))
 	copy(hdr[4:4+wire.CommandSize], cmd)
-	binary.LittleEndian.PutUint32(hdr[16:20], uint32(len(payload))) //nolint:gosec // test payloads are small
-	copy(hdr[20:24], chainhash.DoubleHashB(payload)[0:4])
+	binary.LittleEndian.PutUint32(hdr[16:20], declaredLen)
+	copy(hdr[20:24], checksum[:])
 
-	_, err := w.Write(hdr[:])
+	return hdr
+}
+
+// writeRawFrame writes a well-framed message with a caller-chosen payload.
+func writeRawFrame(t *testing.T, w io.Writer, magic wire.BitcoinNet, cmd string, payload []byte) {
+	t.Helper()
+
+	hdr := frameHeader(magic, cmd, uint32(len(payload)), payloadChecksum(payload)) //nolint:gosec // test payloads are small
+
+	_, err := w.Write(hdr)
 	require.NoError(t, err)
 
 	_, err = w.Write(payload)
 	require.NoError(t, err)
+}
+
+// requireConnFailsWithoutBlock asserts the read loop rejected a block frame
+// outright: no stream reached the consumer and the connection died.
+func requireConnFailsWithoutBlock(t *testing.T, c *Conn) {
+	t.Helper()
+
+	select {
+	case bs, open := <-c.InboundBlocks():
+		require.False(t, open, "a rejected block must not be delivered, got %v", bs)
+	case <-time.After(5 * time.Second):
+		t.Fatal("inbound block channel did not close")
+	}
+
+	<-c.Done()
+	require.Error(t, c.Err())
 }
 
 func recvBlock(t *testing.T, c *Conn) *BlockStream {
@@ -405,14 +438,9 @@ func TestBlockStreamShortStreamSurfacesError(t *testing.T) {
 	payload := blockPayload(t, blk)
 
 	go func() {
-		var hdr [wire.MessageHeaderSize]byte
+		hdr := frameHeader(wire.MainNet, wire.CmdBlock, uint32(len(payload)+512), payloadChecksum(payload)) //nolint:gosec // test payload is small
 
-		binary.LittleEndian.PutUint32(hdr[0:4], uint32(wire.MainNet))
-		copy(hdr[4:4+wire.CommandSize], wire.CmdBlock)
-		binary.LittleEndian.PutUint32(hdr[16:20], uint32(len(payload)+512)) //nolint:gosec // test payload is small
-		copy(hdr[20:24], chainhash.DoubleHashB(payload)[0:4])
-
-		_, _ = a.Write(hdr[:])
+		_, _ = a.Write(hdr)
 		_, _ = a.Write(payload)
 		_ = a.Close()
 	}()
@@ -421,7 +449,12 @@ func TestBlockStreamShortStreamSurfacesError(t *testing.T) {
 
 	_, _ = io.Copy(io.Discard, bs.TxReader())
 
-	require.Error(t, bs.Close(), "a short stream must surface as an error")
+	first := bs.Close()
+	require.Error(t, first, "a short stream must surface as an error")
+
+	// Close is idempotent on the error path too: the read loop calls it again
+	// and must see the same failure.
+	require.Equal(t, first, bs.Close())
 
 	select {
 	case <-cb.Done():
@@ -443,18 +476,125 @@ func TestBlockStreamMalformedHeaderFailsConn(t *testing.T) {
 
 	go func() {
 		// 40 bytes cannot hold an 80 byte block header.
-		writeRawFrame(t, a, wire.MainNet, wire.CmdBlock, make([]byte, 40))
+		payload := make([]byte, 40)
+
+		_, _ = a.Write(frameHeader(wire.MainNet, wire.CmdBlock, uint32(len(payload)), payloadChecksum(payload))) //nolint:gosec // fixed test size
+		_, _ = a.Write(payload)
+	}()
+
+	requireConnFailsWithoutBlock(t, cb)
+}
+
+// The buffered path rejects a transaction count above
+// MaxBlockPayload/minTxPayload. The streaming path must not admit a count the
+// buffered path would have refused, because consumers size their ingest from
+// TxCount.
+func TestBlockStreamAbsurdTxCountRejected(t *testing.T) {
+	a, b := net.Pipe()
+	cb := New(b, testConfig())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cb.Start(ctx)
+
+	const declaredLen = 1_000_000
+
+	require.Less(t, uint64(declaredLen), wire.MaxBlockPayload(), "the length guard must not be what rejects this frame")
+
+	blk := testMsgBlock(t, 0)
+
+	var prefix bytes.Buffer
+
+	require.NoError(t, blk.Header.BsvEncode(&prefix, wire.ProtocolVersion, wire.BaseEncoding))
+	require.NoError(t, wire.WriteVarInt(&prefix, wire.ProtocolVersion, 500_000))
+
+	// 500,000 transactions cannot fit in the ~999,911 payload bytes that
+	// follow: at minTxPayloadBytes each they need at least 5,000,000.
+	require.Less(t, uint64(500_000), uint64(declaredLen-prefix.Len()), "the count must be under the remaining byte count, so only the tx bound can reject it")
+
+	go func() {
+		_, _ = a.Write(frameHeader(wire.MainNet, wire.CmdBlock, declaredLen, payloadChecksum(prefix.Bytes())))
+		_, _ = a.Write(prefix.Bytes())
+	}()
+
+	requireConnFailsWithoutBlock(t, cb)
+	require.Contains(t, cb.Err().Error(), "declares 500000 transactions")
+}
+
+func TestBlockStreamOversizedPayloadRejected(t *testing.T) {
+	a, b := net.Pipe()
+	cb := New(b, testConfig())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cb.Start(ctx)
+
+	oversized := wire.MaxBlockPayload() + 1
+	require.LessOrEqual(t, oversized, uint64(^uint32(0)), "the test needs the oversized length to fit the header field")
+
+	go func() {
+		_, _ = a.Write(frameHeader(wire.MainNet, wire.CmdBlock, uint32(oversized), [4]byte{})) //nolint:gosec // bounded by the assertion above
+	}()
+
+	requireConnFailsWithoutBlock(t, cb)
+	require.Contains(t, cb.Err().Error(), "exceeds")
+}
+
+func TestBlockStreamWrongNetworkRejected(t *testing.T) {
+	a, b := net.Pipe()
+	cb := New(b, testConfig())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cb.Start(ctx)
+
+	payload := blockPayload(t, testMsgBlock(t, 1))
+
+	go func() {
+		_, _ = a.Write(frameHeader(wire.TestNet, wire.CmdBlock, uint32(len(payload)), payloadChecksum(payload))) //nolint:gosec // test payload is small
+		_, _ = a.Write(payload)
+	}()
+
+	requireConnFailsWithoutBlock(t, cb)
+	require.Contains(t, cb.Err().Error(), "other network")
+}
+
+// Replaying the header into wire.ReadMessageWithEncodingN must keep the
+// checksum verification the buffered path performs. A corrupt non-block frame
+// has to fail the connection.
+func TestNonBlockCorruptChecksumFailsConn(t *testing.T) {
+	a, b := net.Pipe()
+	cb := New(b, testConfig())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cb.Start(ctx)
+
+	var payload bytes.Buffer
+
+	require.NoError(t, wire.NewMsgPing(77).BsvEncode(&payload, wire.ProtocolVersion, wire.BaseEncoding))
+
+	bad := payloadChecksum(payload.Bytes())
+	bad[0] ^= 0xff
+
+	go func() {
+		_, _ = a.Write(frameHeader(wire.MainNet, wire.CmdPing, uint32(payload.Len()), bad)) //nolint:gosec // test payload is small
+		_, _ = a.Write(payload.Bytes())
 	}()
 
 	select {
-	case bs, open := <-cb.InboundBlocks():
-		require.False(t, open, "a malformed block must not be delivered, got %v", bs)
+	case msg, open := <-cb.Inbound():
+		require.False(t, open, "a frame with a bad checksum must not be delivered, got %v", msg)
 	case <-time.After(5 * time.Second):
-		t.Fatal("inbound block channel did not close")
+		t.Fatal("inbound channel did not close")
 	}
 
 	<-cb.Done()
-	require.Error(t, cb.Err())
+	require.ErrorContains(t, cb.Err(), "checksum")
 }
 
 func TestBlockStreamAccountsFullPayloadBytes(t *testing.T) {

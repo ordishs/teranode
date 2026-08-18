@@ -114,7 +114,9 @@ func (c *Conn) readLoop() {
 		}
 
 		// Detect "block" before any payload byte is materialized, and hand
-		// the socket to the consumer as a stream.
+		// the socket to the consumer as a stream. An extmsg-wrapped block
+		// carries the outer "extmsg" command, so it takes the buffered path
+		// below; extended headers are deferred per the phase plan.
 		if hdr.command == wire.CmdBlock {
 			if err := c.readBlock(hdr); err != nil {
 				c.fail(err)
@@ -166,9 +168,12 @@ func (c *Conn) readBlock(hdr wireHeader) error {
 
 	bs, err := newBlockStream(c.nc, length, c.pver.Load())
 
-	// Payload bytes are counted as they leave the socket: once for the part
-	// the read loop decoded itself, then once more for whatever the consumer
-	// read or the drain discarded.
+	// Payload bytes are charged as they leave the socket, in two steps: the
+	// part the read loop decoded itself, then whatever the consumer read plus
+	// whatever the drain discarded. A stream the consumer closes is always
+	// drained to the boundary, so a completed block charges the full declared
+	// length, as the buffered path does. The paths that charge less are the
+	// ones that fail the connection.
 	counted := bs.consumed()
 	c.received.Add(counted)
 
