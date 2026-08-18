@@ -78,12 +78,12 @@ func TestServerHelpers_ReconcileConnectionStates_SyncsBothDirections(t *testing.
 	unknownID := mustNewPeerID(t)
 	missedID := mustNewPeerID(t)
 
-	s.addConnectedPeer(liveID, "", 0, nil, "")
-	s.addConnectedPeer(goneID, "", 0, nil, "")
-	s.addConnectedPeer(unknownID, "", 0, nil, "")
+	s.addConnectedPeer(liveID, "", 0, 0, nil, "")
+	s.addConnectedPeer(goneID, "", 0, 0, nil, "")
+	s.addConnectedPeer(unknownID, "", 0, 0, nil, "")
 	// missed is live but its messages arrived before the liveness snapshot
 	// included it, so the hot path only registered it as gossiped.
-	s.addPeer(missedID, "", 0, nil, "")
+	s.addPeer(missedID, "", 0, 0, nil, "")
 
 	// live and missed have open connections (Addrs populated from the host's
 	// connections), gone is a known topic peer whose connection closed
@@ -119,7 +119,7 @@ func TestServerHelpers_StartPeerMapCleanup_RunsReconcile(t *testing.T) {
 	s.registryBatcher = newPeerRegistryBatcher(context.Background(), s.logger, s.peerRegistry, 0)
 
 	stale := mustNewPeerID(t)
-	s.addConnectedPeer(stale, "", 0, nil, "")
+	s.addConnectedPeer(stale, "", 0, 0, nil, "")
 
 	// Known topic peer with no open connection: the ticker-driven reconcile
 	// must clear its stale connected flag.
@@ -146,7 +146,7 @@ func TestServerHelpers_ReconcileConnectionStates_ErrorAndGuardPaths(t *testing.T
 	// ListPeers failure: the pass is skipped and flags stay untouched.
 	s3, reg3 := newServerWithLocalRegistry(t)
 	stale := mustNewPeerID(t)
-	s3.addConnectedPeer(stale, "", 0, nil, "")
+	s3.addConnectedPeer(stale, "", 0, 0, nil, "")
 	counting := newCountingRegistryClient(s3.peerRegistry)
 	s3.peerRegistry = counting
 	s3.P2PClient = &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{{ID: stale.String()}}}
@@ -160,7 +160,7 @@ func TestServerHelpers_ReconcileConnectionStates_ErrorAndGuardPaths(t *testing.T
 	// UpdateConnectionState failures: the loop logs and continues, covering
 	// both the clear and the flag direction.
 	live := mustNewPeerID(t)
-	s3.addPeer(live, "", 0, nil, "")
+	s3.addPeer(live, "", 0, 0, nil, "")
 	s3.P2PClient = &MockServerP2PClient{peers: []p2pMessageBus.PeerInfo{
 		{ID: stale.String()},
 		{ID: live.String(), Addrs: []string{"/ip4/10.0.0.9/tcp/9905"}},
@@ -256,7 +256,7 @@ func TestServerHelpers_AddPeer_Registers(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
 
-	s.addPeer(pid, "client/1.0", 100, nil, "http://peer.example")
+	s.addPeer(pid, "client/1.0", 100, 100, nil, "http://peer.example")
 
 	got, ok := reg.Get(pid.String())
 	require.True(t, ok)
@@ -269,7 +269,7 @@ func TestServerHelpers_AddConnectedPeer_FlipsConnected(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
 
-	s.addConnectedPeer(pid, "", 50, nil, "")
+	s.addConnectedPeer(pid, "", 50, 50, nil, "")
 
 	got, ok := reg.Get(pid.String())
 	require.True(t, ok)
@@ -279,7 +279,7 @@ func TestServerHelpers_AddConnectedPeer_FlipsConnected(t *testing.T) {
 func TestServerHelpers_RemovePeer_DropsEntry(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
-	s.addConnectedPeer(pid, "", 1, nil, "")
+	s.addConnectedPeer(pid, "", 1, 1, nil, "")
 	require.Equal(t, 1, reg.Count())
 
 	s.removePeer(pid)
@@ -294,7 +294,7 @@ func TestServerHelpers_GetPeer_FoundAndNotFound(t *testing.T) {
 	_, found := s.getPeer(pid)
 	require.False(t, found)
 
-	s.addPeer(pid, "", 1, nil, "")
+	s.addPeer(pid, "", 1, 1, nil, "")
 	got, found := s.getPeer(pid)
 	require.True(t, found)
 	require.Equal(t, pid.String(), got.ID)
@@ -303,7 +303,7 @@ func TestServerHelpers_GetPeer_FoundAndNotFound(t *testing.T) {
 func TestServerHelpers_UpdateStorage_PersistsMode(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
-	s.addPeer(pid, "", 1, nil, "")
+	s.addPeer(pid, "", 1, 1, nil, "")
 
 	s.updateStorage(pid, "pruned")
 	got, _ := reg.Get(pid.String())
@@ -334,9 +334,9 @@ func TestServerHelpers_InjectPeerForTesting_MarksFull(t *testing.T) {
 func TestGetNodeStatusMessage_CountsOnlyConnectedPeers(t *testing.T) {
 	s, _ := newServerWithLocalRegistry(t)
 
-	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", 10, nil, "")
-	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", 20, nil, "")
-	s.addPeer(mustNewPeerID(t), "client/1.0", 30, nil, "") // gossiped, not connected
+	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", 10, 10, nil, "")
+	s.addConnectedPeer(mustNewPeerID(t), "client/1.0", 20, 20, nil, "")
+	s.addPeer(mustNewPeerID(t), "client/1.0", 30, 30, nil, "") // gossiped, not connected
 
 	msg := s.getNodeStatusMessage(context.Background())
 	require.NotNil(t, msg)
@@ -394,7 +394,7 @@ func TestServerHelpers_GetPeerIDFromDataHubURL(t *testing.T) {
 
 	require.Empty(t, s.getPeerIDFromDataHubURL("http://anywhere"))
 
-	s.addPeer(pid, "", 1, nil, "http://datahub.example/api/v1")
+	s.addPeer(pid, "", 1, 1, nil, "http://datahub.example/api/v1")
 
 	require.Equal(t, pid.String(), s.getPeerIDFromDataHubURL("http://datahub.example/api/v1"))
 	require.Empty(t, s.getPeerIDFromDataHubURL("http://other.example"))
@@ -541,16 +541,19 @@ func TestHandleNodeStatusTopic_BoundsInflatedAdvertisedHeight(t *testing.T) {
 
 	s.handleNodeStatusTopic(context.Background(), msgBytes, remote.String())
 
-	expectedHeight := uint32(10_100)
 	got, ok := reg.Get(remote.String())
 	require.True(t, ok)
-	require.Equal(t, expectedHeight, got.Height)
+	require.Equal(t, uint32(10_100), got.Height,
+		"registry height drives sync decisions, so it stays capped at localHeight+maxLead")
+	require.Equal(t, uint32(1_000_000), got.AdvertisedHeight,
+		"the registry also keeps the peer's raw claim, for operator-facing display")
 	require.NotNil(t, got.BlockHash)
 	require.Equal(t, blockHash, got.BlockHash.String())
 
 	select {
 	case notification := <-s.notificationCh:
-		require.Equal(t, expectedHeight, notification.BestHeight)
+		require.Equal(t, uint32(1_000_000), notification.BestHeight,
+			"the notification is telemetry, so it reports what the peer advertised, not the cap")
 		require.Equal(t, blockHash, notification.BestBlockHash)
 	default:
 		t.Fatal("expected node_status notification")
@@ -580,16 +583,19 @@ func TestHandleBlockTopic_BoundsInflatedAdvertisedHeight(t *testing.T) {
 
 	s.handleBlockTopic(context.Background(), msgBytes, remote.String())
 
-	expectedHeight := uint32(10_100)
 	got, ok := reg.Get(remote.String())
 	require.True(t, ok)
-	require.Equal(t, expectedHeight, got.Height)
+	require.Equal(t, uint32(10_100), got.Height,
+		"registry height drives sync decisions, so it stays capped at localHeight+maxLead")
+	require.Equal(t, uint32(1_000_000), got.AdvertisedHeight,
+		"the registry also keeps the peer's raw claim, for operator-facing display")
 	require.NotNil(t, got.BlockHash)
 	require.Equal(t, blockHash, got.BlockHash.String())
 
 	select {
 	case notification := <-s.notificationCh:
-		require.Equal(t, expectedHeight, notification.Height)
+		require.Equal(t, uint32(1_000_000), notification.Height,
+			"the notification is telemetry, so it reports what the peer advertised, not the cap")
 		require.Equal(t, blockHash, notification.Hash)
 	default:
 		t.Fatal("expected block notification")
@@ -1386,8 +1392,8 @@ func TestServerGetPeersReturnsConnectedPeersWithHeight(t *testing.T) {
 	connectedPID := mustNewPeerID(t)
 	disconnectedPID := mustNewPeerID(t)
 
-	s.addConnectedPeer(connectedPID, "client/1.0", 123, nil, "")
-	s.addPeer(disconnectedPID, "client/1.0", 99, nil, "")
+	s.addConnectedPeer(connectedPID, "client/1.0", 123, 123, nil, "")
+	s.addPeer(disconnectedPID, "client/1.0", 99, 99, nil, "")
 
 	resp, err := s.GetPeers(context.Background(), &emptypb.Empty{})
 	require.NoError(t, err)

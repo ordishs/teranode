@@ -961,6 +961,7 @@ func TestSimpleClientGetPeerRegistry(t *testing.T) {
 						{
 							Id:                   "12D3KooWBhWMmHCXuyfM48dEPRsBzkemQQu71yC9rR2zHGmAjzQz",
 							Height:               99,
+							AdvertisedHeight:     962710,
 							IsConnected:          true,
 							BlocksReceived:       3,
 							SubtreesReceived:     4,
@@ -977,6 +978,8 @@ func TestSimpleClientGetPeerRegistry(t *testing.T) {
 		require.Equal(t, int64(3), peers[0].BlocksReceived)
 		require.Equal(t, int64(4), peers[0].SubtreesReceived)
 		require.Equal(t, int64(5), peers[0].TransactionsReceived)
+		require.Equal(t, uint32(962710), peers[0].AdvertisedHeight,
+			"the asset peers endpoint reads AdvertisedHeight off this conversion")
 	})
 	t.Run("grpc_error", func(t *testing.T) {
 		client := newClientWithMock(&MockPeerServiceClient{
