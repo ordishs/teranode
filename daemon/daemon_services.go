@@ -451,6 +451,14 @@ func (d *Daemon) startAssetService(ctx context.Context, appSettings *settings.Se
 		blockAssemblyClient = nil
 	}
 
+	assetPeerRegistryClient, err := d.daemonStores.GetPeerRegistryClient(ctx, createLogger(serviceAsset), appSettings, "")
+	if err != nil {
+		// Non-fatal: /api/v1/peers returns 503 until the registry is reachable.
+		createLogger(serviceAsset).Warnf("[Asset] peer registry client unavailable: %v", err)
+
+		assetPeerRegistryClient = nil
+	}
+
 	// Initialize the Asset service with the necessary parts
 	return d.ServiceManager.AddService(serviceAssetFormal, asset.NewServer(
 		createLogger(serviceAsset),
@@ -463,6 +471,7 @@ func (d *Daemon) startAssetService(ctx context.Context, appSettings *settings.Se
 		blockvalidationClient,
 		p2pClient,
 		banList,
+		assetPeerRegistryClient,
 		blockAssemblyClient,
 	))
 }
