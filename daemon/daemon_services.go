@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/pruner"
 	"github.com/bsv-blockchain/teranode/services/rpc"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/svp2p"
 	"github.com/bsv-blockchain/teranode/services/utxopersister"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -69,9 +70,14 @@ func (d *Daemon) startServices(ctx context.Context, logger ulogger.Logger, appSe
 	startBlockPersister := d.shouldStart(serviceBlockPersisterFormal, args)
 	startUTXOPersister := d.shouldStart(serviceUtxoPersisterFormal, args)
 	startLegacy := d.shouldStart(serviceLegacyFormal, args)
+	startSvp2p := d.shouldStart(serviceSvp2pFormal, args)
 	startRPC := d.shouldStart(serviceRPCFormal, args)
 	startAlert := d.shouldStart(serviceAlertFormal, args)
 	startPruner := d.shouldStart(servicePrunerFormal, args)
+
+	if err := validateServiceExclusions(startLegacy, startSvp2p); err != nil {
+		return err
+	}
 
 	// Create the application count based on the services that are going to be started
 	d.appCount += len(d.externalServices)
@@ -121,6 +127,7 @@ func (d *Daemon) startServices(ctx context.Context, logger ulogger.Logger, appSe
 		{startValidator, func() error { return d.startValidatorService(ctx, appSettings, createLogger) }},
 		{startPropagation, func() error { return d.startPropagationService(ctx, appSettings, createLogger) }},
 		{startLegacy, func() error { return d.startLegacyService(ctx, appSettings, createLogger) }},
+		{startSvp2p, func() error { return d.startSvp2pService(ctx, appSettings, createLogger) }},
 		{startPruner, func() error { return d.startPrunerService(ctx, appSettings, createLogger) }},
 	}
 
@@ -1170,6 +1177,37 @@ func (d *Daemon) startLegacyService(
 		subtreeValidationClient,
 		blockValidationClient,
 		blockassemblyClient,
+	))
+}
+
+// validateServiceExclusions refuses service combinations that cannot share a
+// daemon. Legacy and svp2p bridge the same P2P network with the same
+// legacy_* settings and ports, so exactly one of them may run.
+func validateServiceExclusions(startLegacy, startSvp2p bool) error {
+	if startLegacy && startSvp2p {
+		return errors.NewConfigurationError("legacy and svp2p cannot run together: they share ports and settings")
+	}
+
+	return nil
+}
+
+// startSvp2pService initializes and adds the svp2p service to the ServiceManager.
+// Phase 1 needs only the blockchain client; the ingestion dependencies arrive
+// with the bridge in Phase 2.
+func (d *Daemon) startSvp2pService(
+	ctx context.Context,
+	appSettings *settings.Settings,
+	createLogger func(string) ulogger.Logger,
+) error {
+	blockchainClient, err := d.daemonStores.GetBlockchainClient(ctx, createLogger(loggerBlockchainClient), appSettings, serviceSvp2p)
+	if err != nil {
+		return err
+	}
+
+	return d.ServiceManager.AddService(serviceSvp2pFormal, svp2p.New(
+		createLogger(serviceSvp2p),
+		appSettings,
+		blockchainClient,
 	))
 }
 

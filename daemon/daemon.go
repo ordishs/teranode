@@ -94,6 +94,8 @@ const (
 	serviceHelp                    = "help"
 	serviceLegacy                  = "legacy"
 	serviceLegacyFormal            = "Legacy"
+	serviceSvp2p                   = "svp2p"
+	serviceSvp2pFormal             = "Svp2p"
 	serviceNameDaemon              = "Daemon"
 	serviceNameP2P                 = "p2p"
 	serviceNameP2PFormal           = "P2P"
