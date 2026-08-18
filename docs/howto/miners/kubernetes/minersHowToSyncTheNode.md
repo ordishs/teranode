@@ -7,6 +7,7 @@ Last modified: 29-October-2025
 ## Table of Contents
 
 - [Overview](#overview)
+- [Why Seeding Instead of Full IBD](#why-seeding-instead-of-full-ibd)
 - [Synchronization Methods Comparison](#synchronization-methods-comparison)
 - [Method 1: Default Network Sync (P2P)](#method-1-default-network-sync-p2p)
 - [Method 2: Seeding from Legacy SV Node](#method-2-seeding-from-legacy-sv-node)
@@ -18,6 +19,16 @@ Last modified: 29-October-2025
 ## Overview
 
 This guide covers the different methods available for synchronizing a Teranode instance with the BSV Blockchain using Kubernetes. Whether you're setting up a fresh node or recovering from downtime, this document will help you choose the most appropriate synchronization method for your situation.
+
+---
+
+## Why Seeding Instead of Full IBD
+
+Legacy Bitcoin node implementations bootstrap by performing a full Initial Block Download (IBD): downloading and validating every block and every transaction back to the Genesis block. Teranode still supports this as Method 1 below, for compatibility with existing node implementations, but it does not scale as the primary bootstrap strategy for a Teranode-sized chain.
+
+The chain of block headers alone (80 bytes each) is sufficient to prove a node is following the correct Proof-of-Work chain back to Genesis; it does not require replaying every historical transaction to do so. Because Teranode targets a much higher block size and transaction throughput than legacy implementations, replaying the full transaction history from Genesis takes on the order of days (see the timeline under Method 1) and consumes proportionally more bandwidth and storage as the chain grows.
+
+Seeding instead bootstraps a node's UTXO set directly from a verified snapshot — exported from a Legacy SV Node or from an existing, already-synchronized Teranode instance — which reconstructs the current UTXO state in around an hour instead of days. This is why Methods 2 and 3 are recommended for production deployments, while full P2P sync (Method 1) remains available for cases without an existing data source to seed from.
 
 ---
 

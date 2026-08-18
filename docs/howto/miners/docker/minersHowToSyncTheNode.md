@@ -20,6 +20,25 @@ not provide full historical transaction data unless the source explicitly
 contains it. Enable `blockpersister` before syncing if you need raw historical
 block data for an explorer, indexer, or archive.
 
+## Why Seeding Instead of Full IBD
+
+Network sync performs a full Initial Block Download (IBD): it downloads and
+validates every block and transaction back to Genesis, the same way legacy
+node implementations bootstrap. Teranode still supports this path — see
+Network Sync below — but it is not the recommended way to bring up a fresh
+node at Teranode's scale.
+
+The chain of block headers alone is enough to prove a node is following the
+correct Proof-of-Work chain; it does not require replaying the full
+transaction history to do so. Because Teranode targets substantially higher
+block sizes and throughput than legacy nodes, a full IBD from Genesis can take
+days and scales with bandwidth, CPU, and storage as the chain grows.
+
+Seeding instead loads a verified UTXO snapshot before startup, reconstructing
+current state in a fraction of the time of a full download. That is why
+seeding is the recommended path when a compatible snapshot is available, with
+Network Sync reserved for fresh installs that have no seed source.
+
 ## Network Sync
 
 Network sync needs no seed data:
