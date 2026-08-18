@@ -17,6 +17,7 @@
   import RenderSpanWithTooltip from '$lib/components/table/renderers/render-span-with-tooltip/index.svelte'
   import RenderLink from '$lib/components/table/renderers/render-link/index.svelte'
   import RenderClickableSpan from '$lib/components/table/renderers/render-clickable-span/index.svelte'
+  import LegacyPeersCard from './LegacyPeersCard.svelte'
 
   const t = $derived($i18n.t)
 
@@ -35,6 +36,19 @@
     bytes_received: number
     last_block_time: number
     last_message_time: number
+    transport?: string
+    network_address?: string
+    bytes_sent?: number
+    legacy?: {
+      inbound: boolean
+      protocol_version: number
+      service_flags: number
+      ping_micros: number
+      time_offset_secs: number
+      starting_height: number
+      is_sync_peer: boolean
+      time_connected: number
+    }
     url_responsive: boolean
     last_url_check: number
     // Catchup metrics
@@ -83,6 +97,7 @@
 
   let allData: PeerData[] = $state([])  // Full dataset
   let data: PeerData[] = $state([])      // Paginated data for display
+  let legacyData: PeerData[] = $state([]) // Wire-protocol peers, shown in their own card
   let catchupStatus: CatchupStatusData | null = $state(null)
   let isLoading = $state(false)
   let error: string | null = $state(null)
@@ -298,13 +313,23 @@
       // Filter out peers whose last message was over 1 minute ago
       const now = Math.floor(Date.now() / 1000)
       const oneMinuteAgo = now - 60
-      allData = (result.peers || []).filter(peer => peer.last_message_time > oneMinuteAgo)
+      const fetched = result.peers || []
+
+      // The Teranode table keeps its established one-minute freshness filter.
+      // Legacy peers are filtered on connection state instead: a legacy peer
+      // pings every two minutes, so a one-minute last-message window would
+      // hide a healthy peer between pings.
+      allData = fetched.filter(
+        peer => peer.transport !== 'legacy' && peer.last_message_time > oneMinuteAgo,
+      )
+      legacyData = fetched.filter(peer => peer.transport === 'legacy')
       updatePaginatedData()
     } catch (err) {
       console.error('Failed to fetch peers:', err)
       error = err instanceof Error ? err.message : 'Unknown error'
       allData = []
       data = []
+      legacyData = []
     } finally {
       isLoading = false
     }
@@ -873,6 +898,8 @@
       </div>
     {/snippet}
   </Card>
+
+  <LegacyPeersCard peers={legacyData} />
 </PageWithMenu>
 
 {#if showCatchupModal && selectedPeer}
