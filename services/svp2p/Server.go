@@ -12,10 +12,12 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
@@ -26,6 +28,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+// headerHydrateBatch bounds each forward-walk fetch during header index
+// hydration and resync to the wire protocol's own headers-per-message cap.
+const headerHydrateBatch = wire.MaxBlockHeadersPerMsg
 
 // Server is the Teranode service shell for svp2p. It matches the service
 // manager contract of services/legacy/Server.go so the daemon can host
@@ -40,6 +46,9 @@ type Server struct {
 	listenAddresses []string
 	banList         *protocol.BanList
 	manager         *protocol.PeerManager
+
+	headerIndexMu sync.RWMutex
+	headerIndex   *protocol.HeaderIndex
 }
 
 func New(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI) *Server {
@@ -117,6 +126,25 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return err
 	}
 
+	if err := s.hydrateHeaderIndex(ctx); err != nil {
+		if errors.IsContextError(err) {
+			s.logger.Infof("[svp2p] shutting down during header index hydration")
+			return err
+		}
+
+		s.logger.Errorf("[svp2p] failed to hydrate header index: %s", err)
+
+		return err
+	}
+
+	headerNotifications, err := s.blockchainClient.Subscribe(ctx, blockchain.SubscriberSVP2P)
+	if err != nil {
+		s.logger.Errorf("[svp2p] failed to subscribe to blockchain notifications: %s", err)
+		return err
+	}
+
+	go s.runHeaderIndexSubscription(ctx, headerNotifications)
+
 	if err := s.manager.Start(ctx, s.listenAddresses); err != nil {
 		return err
 	}
@@ -159,6 +187,123 @@ func (s *Server) Stop(_ context.Context) error {
 	}
 
 	return s.manager.Stop()
+}
+
+// HeaderIndex returns the server's header index, or nil before Start has
+// hydrated it. Safe for concurrent use.
+func (s *Server) HeaderIndex() *protocol.HeaderIndex {
+	s.headerIndexMu.RLock()
+	defer s.headerIndexMu.RUnlock()
+
+	return s.headerIndex
+}
+
+func (s *Server) setHeaderIndex(idx *protocol.HeaderIndex) {
+	s.headerIndexMu.Lock()
+	s.headerIndex = idx
+	s.headerIndexMu.Unlock()
+}
+
+// hydrateHeaderIndex builds a fresh, genesis-rooted header index from the
+// blockchain service. The blockchain service stays the authoritative header
+// store (spec §11): this index is discarded and rebuilt on every startup.
+func (s *Server) hydrateHeaderIndex(ctx context.Context) error {
+	genesisHeaders, _, err := s.blockchainClient.GetBlockHeadersFromHeight(ctx, 0, 1)
+	if err != nil {
+		return errors.NewServiceError("svp2p: failed to fetch genesis header", err)
+	}
+
+	if len(genesisHeaders) == 0 {
+		return errors.NewServiceError("svp2p: blockchain store returned no genesis header")
+	}
+
+	idx, err := protocol.NewHeaderIndex(genesisHeaders[0].ToWireBlockHeader())
+	if err != nil {
+		return err
+	}
+
+	s.setHeaderIndex(idx)
+
+	return s.syncHeaderIndex(ctx)
+}
+
+// syncHeaderIndex walks the header index forward from its current tip to the
+// blockchain service's best header, in batches bounded by headerHydrateBatch.
+// It runs once during hydration and again on every subscription
+// notification, so it is a no-op once the index has caught up.
+func (s *Server) syncHeaderIndex(ctx context.Context) error {
+	idx := s.HeaderIndex()
+	if idx == nil {
+		return errors.NewServiceError("svp2p: header index sync called before hydration")
+	}
+
+	_, bestMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return errors.NewServiceError("svp2p: failed to get best block header", err)
+	}
+
+	_, tipHeight := idx.Tip()
+
+	for height := uint32(tipHeight) + 1; height <= bestMeta.Height; { //nolint:gosec // header heights are non-negative
+		limit := bestMeta.Height - height + 1
+		if limit > headerHydrateBatch {
+			limit = headerHydrateBatch
+		}
+
+		headers, _, err := s.blockchainClient.GetBlockHeadersFromHeight(ctx, height, limit)
+		if err != nil {
+			return errors.NewServiceError("svp2p: failed to fetch headers from height %d", height, err)
+		}
+
+		if len(headers) == 0 {
+			break
+		}
+
+		// GetBlockHeadersFromHeight returns its batch in descending height
+		// order; AddHeader needs each parent already indexed, so walk the
+		// batch from oldest to newest.
+		for i := len(headers) - 1; i >= 0; i-- {
+			h := headers[i]
+
+			connected, err := idx.AddHeader(h.ToWireBlockHeader())
+			if err != nil {
+				return err
+			}
+
+			if !connected {
+				s.logger.Warnf("[svp2p] orphan header %s while syncing header index at height %d", h.Hash(), height)
+			}
+		}
+
+		height += uint32(len(headers))
+	}
+
+	return nil
+}
+
+// runHeaderIndexSubscription keeps the header index current from the
+// blockchain service's own notifications. It exits when ctx is cancelled,
+// the same shutdown signal Start passes to the rest of the service.
+func (s *Server) runHeaderIndexSubscription(ctx context.Context, notifications <-chan *blockchain.Notification) {
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Infof("[svp2p] header index subscription shutting down")
+			return
+		case notification := <-notifications:
+			if notification == nil || notification.Type != model.NotificationType_Block {
+				continue
+			}
+
+			if err := s.syncHeaderIndex(ctx); err != nil {
+				if errors.IsContextError(err) {
+					return
+				}
+
+				s.logger.Errorf("[svp2p] failed to sync header index: %s", err)
+			}
+		}
+	}
 }
 
 func (s *Server) GetPeerCount(_ context.Context, _ *emptypb.Empty) (*peer_api.GetPeerCountResponse, error) {

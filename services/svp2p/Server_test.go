@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	bt "github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
@@ -161,6 +164,99 @@ func TestServerStopIsClean(t *testing.T) {
 		_, err := net.DialTimeout("tcp", grpcAddr, time.Second)
 		return err != nil
 	}, 10*time.Second, 100*time.Millisecond, "gRPC port still open after Stop")
+}
+
+// testHeaderBlock builds a minimal block extending previousHash. It mirrors
+// the header-chain stub used by the blockchain store's own tests: the store
+// only validates prev-hash linkage, not proof-of-work or the merkle root
+// against transactions.
+func testHeaderBlock(t *testing.T, nonce uint32, previousHash *chainhash.Hash) *model.Block {
+	t.Helper()
+
+	coinbase, err := bt.NewTxFromString(model.CoinbaseHex)
+	require.NoError(t, err)
+
+	bits, err := model.NewNBitFromString("1d00ffff")
+	require.NoError(t, err)
+
+	return &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      uint32(time.Now().Unix()), //nolint:gosec // test data, no overflow risk
+			Nonce:          nonce,
+			Bits:           *bits,
+			HashPrevBlock:  previousHash,
+			HashMerkleRoot: &chainhash.Hash{},
+		},
+		CoinbaseTx:       coinbase,
+		TransactionCount: 1,
+		SizeInBytes:      80,
+	}
+}
+
+func TestServerHydratesHeaderIndexFromBlockchain(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
+	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.WorkingDir = t.TempDir()
+	tSettings.GRPCAdminAPIKey = "test-admin-key"
+
+	store, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+
+	blockchainClient, err := blockchain.NewLocalClient(ulogger.TestLogger{}, tSettings, store, nil, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	genesisHeaders, _, err := blockchainClient.GetBlockHeadersFromHeight(ctx, 0, 1)
+	require.NoError(t, err)
+	require.Len(t, genesisHeaders, 1)
+
+	prevHash := genesisHeaders[0].Hash()
+
+	const chainLen = 3
+	for i := 0; i < chainLen; i++ {
+		block := testHeaderBlock(t, uint32(i+1), prevHash)
+		require.NoError(t, blockchainClient.AddBlock(ctx, block, ""))
+		prevHash = block.Header.Hash()
+	}
+
+	bestHeader, bestMeta, err := blockchainClient.GetBestBlockHeader(ctx)
+	require.NoError(t, err)
+
+	srv := New(ulogger.TestLogger{}, tSettings, blockchainClient)
+	cancel := startServer(t, srv)
+	defer cancel()
+	defer func() { require.NoError(t, srv.Stop(context.Background())) }()
+
+	require.Eventually(t, func() bool {
+		idx := srv.HeaderIndex()
+		if idx == nil {
+			return false
+		}
+
+		hash, height := idx.Tip()
+
+		return hash == *bestHeader.Hash() && height == int32(bestMeta.Height) //nolint:gosec // test-bounded height
+	}, 10*time.Second, 100*time.Millisecond, "header index did not hydrate to the store's best header")
+
+	newBlock := testHeaderBlock(t, uint32(chainLen+1), prevHash)
+	require.NoError(t, blockchainClient.AddBlock(ctx, newBlock, ""))
+
+	wantHeight := int32(bestMeta.Height) + 1 //nolint:gosec // test-bounded height
+	wantHash := *newBlock.Header.Hash()
+
+	require.Eventually(t, func() bool {
+		idx := srv.HeaderIndex()
+		if idx == nil {
+			return false
+		}
+
+		hash, height := idx.Tip()
+
+		return hash == wantHash && height == wantHeight
+	}, 10*time.Second, 100*time.Millisecond, "header index did not advance via the blockchain subscription")
 }
 
 func TestServerHealth(t *testing.T) {
