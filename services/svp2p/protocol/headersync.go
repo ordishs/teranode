@@ -284,6 +284,15 @@ func (hs *HeaderSync) resetHeaderState() {
 // OnHeaders is the net_processing.cpp NetMsgType::HEADERS event. It returns
 // the messages to send back, the misbehavior score to add to this peer, and an
 // error only when the peer must be disconnected outright.
+//
+// Caller contract on that error, which is either ErrCheckpointMismatch or
+// ErrHeadersNoProgress: the machine does not release the round itself. The
+// offending peer still holds the sync slot and headers-first mode is still on
+// when the error returns. The caller must disconnect the peer and then call
+// PeerDisconnected, which frees the slot and resets the header state. This is
+// the legacy shape, where DisconnectWithWarning leads to resetHeaderState and a
+// fresh startSync; splitting it this way keeps the machine free of any
+// knowledge of how a peer is torn down.
 func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Message, int, error) {
 	if peer == nil || peer.State == nil || msg == nil {
 		return nil, 0, nil
@@ -305,14 +314,22 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 		return nil, 0, nil
 	}
 
-	// legacy netsync manager.go handleHeadersMsg returns early for any headers
-	// that arrive outside the headers-first round it drives with its single
-	// sync peer. Carry that scope: while the round runs, a peer that does not
-	// hold the sync slot cannot put headers into the index at all, so it can
-	// neither race the round nor push the tip past the checkpoint the round is
-	// working toward. Its announcement still counts for block availability, so
-	// it stays usable for download afterwards. Outside the round every peer's
-	// headers are indexed, as net_processing.cpp does.
+	// Deliberate divergence from both parents, and stricter than either.
+	// net_processing.cpp indexes headers from every peer at all times. Legacy
+	// netsync manager.go handleHeadersMsg tests the MODE, not the peer — it
+	// disconnects anyone who sends headers while headers-first is off — but the
+	// round it protects is one it drives with a single sync peer. This port
+	// keeps the round single-peer without borrowing the disconnect: while the
+	// round runs, a peer that does not hold the sync slot has its batch
+	// ignored, so it can neither race the round nor push the tip past the
+	// checkpoint the round is working toward. Its announcement still counts for
+	// block availability, so it stays usable for download afterwards. Outside
+	// the round every peer's headers are indexed, as net_processing.cpp does.
+	//
+	// The ignored batch is deliberately unscored: junk headers cost a peer
+	// nothing but our wire decode here, and any disconnect policy for
+	// unrequested headers belongs to the manager (Task 11), which knows what it
+	// asked each peer for.
 	if hs.headersFirstMode && !peer.State.fSyncStarted {
 		peer.State.updateBlockAvailability(hs.cfg.Index, headers[len(headers)-1].BlockHash())
 
@@ -366,6 +383,7 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		lastAccepted       chainhash.Hash
 		lastAcceptedHeight int32
 		accepted           int
+		sawNewHeader       bool
 		reachedCheckpoint  bool
 	)
 
@@ -384,6 +402,11 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 			return nil, scoreInvalidHeader, nil
 		}
 
+		// Whether this header is new has to be read before the insert, because
+		// AddHeader reports a header already in the index as connected. The
+		// round's progress rule below needs to tell the two apart.
+		_, known := hs.cfg.Index.Lookup(header.BlockHash())
+
 		connected, err := hs.cfg.Index.AddHeader(header)
 		if err != nil {
 			return nil, 0, err
@@ -394,6 +417,10 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		// continuity scan guarantees the rest of the batch attaches.
 		if !connected {
 			return nil, scorePrevBlkNotFound, nil
+		}
+
+		if !known {
+			sawNewHeader = true
 		}
 
 		node, ok := hs.cfg.Index.Lookup(header.BlockHash())
@@ -449,11 +476,19 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		// hold as connected, so a peer replaying an old batch would otherwise
 		// draw the same getheaders from us for ever, unscored. Legacy netsync
 		// catches that peer on its header-list anchor — a replayed header does
-		// not connect to the expected parent — and disconnects it; the anchor
-		// height is this port's equivalent of that expectation.
-		if lastAcceptedHeight <= hs.roundAnchorHeight {
+		// not connect to the expected parent — and disconnects it.
+		//
+		// A batch counts as progress if it carried any header the index did not
+		// already hold, or if it ended above the height the last request went
+		// out from. Both clauses are needed. Height alone rejects an honest
+		// fork reply: our tip may sit on a taller branch, so a peer serving its
+		// real chain answers below that height with headers that are all new.
+		// Novelty alone rejects the honest echo of our own tip that the
+		// start-at-the-parent locator asks for. Only a replay — nothing new and
+		// no higher — fails both.
+		if !sawNewHeader && lastAcceptedHeight <= hs.roundAnchorHeight {
 			return nil, 0, errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
-				"svp2p: headers batch ended at height %d, not past the height %d it was requested from",
+				"svp2p: headers batch ended at height %d with nothing new, not past the height %d it was requested from",
 				lastAcceptedHeight, hs.roundAnchorHeight, ErrHeadersNoProgress)
 		}
 
@@ -488,7 +523,7 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 // (ContextualCheckBlockHeader / GetNextWorkRequired), and the bound on that gap
 // is narrower than it looks. Checkpoint enforcement covers only the
 // headers-first round: it applies to the sync peer, up to the next checkpoint.
-// The mainnet checkpoint list in chaincfg ends at height 868500, so above that
+// The mainnet checkpoint list in chaincfg ends at height 945000, so above that
 // height the only gate left on a received header is this check: a peer can feed
 // difficulty-1 headers that cost nothing to grind, and HeaderIndex grows one
 // unbounded map entry per header with no eviction. Restricting the round to the

@@ -452,20 +452,76 @@ func TestHeaderSync_OnHeadersBatching(t *testing.T) {
 		require.Zero(t, misbehavior)
 		require.Len(t, msgs, 1)
 
-		// Replaying it changes nothing: AddHeader reports headers we already
-		// hold as connected, so without the anchor the machine would answer
-		// with the same getheaders for ever. legacy manager.go catches the
-		// replay on its header-list anchor and disconnects the peer.
-		msgs, misbehavior, err = hs.OnHeaders(peer, headersMsg(batch))
+		// Replaying part of it changes nothing: AddHeader reports headers we
+		// already hold as connected, so without the anchor the machine would
+		// answer with the same getheaders for ever. legacy manager.go catches
+		// the replay on its header-list anchor and disconnects the peer.
+		// Replaying a prefix keeps the stall height (3) and the anchor (4)
+		// distinct, so the message has to name both.
+		msgs, misbehavior, err = hs.OnHeaders(peer, headersMsg(batch[:len(batch)-1]))
 		require.Error(t, err)
 		require.True(t, errors.Is(err, ErrHeadersNoProgress))
 		require.False(t, errors.Is(err, ErrCheckpointMismatch))
 		require.Nil(t, msgs)
 		require.Zero(t, misbehavior)
 
-		// The message must name the height it stalled at and the height the
+		// The message names the height it stalled at and the height the
 		// request went out from.
+		require.Contains(t, err.Error(), "height 3")
 		require.Contains(t, err.Error(), "height 4")
+
+		// The machine does not release the round on the error: the caller
+		// disconnects the peer and drives PeerDisconnected.
+		require.True(t, hs.IsHeadersFirstMode())
+		require.True(t, peer.State.fSyncStarted)
+
+		hs.PeerDisconnected(peer)
+		require.False(t, hs.IsHeadersFirstMode())
+		require.False(t, peer.State.fSyncStarted)
+	})
+
+	t.Run("a fork reply below our tip height counts as progress", func(t *testing.T) {
+		// Our tip sits on a branch the sync peer does not share: heights alone
+		// would call its honest answer a replay. This is the recovery case the
+		// header index's height-based tip makes reachable.
+		f := newSyncFixture(t, 6)
+
+		cpHash := chainhash.Hash{0xC0}
+		hs, peer := startedSync(t, f, []chaincfg.Checkpoint{{Height: 100000, Hash: &cpHash}})
+
+		// A different chain forking at height 2 and reaching only height 5,
+		// below our tip at 6. Every header in it is new to the index.
+		fork := minedRun(f.chain[1], 3, 1300)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg(fork))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+
+		// The round continues from the fork tip the next request is issued
+		// from, not from our taller branch.
+		gh := requireGetHeaders(t, msgs)
+		require.Equal(t, f.idx.LocatorFrom(fork[len(fork)-1].BlockHash()), locatorValues(gh))
+		require.True(t, hs.IsHeadersFirstMode())
+
+		for _, h := range fork {
+			_, ok := f.idx.Lookup(h.BlockHash())
+			require.True(t, ok)
+		}
+
+		// Extending that fork keeps working: the anchor moved to the fork, so
+		// the next honest batch is progress by height too.
+		more := minedRun(fork[len(fork)-1], 2, 1400)
+
+		msgs, misbehavior, err = hs.OnHeaders(peer, headersMsg(more))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Len(t, msgs, 1)
+
+		// Replaying the fork after that is still caught: nothing new, no
+		// higher.
+		_, _, err = hs.OnHeaders(peer, headersMsg(fork))
+		require.Error(t, err)
+		require.True(t, errors.Is(err, ErrHeadersNoProgress))
 	})
 
 	t.Run("a peer at our own height makes the only progress it can", func(t *testing.T) {
@@ -857,6 +913,15 @@ func TestHeaderSync_Checkpoints(t *testing.T) {
 		require.Contains(t, err.Error(), "height 3")
 		require.Contains(t, err.Error(), batch[1].BlockHash().String())
 		require.Contains(t, err.Error(), wrong.String())
+
+		// The machine leaves the round held: tearing the peer down is the
+		// caller's job, and PeerDisconnected is what releases it.
+		require.True(t, hs.IsHeadersFirstMode())
+		require.True(t, peer.State.fSyncStarted)
+
+		hs.PeerDisconnected(peer)
+		require.False(t, hs.IsHeadersFirstMode())
+		require.False(t, peer.State.fSyncStarted)
 	})
 
 	t.Run("matching a checkpoint asks for headers up to the next one", func(t *testing.T) {
