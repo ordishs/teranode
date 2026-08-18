@@ -80,6 +80,14 @@
         },
         {
           "linters": [
+            "depguard",
+            "forbidigo",
+            "prealloc"
+          ],
+          "path": "compat/bsvutil"
+        },
+        {
+          "linters": [
             "forbidigo"
           ],
           "path": "pkg"
