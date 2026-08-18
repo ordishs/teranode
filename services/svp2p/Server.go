@@ -29,9 +29,9 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// headerHydrateBatch bounds each forward-walk fetch during header index
+// defaultHeaderBatchSize bounds each forward-walk fetch during header index
 // hydration and resync to the wire protocol's own headers-per-message cap.
-const headerHydrateBatch = wire.MaxBlockHeadersPerMsg
+const defaultHeaderBatchSize = uint32(wire.MaxBlockHeadersPerMsg)
 
 // Server is the Teranode service shell for svp2p. It matches the service
 // manager contract of services/legacy/Server.go so the daemon can host
@@ -49,6 +49,11 @@ type Server struct {
 
 	headerIndexMu sync.RWMutex
 	headerIndex   *protocol.HeaderIndex
+
+	// headerBatchSize is an instance field, not a package const, purely so
+	// tests can shrink it on their own *Server to force a multi-batch
+	// forward walk without touching shared state.
+	headerBatchSize uint32
 }
 
 func New(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI) *Server {
@@ -56,6 +61,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient b
 		logger:           logger,
 		settings:         tSettings,
 		blockchainClient: blockchainClient,
+		headerBatchSize:  defaultHeaderBatchSize,
 	}
 }
 
@@ -137,6 +143,11 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return err
 	}
 
+	// Hydrating before subscribing cannot miss a block that lands in between:
+	// both Client and LocalClient replay their last/current best-block
+	// notification to a subscriber immediately upon Subscribe, so the first
+	// notification received here always re-confirms (rather than skips)
+	// whatever the store's best header was at subscribe time.
 	headerNotifications, err := s.blockchainClient.Subscribe(ctx, blockchain.SubscriberSVP2P)
 	if err != nil {
 		s.logger.Errorf("[svp2p] failed to subscribe to blockchain notifications: %s", err)
@@ -182,6 +193,9 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 }
 
 func (s *Server) Stop(_ context.Context) error {
+	// The header index subscription goroutine (runHeaderIndexSubscription)
+	// is ctx-owned: it exits on the Start ctx's cancellation, which the
+	// daemon triggers before calling Stop. Nothing to join here.
 	if s.manager == nil {
 		return nil
 	}
@@ -228,26 +242,52 @@ func (s *Server) hydrateHeaderIndex(ctx context.Context) error {
 }
 
 // syncHeaderIndex walks the header index forward from its current tip to the
-// blockchain service's best header, in batches bounded by headerHydrateBatch.
-// It runs once during hydration and again on every subscription
-// notification, so it is a no-op once the index has caught up.
+// blockchain service's best header. A bounded-batch forward walk covers
+// straightforward chain growth cheaply, including a full genesis replay on
+// first hydration. That walk alone cannot follow a reorg, though: the
+// blockchain service stays authoritative and can switch its best chain to
+// one whose ancestors sit at heights the forward walk already passed (a
+// competing branch that only recently became taller), leaving those headers
+// unfetched and the new best unconnected. reconcileHeaderIndex covers that
+// case afterward. Both passes are called once during hydration and again on
+// every subscription notification, so both are no-ops once the index has
+// caught up.
 func (s *Server) syncHeaderIndex(ctx context.Context) error {
 	idx := s.HeaderIndex()
 	if idx == nil {
 		return errors.NewServiceError("svp2p: header index sync called before hydration")
 	}
 
-	_, bestMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
+	best, bestMeta, err := s.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
 		return errors.NewServiceError("svp2p: failed to get best block header", err)
 	}
 
+	if err := s.forwardWalkHeaderIndex(ctx, idx, bestMeta.Height); err != nil {
+		return err
+	}
+
+	return s.reconcileHeaderIndex(ctx, idx, best)
+}
+
+// forwardWalkHeaderIndex fetches headers in bounded, height-ordered batches
+// from the index's current tip up to targetHeight.
+//
+// GetBlockHeadersFromHeight ranges over height, not row count — its query is
+// `WHERE height >= $1 AND height < $1+limit` (see
+// stores/blockchain/sql/GetBlockHeadersFromHeight.go), and it returns ALL
+// headers at each height, including competing-fork headers, preallocating
+// for up to 2*limit rows. So the next fetch must start at height+limit
+// regardless of how many rows came back, and each batch is returned in
+// descending height order, so it's walked oldest-first here so a header's
+// parent is always already indexed when AddHeader sees it.
+func (s *Server) forwardWalkHeaderIndex(ctx context.Context, idx *protocol.HeaderIndex, targetHeight uint32) error {
 	_, tipHeight := idx.Tip()
 
-	for height := uint32(tipHeight) + 1; height <= bestMeta.Height; { //nolint:gosec // header heights are non-negative
-		limit := bestMeta.Height - height + 1
-		if limit > headerHydrateBatch {
-			limit = headerHydrateBatch
+	for height := uint32(tipHeight) + 1; height <= targetHeight; { //nolint:gosec // header heights are non-negative
+		limit := targetHeight - height + 1
+		if limit > s.headerBatchSize {
+			limit = s.headerBatchSize
 		}
 
 		headers, _, err := s.blockchainClient.GetBlockHeadersFromHeight(ctx, height, limit)
@@ -255,13 +295,6 @@ func (s *Server) syncHeaderIndex(ctx context.Context) error {
 			return errors.NewServiceError("svp2p: failed to fetch headers from height %d", height, err)
 		}
 
-		if len(headers) == 0 {
-			break
-		}
-
-		// GetBlockHeadersFromHeight returns its batch in descending height
-		// order; AddHeader needs each parent already indexed, so walk the
-		// batch from oldest to newest.
 		for i := len(headers) - 1; i >= 0; i-- {
 			h := headers[i]
 
@@ -275,7 +308,45 @@ func (s *Server) syncHeaderIndex(ctx context.Context) error {
 			}
 		}
 
-		height += uint32(len(headers))
+		height += limit
+	}
+
+	return nil
+}
+
+// reconcileHeaderIndex recovers from a reorg the forward walk could not
+// follow: if best is not yet indexed, its ancestors were left behind on a
+// branch that stopped being best before the forward walk reached their
+// heights. It walks backward one header at a time via GetBlockHeader,
+// starting at best, until it reaches a header already in idx — a walk
+// guaranteed to terminate because genesis is always present from hydration
+// — then adds the recovered segment forward so every ancestor connects.
+func (s *Server) reconcileHeaderIndex(ctx context.Context, idx *protocol.HeaderIndex, best *model.BlockHeader) error {
+	if _, ok := idx.Lookup(*best.Hash()); ok {
+		return nil
+	}
+
+	missing := []*model.BlockHeader{best}
+	current := best
+
+	for current.HashPrevBlock != nil {
+		parent, _, err := s.blockchainClient.GetBlockHeader(ctx, current.HashPrevBlock)
+		if err != nil {
+			return errors.NewServiceError("svp2p: failed to fetch header %s while reconciling a reorg", current.HashPrevBlock, err)
+		}
+
+		if _, ok := idx.Lookup(*parent.Hash()); ok {
+			break
+		}
+
+		missing = append(missing, parent)
+		current = parent
+	}
+
+	for i := len(missing) - 1; i >= 0; i-- {
+		if _, err := idx.AddHeader(missing[i].ToWireBlockHeader()); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -290,7 +361,12 @@ func (s *Server) runHeaderIndexSubscription(ctx context.Context, notifications <
 		case <-ctx.Done():
 			s.logger.Infof("[svp2p] header index subscription shutting down")
 			return
-		case notification := <-notifications:
+		case notification, ok := <-notifications:
+			if !ok {
+				// Channel closed, exit the listener.
+				return
+			}
+
 			if notification == nil || notification.Type != model.NotificationType_Block {
 				continue
 			}
