@@ -1319,3 +1319,15 @@ func (s *Server) disconnectBannedPeerByID(ctx context.Context, peerID peer.ID, r
 
 	s.removePeer(peerID)
 }
+
+// transportHTTPFilter returns a ListPeers transport filter that admits libp2p
+// (HTTP DataHub) peers only. Wire-protocol peers registered by the legacy
+// service are visibility-only entries: catchup fetches blocks and subtrees over
+// HTTP from a peer's DataHub, which a wire peer cannot serve. Filtering on
+// transport states that reason directly, rather than relying on a wire peer
+// happening to have an empty DataHubURL.
+func transportHTTPFilter() *blockchain_api.TransportType {
+	transport := blockchain_api.TransportType_TRANSPORT_HTTP
+
+	return &transport
+}

@@ -36,6 +36,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/p2p/p2p_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -1242,31 +1243,32 @@ func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, peerID str
 	// Send to notification channel for WebSocket clients
 	select {
 	case s.notificationCh <- &notificationMsg{
-		Timestamp:           time.Now().UTC().Format(isoFormat),
-		Type:                "node_status",
-		BaseURL:             nodeStatusMessage.BaseURL,
-		PeerID:              nodeStatusMessage.PeerID,
-		Version:             nodeStatusMessage.Version,
-		CommitHash:          nodeStatusMessage.CommitHash,
-		BestBlockHash:       notificationBestBlockHash,
-		BestHeight:          notificationBestHeight,
-		TxCount:             nodeStatusMessage.TxCount,
-		SubtreeCount:        nodeStatusMessage.SubtreeCount,
-		FSMState:            nodeStatusMessage.FSMState,
-		StartTime:           nodeStatusMessage.StartTime,
-		Uptime:              nodeStatusMessage.Uptime,
-		ClientName:          nodeStatusMessage.ClientName,
-		MinerName:           nodeStatusMessage.MinerName,
-		ListenMode:          nodeStatusMessage.ListenMode,
-		ChainWork:           nodeStatusMessage.ChainWork,
-		SyncPeerID:          nodeStatusMessage.SyncPeerID,
-		SyncPeerHeight:      nodeStatusMessage.SyncPeerHeight,
-		SyncPeerBlockHash:   nodeStatusMessage.SyncPeerBlockHash,
-		SyncConnectedAt:     nodeStatusMessage.SyncConnectedAt,
-		MinMiningTxFee:      nodeStatusMessage.MinMiningTxFee,
-		FeePolicy:           nodeStatusMessage.FeePolicy,
-		ConnectedPeersCount: nodeStatusMessage.ConnectedPeersCount,
-		Storage:             nodeStatusMessage.Storage,
+		Timestamp:                 time.Now().UTC().Format(isoFormat),
+		Type:                      "node_status",
+		BaseURL:                   nodeStatusMessage.BaseURL,
+		PeerID:                    nodeStatusMessage.PeerID,
+		Version:                   nodeStatusMessage.Version,
+		CommitHash:                nodeStatusMessage.CommitHash,
+		BestBlockHash:             notificationBestBlockHash,
+		BestHeight:                notificationBestHeight,
+		TxCount:                   nodeStatusMessage.TxCount,
+		SubtreeCount:              nodeStatusMessage.SubtreeCount,
+		FSMState:                  nodeStatusMessage.FSMState,
+		StartTime:                 nodeStatusMessage.StartTime,
+		Uptime:                    nodeStatusMessage.Uptime,
+		ClientName:                nodeStatusMessage.ClientName,
+		MinerName:                 nodeStatusMessage.MinerName,
+		ListenMode:                nodeStatusMessage.ListenMode,
+		ChainWork:                 nodeStatusMessage.ChainWork,
+		SyncPeerID:                nodeStatusMessage.SyncPeerID,
+		SyncPeerHeight:            nodeStatusMessage.SyncPeerHeight,
+		SyncPeerBlockHash:         nodeStatusMessage.SyncPeerBlockHash,
+		SyncConnectedAt:           nodeStatusMessage.SyncConnectedAt,
+		MinMiningTxFee:            nodeStatusMessage.MinMiningTxFee,
+		FeePolicy:                 nodeStatusMessage.FeePolicy,
+		ConnectedPeersCount:       nodeStatusMessage.ConnectedPeersCount,
+		LegacyConnectedPeersCount: nodeStatusMessage.LegacyConnectedPeersCount,
+		Storage:                   nodeStatusMessage.Storage,
 	}:
 	default:
 		s.logger.Warnf("[handleNodeStatusTopic] notification channel full, dropped node_status notification for %s", nodeStatusMessage.PeerID)
@@ -1600,9 +1602,14 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		s.logger.Debugf("[getNodeStatusMessage] Policy settings not available, using default MinMiningTxFee: %f", defaultFee)
 	}
 
-	// Get connected peers count from the registry. The registry also holds
-	// gossiped/disconnected peers, so count only directly connected ones.
+	// Count connected peers from the registry, which also holds gossiped and
+	// disconnected peers. The two transports are counted separately:
+	// ConnectedPeersCount keeps its established libp2p-only meaning for every
+	// node already consuming this gossip message, and legacy peers get their
+	// own figure.
 	connectedPeersCount := 0
+	legacyConnectedPeersCount := 0
+
 	if s.peerRegistry != nil {
 		allPeers, listErr := s.peerRegistry.ListPeers(ctx, nil, 0, 0, false, false)
 		if listErr != nil {
@@ -1610,12 +1617,20 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 
 			if cached != nil {
 				connectedPeersCount = cached.ConnectedPeersCount
+				legacyConnectedPeersCount = cached.LegacyConnectedPeersCount
 			}
 		} else {
 			for _, p := range allPeers {
-				if p.IsConnected {
-					connectedPeersCount++
+				if !p.IsConnected {
+					continue
 				}
+
+				if p.TransportType == blockchain_api.TransportType_TRANSPORT_WIRE_PROTOCOL {
+					legacyConnectedPeersCount++
+					continue
+				}
+
+				connectedPeersCount++
 			}
 		}
 	}
@@ -1672,32 +1687,33 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		storage, blockPersisterHeight, height, retentionWindow, prunerBlockTrigger)
 
 	msg := &notificationMsg{
-		Timestamp:           time.Now().UTC().Format(isoFormat),
-		Type:                "node_status",
-		BaseURL:             baseURL,
-		PropagationURL:      propagationURL,
-		PeerID:              peerID,
-		Version:             version,
-		CommitHash:          commit,
-		BestBlockHash:       blockHashStr,
-		BestHeight:          height,
-		TxCount:             txCount,
-		SubtreeCount:        subtreeCount,
-		FSMState:            fsmState,
-		StartTime:           startTime,
-		Uptime:              uptime,
-		ClientName:          clientName,
-		MinerName:           minerName,
-		ListenMode:          listenMode,
-		ChainWork:           chainWorkStr,
-		SyncPeerID:          syncPeerID,
-		SyncPeerHeight:      syncPeerHeight,
-		SyncPeerBlockHash:   syncPeerBlockHash,
-		SyncConnectedAt:     syncConnectedAt,
-		MinMiningTxFee:      minMiningTxFee,
-		FeePolicy:           feePolicy,
-		ConnectedPeersCount: connectedPeersCount,
-		Storage:             storage,
+		Timestamp:                 time.Now().UTC().Format(isoFormat),
+		Type:                      "node_status",
+		BaseURL:                   baseURL,
+		PropagationURL:            propagationURL,
+		PeerID:                    peerID,
+		Version:                   version,
+		CommitHash:                commit,
+		BestBlockHash:             blockHashStr,
+		BestHeight:                height,
+		TxCount:                   txCount,
+		SubtreeCount:              subtreeCount,
+		FSMState:                  fsmState,
+		StartTime:                 startTime,
+		Uptime:                    uptime,
+		ClientName:                clientName,
+		MinerName:                 minerName,
+		ListenMode:                listenMode,
+		ChainWork:                 chainWorkStr,
+		SyncPeerID:                syncPeerID,
+		SyncPeerHeight:            syncPeerHeight,
+		SyncPeerBlockHash:         syncPeerBlockHash,
+		SyncConnectedAt:           syncConnectedAt,
+		MinMiningTxFee:            minMiningTxFee,
+		FeePolicy:                 feePolicy,
+		ConnectedPeersCount:       connectedPeersCount,
+		LegacyConnectedPeersCount: legacyConnectedPeersCount,
+		Storage:                   storage,
 	}
 
 	// Cache the status so sendInitialNodeStatuses can serve new websocket
@@ -1740,31 +1756,32 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 
 	// Create the NodeStatusMessage for P2P publishing
 	nodeStatusMessage := NodeStatusMessage{
-		Type:                "node_status",
-		BaseURL:             msg.BaseURL,
-		PropagationURL:      msg.PropagationURL,
-		PeerID:              msg.PeerID,
-		Version:             msg.Version,
-		CommitHash:          msg.CommitHash,
-		BestBlockHash:       msg.BestBlockHash,
-		BestHeight:          msg.BestHeight,
-		TxCount:             msg.TxCount,
-		SubtreeCount:        msg.SubtreeCount,
-		FSMState:            msg.FSMState,
-		StartTime:           msg.StartTime,
-		Uptime:              msg.Uptime,
-		ClientName:          msg.ClientName,
-		MinerName:           msg.MinerName,
-		ListenMode:          msg.ListenMode,
-		ChainWork:           msg.ChainWork,
-		SyncPeerID:          msg.SyncPeerID,
-		SyncPeerHeight:      msg.SyncPeerHeight,
-		SyncPeerBlockHash:   msg.SyncPeerBlockHash,
-		SyncConnectedAt:     msg.SyncConnectedAt,
-		MinMiningTxFee:      msg.MinMiningTxFee,
-		FeePolicy:           msg.FeePolicy,
-		ConnectedPeersCount: msg.ConnectedPeersCount,
-		Storage:             msg.Storage,
+		Type:                      "node_status",
+		BaseURL:                   msg.BaseURL,
+		PropagationURL:            msg.PropagationURL,
+		PeerID:                    msg.PeerID,
+		Version:                   msg.Version,
+		CommitHash:                msg.CommitHash,
+		BestBlockHash:             msg.BestBlockHash,
+		BestHeight:                msg.BestHeight,
+		TxCount:                   msg.TxCount,
+		SubtreeCount:              msg.SubtreeCount,
+		FSMState:                  msg.FSMState,
+		StartTime:                 msg.StartTime,
+		Uptime:                    msg.Uptime,
+		ClientName:                msg.ClientName,
+		MinerName:                 msg.MinerName,
+		ListenMode:                msg.ListenMode,
+		ChainWork:                 msg.ChainWork,
+		SyncPeerID:                msg.SyncPeerID,
+		SyncPeerHeight:            msg.SyncPeerHeight,
+		SyncPeerBlockHash:         msg.SyncPeerBlockHash,
+		SyncConnectedAt:           msg.SyncConnectedAt,
+		MinMiningTxFee:            msg.MinMiningTxFee,
+		FeePolicy:                 msg.FeePolicy,
+		ConnectedPeersCount:       msg.ConnectedPeersCount,
+		LegacyConnectedPeersCount: msg.LegacyConnectedPeersCount,
+		Storage:                   msg.Storage,
 	}
 
 	msgBytes, err := json.Marshal(nodeStatusMessage)
@@ -2062,7 +2079,7 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 
 	// If the centralized peer registry is available, use it as it has richer data.
 	if s.peerRegistry != nil {
-		allPeers, err := s.peerRegistry.ListPeers(ctx, nil, 0, 0, false, false)
+		allPeers, err := s.peerRegistry.ListPeers(ctx, transportHTTPFilter(), 0, 0, false, false)
 		if err != nil {
 			return nil, errors.WrapGRPCPublic(errors.NewServiceError("list peers", err))
 		}
@@ -2505,7 +2522,7 @@ func (s *Server) GetPeerRegistry(ctx context.Context, _ *emptypb.Empty) (*p2p_ap
 		}, nil
 	}
 
-	allPeers, err := s.peerRegistry.ListPeers(ctx, nil, 0, 0, false, false)
+	allPeers, err := s.peerRegistry.ListPeers(ctx, transportHTTPFilter(), 0, 0, false, false)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewServiceError("list peers", err))
 	}
