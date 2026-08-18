@@ -3,7 +3,9 @@
 package transport
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -37,21 +39,23 @@ type queuedMsg struct {
 // (net.cpp nSendSize vs GetSendBufferSize); SendPriority is the reserved
 // lane for mandatory protocol replies (pong, verack).
 type Conn struct {
-	nc        net.Conn
-	cfg       Config
-	pver      atomic.Uint32
-	inbound   chan wire.Message
-	sendCh    chan queuedMsg
-	priCh     chan queuedMsg
-	pending   atomic.Int64
-	sent      atomic.Uint64
-	received  atomic.Uint64
-	quit      chan struct{}
-	done      chan struct{}
-	errMu     sync.Mutex
-	err       error
-	quitOnce  sync.Once
-	closeOnce sync.Once
+	nc            net.Conn
+	cfg           Config
+	pver          atomic.Uint32
+	inbound       chan wire.Message
+	inboundBlocks chan *BlockStream
+	sendCh        chan queuedMsg
+	priCh         chan queuedMsg
+	pending       atomic.Int64
+	sent          atomic.Uint64
+	received      atomic.Uint64
+	quit          chan struct{}
+	done          chan struct{}
+	sockClosed    chan struct{}
+	errMu         sync.Mutex
+	err           error
+	quitOnce      sync.Once
+	closeOnce     sync.Once
 }
 
 func New(nc net.Conn, cfg Config) *Conn {
@@ -59,10 +63,14 @@ func New(nc net.Conn, cfg Config) *Conn {
 		nc:      nc,
 		cfg:     cfg,
 		inbound: make(chan wire.Message, cfg.RecvQueueLen),
-		sendCh:  make(chan queuedMsg, 64),
-		priCh:   make(chan queuedMsg, 16),
-		quit:    make(chan struct{}),
-		done:    make(chan struct{}),
+		// Unbuffered: the read loop hands the socket to one consumer at a
+		// time and waits for it. See InboundBlocks.
+		inboundBlocks: make(chan *BlockStream),
+		sendCh:        make(chan queuedMsg, 64),
+		priCh:         make(chan queuedMsg, 16),
+		quit:          make(chan struct{}),
+		done:          make(chan struct{}),
+		sockClosed:    make(chan struct{}),
 	}
 	c.pver.Store(cfg.ProtocolVersion)
 
@@ -93,11 +101,38 @@ func (c *Conn) Start(ctx context.Context) {
 
 func (c *Conn) readLoop() {
 	defer close(c.inbound)
+	defer close(c.inboundBlocks)
 
 	for {
-		n, msg, _, err := wire.ReadMessageWithEncodingN(c.nc, c.pver.Load(), c.cfg.Net, wire.BaseEncoding)
+		n, hdr, err := readWireHeader(c.nc)
 
 		c.received.Add(uint64(n)) //nolint:gosec // byte count is never negative
+
+		if err != nil {
+			c.fail(err)
+			return
+		}
+
+		// Detect "block" before any payload byte is materialized, and hand
+		// the socket to the consumer as a stream.
+		if hdr.command == wire.CmdBlock {
+			if err := c.readBlock(hdr); err != nil {
+				c.fail(err)
+				return
+			}
+
+			continue
+		}
+
+		// Every other command keeps go-wire's framing path, checksum
+		// verification included: replay the header bytes we already took.
+		r := io.MultiReader(bytes.NewReader(hdr.raw[:]), c.nc)
+
+		total, msg, _, err := wire.ReadMessageWithEncodingN(r, c.pver.Load(), c.cfg.Net, wire.BaseEncoding)
+
+		if total > wire.MessageHeaderSize {
+			c.received.Add(uint64(total - wire.MessageHeaderSize)) //nolint:gosec // header bytes are already counted
+		}
 
 		if err != nil {
 			c.fail(err)
@@ -110,6 +145,58 @@ func (c *Conn) readLoop() {
 			return
 		}
 	}
+}
+
+// readBlock owns the socket for the whole declared block payload. It delivers
+// the stream, then blocks until the consumer closes it. An error returned here
+// means the connection is no longer byte aligned, or the peer framing is
+// broken, so the caller fails the connection.
+func (c *Conn) readBlock(hdr wireHeader) error {
+	// readWireHeader bypasses the checks wire.ReadMessageWithEncodingN makes
+	// on the buffered path, so repeat the two that matter for a block.
+	if hdr.magic != c.cfg.Net {
+		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE, "svp2p: block message from other network [%v]", hdr.magic)
+	}
+
+	length := uint64(hdr.length)
+	if length > wire.MaxBlockPayload() {
+		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
+			"svp2p: block payload of %d bytes exceeds the %d byte maximum", length, wire.MaxBlockPayload())
+	}
+
+	bs, err := newBlockStream(c.nc, length, c.pver.Load())
+
+	// Payload bytes are counted as they leave the socket: once for the part
+	// the read loop decoded itself, then once more for whatever the consumer
+	// read or the drain discarded.
+	counted := bs.consumed()
+	c.received.Add(counted)
+
+	if err != nil {
+		return err
+	}
+
+	defer func() { c.received.Add(bs.consumed() - counted) }()
+
+	select {
+	case c.inboundBlocks <- bs:
+	case <-c.quit:
+		return errors.New(errors.ERR_ERROR, "svp2p: connection closed before the block stream was delivered")
+	case <-c.sockClosed:
+		return errors.New(errors.ERR_ERROR, "svp2p: socket closed before the block stream was delivered")
+	}
+
+	select {
+	case <-bs.done:
+	case <-c.quit:
+		return errors.New(errors.ERR_ERROR, "svp2p: connection closed with a block stream still open")
+	case <-c.sockClosed:
+		return errors.New(errors.ERR_ERROR, "svp2p: socket closed with a block stream still open")
+	}
+
+	// Close is idempotent; this call reports whether the drain reached the
+	// payload boundary. A short stream leaves the socket misaligned.
+	return bs.Close()
 }
 
 func (c *Conn) writeLoop() {
@@ -181,6 +268,21 @@ func (c *Conn) SetProtocolVersion(v uint32) { c.pver.Store(v) }
 
 func (c *Conn) Inbound() <-chan wire.Message { return c.inbound }
 
+// InboundBlocks carries inbound "block" messages as streams: the payload stays
+// on the socket instead of arriving as a decoded wire.MsgBlock on Inbound.
+//
+// The read loop BLOCKS on the connection until the consumer calls Close on the
+// stream. Nothing else — no ping, no inv — is read from that peer meanwhile.
+// This is the synchronous backpressure baseline; a prefetch budget is the only
+// thing that relaxes it. A consumer that abandons a stream stalls the peer
+// until the connection closes.
+//
+// Because a consumer may hold a stream for minutes while it ingests a fat
+// block, the transport sets no socket read deadline. The liveness check is the
+// idle timer in services/svp2p/protocol, which the caller must hold off while
+// a stream is open.
+func (c *Conn) InboundBlocks() <-chan *BlockStream { return c.inboundBlocks }
+
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 func (c *Conn) Err() error {
@@ -215,7 +317,13 @@ func (c *Conn) Close() error { return c.closeNC() }
 func (c *Conn) closeNC() error {
 	var err error
 
-	c.closeOnce.Do(func() { err = c.nc.Close() })
+	c.closeOnce.Do(func() {
+		err = c.nc.Close()
+
+		// A read loop parked on an open block stream is not waiting on the
+		// socket, so it needs the close signalled explicitly.
+		close(c.sockClosed)
+	})
 
 	return err
 }
