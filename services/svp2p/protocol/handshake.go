@@ -247,3 +247,13 @@ func (h *Handshake) Established() bool { return h.established }
 func (h *Handshake) PeerInfo() PeerInfo { return h.info }
 
 func (h *Handshake) MisbehaviorScore() int { return h.misbehavior }
+
+// AddMisbehavior applies a score a machine outside the handshake decided on
+// (the headers and inv handlers), so net_processing.cpp's one Misbehaving
+// counter per peer stays one counter here too. The owning Peer serializes it
+// with the rest of the handshake state.
+func (h *Handshake) AddMisbehavior(delta int) {
+	if delta > 0 {
+		h.misbehavior += delta
+	}
+}

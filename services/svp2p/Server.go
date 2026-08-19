@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -18,10 +19,17 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/svp2p/bridge"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
+	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/health"
@@ -33,6 +41,33 @@ import (
 // hydration and resync to the wire protocol's own headers-per-message cap.
 const defaultHeaderBatchSize = uint32(wire.MaxBlockHeadersPerMsg)
 
+// Deps carries the Teranode service dependencies the block-ingestion bridge
+// needs, in the same set legacy.New takes (daemon/daemon_services.go). They
+// are optional on this Server: the daemon injects them in Task 12, and until
+// it does, the service runs without block sync rather than with a faked
+// pipeline behind it.
+type Deps struct {
+	ValidationClient  validator.Interface
+	SubtreeStore      blob.Store
+	TempStore         blob.Store
+	UtxoStore         utxo.Store
+	SubtreeValidation subtreevalidation.Interface
+	BlockValidation   blockvalidation.Interface
+	BlockAssembly     *blockassembly.Client
+}
+
+// complete reports whether every dependency the bridge needs is present. A
+// partial set is not usable: the ingestion pipeline calls all of them.
+func (d Deps) complete() bool {
+	return d.ValidationClient != nil &&
+		d.SubtreeStore != nil &&
+		d.TempStore != nil &&
+		d.UtxoStore != nil &&
+		d.SubtreeValidation != nil &&
+		d.BlockValidation != nil &&
+		d.BlockAssembly != nil
+}
+
 // Server is the Teranode service shell for svp2p. It matches the service
 // manager contract of services/legacy/Server.go so the daemon can host
 // either service behind the same lifecycle.
@@ -42,10 +77,12 @@ type Server struct {
 	logger           ulogger.Logger
 	settings         *settings.Settings
 	blockchainClient blockchain.ClientI
+	deps             Deps
 
 	listenAddresses []string
 	banList         *protocol.BanList
 	manager         *protocol.PeerManager
+	admission       *bridge.Admission
 
 	headerIndexMu sync.RWMutex
 	headerIndex   *protocol.HeaderIndex
@@ -63,6 +100,15 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient b
 		blockchainClient: blockchainClient,
 		headerBatchSize:  defaultHeaderBatchSize,
 	}
+}
+
+// NewWithDeps is New plus the ingestion dependencies, which is what enables
+// block sync. The daemon switches to it in Task 12.
+func NewWithDeps(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, deps Deps) *Server {
+	srv := New(logger, tSettings, blockchainClient)
+	srv.deps = deps
+
+	return srv
 }
 
 func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
@@ -132,13 +178,13 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return err
 	}
 
-	if err := s.hydrateHeaderIndex(ctx); err != nil {
+	if err := s.startSync(ctx); err != nil {
 		if errors.IsContextError(err) {
 			s.logger.Infof("[svp2p] shutting down during header index hydration")
 			return err
 		}
 
-		s.logger.Errorf("[svp2p] failed to hydrate header index: %s", err)
+		s.logger.Errorf("[svp2p] failed to start block sync: %s", err)
 
 		return err
 	}
@@ -196,6 +242,14 @@ func (s *Server) Stop(_ context.Context) error {
 	// The header index subscription goroutine (runHeaderIndexSubscription)
 	// is ctx-owned: it exits on the Start ctx's cancellation, which the
 	// daemon triggers before calling Stop. Nothing to join here.
+	//
+	// Admission is not ctx-owned: its failure map runs a background eviction
+	// goroutine that only Stop releases.
+	if s.admission != nil {
+		s.admission.Stop()
+		s.admission = nil
+	}
+
 	if s.manager == nil {
 		return nil
 	}
@@ -218,6 +272,62 @@ func (s *Server) setHeaderIndex(idx *protocol.HeaderIndex) {
 	s.headerIndexMu.Unlock()
 }
 
+// startSync builds the header index, hands it and the block-ingestion path to
+// the peer manager, and hydrates the index. The order matters: the manager
+// must own the index before the first header is written to it, because every
+// write goes through the manager's shared sync-state mutex.
+func (s *Server) startSync(ctx context.Context) error {
+	if err := s.hydrateHeaderIndex(ctx); err != nil {
+		return err
+	}
+
+	ingestor, err := s.newBlockIngestor()
+	if err != nil {
+		return err
+	}
+
+	if err := s.manager.ConfigureSync(protocol.SyncConfig{
+		Index:                            s.HeaderIndex(),
+		Ingestor:                         ingestor,
+		AllowSyncCandidateFromLocalPeers: s.settings.Legacy.AllowSyncCandidateFromLocalPeers,
+	}); err != nil {
+		return err
+	}
+
+	return s.syncHeaderIndex(ctx)
+}
+
+// newBlockIngestor constructs the real bridge and its admission gate from the
+// injected dependencies, or returns nil when they are not injected yet. A nil
+// ingestor leaves the manager with the header index and no block sync: the
+// service keeps serving the peer API and following the chain, and asks no peer
+// for a block it has nothing to ingest with. Task 12 injects the dependencies.
+func (s *Server) newBlockIngestor() (protocol.BlockIngestor, error) {
+	if !s.deps.complete() {
+		s.logger.Warnf("[svp2p] block sync disabled: the block ingestion dependencies are not injected")
+		return nil, nil
+	}
+
+	s.admission = bridge.NewAdmission(s.logger, s.settings)
+
+	return &blockIngestor{
+		logger: s.logger,
+		bridge: bridge.New(
+			s.logger,
+			s.settings,
+			s.blockchainClient,
+			s.deps.ValidationClient,
+			s.deps.SubtreeStore,
+			s.deps.TempStore,
+			s.deps.UtxoStore,
+			s.deps.SubtreeValidation,
+			s.deps.BlockValidation,
+			s.deps.BlockAssembly,
+		),
+		admission: s.admission,
+	}, nil
+}
+
 // hydrateHeaderIndex builds a fresh, genesis-rooted header index from the
 // blockchain service. The blockchain service stays the authoritative header
 // store (spec §11): this index is discarded and rebuilt on every startup.
@@ -238,7 +348,7 @@ func (s *Server) hydrateHeaderIndex(ctx context.Context) error {
 
 	s.setHeaderIndex(idx)
 
-	return s.syncHeaderIndex(ctx)
+	return nil
 }
 
 // syncHeaderIndex walks the header index forward from its current tip to the
@@ -267,7 +377,34 @@ func (s *Server) syncHeaderIndex(ctx context.Context) error {
 		return err
 	}
 
-	return s.reconcileHeaderIndex(ctx, idx, best)
+	if err := s.reconcileHeaderIndex(ctx, idx, best); err != nil {
+		return err
+	}
+
+	// The download scheduler walks against our own chain tip (the chainActive
+	// counterpart), and it must be a header the index holds — which the two
+	// passes above have just guaranteed for this one.
+	if !s.manager.SetActiveTip(*best.Hash()) {
+		s.logger.Warnf("[svp2p] best header %s is not in the header index; block download keeps the previous tip", best.Hash())
+	}
+
+	return nil
+}
+
+// addHeaders links headers into the index through the peer manager, which
+// holds the shared sync-state mutex while it writes. Nothing may call
+// HeaderIndex.AddHeader directly: the headers-first machine reads the index
+// and then writes to it under that mutex, so a write outside it makes the
+// machine act on stale state.
+func (s *Server) addHeaders(headers []*wire.BlockHeader, pass string) error {
+	orphans, err := s.manager.AddHeaders(headers)
+
+	for _, orphan := range orphans {
+		hash := orphan.BlockHash()
+		s.logger.Warnf("[svp2p] orphan header %s while syncing header index (%s)", hash, pass)
+	}
+
+	return err
 }
 
 // forwardWalkHeaderIndex fetches headers in bounded, height-ordered batches
@@ -295,17 +432,13 @@ func (s *Server) forwardWalkHeaderIndex(ctx context.Context, idx *protocol.Heade
 			return errors.NewServiceError("svp2p: failed to fetch headers from height %d", height, err)
 		}
 
+		batch := make([]*wire.BlockHeader, 0, len(headers))
 		for i := len(headers) - 1; i >= 0; i-- {
-			h := headers[i]
+			batch = append(batch, headers[i].ToWireBlockHeader())
+		}
 
-			connected, err := idx.AddHeader(h.ToWireBlockHeader())
-			if err != nil {
-				return err
-			}
-
-			if !connected {
-				s.logger.Warnf("[svp2p] orphan header %s while syncing header index at height %d", h.Hash(), height)
-			}
+		if err := s.addHeaders(batch, fmt.Sprintf("forward walk from height %d", height)); err != nil {
+			return err
 		}
 
 		height += limit
@@ -343,13 +476,12 @@ func (s *Server) reconcileHeaderIndex(ctx context.Context, idx *protocol.HeaderI
 		current = parent
 	}
 
+	recovered := make([]*wire.BlockHeader, 0, len(missing))
 	for i := len(missing) - 1; i >= 0; i-- {
-		if _, err := idx.AddHeader(missing[i].ToWireBlockHeader()); err != nil {
-			return err
-		}
+		recovered = append(recovered, missing[i].ToWireBlockHeader())
 	}
 
-	return nil
+	return s.addHeaders(recovered, "reorg reconciliation")
 }
 
 // runHeaderIndexSubscription keeps the header index current from the

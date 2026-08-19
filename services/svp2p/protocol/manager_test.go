@@ -3,12 +3,14 @@ package protocol
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -53,7 +55,16 @@ func dialScripted(t *testing.T, addr string) *scriptedPeer {
 func (s *scriptedPeer) completeOutboundHandshake(t *testing.T) {
 	t.Helper()
 
-	s.write(t, remoteVersion(4321))
+	s.completeOutboundHandshakeAs(t, remoteVersion(4321))
+}
+
+// completeOutboundHandshakeAs is completeOutboundHandshake with the version
+// message spelled out, so a test can advertise service flags — the sync
+// candidate rules read them (headersync.go isSyncCandidate).
+func (s *scriptedPeer) completeOutboundHandshakeAs(t *testing.T, version *wire.MsgVersion) {
+	t.Helper()
+
+	s.write(t, version)
 
 	sawVerack := false
 	for !sawVerack {
@@ -254,6 +265,248 @@ func TestManagerDetectsSelfConnection(t *testing.T) {
 	// on either end, across at least two full redial windows — including
 	// the redials the dialer keeps making per the ruling above.
 	require.Never(t, func() bool { return establishedCount(m) != 0 }, 2*dialRetryBase, 100*time.Millisecond)
+}
+
+// recordingIngestor is a fake of protocol's own narrow ingest interface
+// (peer.go BlockIngestor), not of the bridge: spec §4.4 requires this package
+// to be testable without a Teranode stack, and the real bridge composition
+// behind the interface is covered by Tasks 9, 10 and 13. It records what the
+// peer loop handed it, in arrival order.
+type recordingIngestor struct {
+	mu       sync.Mutex
+	ingested []chainhash.Hash
+	sizes    []uint64
+	txBytes  []int64
+}
+
+func (r *recordingIngestor) WatchProgress(rd io.ReadCloser) IngestProgress {
+	return newTestProgress(rd)
+}
+
+func (r *recordingIngestor) Ingest(_ context.Context, req BlockIngestRequest) IngestOutcome {
+	// The real composition (bridge.IngestBlock) consumes the stream and
+	// releases it on every exit path; do the same, or the transport read loop
+	// stays parked and no second block ever arrives.
+	n, err := io.Copy(io.Discard, req.TxReader)
+
+	if closeErr := req.TxReader.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+
+	if err != nil {
+		return IngestOutcome{Err: err}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ingested = append(r.ingested, req.Header.BlockHash())
+	r.sizes = append(r.sizes, req.SizeBytes)
+	r.txBytes = append(r.txBytes, n)
+
+	return IngestOutcome{}
+}
+
+func (r *recordingIngestor) hashes() []chainhash.Hash {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]chainhash.Hash(nil), r.ingested...)
+}
+
+// testProgress is the IngestProgress the fake hands back, with the same
+// contract bridge.ProgressReader carries: the stamp is seeded at construction
+// so a watcher never sees a zero time.
+type testProgress struct {
+	r io.ReadCloser
+
+	mu   sync.Mutex
+	read uint64
+	last time.Time
+}
+
+func newTestProgress(r io.ReadCloser) *testProgress {
+	return &testProgress{r: r, last: time.Now()}
+}
+
+func (p *testProgress) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+
+	if n > 0 {
+		p.mu.Lock()
+		p.read += uint64(n) //nolint:gosec // n is non-negative
+		p.last = time.Now()
+		p.mu.Unlock()
+	}
+
+	return n, err
+}
+
+func (p *testProgress) Close() error { return p.r.Close() }
+
+func (p *testProgress) BytesRead() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.read
+}
+
+func (p *testProgress) LastProgress() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.last
+}
+
+// blockFor builds a wire block for header with one syntactically valid
+// transaction, which is all the streaming transport needs: it decodes the
+// header and the transaction count and hands the rest to the consumer.
+func blockFor(header *wire.BlockHeader) *wire.MsgBlock {
+	block := wire.NewMsgBlock(header)
+
+	tx := wire.NewMsgTx(1)
+	tx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(&chainhash.Hash{}, 0xffffffff), []byte{0x51}))
+	tx.AddTxOut(wire.NewTxOut(0, []byte{0x51}))
+
+	_ = block.AddTransaction(tx)
+
+	return block
+}
+
+// syncTestManager builds a manager whose chain params mine cheaply (the
+// regtest powLimit on mainnet magic, so the non-regtest sync-candidate branch
+// still runs) with block sync wired to ingestor.
+func syncTestManager(t *testing.T, idx *HeaderIndex, ingestor BlockIngestor) *PeerManager {
+	t.Helper()
+
+	tSettings := managerSettings()
+	tSettings.ChainCfgParams = syncTestParams(nil)
+
+	banList, err := NewBanList("")
+	require.NoError(t, err)
+
+	m := NewPeerManager(ulogger.TestLogger{}, tSettings, banList)
+
+	require.NoError(t, m.ConfigureSync(SyncConfig{
+		Index:        idx,
+		Ingestor:     ingestor,
+		TickInterval: 20 * time.Millisecond,
+	}))
+
+	return m
+}
+
+// TestManagerDrivesHeadersFirstBlockSync is the whole Phase 2 path through the
+// live peer loop: handshake, our getheaders, the peer's headers, our getdata
+// for exactly those blocks, the blocks themselves, and one ingest per block in
+// chain order — with every download released afterwards.
+func TestManagerDrivesHeadersFirstBlockSync(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 3, 1)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	ingestor := &recordingIngestor{}
+	m := syncTestManager(t, idx, ingestor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+	defer func() { _ = far.nc.Close() }()
+
+	version := remoteVersion(4321)
+	version.Services = wire.SFNodeNetwork
+	far.completeOutboundHandshakeAs(t, version)
+
+	// net_processing.cpp SendMessages: the initial getheaders goes out as soon
+	// as the handshake finishes, from a locator on our own tip.
+	getHeaders, ok := far.readUntil(t, wire.CmdGetHeaders).(*wire.MsgGetHeaders)
+	require.True(t, ok)
+	require.Len(t, getHeaders.BlockLocatorHashes, 1)
+
+	genesisHash := genesis.BlockHash()
+	require.Equal(t, genesisHash, *getHeaders.BlockLocatorHashes[0])
+
+	headers := wire.NewMsgHeaders()
+	for _, header := range chain {
+		require.NoError(t, headers.AddBlockHeader(header))
+	}
+
+	far.write(t, headers)
+
+	// The scheduler is the only thing that may request a block (Task 6), and
+	// it asks for the three it just learned about, in chain order.
+	getData, ok := far.readUntil(t, wire.CmdGetData).(*wire.MsgGetData)
+	require.True(t, ok)
+	require.Len(t, getData.InvList, len(chain))
+
+	for i, inv := range getData.InvList {
+		require.Equal(t, wire.InvTypeBlock, inv.Type)
+		require.Equal(t, chain[i].BlockHash(), inv.Hash, "getdata entry %d", i)
+	}
+
+	for _, header := range chain {
+		far.write(t, blockFor(header))
+	}
+
+	require.Eventually(t, func() bool { return len(ingestor.hashes()) == len(chain) },
+		10*time.Second, 20*time.Millisecond, "not every block reached the ingest interface")
+
+	want := make([]chainhash.Hash, 0, len(chain))
+	for _, header := range chain {
+		want = append(want, header.BlockHash())
+	}
+
+	require.Equal(t, want, ingestor.hashes(), "blocks must be ingested in the order they arrived")
+
+	// Every ingest reported completion to the scheduler: nothing is left in
+	// flight and all three blocks are recorded as held (BlockReceived).
+	require.Eventually(t, func() bool {
+		m.syncMu.Lock()
+		defer m.syncMu.Unlock()
+
+		return m.blockDownloader.BlocksInFlight() == 0 && len(m.blockDownloader.haveData) == len(chain)
+	}, 10*time.Second, 20*time.Millisecond, "block downloads were not released on ingest completion")
+}
+
+// TestManagerAdvertisesHeaderIndexHeight covers the Phase 1 placeholder this
+// task replaces: net_processing.cpp PushNodeVersion sends
+// nNodeStartingHeight, which is now the header index tip.
+func TestManagerAdvertisesHeaderIndexHeight(t *testing.T) {
+	genesis := syncGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	for _, header := range minedRun(genesis, 4, 2) {
+		connected, addErr := idx.AddHeader(header)
+		require.NoError(t, addErr)
+		require.True(t, connected)
+	}
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+	defer func() { _ = far.nc.Close() }()
+
+	far.write(t, remoteVersion(4321))
+
+	ourVersion, ok := far.readUntil(t, wire.CmdVersion).(*wire.MsgVersion)
+	require.True(t, ok)
+	require.Equal(t, int32(4), ourVersion.LastBlock)
 }
 
 func TestManagerStopClosesEverything(t *testing.T) {

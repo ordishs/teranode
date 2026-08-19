@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +44,21 @@ func (l *warnRecordingLogger) Warnings() []string {
 	defer l.mu.Unlock()
 
 	return append([]string(nil), l.warnings...)
+}
+
+// orphanWarnings filters out the warnings a healthy startup legitimately
+// emits — today, the one saying block sync is off until the ingestion
+// dependencies are injected — so the hydration assertion stays about orphans.
+func (l *warnRecordingLogger) orphanWarnings() []string {
+	var orphans []string
+
+	for _, w := range l.Warnings() {
+		if strings.Contains(w, "orphan header") {
+			orphans = append(orphans, w)
+		}
+	}
+
+	return orphans
 }
 
 func freePort(t *testing.T) string {
@@ -437,7 +453,7 @@ func TestServerHydratesHeaderIndexAcrossMultipleBatches(t *testing.T) {
 		require.Equal(t, int32(height+1), node.Height) //nolint:gosec // test-bounded height
 	}
 
-	require.Empty(t, warnLogger.Warnings(), "expected no orphan warnings during a linear multi-batch hydration")
+	require.Empty(t, warnLogger.orphanWarnings(), "expected no orphan warnings during a linear multi-batch hydration")
 }
 
 func TestServerHealth(t *testing.T) {
