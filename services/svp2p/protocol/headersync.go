@@ -511,7 +511,15 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		// gate. Without this, a peer that answers with a short batch below the
 		// checkpoint would leave the round with no outstanding request and no
 		// way to resume.
-		hs.roundAnchorHeight = lastAcceptedHeight
+		//
+		// The anchor only ever rises. A batch that carried something new but
+		// ended below the anchor — an honest fork reply, which the progress
+		// test above deliberately admits — must not lower the bar the next
+		// batch is measured against, or a peer could walk the anchor down one
+		// novel-but-lower batch at a time and then replay everything above it.
+		if lastAcceptedHeight > hs.roundAnchorHeight {
+			hs.roundAnchorHeight = lastAcceptedHeight
+		}
 
 		return []wire.Message{hs.getHeaders(hs.locatorFrom(lastAccepted))}, 0, nil
 	}
