@@ -249,7 +249,14 @@ func TestHeaderSync_InitialGetHeaders(t *testing.T) {
 	t.Run("only one peer starts header sync at a time", func(t *testing.T) {
 		f := newSyncFixture(t, 3)
 
-		hs, err := NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: syncTestParams(nil)})
+		// An old tip, so the 24 hour relaxation is off and the single-slot rule
+		// is the only thing under test here. See
+		// TestHeaderSync_TwentyFourHourSyncRelaxation for the other arm.
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       syncTestParams(nil),
+			AdjustedTime: fixtureClock(t, f, 25*time.Hour),
+		})
 		require.NoError(t, err)
 
 		first := fullNodePeer("1.2.3.4:8333")
@@ -364,6 +371,204 @@ func TestHeaderSync_InitialGetHeaders(t *testing.T) {
 
 		require.False(t, hs.IsHeadersFirstMode())
 		require.Equal(t, chainhash.Hash{}, gh.HashStop)
+	})
+}
+
+// fixtureClock returns an AdjustedTime function reading age after the
+// fixture tip's own block time. wire.NewBlockHeader stamps every fixture
+// header with time.Now(), so the fixture cannot place its tip on one side of
+// the 24 hour line by itself; the injected clock is the knob instead, and it
+// is the SAME clock the time-too-new check reads.
+func fixtureClock(t *testing.T, f *syncFixture, age time.Duration) func() int64 {
+	t.Helper()
+
+	tip, ok := f.idx.Lookup(f.tip().BlockHash())
+	require.True(t, ok)
+
+	now := tip.Time + int64(age/time.Second)
+
+	return func() int64 { return now }
+}
+
+// TestHeaderSync_TwentyFourHourSyncRelaxation pins net_processing.cpp
+// SendBlockSync (net_processing.cpp:5191-5196): header sync may start with
+// ADDITIONAL peers once the best header is within 24 hours of the adjusted
+// time. Phase 2 skipped it because HeaderIndex exposed no header timestamp.
+func TestHeaderSync_TwentyFourHourSyncRelaxation(t *testing.T) {
+	t.Run("a tip within 24 hours lets a second candidate start header sync", func(t *testing.T) {
+		f := newSyncFixture(t, 3)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       syncTestParams(nil),
+			AdjustedTime: fixtureClock(t, f, 23*time.Hour),
+		})
+		require.NoError(t, err)
+
+		first := fullNodePeer("1.2.3.4:8333")
+		second := fullNodePeer("5.6.7.8:8333")
+
+		require.Len(t, hs.PeerEstablished(first), 1)
+
+		gh := requireGetHeaders(t, hs.PeerEstablished(second))
+
+		require.True(t, second.State.fSyncStarted)
+		require.Equal(t, 2, hs.nSyncStarted)
+
+		// No round is running, so the additional peer gets the plain
+		// net_processing.cpp getheaders rather than a checkpoint hashStop.
+		require.False(t, hs.IsHeadersFirstMode())
+		require.Equal(t, chainhash.Hash{}, gh.HashStop)
+	})
+
+	t.Run("a tip older than 24 hours keeps the single sync slot", func(t *testing.T) {
+		f := newSyncFixture(t, 3)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       syncTestParams(nil),
+			AdjustedTime: fixtureClock(t, f, 25*time.Hour),
+		})
+		require.NoError(t, err)
+
+		first := fullNodePeer("1.2.3.4:8333")
+		second := fullNodePeer("5.6.7.8:8333")
+
+		require.Len(t, hs.PeerEstablished(first), 1)
+
+		require.Nil(t, hs.PeerEstablished(second))
+		require.False(t, second.State.fSyncStarted)
+		require.Equal(t, 1, hs.nSyncStarted)
+	})
+
+	t.Run("a headers-first round keeps the single slot however fresh the tip is", func(t *testing.T) {
+		f := newSyncFixture(t, 3)
+
+		// A checkpoint above our tip puts the machine in headers-first mode,
+		// which is the state Phase 2 Task 5's round invariants are written
+		// against: exactly one peer drives the round.
+		cpHash := chainhash.Hash{0xC0}
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       syncTestParams([]chaincfg.Checkpoint{{Height: 100000, Hash: &cpHash}}),
+			AdjustedTime: fixtureClock(t, f, time.Hour),
+		})
+		require.NoError(t, err)
+
+		first := fullNodePeer("1.2.3.4:8333")
+		second := fullNodePeer("5.6.7.8:8333")
+
+		require.Len(t, hs.PeerEstablished(first), 1)
+		require.True(t, hs.IsHeadersFirstMode())
+
+		// The tip is one hour old, so the 24 hour test alone would admit this
+		// peer. The round is what refuses it.
+		require.Nil(t, hs.PeerEstablished(second))
+		require.False(t, second.State.fSyncStarted)
+		require.Equal(t, 1, hs.nSyncStarted)
+
+		// The round the first peer holds is untouched: a second peer must not
+		// re-seed nextCheckpoint, headersFirstMode or the round anchor.
+		require.True(t, hs.IsHeadersFirstMode())
+		require.True(t, first.State.fSyncStarted)
+	})
+
+	t.Run("a checkpointless network never runs a round, so the 24 hour test is the only gate", func(t *testing.T) {
+		// regtest and tstn ship no checkpoints. headersFirstMode is only ever
+		// set true when nextCheckpoint is non-nil (PeerEstablished), and
+		// findNextHeaderCheckpoint reads hs.checkpoints, which is empty both
+		// for params carrying no checkpoints and for DisableCheckpoints. So
+		// there is no round on such a network for the relaxation to disturb,
+		// and two header syncs are exactly what net_processing.cpp does.
+		f := newSyncFixture(t, 3)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       syncTestParams(nil),
+			AdjustedTime: fixtureClock(t, f, time.Hour),
+		})
+		require.NoError(t, err)
+
+		require.Empty(t, hs.checkpoints)
+		require.Nil(t, hs.nextCheckpoint, "an empty checkpoint list cannot seed a next checkpoint")
+
+		require.Len(t, hs.PeerEstablished(fullNodePeer("1.2.3.4:8333")), 1)
+
+		require.Nil(t, hs.nextCheckpoint,
+			"nothing a peer does can produce a checkpoint that is not in the params")
+		require.False(t, hs.IsHeadersFirstMode(),
+			"no checkpoint means no headers-first round on any tip")
+
+		require.Len(t, hs.PeerEstablished(fullNodePeer("5.6.7.8:8333")), 1)
+		require.Equal(t, 2, hs.nSyncStarted)
+
+		// The mode is still off with two peers syncing, which is what makes
+		// them plain net_processing.cpp header peers rather than two peers
+		// inside one round.
+		require.False(t, hs.IsHeadersFirstMode())
+	})
+
+	// Two peers may hold fSyncStarted only while headersFirstMode is off, so
+	// neither is a roundOwner in acceptHeaders. That is what keeps the shared
+	// roundAnchorHeight and the ErrHeadersNoProgress terminator out of reach of
+	// a second header source: both live on the machine, not on the peer, and
+	// both are gated on the mode. Without that, the second peer's batch would
+	// walk the anchor up and the first peer's honest continuation would be read
+	// as a replay and disconnected.
+	t.Run("parallel header syncs cannot make each other look non-progressing", func(t *testing.T) {
+		f := newSyncFixture(t, 3)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       syncTestParams(nil),
+			AdjustedTime: fixtureClock(t, f, time.Hour),
+		})
+		require.NoError(t, err)
+
+		first := fullNodePeer("1.2.3.4:8333")
+		second := fullNodePeer("5.6.7.8:8333")
+
+		require.Len(t, hs.PeerEstablished(first), 1)
+
+		// The first peer seeds the anchor from its own start locator, as it
+		// always has. Nothing reads it outside a round, but pinning it is what
+		// makes the assertions below mean "unchanged" rather than "unset".
+		seeded := hs.roundAnchorHeight
+		require.Equal(t, int32(2), seeded, "the initial getheaders went out from the tip's parent")
+
+		require.Len(t, hs.PeerEstablished(second), 1)
+		require.Equal(t, 2, hs.nSyncStarted)
+		require.False(t, hs.IsHeadersFirstMode(), "the round guard is what admitted the second peer")
+		require.Equal(t, seeded, hs.roundAnchorHeight,
+			"an additional near-tip peer must not re-seed the round state")
+
+		batch := minedRun(f.tip(), 3, 7300)
+
+		// The first peer carries the chain forward. acceptHeaders raises the
+		// anchor only for a roundOwner, and neither peer is one here, so there
+		// is nothing for a second header source to walk up.
+		_, score, err := hs.OnHeaders(first, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, score)
+		require.Equal(t, seeded, hs.roundAnchorHeight)
+
+		// The second peer then serves exactly the same headers. Every one is
+		// already indexed and none reaches past where the first peer left off:
+		// nothing new, and not above the anchor. That is precisely the shape
+		// the terminator refuses inside a round — see
+		// "a repeated batch of known headers ends the round instead of
+		// looping", where this same sequence produces ErrHeadersNoProgress.
+		// Outside a round it
+		// must be tolerated, because the peer is answering our own getheaders
+		// honestly.
+		_, score, err = hs.OnHeaders(second, headersMsg(batch))
+		require.NoError(t, err, "a parallel header source must not be disconnected as a replay")
+		require.Zero(t, score)
+
+		require.True(t, first.State.fSyncStarted, "neither peer may lose its slot to the other")
+		require.True(t, second.State.fSyncStarted)
+		require.Equal(t, seeded, hs.roundAnchorHeight,
+			"no round, so no anchor either header source could move")
 	})
 }
 
@@ -646,7 +851,11 @@ func TestHeaderSync_SyncSlotRelease(t *testing.T) {
 		require.True(t, hs.IsHeadersFirstMode())
 		require.True(t, holder.State.fSyncStarted)
 
-		// The slot is still taken, so a new candidate is not asked.
+		// The ROUND is what refuses the new candidate. A taken slot alone is no
+		// longer enough: Task 4's 24 hour relaxation admits further peers on a
+		// fresh tip, and every fixture header is stamped time.Now(). The
+		// !headersFirstMode conjunct in PeerEstablished is what holds the slot
+		// single here.
 		require.Nil(t, hs.PeerEstablished(fullNodePeer("5.6.7.8:8333")))
 	})
 }

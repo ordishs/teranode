@@ -28,6 +28,12 @@ const MaxUnconnectingHeaders = 10
 // it as "time-too-new".
 const MaxFutureBlockTime int64 = 2 * 60 * 60
 
+// NearTipHeaderSyncWindow is the 24 * 60 * 60 seconds net_processing.cpp
+// SendBlockSync (net_processing.cpp:5191-5196) measures pindexBestHeader
+// against before it starts header sync with ADDITIONAL peers. The C++ spells
+// the constant inline; it is named here because PeerEstablished reads it.
+const NearTipHeaderSyncWindow int64 = 24 * 60 * 60
+
 // MaxBlocksToAnnounce mirrors net_processing.cpp MAX_BLOCKS_TO_ANNOUNCE (8):
 // the size limit that separates a short "we are announcing a block you have
 // not seen" headers message, which earns the gap-filling getheaders, from a
@@ -272,18 +278,118 @@ func (hs *HeaderSync) PeerEstablished(peer *SyncPeer) []wire.Message {
 		return nil
 	}
 
-	// net_processing.cpp SendMessages: "Only actively request headers from a
-	// single peer". The C++ relaxes this when pindexBestHeader is within 24
-	// hours of now, which only ever adds parallel header syncs; Phase 2 keeps
-	// the single-peer rule alone, because HeaderIndex exposes no header
-	// timestamp to test the relaxation against. Legacy netsync has the same
-	// single-sync-peer behavior.
-	if hs.nSyncStarted > 0 {
+	// net_processing.cpp SendBlockSync (net_processing.cpp:5191-5196): "Only
+	// actively request headers from a single peer, unless we're close to
+	// today." The slot is single until the best header we hold is within 24
+	// hours of the adjusted time, and from there header sync starts with every
+	// further candidate too. Legacy netsync carries only the single-peer half.
+	//
+	// Phase 2 kept the single-peer rule alone because HeaderIndex exposed no
+	// header timestamp; Phase 3 Task 2 put GetBlockTime() on HeaderNode, so the
+	// relaxation lands here. It reads hs.cfg.AdjustedTime, the SAME injected
+	// clock the time-too-new cap in acceptHeader reads — this machine has one
+	// clock and only one.
+	//
+	// THE BENEFIT IS TRANSIENT, BECAUSE THIS PORT MAKES THE TEST EVENT-DRIVEN
+	// INSTEAD OF PER-PASS. That is the same divergence Task 4's other mechanism
+	// carries (see PeerManager.promoteBlockAvailabilityLocked), but here it has a
+	// cost that one does not pay. SendBlockSync re-evaluates EVERY peer on EVERY
+	// SendMessages pass, so a peer that becomes eligible later still starts
+	// header sync. PeerEstablished is reached from only two places:
+	// PeerManager.Established, the handshake, and PeerManager.electLocked, which
+	// runs only after a rotation or a peerGone. Nothing re-runs it on the sync
+	// tick.
+	//
+	// WHAT THAT COSTS IN STEADY STATE, past the final checkpoint. headersFirstMode
+	// is false there, so CheckStall's header-progress refresh (blockdownload.go,
+	// the IsHeadersFirstMode branch) is unreachable, and nLastProgressTime moves
+	// only when a block is delivered — to the ONE peer that delivered it
+	// (BlockReceived). With MaxLastBlockTime at 180 seconds and mainnet blocks
+	// about ten minutes apart, most 180 second windows deliver no block at all, so
+	// every fSyncStarted peer rotates in the same pass. That frees every slot,
+	// while electLocked returns on the FIRST peer that yields messages, so the one
+	// election refills exactly one. CheckStall's !fSyncStarted early return then
+	// stops a rotated-out peer from ever rotating again, so it triggers no further
+	// election of its own. A node that reached several header peers therefore
+	// falls to exactly ONE within about 180 seconds, and stays there until peers
+	// reconnect.
+	//
+	// IT DOES NOT ENDANGER TASK 5's all-peer download scheduling. What that work
+	// needs from a peer is pindexBestKnownBlock, and Task 4's promotion mechanism
+	// supplies it from index growth alone, independently of fSyncStarted — a peer
+	// that never held the sync slot is still schedulable. The collapse costs
+	// header-sync breadth, not download breadth.
+	//
+	// THE FIX IS SCHEDULED INTO TASK 5, not lost: re-run this eligibility check on
+	// the sync tick, which is exactly what SendMessages does. Task 5's all-peer
+	// work needs that same per-pass sweep shape, so the two land together rather
+	// than building the sweep twice.
+	//
+	// THE !headersFirstMode CONJUNCT HAS NO SVNODE COUNTERPART. It is a
+	// Teranode-specific structural guard, and SendBlockSync has nothing like
+	// it, for the simple reason that SVNode has no headers-first round to
+	// protect: the checkpointed round is legacy netsync's scheme, which this
+	// port inherited from the legacy service and net_processing.cpp never had.
+	// Phase 2 Task 5 scoped that round to ONE peer — only the slot holder may
+	// index headers while it runs — so admitting a second fSyncStarted peer
+	// mid-round would let it re-seed nextCheckpoint, headersFirstMode and
+	// roundAnchorHeight underneath the peer driving the round.
+	//
+	// WHY IT EXISTS, and the dependency to re-evaluate it against. The plan for
+	// this task argued the guard was unnecessary, because a round only runs
+	// below the final checkpoint, where the tip is old. That argument conflates
+	// HEIGHT with TIME and does not hold TODAY FOR ONE REASON: acceptHeader
+	// deliberately does not port ContextualCheckBlockHeader's time-too-old rule
+	// (validation.cpp:5904-5907 — see the note at that site, which books it as
+	// a Phase 3 follow-up). With no median-time-past bound, a header at ANY
+	// height may claim ANY timestamp up to the future cap, and Tip() answers
+	// the highest-WORK node, which during a round is whatever the slot holder
+	// served last. So a peer feeding a fresh node cheap headers below its first
+	// checkpoint can make the tip look recent while the round still runs.
+	//
+	// IF THE TIME-TOO-OLD RULE EVER LANDS, re-evaluate this conjunct rather
+	// than carrying it forward unexamined: a monotonic timestamp sequence would
+	// restore the plan's argument, and the guard could then go. Do not remove
+	// it before that, and do not remove it without first making
+	// roundAnchorHeight per-peer — see the invariant note below.
+	//
+	// IT ALSO KEEPS THE ROUND STATE SINGLE-SOURCED. roundAnchorHeight and the
+	// no-progress terminator that reads it (acceptHeaders) live on this
+	// machine, not on the peer, and both are gated on headersFirstMode. Because
+	// this conjunct makes "headersFirstMode is on" and "more than one peer holds
+	// fSyncStarted" mutually exclusive, two simultaneous header sources can
+	// never share that anchor and so can never make each other look
+	// non-progressing. Outside a round, nextCheckpoint, headersFirstMode and
+	// roundAnchorHeight are all inert — nothing reads them — so parallel header
+	// syncs contend on nothing.
+	//
+	// The guard costs nothing in intended operation: past the final checkpoint,
+	// where a tip within 24 hours of now actually occurs, headersFirstMode is
+	// off. A network with no checkpoints at all — regtest, tstn — never turns
+	// it on, so there the 24 hour test is the only gate, which is exactly
+	// net_processing.cpp.
+	if hs.nSyncStarted > 0 && (hs.headersFirstMode || !hs.tipIsNearAdjustedTime()) {
 		return nil
 	}
 
+	first := hs.nSyncStarted == 0
+
 	peer.State.fSyncStarted = true
 	hs.nSyncStarted++
+
+	if !first {
+		// An ADDITIONAL near-tip peer joins a header sync that is already
+		// running; it does not own the round state. Only the first sync peer
+		// seeds nextCheckpoint, headersFirstMode and the round anchor, so a
+		// late joiner can never turn a round on underneath the peer already
+		// syncing — the guard above only reads the mode as it stands now.
+		// SendBlockSync gives every peer the same plain getheaders from
+		// pindexBestHeader->pprev, which is what syncStartLocator builds, and
+		// headersFirstMode is false here so the hashStop is the zero hash.
+		locator, _ := hs.syncStartLocator()
+
+		return []wire.Message{hs.getHeaders(locator)}
+	}
 
 	_, tipHeight := hs.cfg.Index.Tip()
 	hs.nextCheckpoint = hs.findNextHeaderCheckpoint(tipHeight)
@@ -298,6 +404,26 @@ func (hs *HeaderSync) PeerEstablished(peer *SyncPeer) []wire.Message {
 	hs.roundAnchorHeight = anchor
 
 	return []wire.Message{hs.getHeaders(locator)}
+}
+
+// tipIsNearAdjustedTime is the net_processing.cpp SendBlockSync
+// (net_processing.cpp:5191-5196) test on pindexBestHeader:
+// GetBlockTime() > GetAdjustedTime() - 24 * 60 * 60. The header index tip is
+// this port's pindexBestHeader — HeaderIndex.Tip answers the highest-work node
+// it holds, which is what pindexBestHeader tracks in the source.
+//
+// A tip the index cannot look up answers false, which keeps the single-slot
+// rule. That case is unreachable — Tip returns a hash it holds — and refusing
+// the relaxation is the conservative side of it either way.
+func (hs *HeaderSync) tipIsNearAdjustedTime() bool {
+	tipHash, _ := hs.cfg.Index.Tip()
+
+	tip, ok := hs.cfg.Index.Lookup(tipHash)
+	if !ok {
+		return false
+	}
+
+	return tip.Time > hs.cfg.AdjustedTime()-NearTipHeaderSyncWindow
 }
 
 // PeerDisconnected mirrors net_processing.cpp FinalizeNode: a peer that was
@@ -408,6 +534,24 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 	// peer; unrequested headers cost only a decode and are already bounded by
 	// MAX_HEADERS_RESULTS, so a disconnect policy for them is Phase 3 work,
 	// alongside the header-index hardening this file's PoW note describes.
+	//
+	// The cost of parking the announcement here — a peer stays unschedulable
+	// until something resolves the hash — is what Phase 3 Task 4 answered, on
+	// the OTHER side of the seam: PeerManager sweeps every peer's parked hash
+	// through processBlockAvailability whenever the index grows, so this peer
+	// becomes a download candidate the moment the round indexes what it
+	// announced, with no further traffic from it.
+	//
+	// Soliciting getheaders from non-sync peers DURING a round was considered
+	// for Task 4 and DECLINED (ledger M7), for two reasons. It has no SVNode
+	// source: net_processing.cpp starts header sync only from SendBlockSync. And
+	// mid-round solicitation would put headers from unsolicited peers back on the
+	// round this gate exists to protect.
+	//
+	// SendBlockSync's own near-tip relaxation is NOT a third reason, though it
+	// reads like one. This port refuses that relaxation while a round runs (the
+	// !headersFirstMode conjunct in PeerEstablished), so mid-round — the only
+	// case M7 covers — it yields no extra header peers at all.
 	if hs.headersFirstMode && !peer.State.fSyncStarted {
 		peer.State.updateBlockAvailability(hs.cfg.Index, headers[len(headers)-1].BlockHash())
 
@@ -612,10 +756,11 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 // acceptHeader is the body of validation.cpp AcceptBlockHeader
 // (validation.cpp:6087-6154) for a header the index does not already hold:
 // CheckBlockHeader, then the previous-block lookup, then the checkpoint fence,
-// then ContextualCheckBlockHeader's difficulty rule, then the mapBlockIndex
-// insert. The order is the source's, and it matters — the fence and the
-// difficulty check both read the parent, and neither may run before the cheap
-// proof-of-work check has made the header cost something to produce.
+// then ContextualCheckBlockHeader's difficulty rule, then its time-too-new
+// timestamp cap, then the mapBlockIndex insert. The order is the source's, and
+// it matters — the fence and the difficulty check both read the parent, and
+// neither may run before the cheap proof-of-work check has made the header cost
+// something to produce.
 //
 // accepted reports whether the header was inserted. When it is false the
 // header is refused and the batch stops, and score carries the DoS value the
@@ -814,9 +959,9 @@ func (hs *HeaderSync) lastCheckpointInIndex() *chaincfg.Checkpoint {
 //     checkpoint yet has no lower bound.
 //   - testnet, teratestnet and tstn are NOT bounded by difficulty at all: their
 //     min-difficulty rule makes cheap headers legitimate. time-too-new caps how
-//     DEEP a cheap chain can run (about six headers) but not how WIDE, so a peer
-//     may still put many cheap siblings on one parent. SVNode has the same
-//     exposure on the same networks.
+//     DEEP a cheap chain can run (five headers, floor(7200/1201)) but not how
+//     WIDE, so a peer may still put many cheap siblings on one parent. SVNode
+//     has the same exposure on the same networks.
 //
 // Still unported, deliberately: the historic difficulty eras (see difficulty.go)
 // and the time-too-old rule (see acceptHeader).

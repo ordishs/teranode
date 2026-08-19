@@ -231,8 +231,18 @@ func (m *PeerManager) SyncEnabled() bool {
 // Anything else that grows the index must go through OnHeaders, or the gates
 // there stop bounding what a peer can make us store.
 func (m *PeerManager) AddHeaders(headers []*wire.BlockHeader) ([]*wire.BlockHeader, error) {
+	// Snapshotted before syncMu is taken: the two mutexes are never held
+	// together (see the note on syncMu).
+	handles := m.peerHandles()
+
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
+
+	// Deferred after the unlock, so it runs BEFORE it — including on the
+	// mid-batch error return, where the headers accepted so far stay indexed
+	// and may already have resolved somebody's parked hash. It is a no-op when
+	// the index is not configured.
+	defer m.promoteBlockAvailabilityLocked(handles)
 
 	if m.headerIndex == nil {
 		return nil, errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: header index is not configured")
@@ -252,6 +262,49 @@ func (m *PeerManager) AddHeaders(headers []*wire.BlockHeader) ([]*wire.BlockHead
 	}
 
 	return orphans, nil
+}
+
+// promoteBlockAvailabilityLocked resolves every peer's parked
+// hashLastUnknownBlock against the header index, and is called on both paths
+// that grow the index.
+//
+// net_processing.cpp runs ProcessBlockAvailability (net_processing.cpp:355) on
+// every peer on every SendMessages pass, so a parked hash is resolved by the
+// next pass whatever put the header in mapBlockIndex. THE DIVERGENCE IS THAT
+// THIS PORT MAKES IT EVENT-DRIVEN INSTEAD OF PER-PASS: the sweep runs when the
+// index grows rather than on a timer.
+//
+// The port needs it because it cannot inherit the C++ safety net. Phase 2 Task
+// 5's N2 fix made a non-sync peer availability-only during a headers-first
+// round (see the divergence note in headersync.go OnHeaders), so its
+// announcement parks. The only other caller of processBlockAvailability is
+// FindNextBlocksToDownload, which the download walk reaches on none of its
+// early returns — a peer with no pindexBestKnownBlock is exactly a peer that
+// walk gives up on. So a parked hash could otherwise sit unresolved while the
+// round indexed the very chain it named, and the peer stayed unschedulable.
+// Running it on index growth resolves the hash at the earliest moment it CAN
+// resolve, which is strictly sooner than any pass-driven sweep.
+//
+// Cost is one HeaderIndex.Lookup per PARKED peer per batch — not per header:
+// both callers sweep once, after the whole batch is indexed.
+// processBlockAvailability returns on its zero-hash test for every peer with
+// nothing parked, so an idle peer costs one comparison. Nothing here blocks,
+// which is what lets it run under syncMu.
+//
+// Requires syncMu. handles must be snapshotted by the caller BEFORE it takes
+// syncMu, because mu and syncMu are never held together.
+func (m *PeerManager) promoteBlockAvailabilityLocked(handles []peerHandle) {
+	if m.headerIndex == nil {
+		return
+	}
+
+	for _, h := range handles {
+		if h.sync == nil || h.sync.State == nil {
+			continue
+		}
+
+		h.sync.State.processBlockAvailability(m.headerIndex)
+	}
 }
 
 // SetActiveTip records our own best chain tip, the chainActive counterpart the
@@ -564,6 +617,10 @@ func (m *PeerManager) Established(syncPeer *SyncPeer, services wire.ServiceFlag)
 
 // Headers dispatches the NetMsgType::HEADERS event.
 func (m *PeerManager) Headers(syncPeer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Message, int, error) {
+	// Snapshotted before syncMu is taken: the two mutexes are never held
+	// together (see the note on syncMu).
+	handles := m.peerHandles()
+
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
 
@@ -571,7 +628,16 @@ func (m *PeerManager) Headers(syncPeer *SyncPeer, msg *wire.MsgHeaders) ([]wire.
 		return nil, 0, nil
 	}
 
-	return m.headerSync.OnHeaders(syncPeer, msg)
+	msgs, score, err := m.headerSync.OnHeaders(syncPeer, msg)
+
+	// This batch may have grown the index, which is what can resolve another
+	// peer's parked announcement. It runs on the error path too: OnHeaders
+	// keeps the headers it accepted before the refusal that stopped the batch,
+	// exactly as validation.cpp does, so the index may have grown even when
+	// this peer is about to be disconnected.
+	m.promoteBlockAvailabilityLocked(handles)
+
+	return msgs, score, err
 }
 
 // Inv dispatches the NetMsgType::INV event.
@@ -852,17 +918,41 @@ func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, n
 	}
 
 	if rotated != nil {
-		// Only one rotation is ACTED ON per tick, and rotated is the last one
-		// the loop saw. Only one peer can hold the single sync slot, so a
-		// second rotation in the same pass would be a peer that no longer
-		// holds it, and this election already covers whoever is eligible now.
-		// If a second peer did somehow rotate in the same pass, the next tick
-		// elects for it.
+		// ONE election runs per tick, for the LAST rotation the loop saw. Every
+		// rotation still released its own peer's sync slot and its in-flight
+		// blocks inside the loop — that half is per peer and complete. What is
+		// capped at one per tick is the REPLACEMENT.
 		//
-		// The skip in the rotate branch is per peer, not per pass, so that
-		// reasoning still holds with it in place: every rotating peer sat out
-		// its own download pass, and a rotation the election misses costs one
-		// tick and nothing else.
+		// THE SINGLE-SLOT PREMISE THIS ONCE RESTED ON IS GONE. It used to argue
+		// that only one peer can hold the slot, so a second rotation in the same
+		// pass had to be a peer that no longer held it. Task 4's 24 hour near-tip
+		// relaxation (headersync.go PeerEstablished) lets SEVERAL peers hold
+		// fSyncStarted at once, so several can return StallActionRotateSyncPeer on
+		// one pass, and rotated keeps only the last of them.
+		//
+		// WHAT THAT PERMITS, stated rather than argued away. electLocked excludes
+		// only the last rotation, and a peer rotated EARLIER in this same pass is
+		// eligible again: CheckStall's rotate path cleared its fSyncStarted and
+		// refreshed its nLastProgressTime. So map iteration order may hand the
+		// slot back to a peer this very pass judged non-progressing, ahead of a
+		// peer nothing has tried yet.
+		//
+		// It is bounded, not correct. A re-elected peer is measured again from
+		// that fresh nLastProgressTime and rotates once more within
+		// MaxLastBlockTime if it still does not deliver, and the next election
+		// sees a different map order. A rotation this election misses costs one
+		// tick of header-sync breadth and nothing else — the peer keeps
+		// pindexBestKnownBlock, so it stays a download candidate throughout.
+		//
+		// TASK 5 DISSOLVES IT rather than this branch doing so. Re-running the
+		// eligibility check for every peer on the sync tick — what SendMessages
+		// does, and what Task 5's all-peer scheduling needs anyway — starts header
+		// sync with every eligible peer, so which peer a rotation election happens
+		// to reach first stops mattering. See the transient-benefit note at
+		// PeerEstablished, which books the same sweep.
+		//
+		// The skip in the rotate branch is per peer, not per pass, so every
+		// rotating peer sat out its own download pass either way.
 		out = append(out, m.electLocked(handles, rotated)...)
 	}
 

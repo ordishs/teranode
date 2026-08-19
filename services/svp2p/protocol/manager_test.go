@@ -396,11 +396,11 @@ func blockFor(header *wire.BlockHeader) *wire.MsgBlock {
 // syncTestManager builds a manager whose chain params mine cheaply (the
 // regtest powLimit on mainnet magic, so the non-regtest sync-candidate branch
 // still runs) with block sync wired to ingestor.
-func syncTestManager(t *testing.T, idx *HeaderIndex, ingestor BlockIngestor) *PeerManager {
+func syncTestManager(t *testing.T, idx *HeaderIndex, ingestor BlockIngestor, checkpoints ...chaincfg.Checkpoint) *PeerManager {
 	t.Helper()
 
 	tSettings := managerSettings()
-	tSettings.ChainCfgParams = syncTestParams(nil)
+	tSettings.ChainCfgParams = syncTestParams(checkpoints)
 
 	banList, err := NewBanList("")
 	require.NoError(t, err)
@@ -1203,4 +1203,164 @@ func TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain(t *testing.
 
 	require.Len(t, getDataTo(out, other.peer), MaxBlocksInTransitPerPeer,
 		"the blocks the silent peer was re-handed must reach another peer in the end")
+}
+
+// registerPeer puts a peer in the connection registry the way runPeer does, so
+// a manager-level test exercises the sweeps that read every connected peer's
+// CNodeState entry. The *Peer itself is never run: these tests drive the
+// dispatch methods directly and assert on sync state.
+func registerPeer(m *PeerManager, peer *Peer, syncPeer *SyncPeer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.peers[peer] = syncPeer
+}
+
+// TestManagerPromotesBlockAvailabilityOnIndexGrowth is the manager-level pin on
+// the eager promotion sweep. Phase 2 Task 5's N2 fix made a non-sync peer
+// availability-only during a headers-first round, so its announcement parks in
+// hashLastUnknownBlock. Before this sweep, only FindNextBlocksToDownload's own
+// processBlockAvailability call could resolve that hash, which the download
+// walk reaches on none of its early returns. The peer therefore stayed
+// unschedulable while the round indexed the very chain it had announced.
+func TestManagerPromotesBlockAvailabilityOnIndexGrowth(t *testing.T) {
+	t.Run("a bystander parked during a round is promoted when the round indexes its hash", func(t *testing.T) {
+		genesis := syncGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		// A checkpoint far above our tip keeps the headers-first round running
+		// for the whole test, which is what makes the bystander
+		// availability-only.
+		cpHash := chainhash.Hash{0xC0}
+		m := syncTestManager(t, idx, &recordingIngestor{},
+			chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+		holderPeer, holderFar := newTestPeer(t, time.Minute, time.Minute)
+		bystanderPeer, bystanderFar := newTestPeer(t, time.Minute, time.Minute)
+
+		t.Cleanup(func() {
+			_ = holderFar.nc.Close()
+			_ = bystanderFar.nc.Close()
+		})
+
+		holder := fullNodePeer("1.1.1.1:8333")
+		bystander := fullNodePeer("2.2.2.2:8333")
+
+		registerPeer(m, holderPeer, holder)
+		registerPeer(m, bystanderPeer, bystander)
+
+		require.Len(t, m.Established(holder, wire.SFNodeNetwork), 1)
+
+		m.syncMu.Lock()
+		require.True(t, m.headerSync.IsHeadersFirstMode())
+		require.False(t, bystander.State.fSyncStarted, "the round is single-slot")
+		m.syncMu.Unlock()
+
+		batch := minedRun(genesis, 3, 4200)
+		last := batch[len(batch)-1].BlockHash()
+
+		// The bystander announces a chain we do not hold. Its batch is ignored
+		// and the hash parks.
+		msgs, score, err := m.Headers(bystander, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, score)
+		require.Nil(t, msgs)
+
+		m.syncMu.Lock()
+		require.Equal(t, last, bystander.State.hashLastUnknownBlock)
+		require.Nil(t, bystander.State.pindexBestKnownBlock, "a parked hash is not availability yet")
+		m.syncMu.Unlock()
+
+		// The round indexes exactly that chain. The bystander sends nothing
+		// more: this call carries no traffic from it at all.
+		_, score, err = m.Headers(holder, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, score)
+
+		m.syncMu.Lock()
+		defer m.syncMu.Unlock()
+
+		require.NotNil(t, bystander.State.pindexBestKnownBlock,
+			"a parked hash must resolve the moment the index grows past it")
+		require.Equal(t, last, bystander.State.pindexBestKnownBlock.Hash)
+		require.Equal(t, int32(3), bystander.State.pindexBestKnownBlock.Height)
+		require.Equal(t, chainhash.Hash{}, bystander.State.hashLastUnknownBlock)
+	})
+
+	t.Run("AddHeaders from our own chain promotes a parked announcement", func(t *testing.T) {
+		genesis := syncGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		m := syncTestManager(t, idx, &recordingIngestor{})
+
+		peer, far := newTestPeer(t, time.Minute, time.Minute)
+		t.Cleanup(func() { _ = far.nc.Close() })
+
+		syncPeer := fullNodePeer("3.3.3.3:8333")
+		registerPeer(m, peer, syncPeer)
+
+		chain := minedRun(genesis, 2, 5100)
+		last := chain[len(chain)-1].BlockHash()
+
+		// An inv for a block whose header we do not hold parks the hash.
+		msgs, err := m.Inv(syncPeer, invMsg(t, wire.InvTypeBlock, last))
+		require.NoError(t, err)
+		require.Len(t, msgs, 1, "an unknown block inv asks for the headers that place it")
+
+		m.syncMu.Lock()
+		require.Equal(t, last, syncPeer.State.hashLastUnknownBlock)
+		require.Nil(t, syncPeer.State.pindexBestKnownBlock)
+		m.syncMu.Unlock()
+
+		// The blockchain subscription indexes that chain, and nothing else
+		// happens.
+		orphans, err := m.AddHeaders(chain)
+		require.NoError(t, err)
+		require.Empty(t, orphans)
+
+		m.syncMu.Lock()
+		defer m.syncMu.Unlock()
+
+		require.NotNil(t, syncPeer.State.pindexBestKnownBlock)
+		require.Equal(t, last, syncPeer.State.pindexBestKnownBlock.Hash)
+		require.Equal(t, int32(2), syncPeer.State.pindexBestKnownBlock.Height)
+		require.Equal(t, chainhash.Hash{}, syncPeer.State.hashLastUnknownBlock)
+	})
+
+	t.Run("a hash the index still does not hold stays parked", func(t *testing.T) {
+		genesis := syncGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		m := syncTestManager(t, idx, &recordingIngestor{})
+
+		peer, far := newTestPeer(t, time.Minute, time.Minute)
+		t.Cleanup(func() { _ = far.nc.Close() })
+
+		syncPeer := fullNodePeer("4.4.4.4:8333")
+		registerPeer(m, peer, syncPeer)
+
+		unknown := chainhash.Hash{0xAB}
+
+		_, err = m.Inv(syncPeer, invMsg(t, wire.InvTypeBlock, unknown))
+		require.NoError(t, err)
+
+		// The index grows, but not past the parked hash.
+		orphans, err := m.AddHeaders(minedRun(genesis, 2, 6100))
+		require.NoError(t, err)
+		require.Empty(t, orphans)
+
+		m.syncMu.Lock()
+		defer m.syncMu.Unlock()
+
+		require.Equal(t, unknown, syncPeer.State.hashLastUnknownBlock,
+			"the sweep must not clear a hash it could not resolve")
+		require.Nil(t, syncPeer.State.pindexBestKnownBlock,
+			"the sweep must not invent availability the peer never announced")
+	})
 }
