@@ -782,6 +782,11 @@ func (m *PeerManager) syncTickOnce() {
 // collect-then-act shape every sync path here keeps; syncTickOnce acts on the
 // two lists after the unlock.
 //
+// THE CALLER MUST NOT HOLD syncMu. This method takes it itself, unlike the
+// *Locked helpers in this file, and syncMu is not reentrant. That cuts against
+// the convention here, so any test or caller that seeds sync state under the
+// lock must release it before calling this.
+//
 // ingests must be index-aligned with handles, and is sampled by the caller
 // before syncMu is taken: IngestSnapshot takes the PEER lock, and the package
 // lock order forbids reaching for a peer lock while holding a manager one.

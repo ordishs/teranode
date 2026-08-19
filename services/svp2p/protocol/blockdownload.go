@@ -851,11 +851,17 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 //
 // What a rotation leaves behind is the third thing this method has to answer
 // for. A rotated peer stays connected, and SyncPeerTimedOut cleared its
-// fSyncStarted, so the rotation clause can never fire for it again while it
-// stays. The decision is that it becomes a PLAIN DOWNLOAD PEER: it keeps no
-// clock of its own, and the scheduler may hand it blocks on any later tick.
-// Two things govern it from there, and the ORDER of the two clauses below is
-// what makes the first of them work:
+// fSyncStarted, so the rotation clause cannot fire for it again while it holds
+// no sync slot. It may take the slot back: PeerManager.electLocked runs a
+// second sweep that re-elects even the peer it just excluded when nobody else
+// is eligible, and PeerEstablished sets fSyncStarted again because
+// releaseSyncPeer already returned the slot. On a single-candidate node the
+// rotated peer is therefore re-elected inside the same tick, and the rotation
+// clause governs it once more. The paragraphs below are about the other case,
+// the conservative one: while it holds no slot, it is a PLAIN DOWNLOAD PEER.
+// It keeps no clock of its own, and the scheduler may hand it blocks on any
+// later tick. Two things govern it then, and the ORDER of the two clauses
+// below is what makes the first of them work:
 //
 //   - The DetectStalling clause runs BEFORE the fSyncStarted early-return, so
 //     it still judges a peer that holds no sync slot. Any block such a peer
@@ -870,6 +876,19 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 //     without needing a second peer to name it the staller. That timeout is
 //     NOT carried here yet, so the staller rule above is the whole of the
 //     recovery today.
+//
+// Know what that costs before relying on it. A silent peer comes to rest
+// holding MaxBlocksInTransitPerPeer blocks and no more, because
+// SendGetDataBlocks is the only thing that marks blocks in flight and it asks
+// for at most the remainder of that cap. nStallingSince cannot start until
+// another peer has downloaded the whole rest of the download window and STILL
+// cannot move, since that empty batch is the only thing that names a staller.
+// So the recovery is bounded by the download time for up to
+// BlockDownloadWindow blocks — our own tip stuck behind the hole for all of it
+// — and only then by BlockStallingTimeout. With no second eligible peer it
+// never completes at all. The per-block timeout is what would make this cheap,
+// and TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain
+// (manager_test.go) pins the expensive path it must replace.
 //
 // ingest is what the caller observed about a block this peer is currently
 // ingesting; the zero value means none. It is the input to the large-block

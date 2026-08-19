@@ -935,6 +935,9 @@ func (f *rotationFixture) node(t *testing.T, h int) HeaderNode {
 
 // setup runs sync-state mutations under the mutex the machines are caller-locked
 // against, so a test seeds state the same way the manager would.
+//
+// Do NOT call pass from inside fn: syncPass takes the same mutex and it is not
+// reentrant.
 func (f *rotationFixture) setup(fn func()) {
 	f.m.syncMu.Lock()
 	defer f.m.syncMu.Unlock()
@@ -1013,9 +1016,12 @@ func TestSyncPass_RotationDoesNotReHandBlocksToTheRotatedPeer(t *testing.T) {
 	require.Empty(t, getDataTo(out, rotating.peer),
 		"a peer just judged non-progressing must not be re-handed blocks on the same pass")
 
+	// The fixture fixes the handle order, so the other peer is reached on this
+	// same pass. Production ranges a map, so a rotation the map order puts last
+	// re-offers on the next tick instead; both are within the contract.
 	asked := getDataTo(out, spare.peer)
 	require.Len(t, asked, MaxBlocksInTransitPerPeer)
-	require.Subset(t, asked, held, "the blocks the rotation freed must be re-offered on the same pass")
+	require.Subset(t, asked, held, "the blocks the rotation freed must be re-offered to another peer")
 
 	f.setup(func() {
 		require.False(t, rotating.sync.State.fSyncStarted, "the sync slot must be released")
@@ -1027,6 +1033,46 @@ func TestSyncPass_RotationDoesNotReHandBlocksToTheRotatedPeer(t *testing.T) {
 			require.True(t, f.m.blockDownloader.IsInFlightFrom(spare.sync, hash),
 				"the freed block must now be in flight from the other peer")
 		}
+	})
+}
+
+// TestSyncPass_ASingleCandidateNodeReElectsThePeerItJustRotated pins the one
+// case the post-rotation note on CheckStall has to carve out: electLocked runs
+// a second sweep that re-elects even the peer it was told to exclude, and
+// releaseSyncPeer already returned the slot, so a node with one candidate hands
+// it straight back and the rotation clause governs that peer again.
+//
+// The skip still holds on that pass. The peer is asked for headers, not blocks.
+func TestSyncPass_ASingleCandidateNodeReElectsThePeerItJustRotated(t *testing.T) {
+	f := newRotationFixture(t, 40)
+
+	only := f.handles[0]
+	f.handles = f.handles[:1]
+
+	tip := f.node(t, len(f.chain))
+
+	f.setup(func() {
+		require.Len(t, f.m.headerSync.PeerEstablished(only.sync), 1)
+
+		only.sync.State.pindexBestKnownBlock = &tip
+		require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(only.sync, f.node(t, 1)))
+
+		only.sync.State.nLastProgressTime = testNow - micros(2*MaxLastBlockTime)
+	})
+
+	out, disconnect := f.pass(testNow)
+
+	require.Empty(t, disconnect)
+	require.Empty(t, getDataTo(out, only.peer),
+		"the skip must hold even when the rotated peer is the only candidate")
+
+	require.Len(t, out, 1)
+	require.Equal(t, only.peer, out[0].peer)
+	requireGetHeaders(t, out[0].msgs)
+
+	f.setup(func() {
+		require.True(t, only.sync.State.fSyncStarted,
+			"the only candidate takes the sync slot straight back")
 	})
 }
 
@@ -1060,15 +1106,25 @@ func TestSyncPass_ARotatedPeerThatStallsTheWindowStillGoes(t *testing.T) {
 // CROSS-TASK test for mechanism (c), the per-block download timeout, which is
 // NOT carried yet.
 //
-// It pins the whole recovery chain as it stands today: a rotated peer is a
-// plain download peer, later ticks hand it blocks again, and the only thing
-// that takes those blocks back is the staller rule — which costs the peer its
-// connection. That is a long way round for one silent peer.
+// It pins the whole recovery chain as it stands today, and the chain is long.
+// A rotated peer is a plain download peer, so a later tick hands it up to
+// MaxBlocksInTransitPerPeer blocks. It stays silent, so it never gives them
+// back and never asks for more: 16 in flight is where a silent peer stops, for
+// ever. Nothing then reaches those 16 blocks until ANOTHER peer downloads the
+// whole rest of the download window and still cannot move, which is the only
+// thing that names the silent peer the staller and starts its clock. Only then
+// does BlockStallingTimeout run, and only the disconnect that follows releases
+// the blocks. With no second eligible peer, none of it ever happens.
+//
+// So the real cost is not the three ticks below. It is the download time for up
+// to BlockDownloadWindow blocks — during which our own chain tip cannot advance
+// past the hole those 16 blocks leave — plus BlockStallingTimeout, plus a
+// disconnect. The ticks here are only the shape of it.
 //
 // WHEN THE PER-BLOCK DOWNLOAD TIMEOUT LANDS, EXTEND THIS TEST: the blocks must
-// come back from the silent peer on the timeout alone, with no disconnect and
-// no second peer needed to name it the staller. Keep the staller path below as
-// the backstop it is.
+// come back from the silent peer on the timeout alone — no window drain, no
+// second peer to name it the staller, and no disconnect. Keep the staller path
+// below as the backstop it is.
 func TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain(t *testing.T) {
 	const height = BlockDownloadWindow + 6
 
@@ -1093,27 +1149,42 @@ func TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain(t *testing.
 	require.Empty(t, disconnect)
 	require.Empty(t, getDataTo(out, silent.peer))
 
-	// The ticks that follow hand the rotated peer blocks again: it is a plain
-	// download peer now, and nothing about the rotation stops the scheduler
-	// choosing it. Marking the window in flight from it stands in for those
-	// ticks, which would take BlockDownloadWindow/MaxBlocksInTransitPerPeer of
-	// them to reach this state one getdata at a time.
 	f.setup(func() {
-		for h := 1; h <= BlockDownloadWindow; h++ {
+		// A later tick hands the rotated peer blocks again: it is a plain
+		// download peer now, and nothing about the rotation stops the scheduler
+		// choosing it. This is where a silent peer comes to rest —
+		// SendGetDataBlocks is the only caller of MarkBlockAsInFlight, it asks
+		// for at most MaxBlocksInTransitPerPeer minus what is already in
+		// flight, and nothing decrements that count until a block arrives.
+		for h := 1; h <= MaxBlocksInTransitPerPeer; h++ {
 			require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(silent.sync, f.node(t, h)))
 		}
 
 		other.sync.State.pindexBestKnownBlock = &tip
+
+		// The other peer then downloads the whole rest of the window, 16 blocks
+		// per tick, while the silent peer holds the head of it. That is the
+		// real precondition for naming a staller, and it is the expensive part
+		// of this recovery: our own tip cannot advance past the hole at height
+		// 1 for any of it. Requesting and delivering them here in one loop is
+		// the same sequence, minus the wire.
+		for h := MaxBlocksInTransitPerPeer + 1; h <= BlockDownloadWindow; h++ {
+			node := f.node(t, h)
+
+			require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(other.sync, node))
+			require.True(t, f.m.blockDownloader.BlockReceived(other.sync, node.Hash, testNow))
+		}
 	})
 
-	// Tick 2: the other peer can fetch nothing, because the silent peer holds
-	// the whole window. That names the silent peer the staller.
+	// Tick 2: the other peer has drained the window and still cannot move,
+	// because the silent peer holds its head. THAT names the silent peer the
+	// staller and starts its clock.
 	second := testNow + micros(time.Second)
 
 	out, disconnect = f.pass(second)
 
 	require.Empty(t, disconnect)
-	require.Empty(t, getDataTo(out, other.peer), "the window is held shut")
+	require.Empty(t, getDataTo(out, other.peer), "the window is held shut by the silent peer's 16 blocks")
 	require.Equal(t, second, silent.sync.State.nStallingSince, "the peer holding the window head starts stalling")
 
 	// Tick 3: the stall timeout expires. Today this is the ONLY thing that
