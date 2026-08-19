@@ -203,6 +203,88 @@ func TestFindNextBlocksToDownload_SkipsBlocksAlreadyInFlight(t *testing.T) {
 	require.Equal(t, int32(7), blocks[1].Height, "the in-flight height 6 must be skipped, not re-requested")
 }
 
+// TestFindNextBlocksToDownload_ComparesChainWorkNotHeight pins the
+// net_processing.cpp:362-368 gate: "This peer has nothing interesting" fires
+// when the peer's best known block carries less work than our own tip, whatever
+// the two heights are. The Phase 2 port compared heights here, which scheduled
+// a whole low-work branch off a peer that had nothing better than what we hold.
+func TestFindNextBlocksToDownload_ComparesChainWorkNotHeight(t *testing.T) {
+	// Two branches off the same genesis, weights from the per-header proofs
+	// pinned by TestBlockProof:
+	//   heavy, 3 headers: 4_295_032_833 + 3 * 8_589_934_591 = 30_064_836_606
+	//   light, 5 headers: 6 * 4_295_032_833                 = 25_770_196_998
+	// The light branch stands two blocks taller and carries less work.
+	const (
+		heavyLen = 3
+		lightLen = 5
+	)
+
+	newFixture := func(t *testing.T) (*BlockDownloader, HeaderNode, HeaderNode) {
+		t.Helper()
+
+		genesis := testGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		nc := &nonceCounter{}
+		heavy := buildChainBits(t, idx, nc, genesis, heavyLen, heavyBits)
+		light := buildChainBits(t, idx, nc, genesis, lightLen, difficulty1Bits)
+
+		cpHash := chainhash.Hash{0xC0}
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:  idx,
+			Params: syncTestParams([]chaincfg.Checkpoint{{Height: 100000, Hash: &cpHash}}),
+		})
+		require.NoError(t, err)
+
+		bd, err := NewBlockDownloader(idx, hs)
+		require.NoError(t, err)
+
+		heavyTip, ok := idx.Lookup(heavy[len(heavy)-1].BlockHash())
+		require.True(t, ok)
+		require.Equal(t, int32(heavyLen), heavyTip.Height)
+
+		lightTip, ok := idx.Lookup(light[len(light)-1].BlockHash())
+		require.True(t, ok)
+		require.Equal(t, int32(lightLen), lightTip.Height)
+
+		require.Positive(t, heavyTip.ChainWork.Cmp(lightTip.ChainWork),
+			"test setup: the shorter branch must be the heavier one")
+
+		return bd, heavyTip, lightTip
+	}
+
+	t.Run("a taller but lighter best known block has nothing interesting", func(t *testing.T) {
+		bd, heavyTip, lightTip := newFixture(t)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		peer.State.pindexBestKnownBlock = &lightTip
+
+		blocks, staller := bd.FindNextBlocksToDownload(peer, heavyTip, MaxBlocksInTransitPerPeer)
+
+		require.Empty(t, blocks, "a branch with less work than our tip must not be scheduled")
+		require.Nil(t, staller)
+	})
+
+	t.Run("a shorter but heavier best known block is scheduled", func(t *testing.T) {
+		bd, heavyTip, lightTip := newFixture(t)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		peer.State.pindexBestKnownBlock = &heavyTip
+
+		blocks, staller := bd.FindNextBlocksToDownload(peer, lightTip, MaxBlocksInTransitPerPeer)
+
+		require.Nil(t, staller)
+		require.Len(t, blocks, heavyLen, "the whole heavier branch is missing and must be fetched")
+
+		for i := range blocks {
+			require.Equal(t, int32(1+i), blocks[i].Height)
+		}
+	})
+}
+
 // TestFindNextBlocksToDownload_FollowsAPeerReorg pins the net_processing.cpp
 // "If the peer reorganized, our previous pindexLastCommonBlock may not be an
 // ancestor of its current tip anymore" rewind.
@@ -625,6 +707,37 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 		require.True(t, peer.State.fSyncStarted)
 
 		// The clock restarted from the observation, not from testNow.
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, advanced+micros(MaxLastBlockTime)))
+		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, advanced+micros(MaxLastBlockTime)+1))
+	})
+
+	// The tip is chosen by cumulative work, so a heavier branch can take it
+	// while standing shorter than the branch it displaces. The rotation clock
+	// must read that as progress: the peer delivered the headers that moved
+	// the tip, and a height watermark would have missed it and rotated a peer
+	// that was doing exactly what we wanted.
+	t.Run("a tip moving to a shorter heavier branch refreshes the clock", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, f.hs.PeerEstablished(peer), 1)
+		require.True(t, f.hs.IsHeadersFirstMode())
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
+
+		// Two heavy headers off genesis outweigh the fixture's three light
+		// ones (4_295_032_833 + 2 * 8_589_934_591 = 21_474_902_015 against
+		// 4 * 4_295_032_833 = 17_180_131_332) one block shorter.
+		heavy := buildChainBits(t, f.idx, &nonceCounter{next: 7000}, f.genesis, 2, heavyBits)
+
+		tipHash, tipHeight := f.idx.Tip()
+		require.Equal(t, heavy[len(heavy)-1].BlockHash(), tipHash)
+		require.Equal(t, int32(2), tipHeight, "the new tip stands below the branch it displaced")
+
+		advanced := testNow + micros(MaxLastBlockTime) - 1
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, advanced))
+		require.True(t, peer.State.fSyncStarted)
+
 		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, advanced+micros(MaxLastBlockTime)))
 		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, advanced+micros(MaxLastBlockTime)+1))
 	})

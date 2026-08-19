@@ -20,52 +20,88 @@ func TestUpdateBlockAvailability_KnownHash(t *testing.T) {
 
 	// A side chain forking off height 2 gives a second, distinct hash at
 	// height 4 (2 -> 3' -> 4'), for a tie-break test that isn't degenerately
-	// comparing a hash against itself.
+	// comparing a hash against itself. Both branches run at the same
+	// difficulty, so the two height-4 nodes carry identical chain work.
 	side := buildChain(t, idx, nc, chain[1], 2)
 	sideHeight4 := side[len(side)-1].BlockHash()
 	require.NotEqual(t, atHeight(4), sideHeight4)
 
+	// A heavy branch forking off height 1 and running to height 4. Against
+	// the main chain's height-6 tip:
+	//   main:  7 * 4_295_032_833                      = 30_065_229_831
+	//   heavy: 2 * 4_295_032_833 + 3 * 8_589_934_591  = 34_359_869_439
+	// so it is two blocks shorter and still the heavier of the two.
+	heavy := buildChainBits(t, idx, nc, chain[0], 3, heavyBits)
+	heavyHash := heavy[len(heavy)-1].BlockHash()
+
+	// The state a peer's pindexBestKnownBlock is really in: a snapshot the
+	// index handed out, carrying that node's accumulated chain work.
+	indexed := func(t *testing.T, hash chainhash.Hash) *HeaderNode {
+		t.Helper()
+
+		n, ok := idx.Lookup(hash)
+		require.True(t, ok)
+
+		return &n
+	}
+
 	tests := []struct {
 		name           string
-		initialBest    *HeaderNode // nil means pindexBestKnownBlock starts as nullptr
+		initialBest    chainhash.Hash // zero means pindexBestKnownBlock starts as nullptr
 		announce       chainhash.Hash
 		wantBestHeight int32
 		wantBestHash   chainhash.Hash
 	}{
 		{
 			name:           "no prior best known block: known hash sets it",
-			initialBest:    nil,
 			announce:       atHeight(3),
 			wantBestHeight: 3,
 			wantBestHash:   atHeight(3),
 		},
 		{
-			name:           "higher known hash raises pindexBestKnownBlock",
-			initialBest:    &HeaderNode{Hash: atHeight(2), Height: 2},
+			name:           "heavier known hash raises pindexBestKnownBlock",
+			initialBest:    atHeight(2),
 			announce:       atHeight(5),
 			wantBestHeight: 5,
 			wantBestHash:   atHeight(5),
 		},
 		{
-			name:           "lower known hash does not lower pindexBestKnownBlock",
-			initialBest:    &HeaderNode{Hash: atHeight(5), Height: 5},
+			name:           "lighter known hash does not lower pindexBestKnownBlock",
+			initialBest:    atHeight(5),
 			announce:       atHeight(2),
 			wantBestHeight: 5,
 			wantBestHash:   atHeight(5),
 		},
 		{
-			name:           "equal-height known hash still replaces pindexBestKnownBlock, mirroring the C++ >= compare",
-			initialBest:    &HeaderNode{Hash: atHeight(4), Height: 4},
+			name:           "equal-work known hash still replaces pindexBestKnownBlock, mirroring the C++ >= compare",
+			initialBest:    atHeight(4),
 			announce:       sideHeight4,
 			wantBestHeight: 4,
 			wantBestHash:   sideHeight4,
+		},
+		{
+			name:           "a shorter but heavier announcement raises pindexBestKnownBlock",
+			initialBest:    atHeight(6),
+			announce:       heavyHash,
+			wantBestHeight: 4,
+			wantBestHash:   heavyHash,
+		},
+		{
+			name:           "a taller but lighter announcement does not raise pindexBestKnownBlock",
+			initialBest:    heavyHash,
+			announce:       atHeight(6),
+			wantBestHeight: 4,
+			wantBestHash:   heavyHash,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			state := newPeerSyncState()
-			state.pindexBestKnownBlock = tc.initialBest
+
+			if tc.initialBest != (chainhash.Hash{}) {
+				state.pindexBestKnownBlock = indexed(t, tc.initialBest)
+			}
 
 			state.updateBlockAvailability(idx, tc.announce)
 
@@ -171,15 +207,72 @@ func TestProcessBlockAvailability_ClearsPendingWithoutPromoting(t *testing.T) {
 	chain := buildChain(t, idx, nc, genesis, 5) // heights 1..5
 	lowerHash := chain[1].BlockHash()           // height 2, resolves but is not better
 
+	best, ok := idx.Lookup(chain[4].BlockHash())
+	require.True(t, ok)
+
 	state := newPeerSyncState()
 	state.hashLastUnknownBlock = lowerHash
-	state.pindexBestKnownBlock = &HeaderNode{Hash: chain[4].BlockHash(), Height: 5}
+	state.pindexBestKnownBlock = &best
 
 	state.processBlockAvailability(idx)
 
 	require.Equal(t, chainhash.Hash{}, state.hashLastUnknownBlock, "pending hash must clear once resolved, regardless of promotion")
-	require.Equal(t, int32(5), state.pindexBestKnownBlock.Height, "pindexBestKnownBlock must not move to a lower-height resolved hash")
+	require.Equal(t, int32(5), state.pindexBestKnownBlock.Height, "pindexBestKnownBlock must not move to a lighter resolved hash")
 	require.Equal(t, chain[4].BlockHash(), state.pindexBestKnownBlock.Hash)
+}
+
+// TestProcessBlockAvailability_PromotesOnWorkNotHeight pins the
+// net_processing.cpp ProcessBlockAvailability compare against nChainWork: the
+// pending hash resolving to a shorter branch still raises
+// pindexBestKnownBlock when that branch carries more work, and a taller,
+// lighter one does not.
+func TestProcessBlockAvailability_PromotesOnWorkNotHeight(t *testing.T) {
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	// light: 5 headers at difficulty 1 → 6 * 4_295_032_833 = 25_770_196_998
+	// heavy: 3 headers at heavyBits   → 4_295_032_833 + 3 * 8_589_934_591
+	//                                 = 30_064_836_606
+	light := buildChainBits(t, idx, nc, genesis, 5, difficulty1Bits)
+	heavy := buildChainBits(t, idx, nc, genesis, 3, heavyBits)
+
+	lightTip, ok := idx.Lookup(light[len(light)-1].BlockHash())
+	require.True(t, ok)
+
+	heavyTip, ok := idx.Lookup(heavy[len(heavy)-1].BlockHash())
+	require.True(t, ok)
+
+	require.Positive(t, heavyTip.ChainWork.Cmp(lightTip.ChainWork))
+	require.Less(t, heavyTip.Height, lightTip.Height)
+
+	t.Run("a shorter but heavier resolved hash promotes", func(t *testing.T) {
+		best := lightTip
+
+		state := newPeerSyncState()
+		state.pindexBestKnownBlock = &best
+		state.hashLastUnknownBlock = heavyTip.Hash
+
+		state.processBlockAvailability(idx)
+
+		require.Equal(t, heavyTip.Hash, state.pindexBestKnownBlock.Hash)
+		require.Equal(t, chainhash.Hash{}, state.hashLastUnknownBlock)
+	})
+
+	t.Run("a taller but lighter resolved hash does not promote", func(t *testing.T) {
+		best := heavyTip
+
+		state := newPeerSyncState()
+		state.pindexBestKnownBlock = &best
+		state.hashLastUnknownBlock = lightTip.Hash
+
+		state.processBlockAvailability(idx)
+
+		require.Equal(t, heavyTip.Hash, state.pindexBestKnownBlock.Hash)
+		require.Equal(t, chainhash.Hash{}, state.hashLastUnknownBlock)
+	})
 }
 
 func TestProcessBlockAvailability_NoOpWhenStillUnknown(t *testing.T) {
@@ -205,8 +298,11 @@ func TestProcessBlockAvailability_NoOpWhenNoPending(t *testing.T) {
 	idx, err := NewHeaderIndex(genesis)
 	require.NoError(t, err)
 
+	best, ok := idx.Lookup(genesis.BlockHash())
+	require.True(t, ok)
+
 	state := newPeerSyncState()
-	state.pindexBestKnownBlock = &HeaderNode{Hash: genesis.BlockHash(), Height: 0}
+	state.pindexBestKnownBlock = &best
 
 	state.processBlockAvailability(idx)
 

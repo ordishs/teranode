@@ -1,25 +1,50 @@
 package protocol
 
 import (
+	"math/big"
 	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 )
 
 // node mirrors block_index.h CBlockIndex: pprev links to the parent, pskip
-// is the skiplist shortcut set once at insert time, and nHeight is the
-// height above genesis. Teranode's blockchain service stays the
-// authoritative header store (spec §11); this tree is a rebuildable,
-// in-memory cache scoped to protocol decisions (locators, best-known-block,
-// download scheduling) that must not sit on a per-message gRPC call.
+// is the skiplist shortcut set once at insert time, nHeight is the height
+// above genesis, and nChainWork is the cumulative proof of work of the whole
+// branch ending here. Teranode's blockchain service stays the authoritative
+// header store (spec §11); this tree is a rebuildable, in-memory cache scoped
+// to protocol decisions (locators, best-known-block, download scheduling)
+// that must not sit on a per-message gRPC call.
 type node struct {
 	hash   chainhash.Hash
 	header wire.BlockHeader
 	prev   *node // CBlockIndex::pprev
 	skip   *node // CBlockIndex::pskip
 	height int32 // CBlockIndex::nHeight
+
+	// chainWork is CBlockIndex::nChainWork. It is set once, under idx.mu,
+	// before the node is published into idx.nodes, and is never written
+	// again — which is what lets exportNode hand the same *big.Int out to
+	// every caller instead of copying it. See the note on HeaderNode.
+	chainWork *big.Int
+}
+
+// blockProof is block_index.cpp GetBlockProof (block_index.cpp:114-125): the
+// work one header contributes, 2**256 / (target + 1), computed there as
+// (~bnTarget / (bnTarget + 1)) + 1 because arith_uint256 cannot hold 2**256.
+// math/big has no such limit, so the quotient is taken directly; the two
+// forms are the same value, and TestBlockProof pins it against hand-derived
+// vectors.
+//
+// work.CalcBlockWork is Teranode's existing port of that function and stays
+// the single implementation of the arithmetic. It answers zero for the two
+// targets arith_uint256::SetCompact rejects — negative-encoded (fNegative)
+// and past 2**256 (fOverflow) — matching GetBlockProof's own zero return for
+// them.
+func blockProof(bits uint32) *big.Int {
+	return work.CalcBlockWork(bits)
 }
 
 // invertLowestOne mirrors block_index.cpp InvertLowestOne (block_index.cpp:18-20):
@@ -47,13 +72,28 @@ func getSkipHeight(height int32) int32 {
 
 // HeaderNode is the exported, immutable snapshot of a node returned by
 // Lookup and Ancestor. It carries the CBlockIndex fields callers in other
-// packages need: the hash, its height, and its parent's hash for walking
-// the tree one step at a time via another Lookup call. ParentHash is the
-// zero chainhash.Hash at genesis, which has no parent.
+// packages need: the hash, its height, its cumulative chain work, and its
+// parent's hash for walking the tree one step at a time via another Lookup
+// call. ParentHash is the zero chainhash.Hash at genesis, which has no
+// parent.
+//
+// ChainWork is CBlockIndex::nChainWork, and it is a pointer INTO the index:
+// every snapshot of the same node shares one *big.Int with the tree, so a
+// caller must treat it as read-only. Mutating it would corrupt tip selection
+// for every other reader. Sharing rather than copying is what keeps Lookup
+// allocation-free on the download walk, which calls it once per block of the
+// window; the value is safe to share because a node's chainWork is written
+// once at insert and never again.
+//
+// ChainWork is nil on a HeaderNode that did not come out of the index (a
+// zero value, or one a caller built). Read it through chainWorkOf, which
+// answers zero work for that case, the same state a C++ CBlockIndex is in
+// before SetChainWork runs.
 type HeaderNode struct {
 	Hash       chainhash.Hash
 	ParentHash chainhash.Hash
 	Height     int32
+	ChainWork  *big.Int
 }
 
 func exportNode(n *node) HeaderNode {
@@ -62,7 +102,19 @@ func exportNode(n *node) HeaderNode {
 		parentHash = n.prev.hash
 	}
 
-	return HeaderNode{Hash: n.hash, ParentHash: parentHash, Height: n.height}
+	return HeaderNode{Hash: n.hash, ParentHash: parentHash, Height: n.height, ChainWork: n.chainWork}
+}
+
+// chainWorkOf reads a HeaderNode's cumulative work, answering zero for a
+// snapshot that never came from the index. It is the only way the comparison
+// sites below read ChainWork, so a caller-built HeaderNode compares as the
+// zero-work node it is instead of panicking on a nil *big.Int.
+func chainWorkOf(n HeaderNode) *big.Int {
+	if n.ChainWork == nil {
+		return new(big.Int)
+	}
+
+	return n.ChainWork
 }
 
 // HeaderIndex is the net_processing.cpp mapBlockIndex counterpart: a small
@@ -95,6 +147,10 @@ func NewHeaderIndex(genesis *wire.BlockHeader) (*HeaderIndex, error) {
 		header: *genesis,
 		prev:   nil,
 		height: 0,
+		// block_index.h SetChainWork: nChainWork = (pprev ? pprev->nChainWork
+		// : 0) + GetBlockProof(*this). Genesis has no pprev, so it carries
+		// only its own proof.
+		chainWork: blockProof(genesis.Bits),
 	}
 
 	return &HeaderIndex{
@@ -137,16 +193,26 @@ func (idx *HeaderIndex) AddHeader(header *wire.BlockHeader) (connected bool, err
 		header: *header,
 		prev:   parent,
 		height: parent.height + 1,
+		// block_index.h SetChainWork: nChainWork = (pprev ? pprev->nChainWork
+		// : 0) + GetBlockProof(*this).
+		chainWork: new(big.Int).Add(parent.chainWork, blockProof(header.Bits)),
 	}
 	n.skip = buildSkipLocked(n)
 
 	idx.nodes[hash] = n
 
-	// Phase 2 simplification: the tip is the tallest known header, not the
-	// one with the most cumulative chain work. This is testnet-sufficient;
-	// a work-based tip is a Phase 3 hardening candidate if the parity
-	// harness diverges (spec §6, header index).
-	if n.height > idx.tip.height {
+	// block_index_store.h SetBestHeader, whose ordering is
+	// CBlockIndexWorkComparator (block_index.h:1225-1260): "First sort by
+	// most total work", then by validation-completion time and sequence id —
+	// tails this index has no counterpart for, and which both leave the
+	// first-seen node ahead of a later arrival. A strictly-greater test is
+	// that whole ordering here: more work takes the tip, an equal-work
+	// branch does not displace the branch already on it.
+	//
+	// This replaces the Phase 2 height rule (spec §6, header index), which
+	// left Tip() on the taller branch after a shorter, heavier one arrived.
+	// Upgraded by Phase 3 Task 1.
+	if n.chainWork.Cmp(idx.tip.chainWork) > 0 {
 		idx.tip = n
 	}
 

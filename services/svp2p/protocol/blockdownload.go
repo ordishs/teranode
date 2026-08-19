@@ -151,10 +151,16 @@ type BlockDownloader struct {
 	// still, which is every call but the ones that follow a new block.
 	haveDataWatermark int32
 
-	// lastTipHeight is the header index tip height at the previous stall check.
-	// It is how CheckStall observes headers-first progress without reading a
-	// clock or being told about it — see the source note there.
-	lastTipHeight int32
+	// lastTipHash is the header index tip at the previous stall check. It is
+	// how CheckStall observes headers-first progress without reading a clock
+	// or being told about it — see the source note there.
+	//
+	// It is the tip hash rather than its height because the index now selects
+	// the tip by cumulative work: a heavier branch can take the tip while
+	// standing shorter than the branch it displaced, and a height watermark
+	// would read that fall as no progress. AddHeader replaces the tip only on
+	// strictly more work, so any change of this hash is an advance.
+	lastTipHash chainhash.Hash
 
 	// txInvsReceived counts tx inventory announcements. Decision 1 defers the
 	// whole tx path to Phase 3, so Phase 2 counts and logs them and does
@@ -184,14 +190,14 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 		return nil, errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: header sync is nil")
 	}
 
-	_, tipHeight := idx.Tip()
+	tipHash, _ := idx.Tip()
 
 	return &BlockDownloader{
 		idx:              idx,
 		hs:               hs,
 		inFlight:         make(map[chainhash.Hash]*SyncPeer),
 		haveData:         make(map[chainhash.Hash]int32),
-		lastTipHeight:    tipHeight,
+		lastTipHash:      tipHash,
 		maxLastBlockTime: MaxLastBlockTime,
 	}, nil
 }
@@ -257,12 +263,25 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 		return nil, nil
 	}
 
-	// C++ compares nChainWork against nMinimumChainWork and against our own
-	// tip's work. The header index tracks height instead (spec §6, Phase 2
-	// simplification), so this is the same "not better than what we already
-	// have" test against Height. nMinimumChainWork has no height counterpart
-	// and is not carried.
-	if best.Height < activeTip.Height {
+	// net_processing.cpp:362-368:
+	//
+	//   else if (auto chainWork = state->pindexBestKnownBlock->GetChainWork();
+	//       chainWork < nMinimumChainWork ||
+	//       chainWork < chainActive.Tip()->GetChainWork())
+	//
+	// Phase 2 compared Height here because the header index carried no work;
+	// Phase 3 Task 1 restored the work compare with the index field.
+	//
+	// The nMinimumChainWork half is dropped: it is a chain parameter
+	// (chainparams.cpp consensus.nMinimumChainWork) and go-chaincfg v1.6.0,
+	// the version this module pins, has no field for it — chaincfg.Params
+	// carries PowLimit, PowLimitBits and Checkpoints but nothing equivalent.
+	// The gate it provides is an IBD guard against wasting download slots on
+	// a peer advertising a chain nobody could have mined; the checkpoint
+	// fence in HeaderSync covers the same ground for the branches a peer can
+	// actually get us to accept. Restore this if go-chaincfg gains the
+	// parameter.
+	if chainWorkOf(*best).Cmp(chainWorkOf(activeTip)) < 0 {
 		// "This peer has nothing interesting."
 		return nil, nil
 	}
@@ -803,8 +822,10 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 //
 // Progress means one of two things, and only the sync peer has a clock at all:
 //   - a block was delivered (legacy's own trigger, refreshed in BlockReceived);
-//   - the header index tip rose while a headers-first round was running and
+//   - the header index tip moved while a headers-first round was running and
 //     this peer had no block download outstanding to be judged on instead.
+//     The tip is selected by cumulative work, so any move is a gain in work,
+//     even one that lands on a shorter branch.
 //
 // That second source is this port's, and it is a deliberate departure from a
 // choice legacy made on purpose. legacy netsync manager.go handleCheckSyncPeer
@@ -852,8 +873,8 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 		return StallActionNone
 	}
 
-	if _, tipHeight := bd.idx.Tip(); tipHeight > bd.lastTipHeight {
-		bd.lastTipHeight = tipHeight
+	if tipHash, _ := bd.idx.Tip(); tipHash != bd.lastTipHash {
+		bd.lastTipHash = tipHash
 
 		if bd.hs.IsHeadersFirstMode() && state.nBlocksInFlight == 0 {
 			state.nLastProgressTime = nowMicros

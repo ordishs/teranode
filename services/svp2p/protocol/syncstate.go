@@ -21,14 +21,15 @@ import (
 type peerSyncState struct {
 	// pindexBestKnownBlock mirrors CNodeState::pindexBestKnownBlock: the best
 	// known block we know this peer has announced. nil mirrors the C++
-	// nullptr — we don't have a known best block for this peer yet. SVNode
-	// compares by nChainWork; the header index (spec §6, Phase 2
-	// simplification) tracks height instead, so this ports the same
-	// nullptr-or-not-lower comparison against Height. HeaderNode is a value
-	// snapshot returned by HeaderIndex.Lookup at the moment it was read, not
-	// a live pointer into the index's tree: a later Lookup of the same hash
-	// returns an equal-by-value HeaderNode, never the same address, so
-	// pointer equality against a fresh Lookup result is meaningless here.
+	// nullptr — we don't have a known best block for this peer yet. The
+	// comparison is SVNode's own nullptr-or-not-lower test against
+	// nChainWork; Phase 2 compared Height instead because the header index
+	// carried no work, and Phase 3 Task 1 restored the work compare with the
+	// index field. HeaderNode is a value snapshot returned by
+	// HeaderIndex.Lookup at the moment it was read, not a live pointer into
+	// the index's tree: a later Lookup of the same hash returns an
+	// equal-by-value HeaderNode, never the same address, so pointer equality
+	// against a fresh Lookup result is meaningless here.
 	pindexBestKnownBlock *HeaderNode
 
 	// hashLastUnknownBlock mirrors CNodeState::hashLastUnknownBlock: the hash
@@ -95,16 +96,17 @@ func newPeerSyncState() *peerSyncState {
 func (s *peerSyncState) updateBlockAvailability(idx *HeaderIndex, hash chainhash.Hash) {
 	s.processBlockAvailability(idx)
 
-	// C++ additionally guards on pindex->nChainWork > 0 (a header accepted
-	// but not yet connected to the genesis-rooted chain carries zero work).
-	// No counterpart is needed here: HeaderIndex.AddHeader only ever attaches
-	// a node to a parent already in the tree, so every Lookup hit already
-	// has a valid height, unlike SVNode's mapBlockIndex which can hold
-	// disconnected entries.
+	// C++ additionally guards on pindex->nChainWork > 0, which detects a
+	// header accepted into mapBlockIndex but not yet linked to the
+	// genesis-rooted chain. No counterpart is needed here:
+	// HeaderIndex.AddHeader only ever attaches a node to a parent already in
+	// the tree, so every Lookup hit is genesis-rooted and already carries the
+	// accumulated proof of its whole branch.
 	node, ok := idx.Lookup(hash)
 	if ok {
 		// An actually better block was announced.
-		if s.pindexBestKnownBlock == nil || node.Height >= s.pindexBestKnownBlock.Height {
+		if s.pindexBestKnownBlock == nil ||
+			chainWorkOf(node).Cmp(chainWorkOf(*s.pindexBestKnownBlock)) >= 0 {
 			s.pindexBestKnownBlock = &node
 		}
 	} else {
@@ -123,12 +125,12 @@ func (s *peerSyncState) processBlockAvailability(idx *HeaderIndex) {
 		return
 	}
 
-	// C++ additionally guards on pindex->nChainWork > 0 (a header accepted
-	// but not yet connected to the genesis-rooted chain carries zero work).
-	// No counterpart is needed here: HeaderIndex.AddHeader only ever attaches
-	// a node to a parent already in the tree, so every Lookup hit already
-	// has a valid height, unlike SVNode's mapBlockIndex which can hold
-	// disconnected entries.
+	// C++ additionally guards on pindex->nChainWork > 0, which detects a
+	// header accepted into mapBlockIndex but not yet linked to the
+	// genesis-rooted chain. No counterpart is needed here:
+	// HeaderIndex.AddHeader only ever attaches a node to a parent already in
+	// the tree, so every Lookup hit is genesis-rooted and already carries the
+	// accumulated proof of its whole branch.
 	node, ok := idx.Lookup(s.hashLastUnknownBlock)
 	if !ok {
 		return
@@ -138,7 +140,8 @@ func (s *peerSyncState) processBlockAvailability(idx *HeaderIndex) {
 	// of whether it actually raises pindexBestKnownBlock: net_processing.cpp
 	// clears hashLastUnknownBlock as soon as the pending hash is found,
 	// even when it turns out to be no better than what's already known.
-	if s.pindexBestKnownBlock == nil || node.Height >= s.pindexBestKnownBlock.Height {
+	if s.pindexBestKnownBlock == nil ||
+		chainWorkOf(node).Cmp(chainWorkOf(*s.pindexBestKnownBlock)) >= 0 {
 		s.pindexBestKnownBlock = &node
 	}
 

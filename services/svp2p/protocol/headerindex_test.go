@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -30,10 +31,257 @@ func testGenesis() *wire.BlockHeader {
 // childOf returns a header extending parent, with a unique nonce so its
 // hash never collides with a sibling built from the same parent.
 func childOf(parent *wire.BlockHeader, nonce uint32) *wire.BlockHeader {
+	return childOfBits(parent, nonce, difficulty1Bits)
+}
+
+// childOfBits is childOf with the difficulty target chosen by the caller, so
+// a test can build two branches of unequal work.
+func childOfBits(parent *wire.BlockHeader, nonce uint32, bits uint32) *wire.BlockHeader {
 	prevHash := parent.BlockHash()
 	zero := chainhash.Hash{}
 
-	return wire.NewBlockHeader(1, &prevHash, &zero, 0x1d00ffff, nonce)
+	return wire.NewBlockHeader(1, &prevHash, &zero, bits, nonce)
+}
+
+// The two targets every work-based test in this package builds branches from.
+// Their hand-derived GetBlockProof values are pinned by TestBlockProof below.
+const (
+	// difficulty1Bits is the difficulty-1 target, worth 4_295_032_833 per
+	// header.
+	difficulty1Bits = uint32(0x1d00ffff)
+
+	// heavyBits is a target worth 8_589_934_591 per header, just under twice
+	// difficulty1Bits.
+	heavyBits = uint32(0x1d008000)
+)
+
+const (
+	difficulty1Work = int64(4_295_032_833)
+	heavyWork       = int64(8_589_934_591)
+)
+
+// buildChainBits is buildChain with the branch's difficulty target chosen by
+// the caller.
+func buildChainBits(t *testing.T, idx *HeaderIndex, nc *nonceCounter, from *wire.BlockHeader, count int, bits uint32) []*wire.BlockHeader {
+	t.Helper()
+
+	headers := make([]*wire.BlockHeader, 0, count)
+	prev := from
+
+	for i := 0; i < count; i++ {
+		h := childOfBits(prev, nc.take(), bits)
+
+		connected, err := idx.AddHeader(h)
+		require.NoError(t, err)
+		require.True(t, connected)
+
+		headers = append(headers, h)
+		prev = h
+	}
+
+	return headers
+}
+
+// TestBlockProof pins the block_index.cpp GetBlockProof port
+// (block_index.cpp:114-125) against values derived by hand from the compact
+// target, independent of any big.Int code this package calls.
+func TestBlockProof(t *testing.T) {
+	tests := []struct {
+		name string
+		bits uint32
+		want string
+	}{
+		{
+			// 0x1d00ffff: exponent 0x1d = 29, mantissa 0x00ffff = 65535, so
+			// target = 65535 * 256^(29-3) = (2^16 - 1) * 2^208.
+			// GetBlockProof is floor(2^256 / (target + 1)). Take
+			// q = 4295032833; then q * 65535 = 2^48 - 1, so
+			//   q * (target + 1) = (2^48 - 1) * 2^208 + q = 2^256 - 2^208 + q,
+			// which is below 2^256 because 2^208 > q, while
+			//   (q + 1) * (target + 1) = 2^256 + 65534 * 2^208 + q + 1
+			// is above it. The floor is therefore exactly q.
+			name: "difficulty-1 target",
+			bits: 0x1d00ffff,
+			want: "4295032833",
+		},
+		{
+			// 0x1d008000: exponent 29, mantissa 0x008000 = 2^15, so
+			// target = 2^15 * 2^208 = 2^223.
+			// (2^33) * (2^223 + 1) = 2^256 + 2^33 is above 2^256, and
+			// (2^33 - 1) * (2^223 + 1) = 2^256 + 2^33 - 2^223 - 1 is below it
+			// because 2^223 > 2^33. The floor is 2^33 - 1 = 8589934591.
+			name: "heavier target",
+			bits: 0x1d008000,
+			want: "8589934591",
+		},
+		{
+			// 0x207fffff (the regtest power limit): exponent 0x20 = 32,
+			// mantissa 0x7fffff = 2^23 - 1, so
+			// target = (2^23 - 1) * 2^232 = 2^255 - 2^232.
+			// 2 * (target + 1) = 2^256 - 2^233 + 2 is below 2^256 and
+			// 3 * (target + 1) is above it, since 3 * 2^255 alone exceeds
+			// 2^256. The floor is 2.
+			name: "regtest power limit",
+			bits: 0x207fffff,
+			want: "2",
+		},
+		{
+			// arith_uint256::SetCompact reports fNegative when the sign bit
+			// (0x00800000) is set on a non-zero mantissa, and GetBlockProof
+			// returns 0 for it.
+			name: "negative-encoded target contributes no work",
+			bits: 0x1d80ffff,
+			want: "0",
+		},
+		{
+			// exponent 0x22 = 34 with mantissa 0x010000 puts the target past
+			// 2^256, which is arith_uint256::SetCompact's fOverflow: 0 work.
+			name: "overflowing target contributes no work",
+			bits: 0x22010000,
+			want: "0",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want, ok := new(big.Int).SetString(tc.want, 10)
+			require.True(t, ok)
+
+			require.Equal(t, 0, want.Cmp(blockProof(tc.bits)),
+				"want %s, got %s", want, blockProof(tc.bits))
+		})
+	}
+}
+
+// TestAddHeader_AccumulatesChainWork pins block_index.h SetChainWork:
+// nChainWork = (pprev ? pprev->nChainWork : 0) + GetBlockProof(*this). Genesis
+// carries its own proof and nothing else; every child adds its own on top of
+// its parent's total.
+func TestAddHeader_AccumulatesChainWork(t *testing.T) {
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	root, ok := idx.Lookup(genesis.BlockHash())
+	require.True(t, ok)
+	require.Equal(t, big.NewInt(difficulty1Work), root.ChainWork,
+		"genesis has no parent, so its chain work is its own proof")
+
+	// Three difficulty-1 headers, then two heavy ones: the running total is
+	// the hand-derived per-header proof summed along the chain.
+	light := buildChain(t, idx, nc, genesis, 3)
+	heavy := buildChainBits(t, idx, nc, light[2], 2, heavyBits)
+
+	wants := []struct {
+		header *wire.BlockHeader
+		want   int64
+	}{
+		{light[0], 2 * difficulty1Work},
+		{light[1], 3 * difficulty1Work},
+		{light[2], 4 * difficulty1Work},
+		{heavy[0], 4*difficulty1Work + heavyWork},
+		{heavy[1], 4*difficulty1Work + 2*heavyWork},
+	}
+
+	for i, w := range wants {
+		n, found := idx.Lookup(w.header.BlockHash())
+		require.True(t, found)
+		require.Equal(t, big.NewInt(w.want), n.ChainWork, "chain work at index %d", i)
+	}
+}
+
+// TestAddHeader_TipFollowsMostWork pins the block_index_store.h SetBestHeader
+// rule and its CBlockIndexWorkComparator (block_index.h:1225-1260): "First
+// sort by most total work", with the sequence-id tail leaving the first-seen
+// branch in place on a tie. It replaces the Phase 2 height rule, and with it
+// the reorg case Phase 2 Task 3 deferred: a shorter branch that carries more
+// work must take the tip.
+func TestAddHeader_TipFollowsMostWork(t *testing.T) {
+	// Branch weights, all derived from the pinned per-header proofs above:
+	//   3 light headers above genesis: 3 * 4_295_032_833 = 12_885_098_499
+	//   2 heavy headers above genesis: 2 * 8_589_934_591 = 17_179_869_182
+	// The heavy branch is one block shorter than the light branch and still
+	// outweighs it.
+	const (
+		lightLen = 3
+		heavyLen = 2
+	)
+
+	t.Run("a taller but lighter branch does not take the tip", func(t *testing.T) {
+		genesis := testGenesis()
+		nc := &nonceCounter{}
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		heavy := buildChainBits(t, idx, nc, genesis, heavyLen, heavyBits)
+		heavyTip := heavy[len(heavy)-1]
+
+		hash, height := idx.Tip()
+		require.Equal(t, heavyTip.BlockHash(), hash)
+		require.Equal(t, int32(heavyLen), height)
+
+		light := buildChainBits(t, idx, nc, genesis, lightLen, difficulty1Bits)
+		lightTip := light[len(light)-1]
+
+		lightNode, ok := idx.Lookup(lightTip.BlockHash())
+		require.True(t, ok)
+		require.Equal(t, int32(lightLen), lightNode.Height,
+			"the lighter branch is taller than the heavy one")
+
+		hash, height = idx.Tip()
+		require.Equal(t, heavyTip.BlockHash(), hash, "the taller branch carries less work")
+		require.Equal(t, int32(heavyLen), height)
+	})
+
+	t.Run("a shorter but heavier branch takes the tip", func(t *testing.T) {
+		genesis := testGenesis()
+		nc := &nonceCounter{}
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		light := buildChainBits(t, idx, nc, genesis, lightLen, difficulty1Bits)
+		lightTip := light[len(light)-1]
+
+		hash, height := idx.Tip()
+		require.Equal(t, lightTip.BlockHash(), hash)
+		require.Equal(t, int32(lightLen), height)
+
+		heavy := buildChainBits(t, idx, nc, genesis, heavyLen, heavyBits)
+		heavyTip := heavy[len(heavy)-1]
+
+		hash, height = idx.Tip()
+		require.Equal(t, heavyTip.BlockHash(), hash, "the heavier branch takes the tip although it is shorter")
+		require.Equal(t, int32(heavyLen), height)
+	})
+
+	t.Run("equal work leaves the first-seen branch on the tip", func(t *testing.T) {
+		genesis := testGenesis()
+		nc := &nonceCounter{}
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		first := buildChainBits(t, idx, nc, genesis, lightLen, difficulty1Bits)
+		firstTip := first[len(first)-1]
+
+		second := buildChainBits(t, idx, nc, genesis, lightLen, difficulty1Bits)
+		secondTip := second[len(second)-1]
+		require.NotEqual(t, firstTip.BlockHash(), secondTip.BlockHash())
+
+		firstNode, ok := idx.Lookup(firstTip.BlockHash())
+		require.True(t, ok)
+
+		secondNode, ok := idx.Lookup(secondTip.BlockHash())
+		require.True(t, ok)
+		require.Equal(t, firstNode.ChainWork, secondNode.ChainWork, "both branches carry the same work")
+
+		hash, _ := idx.Tip()
+		require.Equal(t, firstTip.BlockHash(), hash, "a tie keeps the branch that arrived first")
+	})
 }
 
 // buildChain extends the index from "from" for "count" headers, requiring
@@ -139,6 +387,11 @@ func TestAddHeader_DuplicateIsIdempotent(t *testing.T) {
 	require.Equal(t, beforeHeight, afterHeight)
 }
 
+// TestAddHeader_SideChainDoesNotMoveTipUnlessLonger builds every branch at the
+// same difficulty target, where height and cumulative work rank identically, so
+// it pins the same outcomes under the work-based tip rule as it did under the
+// Phase 2 height rule. The cases where the two rules disagree are
+// TestAddHeader_TipFollowsMostWork.
 func TestAddHeader_SideChainDoesNotMoveTipUnlessLonger(t *testing.T) {
 	genesis := testGenesis()
 	nc := &nonceCounter{}
@@ -169,8 +422,9 @@ func TestAddHeader_SideChainDoesNotMoveTipUnlessLonger(t *testing.T) {
 	require.Equal(t, mainTip.BlockHash(), tipHash)
 	require.Equal(t, int32(5), tipHeight)
 
-	// Extend the side chain past the main tip (4' -> 5' -> 6'): the tip must
-	// now switch, since Phase 2 selects by height.
+	// Extend the side chain past the main tip (4' -> 5' -> 6'): at equal
+	// difficulty the taller branch also carries the most work, so the tip
+	// must now switch.
 	longerSide := buildChain(t, idx, nc, sideTip, 2)
 	newSideTip := longerSide[len(longerSide)-1]
 
