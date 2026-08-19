@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -1113,4 +1114,478 @@ func TestNewHeaderSync_Validation(t *testing.T) {
 
 	_, err = NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: &noLimit})
 	require.Error(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// Contextual difficulty and the checkpoint fence
+// ---------------------------------------------------------------------------
+
+// daaFixtureBaseTime anchors the DAA-era fixture chain. Its headers sit
+// exactly ten minutes apart, which is the spacing the DAA is tuned for, so the
+// difficulty it computes for the next header is the one the chain already
+// runs at.
+const daaFixtureBaseTime int64 = 1600000000
+
+// daaSyncParams returns mainnet params with the regtest powLimit and the DAA
+// active from height 0, so a cheaply ground fixture chain still exercises the
+// contextual difficulty check. Mainnet's own DaaForkHeight is far above any
+// height a test chain reaches.
+func daaSyncParams(checkpoints []chaincfg.Checkpoint) *chaincfg.Params {
+	params := chaincfg.MainNetParams
+	params.PowLimit = testPowLimit()
+	params.DaaForkHeight = 0
+	params.Checkpoints = checkpoints
+
+	return &params
+}
+
+// timedChild grinds a child of parent with an explicit timestamp, so the
+// fixture's block spacing is deterministic instead of whatever wall clock
+// wire.NewBlockHeader stamps.
+func timedChild(parent *wire.BlockHeader, bits, salt uint32, when int64) *wire.BlockHeader {
+	prevHash := parent.BlockHash()
+
+	merkle := chainhash.Hash{}
+	merkle[0] = byte(salt)
+	merkle[1] = byte(salt >> 8)
+	merkle[2] = byte(salt >> 16)
+
+	h := &wire.BlockHeader{
+		Version:    1,
+		PrevBlock:  prevHash,
+		MerkleRoot: merkle,
+		Timestamp:  time.Unix(when, 0),
+		Bits:       bits,
+	}
+
+	for !testMeetsTarget(h) {
+		h.Nonce++
+	}
+
+	return h
+}
+
+// daaGenesis is syncGenesis with a fixed timestamp.
+func daaGenesis() *wire.BlockHeader {
+	zero := chainhash.Hash{}
+
+	h := &wire.BlockHeader{
+		Version:    1,
+		PrevBlock:  zero,
+		MerkleRoot: zero,
+		Timestamp:  time.Unix(daaFixtureBaseTime, 0),
+		Bits:       testEasyBits,
+	}
+
+	for !testMeetsTarget(h) {
+		h.Nonce++
+	}
+
+	return h
+}
+
+// newDaaSyncFixture builds an index of localHeight headers at testEasyBits,
+// ten minutes apart. Under the regtest powLimit that spacing is a fixed point
+// of the DAA: each header contributes a chain work of exactly 2, so the
+// 144-block window yields the powLimit target again, whose compact form is
+// testEasyBits. The fixture therefore satisfies its own contextual difficulty,
+// which the first assertion of every test below pins.
+func newDaaSyncFixture(t *testing.T, localHeight int) *syncFixture {
+	t.Helper()
+
+	genesis := daaGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	chain := make([]*wire.BlockHeader, 0, localHeight)
+	prev := genesis
+
+	for i := 1; i <= localHeight; i++ {
+		h := timedChild(prev, testEasyBits, uint32(i), daaFixtureBaseTime+int64(i)*600) //nolint:gosec // test heights are small
+
+		connected, addErr := idx.AddHeader(h)
+		require.NoError(t, addErr)
+		require.True(t, connected)
+
+		chain = append(chain, h)
+		prev = h
+	}
+
+	return &syncFixture{genesis: genesis, idx: idx, chain: chain}
+}
+
+// startedSyncWith is startedSync for a caller that needs params other than
+// syncTestParams.
+func startedSyncWith(t *testing.T, f *syncFixture, params *chaincfg.Params) (*HeaderSync, *SyncPeer) {
+	t.Helper()
+
+	hs, err := NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: params})
+	require.NoError(t, err)
+
+	peer := fullNodePeer("1.2.3.4:8333")
+	require.Len(t, hs.PeerEstablished(peer), 1)
+
+	return hs, peer
+}
+
+// TestHeaderSync_ContextualDifficulty pins ContextualCheckBlockHeader's
+// "bad-diffbits" rule on received headers.
+func TestHeaderSync_ContextualDifficulty(t *testing.T) {
+	const fixtureHeight = 200
+
+	// The fixture spacing must be a fixed point of the DAA, or every row below
+	// would be asserting against an accidental value.
+	requireFixtureIsDaaStable := func(t *testing.T, f *syncFixture, params *chaincfg.Params) HeaderNode {
+		t.Helper()
+
+		tip, ok := f.idx.Lookup(f.tip().BlockHash())
+		require.True(t, ok)
+		require.Equal(t, int32(fixtureHeight), tip.Height)
+
+		want, validated := GetNextWorkRequired(f.idx, params, tip, tip.Time+600)
+		require.True(t, validated)
+		require.Equal(t, testEasyBits, want, "the fixture chain must satisfy its own contextual difficulty")
+
+		return tip
+	}
+
+	t.Run("a header claiming the wrong nBits is refused with the bad-diffbits score", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+		params := daaSyncParams(nil)
+		tip := requireFixtureIsDaaStable(t, f, params)
+
+		hs, peer := startedSyncWith(t, f, params)
+
+		// One tick below the target the DAA requires: still inside the
+		// powLimit, so the cheap CheckBlockHeader proof-of-work check passes
+		// and only the contextual check can catch it.
+		bad := timedChild(f.tip(), testEasyBits-1, 9001, tip.Time+600)
+		require.True(t, hs.checkBlockHeaderPoW(bad))
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{bad}))
+
+		// validation.cpp ContextualCheckBlockHeader:
+		// state.DoS(100, ..., "bad-diffbits"), applied by net_processing.cpp as
+		// Misbehaving(pfrom, nDoS, "invalid header received").
+		require.NoError(t, err)
+		require.Equal(t, scoreBadDiffBits, misbehavior)
+		require.Nil(t, msgs)
+
+		// The header never reaches the index, which is what bounds its growth.
+		_, ok := f.idx.Lookup(bad.BlockHash())
+		require.False(t, ok)
+
+		_, tipHeight := f.idx.Tip()
+		require.Equal(t, int32(fixtureHeight), tipHeight)
+	})
+
+	t.Run("a header claiming the nBits the DAA requires is accepted", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+		params := daaSyncParams(nil)
+		tip := requireFixtureIsDaaStable(t, f, params)
+
+		hs, peer := startedSyncWith(t, f, params)
+
+		good := timedChild(f.tip(), testEasyBits, 9002, tip.Time+600)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{good}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		node, ok := f.idx.Lookup(good.BlockHash())
+		require.True(t, ok)
+		require.Equal(t, int32(fixtureHeight+1), node.Height)
+	})
+
+	t.Run("the check applies to a peer that never started a sync", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+		params := daaSyncParams(nil)
+		tip := requireFixtureIsDaaStable(t, f, params)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: params})
+		require.NoError(t, err)
+
+		// No PeerEstablished, so this peer holds no sync slot and no round is
+		// running: the net_processing.cpp path, where every peer's headers are
+		// indexed. The contextual check covers it too.
+		bystander := fullNodePeer("5.6.7.8:8333")
+		bad := timedChild(f.tip(), testEasyBits-1, 9003, tip.Time+600)
+
+		msgs, misbehavior, err := hs.OnHeaders(bystander, headersMsg([]*wire.BlockHeader{bad}))
+		require.NoError(t, err)
+		require.Equal(t, scoreBadDiffBits, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(bad.BlockHash())
+		require.False(t, ok)
+	})
+
+	t.Run("a batch is refused at the first bad header, keeping the ones before it", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+		params := daaSyncParams(nil)
+		tip := requireFixtureIsDaaStable(t, f, params)
+
+		hs, peer := startedSyncWith(t, f, params)
+
+		good := timedChild(f.tip(), testEasyBits, 9004, tip.Time+600)
+		bad := timedChild(good, testEasyBits-1, 9005, tip.Time+1200)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{good, bad}))
+		require.NoError(t, err)
+		require.Equal(t, scoreBadDiffBits, misbehavior)
+		require.Nil(t, msgs)
+
+		// AcceptBlockHeader inserts each header as it passes, so the good one
+		// stays; the loop stops at the bad one.
+		_, ok := f.idx.Lookup(good.BlockHash())
+		require.True(t, ok)
+
+		_, ok = f.idx.Lookup(bad.BlockHash())
+		require.False(t, ok)
+	})
+
+	t.Run("a header re-served from the index is not re-checked", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+		params := daaSyncParams(nil)
+		requireFixtureIsDaaStable(t, f, params)
+
+		hs, peer := startedSyncWith(t, f, params)
+
+		// AcceptBlockHeader returns early for a header already in
+		// mapBlockIndex, before every contextual check. Replaying the tail of
+		// our own chain must therefore cost the peer nothing.
+		replay := f.chain[len(f.chain)-3:]
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg(replay))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+	})
+
+	t.Run("a pre-DAA header is not contextually validated", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+
+		// Real mainnet DaaForkHeight, far above the fixture, so every header
+		// here sits in a historic difficulty era this port never evaluates.
+		params := daaSyncParams(nil)
+		params.DaaForkHeight = chaincfg.MainNetParams.DaaForkHeight
+		require.Greater(t, int32(params.DaaForkHeight), int32(fixtureHeight)) //nolint:gosec // fork heights are small positive constants
+
+		hs, peer := startedSyncWith(t, f, params)
+
+		wrongBits := timedChild(f.tip(), testEasyBits-1, 9006, daaFixtureBaseTime+(fixtureHeight+1)*600)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{wrongBits}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(wrongBits.BlockHash())
+		require.True(t, ok, "a pre-DAA header is accepted on its own claimed target alone")
+	})
+}
+
+// TestHeaderSync_CheckpointFence pins validation.cpp
+// CheckIndexAgainstCheckpoint's "Don't accept any forks from the main chain
+// prior to last checkpoint" rule. It runs against syncTestParams, whose
+// DaaForkHeight is real mainnet's, so no contextual difficulty answer exists
+// at these heights and the fence is the only gate under test.
+func TestHeaderSync_CheckpointFence(t *testing.T) {
+	const (
+		fixtureHeight = 120
+		cpHeight      = 60
+		forkHeight    = 30
+	)
+
+	// newFenced returns a fixture whose checkpoint at cpHeight names a header
+	// the index already holds, which is what makes GetLastCheckpoint answer.
+	newFenced := func(t *testing.T, disable bool) (*syncFixture, *HeaderSync, *SyncPeer) {
+		t.Helper()
+
+		f := newSyncFixture(t, fixtureHeight)
+		cpHash := f.chain[cpHeight-1].BlockHash()
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:              f.idx,
+			Params:             syncTestParams([]chaincfg.Checkpoint{{Height: cpHeight, Hash: &cpHash}}),
+			DisableCheckpoints: disable,
+		})
+		require.NoError(t, err)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, hs.PeerEstablished(peer), 1)
+		require.False(t, hs.IsHeadersFirstMode(), "the fixture tip is past the final checkpoint")
+
+		return f, hs, peer
+	}
+
+	t.Run("a fork below the last known checkpoint disconnects the peer", func(t *testing.T) {
+		f, hs, peer := newFenced(t, false)
+
+		// A brand-new header building on our chain at forkHeight: its own
+		// height is forkHeight+1, well below the checkpoint.
+		fork := minedChild(f.chain[forkHeight-1], testEasyBits, 7001)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{fork}))
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, ErrCheckpointFork))
+		require.Nil(t, msgs)
+		require.Zero(t, misbehavior)
+
+		require.Contains(t, err.Error(), "height 31")
+		require.Contains(t, err.Error(), "60")
+
+		_, ok := f.idx.Lookup(fork.BlockHash())
+		require.False(t, ok)
+	})
+
+	t.Run("a header at or above the checkpoint height is accepted", func(t *testing.T) {
+		f, hs, peer := newFenced(t, false)
+
+		extend := minedChild(f.tip(), testEasyBits, 7002)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{extend}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(extend.BlockHash())
+		require.True(t, ok)
+	})
+
+	t.Run("headers we already hold below the checkpoint are not fenced", func(t *testing.T) {
+		f, hs, peer := newFenced(t, false)
+
+		// The duplicate early return in AcceptBlockHeader runs before the
+		// fence, so our own history is never refused back to us.
+		replay := f.chain[forkHeight-1 : forkHeight+2]
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg(replay))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+	})
+
+	t.Run("disabled checkpoints lift the fence", func(t *testing.T) {
+		f, hs, peer := newFenced(t, true)
+
+		// fCheckpointsEnabled gates CheckIndexAgainstCheckpoint entirely.
+		fork := minedChild(f.chain[forkHeight-1], testEasyBits, 7003)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{fork}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(fork.BlockHash())
+		require.True(t, ok)
+	})
+
+	t.Run("a checkpoint we have not reached yet does not fence anything", func(t *testing.T) {
+		f := newSyncFixture(t, fixtureHeight)
+
+		// GetLastCheckpoint looks the checkpoint hash up in the index; a
+		// checkpoint we never reached is not there, so no fence height exists.
+		unknown := chainhash.Hash{0xC0}
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:  f.idx,
+			Params: syncTestParams([]chaincfg.Checkpoint{{Height: cpHeight, Hash: &unknown}}),
+		})
+		require.NoError(t, err)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, hs.PeerEstablished(peer), 1)
+
+		fork := minedChild(f.chain[forkHeight-1], testEasyBits, 7004)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{fork}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(fork.BlockHash())
+		require.True(t, ok)
+	})
+
+	t.Run("the highest checkpoint present in the index sets the fence", func(t *testing.T) {
+		f := newSyncFixture(t, fixtureHeight)
+
+		low := f.chain[cpHeight-1].BlockHash()
+		high := f.chain[fixtureHeight-1].BlockHash()
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index: f.idx,
+			Params: syncTestParams([]chaincfg.Checkpoint{
+				{Height: cpHeight, Hash: &low},
+				{Height: fixtureHeight, Hash: &high},
+			}),
+		})
+		require.NoError(t, err)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, hs.PeerEstablished(peer), 1)
+
+		// Between the two checkpoints: refused, because the higher one is the
+		// last checkpoint the index holds.
+		fork := minedChild(f.chain[cpHeight+4], testEasyBits, 7005)
+
+		_, _, err = hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{fork}))
+		require.Error(t, err)
+		require.True(t, errors.Is(err, ErrCheckpointFork))
+		require.Contains(t, err.Error(), "120")
+	})
+}
+
+// TestHeaderSync_HydrationBypassesContextualChecks pins the deliberate split
+// between the two ways a header reaches the index: PeerManager.AddHeaders, the
+// path Server hydration and the blockchain subscription use, carries headers
+// our own validated store already accepted and runs none of the checks
+// acceptHeaders applies to a peer's headers.
+func TestHeaderSync_HydrationBypassesContextualChecks(t *testing.T) {
+	const fixtureHeight = 200
+
+	f := newDaaSyncFixture(t, fixtureHeight)
+
+	tip, ok := f.idx.Lookup(f.tip().BlockHash())
+	require.True(t, ok)
+
+	cpHash := f.chain[fixtureHeight/2-1].BlockHash()
+	params := daaSyncParams([]chaincfg.Checkpoint{{Height: fixtureHeight / 2, Hash: &cpHash}})
+
+	// Two headers a peer could never get past acceptHeaders: one claiming the
+	// wrong contextual difficulty, one forking below the last checkpoint.
+	wrongBits := timedChild(f.tip(), testEasyBits-1, 8001, tip.Time+600)
+	fork := timedChild(f.chain[9], testEasyBits, 8002, daaFixtureBaseTime+11*600)
+
+	hs, peer := startedSyncWith(t, f, params)
+
+	_, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{wrongBits}))
+	require.NoError(t, err)
+	require.Equal(t, scoreBadDiffBits, misbehavior)
+
+	_, _, err = hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{fork}))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrCheckpointFork))
+
+	for _, h := range []*wire.BlockHeader{wrongBits, fork} {
+		_, indexed := f.idx.Lookup(h.BlockHash())
+		require.False(t, indexed)
+	}
+
+	// The same two headers arriving through the hydration path are indexed.
+	manager := newTestManager(t, nil)
+	require.NoError(t, manager.ConfigureSync(SyncConfig{Index: f.idx}))
+
+	orphans, err := manager.AddHeaders([]*wire.BlockHeader{wrongBits, fork})
+	require.NoError(t, err)
+	require.Empty(t, orphans)
+
+	for _, h := range []*wire.BlockHeader{wrongBits, fork} {
+		_, indexed := f.idx.Lookup(h.BlockHash())
+		require.True(t, indexed, "the hydration path must index what our own store already accepted")
+	}
 }

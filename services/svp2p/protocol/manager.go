@@ -209,6 +209,24 @@ func (m *PeerManager) SyncEnabled() bool {
 // It is how the blockchain-subscription goroutine writes to the index without
 // racing the headers-first machine's Lookup-before-AddHeader sequence. Pass
 // headers oldest first, so each header's parent is already indexed.
+//
+// THIS PATH RUNS NO HEADER VALIDATION, deliberately. It is the trusted half of
+// the two ways a header reaches the index: Server hydration and the blockchain
+// subscription feed it headers Teranode's own blockchain service already
+// validated and stored, so re-checking them here would be checking our own
+// chain against itself. A peer's headers take the other half,
+// HeaderSync.OnHeaders, which applies CheckBlockHeader, the checkpoint fence
+// and the contextual difficulty rule before anything is inserted (see
+// headersync.go acceptHeader).
+//
+// The distinction is load-bearing for the contextual difficulty check, which
+// needs the parent's 147-block window. Hydration walks the store forward from
+// the index tip and would otherwise have to satisfy that window while it is
+// still building it. It also means a header this method inserts is NOT
+// evidence that a peer could have got the same header past OnHeaders.
+//
+// Anything else that grows the index must go through OnHeaders, or the gates
+// there stop bounding what a peer can make us store.
 func (m *PeerManager) AddHeaders(headers []*wire.BlockHeader) ([]*wire.BlockHeader, error) {
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()

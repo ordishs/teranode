@@ -44,6 +44,14 @@ const (
 	// state.DoS(50, ..., "high-hash"); net_processing.cpp then applies that
 	// nDoS as Misbehaving(pfrom, nDoS, "invalid header received").
 	scoreInvalidHeader = 50
+
+	// ContextualCheckBlockHeader fails a header whose nBits is not the value
+	// GetNextWorkRequired demands with
+	// state.DoS(100, ..., REJECT_INVALID, "bad-diffbits"), which
+	// net_processing.cpp applies as Misbehaving(pfrom, nDoS, "invalid header
+	// received"). One hundred is the ban threshold, so a single such header
+	// ends the peer.
+	scoreBadDiffBits = 100
 )
 
 // ErrCheckpointMismatch reports a header at a checkpoint height whose hash is
@@ -53,6 +61,20 @@ const (
 // purpose: the teranode errors package matches errors.Is by code, and both
 // sentinels mean the same thing to a caller — disconnect this peer.
 var ErrCheckpointMismatch = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: header does not match checkpoint")
+
+// ErrCheckpointFork reports a header that would fork the chain below the last
+// checkpoint the index holds — validation.cpp CheckIndexAgainstCheckpoint's
+// "bad-fork-prior-to-checkpoint". SVNode scores that DoS(100), one point above
+// the ban threshold, so the peer is gone either way; this port answers with a
+// disconnect error instead, the legacy DisconnectWithWarning shape the
+// checkpoint-mismatch path above already uses, so both checkpoint refusals
+// reach the caller the same way.
+//
+// It shares ERR_NETWORK_PEER_MALICIOUS with ErrCheckpointMismatch for the
+// reason documented there: the teranode errors package matches errors.Is by
+// code, and both sentinels mean "disconnect this peer". A caller that must
+// tell them apart reads the message.
+var ErrCheckpointFork = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: header forks below the last checkpoint")
 
 // ErrHeadersNoProgress reports a headers batch that did not carry the
 // headers-first round past the point the last getheaders was issued from — a
@@ -407,37 +429,39 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 	checkpointRound := roundOwner && hs.nextCheckpoint != nil
 
 	for _, header := range headers {
-		// AcceptBlockHeader calls CheckBlockHeader before the mapBlockIndex
-		// insert; HeaderIndex.AddHeader deliberately carries only the insert,
-		// so the PoW check belongs here.
-		if !hs.checkBlockHeaderPoW(header) {
-			return nil, scoreInvalidHeader, nil
-		}
+		hash := header.BlockHash()
 
-		// Whether this header is new has to be read before the insert, because
-		// AddHeader reports a header already in the index as connected. The
-		// round's progress rule below needs to tell the two apart.
-		_, known := hs.cfg.Index.Lookup(header.BlockHash())
-
-		connected, err := hs.cfg.Index.AddHeader(header)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		// AcceptBlockHeader: "prev-blk-not-found" → DoS(10). Reachable only for
-		// the first header of a bulk batch whose parent we do not have; the
-		// continuity scan guarantees the rest of the batch attaches.
-		if !connected {
-			return nil, scorePrevBlkNotFound, nil
-		}
+		// AcceptBlockHeader (validation.cpp:6104-6117) checks for a duplicate
+		// FIRST and returns early: a header already in mapBlockIndex is
+		// answered without running CheckBlockHeader, the checkpoint fence or
+		// ContextualCheckBlockHeader. That order is load-bearing here, not an
+		// optimisation. Our own history is re-served to us constantly — the
+		// start-at-the-parent locator asks for it, and any peer may echo it —
+		// and the fence below refuses every NEW header below the last
+		// checkpoint. Re-checking a header we already hold would turn that
+		// echo into a disconnect.
+		//
+		// Whether the header is new is also what the round's progress rule at
+		// the bottom of this function needs, since AddHeader reports a header
+		// already in the index as connected.
+		node, known := hs.cfg.Index.Lookup(hash)
 
 		if !known {
-			sawNewHeader = true
-		}
+			inserted, score, err := hs.acceptHeader(header)
+			if err != nil {
+				return nil, 0, err
+			}
 
-		node, ok := hs.cfg.Index.Lookup(header.BlockHash())
-		if !ok {
-			break
+			// A non-zero score is the DoS value the failed check carries, which
+			// net_processing.cpp applies as Misbehaving(pfrom, nDoS, "invalid
+			// header received"). The batch stops there; the headers already
+			// inserted stay, as they do in the source.
+			if score != 0 {
+				return nil, score, nil
+			}
+
+			node = inserted
+			sawNewHeader = true
 		}
 
 		lastAccepted = node.Hash
@@ -534,25 +558,149 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 	return nil, 0, nil
 }
 
+// acceptHeader is the body of validation.cpp AcceptBlockHeader
+// (validation.cpp:6087-6154) for a header the index does not already hold:
+// CheckBlockHeader, then the previous-block lookup, then the checkpoint fence,
+// then ContextualCheckBlockHeader's difficulty rule, then the mapBlockIndex
+// insert. The order is the source's, and it matters — the fence and the
+// difficulty check both read the parent, and neither may run before the cheap
+// proof-of-work check has made the header cost something to produce.
+//
+// It answers the inserted node on success, or a DoS score for a scored
+// refusal, or an error for a refusal that disconnects the peer. Exactly one of
+// the three is set.
+func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (HeaderNode, int, error) {
+	// AcceptBlockHeader calls CheckBlockHeader before the mapBlockIndex
+	// insert; HeaderIndex.AddHeader deliberately carries only the insert, so
+	// the PoW check belongs here.
+	if !hs.checkBlockHeaderPoW(header) {
+		return HeaderNode{}, scoreInvalidHeader, nil
+	}
+
+	// FindPreviousBlockIndex. AcceptBlockHeader answers a missing parent with
+	// "prev-blk-not-found" → DoS(10). Reachable only for the first header of a
+	// bulk batch whose parent we do not have; the continuity scan in OnHeaders
+	// guarantees the rest of the batch attaches.
+	parent, ok := hs.cfg.Index.Lookup(header.PrevBlock)
+	if !ok {
+		return HeaderNode{}, scorePrevBlkNotFound, nil
+	}
+
+	// fCheckpointsEnabled && !CheckIndexAgainstCheckpoint(...).
+	fence := hs.lastCheckpointInIndex()
+	if !checkIndexAgainstCheckpoint(parent, fence) {
+		return HeaderNode{}, 0, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+			"svp2p: header at height %d forks below the last checkpoint we hold at height %d",
+			parent.Height+1, fence.Height, ErrCheckpointFork)
+	}
+
+	// ContextualCheckBlockHeader (validation.cpp:5896-5901): "Check proof of
+	// work" — the header's nBits must be exactly what GetNextWorkRequired
+	// demands for this parent → state.DoS(100, ..., "bad-diffbits").
+	//
+	// validated is false where this port has no answer: a parent in a historic
+	// difficulty era, or one whose DAA window is short. Both are documented on
+	// GetNextWorkRequired, and both mean the header is accepted on its own
+	// claimed target alone — see the scope note at the top of difficulty.go
+	// before assuming otherwise.
+	if want, validated := GetNextWorkRequired(hs.cfg.Index, hs.cfg.Params, parent, header.Timestamp.Unix()); validated &&
+		header.Bits != want {
+		return HeaderNode{}, scoreBadDiffBits, nil
+	}
+
+	// AddToBlockIndex.
+	connected, err := hs.cfg.Index.AddHeader(header)
+	if err != nil {
+		return HeaderNode{}, 0, err
+	}
+
+	// Defensive: the parent lookup above already proved the header attaches,
+	// and nothing writes to the index between the two calls, so this cannot
+	// fire. It scores the source's value rather than inserting nothing and
+	// carrying on.
+	if !connected {
+		return HeaderNode{}, scorePrevBlkNotFound, nil
+	}
+
+	node, ok := hs.cfg.Index.Lookup(header.BlockHash())
+	if !ok {
+		return HeaderNode{}, 0, errors.New(errors.ERR_SERVICE_ERROR,
+			"svp2p: header %s vanished from the index directly after insert", header.BlockHash())
+	}
+
+	return node, 0, nil
+}
+
+// checkIndexAgainstCheckpoint is validation.cpp CheckIndexAgainstCheckpoint
+// (validation.cpp:5856-5884), second half: "Don't accept any forks from the
+// main chain prior to last checkpoint." A new header whose own height falls
+// below the last checkpoint we hold is refused, because our chain already
+// reaches that checkpoint and anything branching in below it is a fork we can
+// never adopt.
+//
+// The source's first half — Checkpoints::CheckBlock, the hash-must-match rule
+// at a checkpoint height — is not repeated here. This port already carries it
+// in acceptHeaders, from legacy netsync manager.go, where it is scoped to the
+// headers-first round and answers with ErrCheckpointMismatch. Running it twice
+// would give one rule two different refusal shapes.
+//
+// It runs for every new header, in a round or outside one, which is what
+// bounds HeaderIndex growth below the final checkpoint: a peer cannot spend a
+// map entry on a header at a height our chain has already settled.
+//
+// The source resolves the fence itself with Checkpoints::GetLastCheckpoint;
+// here the caller resolves it through lastCheckpointInIndex and passes it in,
+// so the rule stays a pure function of the two values it compares and the
+// index is read once per header. A nil checkpoint is both "we have reached
+// none of them" and the source's fCheckpointsEnabled being off, which
+// DisableCheckpoints expresses by leaving hs.checkpoints empty.
+func checkIndexAgainstCheckpoint(parent HeaderNode, checkpoint *chaincfg.Checkpoint) bool {
+	if checkpoint == nil {
+		return true
+	}
+
+	// int32_t nHeight = pindexPrev->GetHeight() + 1;
+	return parent.Height+1 >= checkpoint.Height
+}
+
+// lastCheckpointInIndex is checkpoints.cpp Checkpoints::GetLastCheckpoint
+// (checkpoints.cpp:24-36): the highest checkpoint whose hash the index holds,
+// or nil when we have reached none of them. It walks the list in reverse, as
+// the source does with boost::adaptors::reverse over the ordered map.
+//
+// The fence therefore tightens as the chain grows: it does nothing on a fresh
+// node, and settles at the final checkpoint once we are past it. That is the
+// source's behavior, and it is why the fence cannot lock out a node that is
+// still syncing toward its first checkpoint.
+func (hs *HeaderSync) lastCheckpointInIndex() *chaincfg.Checkpoint {
+	for i := len(hs.checkpoints) - 1; i >= 0; i-- {
+		checkpoint := &hs.checkpoints[i]
+		if checkpoint.Hash == nil {
+			continue
+		}
+
+		if _, ok := hs.cfg.Index.Lookup(*checkpoint.Hash); ok {
+			return checkpoint
+		}
+	}
+
+	return nil
+}
+
 // checkBlockHeaderPoW is pow.cpp CheckProofOfWork, the cheap per-header check
 // validation.cpp CheckBlockHeader runs: the target the header's own nBits
 // claims must be in range, and the header hash must be at or below it. It
 // needs no ancestor context.
 //
-// Phase 2 does not carry the contextual difficulty check
-// (ContextualCheckBlockHeader / GetNextWorkRequired), and the bound on that gap
-// is narrower than it looks. Checkpoint enforcement covers only the
-// headers-first round: it applies to the sync peer, up to the next checkpoint.
-// The mainnet checkpoint list in chaincfg ends at height 945000, so above that
-// height the only gate left on a received header is this check: a peer can feed
-// difficulty-1 headers that cost nothing to grind, and HeaderIndex grows one
-// unbounded map entry per header with no eviction. Restricting the round to the
-// sync peer bounds who can do it only while a round runs, by design — outside a
-// round every peer's headers are indexed, as net_processing.cpp does. Phase 3
-// must close it with one of: the contextual GetNextWorkRequired check, a
-// CheckIndexAgainstCheckpoint port that refuses headers forking below the last
-// checkpoint, or a height/size cap on the index. This is spec §6 header-index
-// hardening, and it is tracked in the Task 5 report.
+// Phase 2 left the contextual difficulty check unported, which let a peer feed
+// difficulty-1 headers above the final checkpoint at no cost and grow
+// HeaderIndex by one unevictable map entry each. Phase 3 Task 2 closed that:
+// acceptHeader now runs checkIndexAgainstCheckpoint and GetNextWorkRequired on
+// every new header from every peer, in a round or outside one. Below the last
+// checkpoint the index holds, the fence refuses the header outright; above it,
+// the DAA makes each header cost the network's real difficulty to produce.
+// What remains uncovered is the historic difficulty eras, deliberately — see
+// the scope note at the top of difficulty.go.
 func (hs *HeaderSync) checkBlockHeaderPoW(header *wire.BlockHeader) bool {
 	var bits model.NBit
 

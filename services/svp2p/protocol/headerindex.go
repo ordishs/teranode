@@ -89,11 +89,22 @@ func getSkipHeight(height int32) int32 {
 // zero value, or one a caller built). Read it through chainWorkOf, which
 // answers zero work for that case, the same state a C++ CBlockIndex is in
 // before SetChainWork runs.
+//
+// Time and Bits are CBlockIndex::GetBlockTime() and CBlockIndex::GetBits():
+// the two header fields the contextual difficulty check reads off an
+// ancestor. They come from the wire.BlockHeader the index has stored since
+// Phase 2 Task 2, and Phase 3 Task 2 is what first reads it.
 type HeaderNode struct {
 	Hash       chainhash.Hash
 	ParentHash chainhash.Hash
 	Height     int32
 	ChainWork  *big.Int
+
+	// Time is CBlockHeader::nTime in Unix seconds.
+	Time int64
+
+	// Bits is CBlockHeader::nBits, the compact target the header claims.
+	Bits uint32
 }
 
 func exportNode(n *node) HeaderNode {
@@ -102,7 +113,14 @@ func exportNode(n *node) HeaderNode {
 		parentHash = n.prev.hash
 	}
 
-	return HeaderNode{Hash: n.hash, ParentHash: parentHash, Height: n.height, ChainWork: n.chainWork}
+	return HeaderNode{
+		Hash:       n.hash,
+		ParentHash: parentHash,
+		Height:     n.height,
+		ChainWork:  n.chainWork,
+		Time:       n.header.Timestamp.Unix(),
+		Bits:       n.header.Bits,
+	}
 }
 
 // chainWorkOf reads a HeaderNode's cumulative work, answering zero for a
@@ -215,10 +233,12 @@ func (idx *HeaderIndex) AddHeader(header *wire.BlockHeader) (connected bool, err
 	//
 	// SetBestHeader also gates on bestHeaderCandidate.IsValid(TREE), which
 	// this index has no status field for. The counterpart is upstream:
-	// HeaderSync.checkBlockHeaderPoW (headersync.go) runs before OnHeaders
-	// calls AddHeader, and headers from the blockchain subscription come from
-	// Teranode's own validated store. That gate is also what keeps a node's
-	// work non-zero — see the longer note on the availability compares in
+	// HeaderSync.acceptHeader (headersync.go) runs CheckBlockHeader's
+	// proof-of-work check, the checkpoint fence and the contextual difficulty
+	// rule before OnHeaders calls AddHeader, and headers from the blockchain
+	// subscription come from Teranode's own validated store. The
+	// proof-of-work half of that gate is also what keeps a node's work
+	// non-zero — see the longer note on the availability compares in
 	// syncstate.go.
 	if n.chainWork.Cmp(idx.tip.chainWork) > 0 {
 		idx.tip = n
