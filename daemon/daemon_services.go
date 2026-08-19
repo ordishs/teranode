@@ -1192,22 +1192,92 @@ func validateServiceExclusions(startLegacy, startSvp2p bool) error {
 }
 
 // startSvp2pService initializes and adds the svp2p service to the ServiceManager.
-// Phase 1 needs only the blockchain client; the ingestion dependencies arrive
-// with the bridge in Phase 2.
+// It fetches the same ingestion dependencies startLegacyService fetches and
+// injects them via svp2p.NewWithDeps, so the daemon always runs svp2p with
+// block sync enabled.
 func (d *Daemon) startSvp2pService(
 	ctx context.Context,
 	appSettings *settings.Settings,
 	createLogger func(string) ulogger.Logger,
 ) error {
+	// Get the subtree store
+	var subtreeStore blob.Store
+
+	subtreeStore, err := d.daemonStores.GetSubtreeStore(ctx, createLogger(loggerSubtrees), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Get the temporary store
+	var tempStore blob.Store
+
+	tempStore, err = d.daemonStores.GetTempStore(ctx, createLogger(loggerTemp), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Get the UTXO store
+	var utxoStore utxo.Store
+
+	utxoStore, err = d.daemonStores.GetUtxoStore(ctx, createLogger(loggerUtxos), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Get the validator client
+	var validatorClient validator.Interface
+
+	validatorClient, err = d.daemonStores.GetValidatorClient(ctx, createLogger(loggerTxValidator), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Get the blockchain client
 	blockchainClient, err := d.daemonStores.GetBlockchainClient(ctx, createLogger(loggerBlockchainClient), appSettings, serviceSvp2p)
 	if err != nil {
 		return err
 	}
 
-	return d.ServiceManager.AddService(serviceSvp2pFormal, svp2p.New(
+	// Get the subtree validation client
+	var subtreeValidationClient subtreevalidation.Interface
+
+	subtreeValidationClient, err = d.daemonStores.GetSubtreeValidationClient(ctx, createLogger(loggerSubtreeValidation), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Get the block validation client
+	var blockValidationClient blockvalidation.Interface
+
+	blockValidationClient, err = d.daemonStores.GetBlockValidationClient(ctx, createLogger(loggerBlockValidation), appSettings)
+	if err != nil {
+		return err
+	}
+
+	// Get the block assembly client
+	var blockassemblyClient *blockassembly.Client
+
+	blockassemblyClient, err = blockassembly.NewClient(ctx, createLogger(loggerBlockAssembly), appSettings)
+	if err != nil {
+		return err
+	}
+
+	d.daemonStores.retainClient(blockassemblyClient)
+
+	// Add the svp2p service to the ServiceManager
+	return d.ServiceManager.AddService(serviceSvp2pFormal, svp2p.NewWithDeps(
 		createLogger(serviceSvp2p),
 		appSettings,
 		blockchainClient,
+		svp2p.Deps{
+			ValidationClient:  validatorClient,
+			SubtreeStore:      subtreeStore,
+			TempStore:         tempStore,
+			UtxoStore:         utxoStore,
+			SubtreeValidation: subtreeValidationClient,
+			BlockValidation:   blockValidationClient,
+			BlockAssembly:     blockassemblyClient,
+		},
 	))
 }
 
