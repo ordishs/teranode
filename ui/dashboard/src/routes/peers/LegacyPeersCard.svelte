@@ -94,14 +94,14 @@
             <th>Address</th>
             <th>User Agent</th>
             <th>Dir</th>
-            <th class="num">Version</th>
-            <th class="num">Services</th>
-            <th class="num">Ping</th>
-            <th class="num">Offset</th>
-            <th class="num">Start Height</th>
-            <th class="num">Height</th>
-            <th class="num">Sent</th>
-            <th class="num">Received</th>
+            <th class="lp-num">Version</th>
+            <th class="lp-num">Services</th>
+            <th class="lp-num">Ping</th>
+            <th class="lp-num">Offset</th>
+            <th class="lp-num">Start Height</th>
+            <th class="lp-num">Height</th>
+            <th class="lp-num">Sent</th>
+            <th class="lp-num">Received</th>
             <th>Connected</th>
           </tr>
         </thead>
@@ -119,14 +119,14 @@
               </td>
               <td class="agent" title={peer.client_name || ''}>{peer.client_name || '-'}</td>
               <td>{peer.legacy?.inbound ? 'in' : 'out'}</td>
-              <td class="num">{peer.legacy?.protocol_version || '-'}</td>
-              <td class="num">{formatServiceFlags(peer.legacy?.service_flags)}</td>
-              <td class="num">{formatPing(peer.legacy?.ping_micros)}</td>
-              <td class="num">{formatOffset(peer.legacy?.time_offset_secs)}</td>
-              <td class="num">{(peer.legacy?.starting_height || 0).toLocaleString()}</td>
-              <td class="num">{(peer.height || 0).toLocaleString()}</td>
-              <td class="num">{formatBytes(peer.bytes_sent)}</td>
-              <td class="num">{formatBytes(peer.bytes_received)}</td>
+              <td class="lp-num">{peer.legacy?.protocol_version || '-'}</td>
+              <td class="lp-num">{formatServiceFlags(peer.legacy?.service_flags)}</td>
+              <td class="lp-num">{formatPing(peer.legacy?.ping_micros)}</td>
+              <td class="lp-num">{formatOffset(peer.legacy?.time_offset_secs)}</td>
+              <td class="lp-num">{(peer.legacy?.starting_height || 0).toLocaleString()}</td>
+              <td class="lp-num">{(peer.height || 0).toLocaleString()}</td>
+              <td class="lp-num">{formatBytes(peer.bytes_sent)}</td>
+              <td class="lp-num">{formatBytes(peer.bytes_received)}</td>
               <td>{formatConnected(peer.legacy?.time_connected)}</td>
             </tr>
           {/each}
@@ -178,8 +178,8 @@
     border-bottom: 1px solid rgba(128, 128, 128, 0.2);
   }
 
-  .legacy-table th.num,
-  .legacy-table td.num {
+  .legacy-table th.lp-num,
+  .legacy-table td.lp-num {
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
