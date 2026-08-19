@@ -531,6 +531,23 @@ func TestCheckStall_DisconnectsAStallingPeer(t *testing.T) {
 	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(BlockStallingTimeout)+1))
 }
 
+// TestCheckStall_DisconnectsAStallerThatHoldsNoSyncSlot pins the ORDER of the
+// two clauses in CheckStall. DetectStalling runs before the fSyncStarted early
+// return, so a peer a rotation stripped of the sync slot is still judged on the
+// blocks it holds. Reverse the two and a rotated-but-connected peer becomes
+// ungovernable: every block the scheduler re-hands it is lost until it
+// disconnects on its own.
+func TestCheckStall_DisconnectsAStallerThatHoldsNoSyncSlot(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+
+	peer := f.peerAt(t, "1.2.3.4:8333", 3)
+	require.False(t, peer.State.fSyncStarted, "this is the state a rotation leaves behind")
+
+	peer.State.nStallingSince = testNow
+
+	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(BlockStallingTimeout)+1))
+}
+
 func TestCheckStall_IgnoresAPeerThatIsNotStalling(t *testing.T) {
 	f := newDownloadFixture(t, 3)
 	peer := f.peerAt(t, "1.2.3.4:8333", 3)

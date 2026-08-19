@@ -215,15 +215,18 @@ func (m *PeerManager) SyncEnabled() bool {
 // subscription feed it headers Teranode's own blockchain service already
 // validated and stored, so re-checking them here would be checking our own
 // chain against itself. A peer's headers take the other half,
-// HeaderSync.OnHeaders, which applies CheckBlockHeader, the checkpoint fence
-// and the contextual difficulty rule before anything is inserted (see
-// headersync.go acceptHeader).
+// HeaderSync.OnHeaders, which applies CheckBlockHeader, the checkpoint fence,
+// the contextual difficulty rule and the timestamp cap before anything is
+// inserted (see headersync.go acceptHeader).
 //
 // The distinction is load-bearing for the contextual difficulty check, which
 // needs the parent's 147-block window. Hydration walks the store forward from
 // the index tip and would otherwise have to satisfy that window while it is
-// still building it. It also means a header this method inserts is NOT
-// evidence that a peer could have got the same header past OnHeaders.
+// still building it. It matters for the timestamp cap too: a header our own
+// store already holds must not be refused because THIS node's clock is skewed,
+// which is exactly what the too-far-in-the-future rule would do to it. It also
+// means a header this method inserts is NOT evidence that a peer could have got
+// the same header past OnHeaders.
 //
 // Anything else that grows the index must go through OnHeaders, or the gates
 // there stop bounding what a peer can make us store.
@@ -762,17 +765,34 @@ func (m *PeerManager) syncTickOnce() {
 		ingests[i] = h.peer.IngestSnapshot()
 	}
 
-	var (
-		out        []outgoing
-		disconnect []*Peer
-		rotated    *SyncPeer
-	)
+	out, disconnect := m.syncPass(handles, ingests, now)
+
+	for _, peer := range disconnect {
+		m.logger.Warnf("[svp2p] disconnecting %s: stalling block download", peer.Info().Addr)
+		peer.Disconnect("stalling block download")
+	}
+
+	sendAll(out)
+}
+
+// syncPass is the locked half of one tick: the stall check and the
+// block-download pass for every peer, plus the election a rotation triggers.
+// It RETURNS the work instead of doing it, because neither Conn.Send nor
+// Peer.Disconnect may run under syncMu — both can block on a peer. That is the
+// collect-then-act shape every sync path here keeps; syncTickOnce acts on the
+// two lists after the unlock.
+//
+// ingests must be index-aligned with handles, and is sampled by the caller
+// before syncMu is taken: IngestSnapshot takes the PEER lock, and the package
+// lock order forbids reaching for a peer lock while holding a manager one.
+func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, now int64) (out []outgoing, disconnect []*Peer) {
+	var rotated *SyncPeer
 
 	m.syncMu.Lock()
 
 	if m.blockDownloader == nil {
 		m.syncMu.Unlock()
-		return
+		return nil, nil
 	}
 
 	activeTip := m.activeTip
@@ -795,6 +815,29 @@ func (m *PeerManager) syncTickOnce() {
 
 			m.logger.Warnf("[svp2p] rotating the sync peer %s: no sync progress", h.sync.Addr)
 
+			// The rest of this peer's pass is skipped. Without the skip,
+			// SendGetDataBlocks below hands the peer we have just judged
+			// non-progressing another MaxBlocksInTransitPerPeer blocks on THIS
+			// pass: clearPeer nils pindexLastCommonBlock but keeps
+			// pindexBestKnownBlock, so FindNextBlocksToDownload bootstraps the
+			// window from our own tip again and refills it.
+			//
+			// The seam is a composition of two models, and neither model's
+			// safety net came across with it. SVNode runs a per-peer download
+			// loop and relies on a per-block download timeout to take blocks
+			// back from a peer that does not deliver. legacy netsync rotates
+			// the sync peer alone and hands blocks to nobody else. Composed
+			// here, the rotated peer keeps being re-handed blocks, while its
+			// own rotation clause can no longer fire for it, because
+			// SyncPeerTimedOut cleared fSyncStarted. What DOES still govern it
+			// from here is stated at CheckStall.
+			//
+			// The skip costs this peer its own chance to NAME a staller on
+			// this pass, since that clock is started from inside
+			// SendGetDataBlocks. Every other peer on the pass still names one,
+			// and the next tick gives this peer the chance back.
+			continue
+
 		case StallActionNone:
 		}
 
@@ -804,22 +847,23 @@ func (m *PeerManager) syncTickOnce() {
 	}
 
 	if rotated != nil {
-		// Only one rotation is acted on per tick, because only one peer can
-		// hold the single sync slot: a second rotation in the same pass would
-		// be a peer that no longer holds it, and the election below already
-		// covers whoever is eligible now. If a second peer did somehow rotate
-		// in the same pass, the next tick elects for it.
+		// Only one rotation is ACTED ON per tick, and rotated is the last one
+		// the loop saw. Only one peer can hold the single sync slot, so a
+		// second rotation in the same pass would be a peer that no longer
+		// holds it, and this election already covers whoever is eligible now.
+		// If a second peer did somehow rotate in the same pass, the next tick
+		// elects for it.
+		//
+		// The skip in the rotate branch is per peer, not per pass, so that
+		// reasoning still holds with it in place: every rotating peer sat out
+		// its own download pass, and a rotation the election misses costs one
+		// tick and nothing else.
 		out = append(out, m.electLocked(handles, rotated)...)
 	}
 
 	m.syncMu.Unlock()
 
-	for _, peer := range disconnect {
-		m.logger.Warnf("[svp2p] disconnecting %s: stalling block download", peer.Info().Addr)
-		peer.Disconnect("stalling block download")
-	}
-
-	sendAll(out)
+	return out, disconnect
 }
 
 func (m *PeerManager) newNonce() uint64 {

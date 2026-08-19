@@ -848,6 +848,29 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 // blockchain-service subscription, so a rise can come from our own node rather
 // than from this peer. That can only ever delay a rotation, never cause a wrong
 // one, and only while the node is genuinely advancing.
+//
+// What a rotation leaves behind is the third thing this method has to answer
+// for. A rotated peer stays connected, and SyncPeerTimedOut cleared its
+// fSyncStarted, so the rotation clause can never fire for it again while it
+// stays. The decision is that it becomes a PLAIN DOWNLOAD PEER: it keeps no
+// clock of its own, and the scheduler may hand it blocks on any later tick.
+// Two things govern it from there, and the ORDER of the two clauses below is
+// what makes the first of them work:
+//
+//   - The DetectStalling clause runs BEFORE the fSyncStarted early-return, so
+//     it still judges a peer that holds no sync slot. Any block such a peer
+//     heads the download window with starts its nStallingSince clock through
+//     SendGetDataBlocks, and this method then disconnects it, which releases
+//     the blocks through FinalizeNode. Reverse the two clauses and a
+//     rotated-but-connected peer becomes ungovernable: blocks re-handed to it
+//     would never come back. TestCheckStall_DisconnectsAStallerThatHoldsNoSyncSlot
+//     pins the order.
+//   - SVNode also takes single blocks back on a per-block download timeout,
+//     which reaches a silent peer without costing it its connection and
+//     without needing a second peer to name it the staller. That timeout is
+//     NOT carried here yet, so the staller rule above is the whole of the
+//     recovery today.
+//
 // ingest is what the caller observed about a block this peer is currently
 // ingesting; the zero value means none. It is the input to the large-block
 // suppression documented above the rotation branch.
@@ -868,7 +891,11 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 		return StallActionDisconnect
 	}
 
-	// legacy netsync handleCheckSyncPeer only ever examines the sync peer.
+	// legacy netsync handleCheckSyncPeer only ever examines the sync peer. This
+	// return MUST stay below the DetectStalling clause above: a rotated peer
+	// reaches here with fSyncStarted cleared, and the staller rule is the only
+	// thing left that can release the blocks it was re-handed. See the note on
+	// what a rotation leaves behind.
 	if !state.fSyncStarted {
 		return StallActionNone
 	}

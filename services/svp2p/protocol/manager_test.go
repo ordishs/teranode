@@ -874,3 +874,262 @@ func TestManagerStopClosesEverything(t *testing.T) {
 	_, err := net.DialTimeout("tcp", addr, time.Second)
 	require.Error(t, err)
 }
+
+// rotationFixture drives the manager's sync tick one pass at a time, with an
+// explicit clock and no live connections. A rotation and the download pass that
+// follows it happen inside a single syncPass call, so the only way to observe
+// what the rotated peer was asked for on that pass is to hold the pass still.
+//
+// The peers here are real *Peer values over an unread net.Pipe. Nothing is ever
+// sent to them: syncPass returns the send list rather than sending it.
+type rotationFixture struct {
+	m       *PeerManager
+	idx     *HeaderIndex
+	genesis *wire.BlockHeader
+	chain   []*wire.BlockHeader
+	handles []peerHandle
+}
+
+func newRotationFixture(t *testing.T, height int) *rotationFixture {
+	t.Helper()
+
+	genesis := testGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+
+	// The chain is built AFTER ConfigureSync sampled the index tip, so our own
+	// active tip stays at genesis and every header above it is a block still to
+	// download.
+	chain := buildChain(t, idx, &nonceCounter{}, genesis, height)
+
+	f := &rotationFixture{m: m, idx: idx, genesis: genesis, chain: chain}
+
+	for _, addr := range []string{"1.1.1.1:8333", "2.2.2.2:8333"} {
+		peer, far := newTestPeer(t, time.Minute, time.Minute)
+
+		t.Cleanup(func() { _ = far.nc.Close() })
+
+		f.handles = append(f.handles, peerHandle{peer: peer, sync: fullNodePeer(addr)})
+	}
+
+	return f
+}
+
+// node returns the indexed header at height h, where 0 is genesis.
+func (f *rotationFixture) node(t *testing.T, h int) HeaderNode {
+	t.Helper()
+
+	hash := f.genesis.BlockHash()
+	if h > 0 {
+		hash = f.chain[h-1].BlockHash()
+	}
+
+	n, ok := f.idx.Lookup(hash)
+	require.True(t, ok)
+
+	return n
+}
+
+// setup runs sync-state mutations under the mutex the machines are caller-locked
+// against, so a test seeds state the same way the manager would.
+func (f *rotationFixture) setup(fn func()) {
+	f.m.syncMu.Lock()
+	defer f.m.syncMu.Unlock()
+
+	fn()
+}
+
+// pass runs one sync tick at the given clock, with no peer ingesting.
+func (f *rotationFixture) pass(now int64) (out []outgoing, disconnect []*Peer) {
+	return f.m.syncPass(f.handles, make([]IngestSnapshot, len(f.handles)), now)
+}
+
+// getDataTo returns every block hash one pass asked peer for.
+func getDataTo(out []outgoing, peer *Peer) []chainhash.Hash {
+	hashes := make([]chainhash.Hash, 0)
+
+	for _, o := range out {
+		if o.peer != peer {
+			continue
+		}
+
+		for _, msg := range o.msgs {
+			getData, ok := msg.(*wire.MsgGetData)
+			if !ok {
+				continue
+			}
+
+			for _, inv := range getData.InvList {
+				hashes = append(hashes, inv.Hash)
+			}
+		}
+	}
+
+	return hashes
+}
+
+// TestSyncPass_RotationDoesNotReHandBlocksToTheRotatedPeer is the manager-level
+// pin on mechanism (a) of the rotation finding: the rotate branch must skip the
+// rest of that peer's pass. Without the skip, SendGetDataBlocks hands the peer
+// we just judged non-progressing another MaxBlocksInTransitPerPeer blocks on
+// the SAME pass, because clearPeer nils pindexLastCommonBlock but keeps
+// pindexBestKnownBlock and the window simply bootstraps again.
+func TestSyncPass_RotationDoesNotReHandBlocksToTheRotatedPeer(t *testing.T) {
+	f := newRotationFixture(t, 40)
+
+	rotating, spare := f.handles[0], f.handles[1]
+	tip := f.node(t, len(f.chain))
+
+	held := make([]chainhash.Hash, 0, 3)
+
+	f.setup(func() {
+		require.Len(t, f.m.headerSync.PeerEstablished(rotating.sync), 1)
+		require.True(t, rotating.sync.State.fSyncStarted)
+
+		rotating.sync.State.pindexBestKnownBlock = &tip
+
+		for h := 1; h <= 3; h++ {
+			node := f.node(t, h)
+			require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(rotating.sync, node))
+
+			held = append(held, node.Hash)
+		}
+
+		// A progress clock that has already run past the rotation window.
+		rotating.sync.State.nLastProgressTime = testNow - micros(2*MaxLastBlockTime)
+
+		// A second peer on the same chain, eligible for both the slot and the
+		// blocks the rotation frees.
+		spare.sync.State.pindexBestKnownBlock = &tip
+	})
+
+	out, disconnect := f.pass(testNow)
+
+	require.Empty(t, disconnect, "a rotation must not disconnect anyone")
+
+	require.Empty(t, getDataTo(out, rotating.peer),
+		"a peer just judged non-progressing must not be re-handed blocks on the same pass")
+
+	asked := getDataTo(out, spare.peer)
+	require.Len(t, asked, MaxBlocksInTransitPerPeer)
+	require.Subset(t, asked, held, "the blocks the rotation freed must be re-offered on the same pass")
+
+	f.setup(func() {
+		require.False(t, rotating.sync.State.fSyncStarted, "the sync slot must be released")
+		require.Equal(t, 0, rotating.sync.State.nBlocksInFlight)
+		require.Nil(t, rotating.sync.State.pindexLastCommonBlock,
+			"the rotated peer must stay schedulable from scratch")
+
+		for _, hash := range held {
+			require.True(t, f.m.blockDownloader.IsInFlightFrom(spare.sync, hash),
+				"the freed block must now be in flight from the other peer")
+		}
+	})
+}
+
+// TestSyncPass_ARotatedPeerThatStallsTheWindowStillGoes is mechanism (b): a
+// rotated peer stays connected and keeps no sync slot, so its own rotation
+// clause can never fire again. What still governs it is DetectStalling, which
+// CheckStall runs BEFORE the fSyncStarted early-return. Reverse those two and a
+// rotated-but-connected peer could never be released again.
+func TestSyncPass_ARotatedPeerThatStallsTheWindowStillGoes(t *testing.T) {
+	f := newRotationFixture(t, 40)
+
+	stalled := f.handles[0]
+	tip := f.node(t, len(f.chain))
+
+	f.setup(func() {
+		// The state a rotation leaves behind: connected, no sync slot, and now
+		// heading the download window.
+		require.False(t, stalled.sync.State.fSyncStarted)
+
+		stalled.sync.State.pindexBestKnownBlock = &tip
+		stalled.sync.State.nStallingSince = testNow
+	})
+
+	_, disconnect := f.pass(testNow + micros(BlockStallingTimeout) + 1)
+
+	require.Equal(t, []*Peer{stalled.peer}, disconnect,
+		"the staller rule must still reach a peer that holds no sync slot")
+}
+
+// TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain is the
+// CROSS-TASK test for mechanism (c), the per-block download timeout, which is
+// NOT carried yet.
+//
+// It pins the whole recovery chain as it stands today: a rotated peer is a
+// plain download peer, later ticks hand it blocks again, and the only thing
+// that takes those blocks back is the staller rule — which costs the peer its
+// connection. That is a long way round for one silent peer.
+//
+// WHEN THE PER-BLOCK DOWNLOAD TIMEOUT LANDS, EXTEND THIS TEST: the blocks must
+// come back from the silent peer on the timeout alone, with no disconnect and
+// no second peer needed to name it the staller. Keep the staller path below as
+// the backstop it is.
+func TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain(t *testing.T) {
+	const height = BlockDownloadWindow + 6
+
+	f := newRotationFixture(t, height)
+
+	silent, other := f.handles[0], f.handles[1]
+	tip := f.node(t, height)
+
+	f.setup(func() {
+		require.Len(t, f.m.headerSync.PeerEstablished(silent.sync), 1)
+
+		silent.sync.State.pindexBestKnownBlock = &tip
+		require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(silent.sync, f.node(t, 1)))
+
+		silent.sync.State.nLastProgressTime = testNow - micros(2*MaxLastBlockTime)
+	})
+
+	// Tick 1: the rotation. The other peer has announced no chain yet, so the
+	// freed block goes nowhere — and the rotated peer is asked for nothing.
+	out, disconnect := f.pass(testNow)
+
+	require.Empty(t, disconnect)
+	require.Empty(t, getDataTo(out, silent.peer))
+
+	// The ticks that follow hand the rotated peer blocks again: it is a plain
+	// download peer now, and nothing about the rotation stops the scheduler
+	// choosing it. Marking the window in flight from it stands in for those
+	// ticks, which would take BlockDownloadWindow/MaxBlocksInTransitPerPeer of
+	// them to reach this state one getdata at a time.
+	f.setup(func() {
+		for h := 1; h <= BlockDownloadWindow; h++ {
+			require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(silent.sync, f.node(t, h)))
+		}
+
+		other.sync.State.pindexBestKnownBlock = &tip
+	})
+
+	// Tick 2: the other peer can fetch nothing, because the silent peer holds
+	// the whole window. That names the silent peer the staller.
+	second := testNow + micros(time.Second)
+
+	out, disconnect = f.pass(second)
+
+	require.Empty(t, disconnect)
+	require.Empty(t, getDataTo(out, other.peer), "the window is held shut")
+	require.Equal(t, second, silent.sync.State.nStallingSince, "the peer holding the window head starts stalling")
+
+	// Tick 3: the stall timeout expires. Today this is the ONLY thing that
+	// takes those blocks back.
+	third := second + micros(BlockStallingTimeout) + 1
+
+	_, disconnect = f.pass(third)
+
+	require.Equal(t, []*Peer{silent.peer}, disconnect)
+
+	// The disconnect the manager then performs is what releases them.
+	f.m.peerGone(silent.sync)
+	f.handles = f.handles[1:]
+
+	out, _ = f.pass(third + micros(time.Second))
+
+	require.Len(t, getDataTo(out, other.peer), MaxBlocksInTransitPerPeer,
+		"the blocks the silent peer was re-handed must reach another peer in the end")
+}
