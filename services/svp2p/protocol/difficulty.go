@@ -28,6 +28,28 @@ import (
 // index holds. Neither of those needs a difficulty answer, so building the EDA
 // would add consensus-critical arithmetic that changes no decision.
 //
+// WHAT IS AND IS NOT BOUNDED, precisely — do not read the paragraph above as
+// "the index is now bounded everywhere".
+//
+//   - mainnet steady state (past the final checkpoint, 945000): fully bounded.
+//     Every new header is post-DAA, so it costs the network's real difficulty.
+//   - mainnet and STN during IBD: bounded BELOW the highest checkpoint the
+//     index currently holds (the fence refuses those outright) and ABOVE
+//     daaHeight (the DAA prices them). Between the two lies a transient band —
+//     heights above the last checkpoint we have reached but below daaHeight —
+//     that is priced by neither, and it shrinks to nothing as the sync passes
+//     each checkpoint. A node holding no checkpoint yet has no lower bound at
+//     all.
+//   - ReduceMinDifficulty networks (testnet, teratestnet, tstn): NOT bounded by
+//     difficulty. getNextCashWorkRequired's min-difficulty branch answers the
+//     powLimit for any header whose timestamp is more than two target spacings
+//     past its parent's, so those headers are cheap by design. The only bound
+//     on them is the time-too-new cap in headersync.go acceptHeader, and that
+//     bounds the DEPTH of such a chain (roughly six headers), not its WIDTH —
+//     a peer may still put arbitrarily many cheap siblings on one parent.
+//     SVNode carries the same exposure on the same networks; closing it is not
+//     something this port can do without diverging from it.
+//
 // A reader who needs pre-DAA difficulty validation must port
 // GetNextEDAWorkRequired (pow.cpp:22-93) and CalculateNextWorkRequired
 // (pow.cpp:119-148) here, and must not assume this file already does it.
@@ -37,12 +59,28 @@ import (
 // nBits of the block it is building. This file does not call it, on purpose:
 // the protocol package holds no Teranode service dependency (spec §4.4), and
 // that one reads a model.SuitableBlock the store produces, not a HeaderNode.
-// The two agree — same work difference, same [72, 288] spacing clamp, same
-// (2**256 - work) / work, same powLimit clip, and the same shallowest height
-// they will answer for (that one's `blockHeight < DifficultyAdjustmentWindow+4`
-// is this one's daaMinParentHeight, one height lower because it counts the
-// block being built rather than its parent). A change to the arithmetic here
-// belongs in both.
+// The two agree ON EVERY REACHABLE INPUT — same work difference, same
+// [72, 288] spacing clamp, same (2**256 - work) / work, same powLimit clip,
+// and the same shallowest height they will answer for (that one's
+// `blockHeight < DifficultyAdjustmentWindow+4` is this one's
+// daaMinParentHeight, one height lower because it counts the block being built
+// rather than its parent). A change to the arithmetic here belongs in both.
+//
+// They differ only in degenerate branches, in three places, none of which a
+// shipped network can reach:
+//
+//   - a work sum that floors to zero: that one answers the last suitable
+//     block's nBits, this one answers the powLimit;
+//   - a clamped timespan of zero: that one guards it explicitly and answers the
+//     last suitable block's nBits, this one has no guard. Both clamp to
+//     [72, 288] spacings BEFORE dividing, so the guard is dead for any positive
+//     target spacing;
+//   - a chain params with a non-positive target spacing, which is the only way
+//     to reach the previous branch: that one falls into its zero guard, this
+//     one reports the header as unvalidated and accepts it on its own nBits.
+//
+// The difference is therefore a documentation matter rather than a consensus
+// one, but a change that makes any of the three reachable is not.
 
 // daaWindow is the 144-block adjustment interval of the DAA, the literal 144
 // in pow.cpp GetNextCashWorkRequired's `int32_t nHeightFirst = nHeight - 144`.
@@ -269,23 +307,27 @@ func getNextCashWorkRequired(idx *HeaderIndex, params *chaincfg.Params, parent H
 //   - the parent's 147-block DAA window is not fully in the index;
 //   - the params carry no target spacing.
 //
-// INSUFFICIENT CONTEXT — the policy and why it is safe. SVNode always has the
-// window, because it validates every block in order from genesis and asserts
-// on the height. This index cannot assert: it is a rebuildable cache, and a
-// peer chooses which headers arrive. The policy is to SKIP the check, not to
-// refuse the header.
+// INSUFFICIENT CONTEXT — the policy and why. SVNode always has the window,
+// because it validates every block in order from genesis and asserts on the
+// height. This index cannot assert: it is a rebuildable cache, and a peer
+// chooses which headers arrive. The policy is to SKIP the check, not to refuse
+// the header.
 //
-// Skipping is safe because a short window and an unfenced height cannot occur
-// together. HeaderIndex is genesis-rooted (see its doc comment): AddHeader
-// only ever attaches a node to a parent already in the tree, so every node's
-// ancestor chain is complete down to height 0, and the window is present for
-// every parent at or above daaMinParentHeight. The only parents below it sit
-// at heights under 147, which is below daaHeight on every configured network
-// (mainnet 504031, testnet 1188697, STN 2200; regtest takes the no-retarget
-// branch before this one) — so those headers were already outside this port's
-// scope, and they are covered by the checkpoint gates instead. Refusing them
-// would therefore reject honest headers on a network whose daaHeight is small
-// without gaining any bound, since the fence already bounds those heights.
+// The short-window case IS REACHABLE, on two of the six networks go-chaincfg
+// defines. teratestnet and tstn both set DaaForkHeight 0 with
+// NoDifficultyAdjustment false, and settings.conf configures both, so on those
+// chains heights 0 to 146 reach the DAA and are skipped for a short window.
+// (On mainnet 504031, testnet 1188697 and STN 2200 the daaHeight gate refuses
+// first, and regtest takes the no-retarget branch before either; on those four
+// the case is unreachable, because HeaderIndex is genesis-rooted — see its doc
+// comment — so every parent at or above daaMinParentHeight has its full
+// ancestor chain.)
+//
+// Skipping is preferred to refusing because of what the two buy. The whole
+// exposure is 147 heights at the very start of a chain, once, and refusing
+// would reject the honest early headers of a real teratestnet or tstn sync to
+// gain a bound worth those 147 heights. Below-fence heights also stay covered
+// by the checkpoint gates as soon as the node holds a checkpoint.
 func GetNextWorkRequired(idx *HeaderIndex, params *chaincfg.Params, parent HeaderNode, headerTime int64) (nBits uint32, validated bool) {
 	if idx == nil || params == nil || params.PowLimit == nil {
 		return 0, false

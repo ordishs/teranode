@@ -1114,6 +1114,39 @@ func TestNewHeaderSync_Validation(t *testing.T) {
 
 	_, err = NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: &noLimit})
 	require.Error(t, err)
+
+	// findNextHeaderCheckpoint and lastCheckpointInIndex both read the list as
+	// ascending by height, and the latter now gates a disconnect, so a list
+	// that is not ascending must not build a machine.
+	h1 := chainhash.Hash{0x01}
+	h2 := chainhash.Hash{0x02}
+
+	_, err = NewHeaderSync(HeaderSyncConfig{
+		Index:  f.idx,
+		Params: syncTestParams([]chaincfg.Checkpoint{{Height: 200, Hash: &h1}, {Height: 100, Hash: &h2}}),
+	})
+	require.Error(t, err)
+
+	// Equal heights are not ascending either.
+	_, err = NewHeaderSync(HeaderSyncConfig{
+		Index:  f.idx,
+		Params: syncTestParams([]chaincfg.Checkpoint{{Height: 100, Hash: &h1}, {Height: 100, Hash: &h2}}),
+	})
+	require.Error(t, err)
+
+	// Every network go-chaincfg ships is ascending, so the check is inert in
+	// production. Pin that, so a params change cannot silently disable sync.
+	for _, params := range []*chaincfg.Params{
+		&chaincfg.MainNetParams,
+		&chaincfg.TestNetParams,
+		&chaincfg.StnParams,
+		&chaincfg.RegressionNetParams,
+		&chaincfg.TeraTestNetParams,
+		&chaincfg.TeraScalingTestNetParams,
+	} {
+		_, err = NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: params})
+		require.NoError(t, err, "network %s", params.Name)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,5 +1620,251 @@ func TestHeaderSync_HydrationBypassesContextualChecks(t *testing.T) {
 	for _, h := range []*wire.BlockHeader{wrongBits, fork} {
 		_, indexed := f.idx.Lookup(h.BlockHash())
 		require.True(t, indexed, "the hydration path must index what our own store already accepted")
+	}
+}
+
+// fixedClock returns an AdjustedTime function pinned to ts, so a
+// time-too-new row is decided by arithmetic rather than by the wall clock.
+func fixedClock(ts int64) func() int64 {
+	return func() int64 { return ts }
+}
+
+// TestHeaderSync_TimeTooNew pins ContextualCheckBlockHeader's timestamp cap
+// (validation.cpp:5909-5913): a header more than MAX_FUTURE_BLOCK_TIME past
+// the adjusted time is refused. state.Invalid carries no DoS score, so the
+// peer is neither scored nor disconnected.
+func TestHeaderSync_TimeTooNew(t *testing.T) {
+	const fixtureHeight = 200
+
+	// The clock is pinned to the fixture tip's own timestamp, so every row
+	// below reads as an offset from the chain's own notion of now.
+	newAtTip := func(t *testing.T) (*syncFixture, *HeaderSync, *SyncPeer, HeaderNode) {
+		t.Helper()
+
+		f := newDaaSyncFixture(t, fixtureHeight)
+
+		tip, ok := f.idx.Lookup(f.tip().BlockHash())
+		require.True(t, ok)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       daaSyncParams(nil),
+			AdjustedTime: fixedClock(tip.Time),
+		})
+		require.NoError(t, err)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, hs.PeerEstablished(peer), 1)
+
+		return f, hs, peer, tip
+	}
+
+	t.Run("a header exactly at the cap is accepted", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+
+		tip, ok := f.idx.Lookup(f.tip().BlockHash())
+		require.True(t, ok)
+
+		// The comparison is strict, so adjustedTime + MAX_FUTURE_BLOCK_TIME is
+		// the last accepted second.
+		at := timedChild(f.tip(), testEasyBits, 6001, tip.Time+MaxFutureBlockTime)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       daaSyncParams(nil),
+			AdjustedTime: fixedClock(tip.Time),
+		})
+		require.NoError(t, err)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, hs.PeerEstablished(peer), 1)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{at}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok = f.idx.Lookup(at.BlockHash())
+		require.True(t, ok)
+	})
+
+	t.Run("a header one second past the cap is refused without a score", func(t *testing.T) {
+		f, hs, peer, tip := newAtTip(t)
+
+		past := timedChild(f.tip(), testEasyBits, 6002, tip.Time+MaxFutureBlockTime+1)
+		require.True(t, hs.checkBlockHeaderPoW(past))
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{past}))
+
+		// state.Invalid is DoS(0): net_processing.cpp calls Misbehaving only
+		// when nDoS > 0, so the peer keeps its score and its connection.
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+
+		// ProcessNewBlockHeaders failed, so the handler returns before the
+		// availability update and before any continuation getheaders.
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(past.BlockHash())
+		require.False(t, ok)
+
+		_, tipHeight := f.idx.Tip()
+		require.Equal(t, int32(fixtureHeight), tipHeight)
+	})
+
+	t.Run("a batch keeps the headers before the too-new one", func(t *testing.T) {
+		f, hs, peer, tip := newAtTip(t)
+
+		good := timedChild(f.tip(), testEasyBits, 6003, tip.Time+600)
+		tooNew := timedChild(good, testEasyBits, 6004, tip.Time+MaxFutureBlockTime+1)
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{good, tooNew}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(good.BlockHash())
+		require.True(t, ok)
+
+		_, ok = f.idx.Lookup(tooNew.BlockHash())
+		require.False(t, ok)
+	})
+
+	t.Run("the refusal is not permanent", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+
+		tip, ok := f.idx.Lookup(f.tip().BlockHash())
+		require.True(t, ok)
+
+		ahead := timedChild(f.tip(), testEasyBits, 6005, tip.Time+MaxFutureBlockTime+600)
+
+		now := tip.Time
+		clock := &now
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{
+			Index:        f.idx,
+			Params:       daaSyncParams(nil),
+			AdjustedTime: func() int64 { return *clock },
+		})
+		require.NoError(t, err)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, hs.PeerEstablished(peer), 1)
+
+		_, _, err = hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{ahead}))
+		require.NoError(t, err)
+
+		_, ok = f.idx.Lookup(ahead.BlockHash())
+		require.False(t, ok)
+
+		// Our clock advances past the header's timestamp; the same header now
+		// passes. Nothing about the header changed, which is why the refusal
+		// must not be a score or a disconnect.
+		*clock = ahead.Timestamp.Unix()
+
+		_, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{ahead}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+
+		_, ok = f.idx.Lookup(ahead.BlockHash())
+		require.True(t, ok)
+	})
+
+	t.Run("a nil clock defaults to the wall clock", func(t *testing.T) {
+		f := newDaaSyncFixture(t, fixtureHeight)
+
+		hs, err := NewHeaderSync(HeaderSyncConfig{Index: f.idx, Params: daaSyncParams(nil)})
+		require.NoError(t, err)
+
+		peer := fullNodePeer("1.2.3.4:8333")
+		require.Len(t, hs.PeerEstablished(peer), 1)
+
+		// A day ahead of any real clock this test can run under.
+		ahead := timedChild(f.tip(), testEasyBits, 6006, time.Now().Add(24*time.Hour).Unix())
+
+		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{ahead}))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+		require.Nil(t, msgs)
+
+		_, ok := f.idx.Lookup(ahead.BlockHash())
+		require.False(t, ok)
+	})
+}
+
+// TestHeaderSync_MinDifficultyWalkIsDepthBounded pins the bound time-too-new
+// actually buys on a ReduceMinDifficulty network, and pins its limit.
+//
+// The min-difficulty branch answers the powLimit whenever a header's timestamp
+// is more than 2 * nPowTargetSpacing past its parent's, so a peer can chain
+// cheap headers only by walking timestamps forward 1201 seconds at a time.
+// time-too-new caps that walk at MAX_FUTURE_BLOCK_TIME, which is
+// 7200 / 1201 = 5 headers deep from a tip at the current time.
+//
+// It bounds DEPTH, not WIDTH: the last row shows a peer can still put
+// arbitrarily many cheap siblings on one parent, because each needs only a
+// distinct hash and a timestamp inside the same window. SVNode carries the
+// same exposure on its min-difficulty networks — this is parity, not a fix.
+func TestHeaderSync_MinDifficultyWalkIsDepthBounded(t *testing.T) {
+	const fixtureHeight = 200
+
+	f := newDaaSyncFixture(t, fixtureHeight)
+
+	params := daaSyncParams(nil)
+	params.ReduceMinDifficulty = true
+
+	tip, ok := f.idx.Lookup(f.tip().BlockHash())
+	require.True(t, ok)
+
+	// Under the test powLimit the min-difficulty answer is testEasyBits, the
+	// same bits the fixture already runs at, so a walk header is cheap.
+	require.Equal(t, testEasyBits, compactFromTarget(params.PowLimit))
+
+	hs, err := NewHeaderSync(HeaderSyncConfig{
+		Index:        f.idx,
+		Params:       params,
+		AdjustedTime: fixedClock(tip.Time),
+	})
+	require.NoError(t, err)
+
+	peer := fullNodePeer("1.2.3.4:8333")
+	require.Len(t, hs.PeerEstablished(peer), 1)
+
+	// Walk forward one step past the min-difficulty threshold each time.
+	step := int64(2*int64(params.TargetTimePerBlock/time.Second)) + 1
+
+	parent := f.tip()
+	accepted := 0
+
+	for i := 0; i < 50; i++ {
+		next := timedChild(parent, testEasyBits, uint32(5000+i), tip.Time+step*int64(i+1)) //nolint:gosec // test salt
+
+		_, misbehavior, onErr := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{next}))
+		require.NoError(t, onErr)
+		require.Zero(t, misbehavior)
+
+		if _, indexed := f.idx.Lookup(next.BlockHash()); !indexed {
+			break
+		}
+
+		accepted++
+		parent = next
+	}
+
+	// floor(7200 / 1201) = 5 steps land at or under the cap; the sixth is
+	// 7206 seconds ahead and is refused.
+	require.Equal(t, 5, accepted)
+
+	// WIDTH IS NOT BOUNDED. Siblings of one parent all sit inside the same
+	// window, so the cap never fires for them.
+	for i := 0; i < 20; i++ {
+		sibling := timedChild(f.tip(), testEasyBits, uint32(6100+i), tip.Time+step) //nolint:gosec // test salt
+
+		_, misbehavior, onErr := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{sibling}))
+		require.NoError(t, onErr)
+		require.Zero(t, misbehavior)
+
+		_, indexed := f.idx.Lookup(sibling.BlockHash())
+		require.True(t, indexed, "sibling %d", i)
 	}
 }

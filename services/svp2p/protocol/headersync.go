@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math/big"
 	"net"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -20,6 +21,12 @@ const MaxHeadersResults = 2000
 // (10): how many headers messages with an unknown parent a peer may send
 // before it scores misbehavior.
 const MaxUnconnectingHeaders = 10
+
+// MaxFutureBlockTime mirrors block_index.h MAX_FUTURE_BLOCK_TIME
+// (block_index.h:31): 2 * 60 * 60 seconds. It is how far past the adjusted
+// time a header's timestamp may sit before ContextualCheckBlockHeader refuses
+// it as "time-too-new".
+const MaxFutureBlockTime int64 = 2 * 60 * 60
 
 // MaxBlocksToAnnounce mirrors net_processing.cpp MAX_BLOCKS_TO_ANNOUNCE (8):
 // the size limit that separates a short "we are announcing a block you have
@@ -108,6 +115,22 @@ type HeaderSyncConfig struct {
 	// (legacy_allowSyncCandidateFromLocalPeers): in regtest it lifts the
 	// localhost restriction on sync candidates.
 	AllowSyncCandidateFromLocalPeers bool
+
+	// AdjustedTime supplies the nAdjustedTime argument
+	// ContextualCheckBlockHeader takes, in Unix seconds. It is the only clock
+	// this machine consults, and it is injected rather than read, which is
+	// what keeps every decision path in this package testable without a wall
+	// clock. NewHeaderSync fills it with the system clock when it is nil, so
+	// the default is chosen at construction rather than inside a check.
+	//
+	// SVNode passes GetAdjustedTime(), which is the local clock plus the
+	// median time offset of its peers (timedata.cpp, clamped to +/-70
+	// minutes). This port has no peer time-offset machinery, so it passes the
+	// local clock alone. The divergence only matters for a node whose own
+	// clock is wrong by more than MAX_FUTURE_BLOCK_TIME minus the network's
+	// real spread — two hours — and a clock that far out breaks far more of
+	// this node than header acceptance.
+	AdjustedTime func() int64
 }
 
 // SyncPeer is the per-peer handle the machine needs for one event: the
@@ -183,6 +206,27 @@ func NewHeaderSync(cfg HeaderSyncConfig) (*HeaderSync, error) {
 	// claims, so refuse to build a machine that cannot enforce it.
 	if cfg.Params.PowLimit == nil {
 		return nil, errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: chain params carry no powLimit")
+	}
+
+	// Both findNextHeaderCheckpoint and lastCheckpointInIndex read the list as
+	// ascending by height — the first walks it backwards to find the next
+	// checkpoint above a height, the second to find the highest one we hold.
+	// SVNode gets that ordering for free from std::map<int32_t, uint256>; a Go
+	// slice does not, and lastCheckpointInIndex now gates a disconnect, so an
+	// unordered list is refused here rather than silently fencing at the wrong
+	// height. Every network go-chaincfg ships is already ascending.
+	for i := 1; i < len(cfg.Params.Checkpoints); i++ {
+		if cfg.Params.Checkpoints[i].Height <= cfg.Params.Checkpoints[i-1].Height {
+			return nil, errors.New(errors.ERR_INVALID_ARGUMENT,
+				"svp2p: chain params checkpoints are not ascending by height (%d after %d at index %d)",
+				cfg.Params.Checkpoints[i].Height, cfg.Params.Checkpoints[i-1].Height, i)
+		}
+	}
+
+	// The machine consults no wall clock of its own; the default is bound here
+	// so every check downstream can assume a non-nil function.
+	if cfg.AdjustedTime == nil {
+		cfg.AdjustedTime = func() int64 { return time.Now().Unix() }
 	}
 
 	hs := &HeaderSync{cfg: cfg}
@@ -447,16 +491,23 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		node, known := hs.cfg.Index.Lookup(hash)
 
 		if !known {
-			inserted, score, err := hs.acceptHeader(header)
+			inserted, score, ok, err := hs.acceptHeader(header)
 			if err != nil {
 				return nil, 0, err
 			}
 
-			// A non-zero score is the DoS value the failed check carries, which
-			// net_processing.cpp applies as Misbehaving(pfrom, nDoS, "invalid
-			// header received"). The batch stops there; the headers already
-			// inserted stay, as they do in the source.
-			if score != 0 {
+			// A refused header stops the batch where AcceptBlockHeader fails
+			// it. The headers already inserted stay, as they do in the source,
+			// and the handler returns before the availability update and before
+			// any continuation getheaders — net_processing.cpp's early return
+			// on a failed ProcessNewBlockHeaders.
+			//
+			// The score is whatever the failed check declares. It is non-zero
+			// for the DoS refusals, which net_processing.cpp applies as
+			// Misbehaving(pfrom, nDoS, "invalid header received"), and zero for
+			// a state.Invalid refusal such as time-too-new. Reading `ok` rather
+			// than testing the score is what keeps those two apart.
+			if !ok {
 				return nil, score, nil
 			}
 
@@ -566,15 +617,18 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 // difficulty check both read the parent, and neither may run before the cheap
 // proof-of-work check has made the header cost something to produce.
 //
-// It answers the inserted node on success, or a DoS score for a scored
-// refusal, or an error for a refusal that disconnects the peer. Exactly one of
-// the three is set.
-func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (HeaderNode, int, error) {
+// accepted reports whether the header was inserted. When it is false the
+// header is refused and the batch stops, and score carries the DoS value the
+// failed check declares — which is legitimately ZERO for a state.Invalid
+// refusal such as time-too-new, where SVNode refuses the header but neither
+// scores nor disconnects the peer. err is set only for a refusal that must
+// disconnect the peer.
+func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (node HeaderNode, score int, accepted bool, err error) {
 	// AcceptBlockHeader calls CheckBlockHeader before the mapBlockIndex
 	// insert; HeaderIndex.AddHeader deliberately carries only the insert, so
 	// the PoW check belongs here.
 	if !hs.checkBlockHeaderPoW(header) {
-		return HeaderNode{}, scoreInvalidHeader, nil
+		return HeaderNode{}, scoreInvalidHeader, false, nil
 	}
 
 	// FindPreviousBlockIndex. AcceptBlockHeader answers a missing parent with
@@ -583,13 +637,13 @@ func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (HeaderNode, int, e
 	// guarantees the rest of the batch attaches.
 	parent, ok := hs.cfg.Index.Lookup(header.PrevBlock)
 	if !ok {
-		return HeaderNode{}, scorePrevBlkNotFound, nil
+		return HeaderNode{}, scorePrevBlkNotFound, false, nil
 	}
 
 	// fCheckpointsEnabled && !CheckIndexAgainstCheckpoint(...).
 	fence := hs.lastCheckpointInIndex()
 	if !checkIndexAgainstCheckpoint(parent, fence) {
-		return HeaderNode{}, 0, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+		return HeaderNode{}, 0, false, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
 			"svp2p: header at height %d forks below the last checkpoint we hold at height %d",
 			parent.Height+1, fence.Height, ErrCheckpointFork)
 	}
@@ -603,15 +657,42 @@ func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (HeaderNode, int, e
 	// GetNextWorkRequired, and both mean the header is accepted on its own
 	// claimed target alone — see the scope note at the top of difficulty.go
 	// before assuming otherwise.
-	if want, validated := GetNextWorkRequired(hs.cfg.Index, hs.cfg.Params, parent, header.Timestamp.Unix()); validated &&
+	headerTime := header.Timestamp.Unix()
+
+	if want, validated := GetNextWorkRequired(hs.cfg.Index, hs.cfg.Params, parent, headerTime); validated &&
 		header.Bits != want {
-		return HeaderNode{}, scoreBadDiffBits, nil
+		return HeaderNode{}, scoreBadDiffBits, false, nil
+	}
+
+	// ContextualCheckBlockHeader's "Check timestamp against prev" —
+	// time-too-old, block.GetBlockTime() <= pindexPrev->GetMedianTimePast()
+	// (validation.cpp:5904-5907) — SITS HERE IN THE SOURCE AND IS NOT PORTED.
+	// It needs median-time-past over the header index, which is a piece of
+	// machinery this index does not have (the 11-block median CBlockIndex
+	// caches at insert). Booked as a named Phase 3 follow-up: "port
+	// median-time-past to HeaderIndex and add the time-too-old rule". Until it
+	// lands, a header may claim any timestamp at or before its parent's, so
+	// the timestamp sequence of an indexed branch is not monotonic.
+	//
+	// ContextualCheckBlockHeader "Check timestamp"
+	// (validation.cpp:5909-5913): a header more than MAX_FUTURE_BLOCK_TIME
+	// past the adjusted time is refused with
+	// state.Invalid(false, REJECT_INVALID, "time-too-new", ...).
+	//
+	// state.Invalid is DoS(0), and net_processing.cpp calls Misbehaving only
+	// when nDoS > 0, so this refusal neither scores nor disconnects the peer —
+	// deliberately, because it is the ONLY refusal in this function that a
+	// well-behaved peer can trigger and that time alone will undo. The header
+	// may be perfectly valid a few minutes from now, and the peer re-announces
+	// it; scoring an honest peer for our own clock would be wrong.
+	if headerTime > hs.cfg.AdjustedTime()+MaxFutureBlockTime {
+		return HeaderNode{}, 0, false, nil
 	}
 
 	// AddToBlockIndex.
 	connected, err := hs.cfg.Index.AddHeader(header)
 	if err != nil {
-		return HeaderNode{}, 0, err
+		return HeaderNode{}, 0, false, err
 	}
 
 	// Defensive: the parent lookup above already proved the header attaches,
@@ -619,16 +700,16 @@ func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (HeaderNode, int, e
 	// fire. It scores the source's value rather than inserting nothing and
 	// carrying on.
 	if !connected {
-		return HeaderNode{}, scorePrevBlkNotFound, nil
+		return HeaderNode{}, scorePrevBlkNotFound, false, nil
 	}
 
-	node, ok := hs.cfg.Index.Lookup(header.BlockHash())
+	node, ok = hs.cfg.Index.Lookup(header.BlockHash())
 	if !ok {
-		return HeaderNode{}, 0, errors.New(errors.ERR_SERVICE_ERROR,
+		return HeaderNode{}, 0, false, errors.New(errors.ERR_SERVICE_ERROR,
 			"svp2p: header %s vanished from the index directly after insert", header.BlockHash())
 	}
 
-	return node, 0, nil
+	return node, 0, true, nil
 }
 
 // checkIndexAgainstCheckpoint is validation.cpp CheckIndexAgainstCheckpoint
@@ -643,6 +724,23 @@ func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (HeaderNode, int, e
 // in acceptHeaders, from legacy netsync manager.go, where it is scoped to the
 // headers-first round and answers with ErrCheckpointMismatch. Running it twice
 // would give one rule two different refusal shapes.
+//
+// WHAT THAT COSTS. The two rules cover different sets, and the omission leaves
+// a real gap rather than a redundancy. Take a checkpoint height ABOVE the
+// highest checkpoint currently in the index — one the sync has not reached yet:
+//
+//   - this fence does not refuse a wrong-hash header there, because the header's
+//     height is above the fence height, which is all this rule tests;
+//   - the round's check does not see it either, unless the header arrives from
+//     the peer holding the sync slot while headers-first mode is running.
+//
+// So a NON-SYNC peer's header claiming a wrong hash at an unreached checkpoint
+// height is checked by neither rule, and is indexed if it satisfies the
+// difficulty and timestamp gates. It cannot mislead the sync round, which
+// re-checks the checkpoint when it gets there, and it cannot take the tip
+// without out-working the honest chain. It does cost an index entry. Closing it
+// means porting CheckBlock here and accepting two refusal shapes for one rule,
+// or unifying both onto this one — a deliberate design change, not an edit.
 //
 // It runs for every new header, in a round or outside one, which is what
 // bounds HeaderIndex growth below the final checkpoint: a peer cannot spend a
@@ -672,6 +770,13 @@ func checkIndexAgainstCheckpoint(parent HeaderNode, checkpoint *chaincfg.Checkpo
 // node, and settles at the final checkpoint once we are past it. That is the
 // source's behavior, and it is why the fence cannot lock out a node that is
 // still syncing toward its first checkpoint.
+//
+// The reverse walk assumes hs.checkpoints is ASCENDING by height — the source
+// gets that from std::map<int32_t, uint256>, a Go slice does not. NewHeaderSync
+// refuses to build a machine from an unordered list, so the assumption is
+// enforced at construction rather than trusted here; without it this function
+// could answer a checkpoint that is not the highest one held, and fence at the
+// wrong height on a rule that disconnects.
 func (hs *HeaderSync) lastCheckpointInIndex() *chaincfg.Checkpoint {
 	for i := len(hs.checkpoints) - 1; i >= 0; i-- {
 		checkpoint := &hs.checkpoints[i]
@@ -694,13 +799,27 @@ func (hs *HeaderSync) lastCheckpointInIndex() *chaincfg.Checkpoint {
 //
 // Phase 2 left the contextual difficulty check unported, which let a peer feed
 // difficulty-1 headers above the final checkpoint at no cost and grow
-// HeaderIndex by one unevictable map entry each. Phase 3 Task 2 closed that:
-// acceptHeader now runs checkIndexAgainstCheckpoint and GetNextWorkRequired on
-// every new header from every peer, in a round or outside one. Below the last
-// checkpoint the index holds, the fence refuses the header outright; above it,
-// the DAA makes each header cost the network's real difficulty to produce.
-// What remains uncovered is the historic difficulty eras, deliberately — see
-// the scope note at the top of difficulty.go.
+// HeaderIndex by one unevictable map entry each. Phase 3 Task 2 narrowed that:
+// acceptHeader now runs checkIndexAgainstCheckpoint, GetNextWorkRequired and
+// the time-too-new cap on every new header from every peer, in a round or
+// outside one.
+//
+// The honest scope of that, because "closed" would overstate it:
+//
+//   - mainnet past the final checkpoint (945000) — its steady state — is fully
+//     bounded: every header there is post-DAA and costs real difficulty.
+//   - mainnet and STN during IBD are bounded below the highest checkpoint the
+//     index holds and above daaHeight, with a transient unpriced band between
+//     the two that closes as the sync passes each checkpoint. A node holding no
+//     checkpoint yet has no lower bound.
+//   - testnet, teratestnet and tstn are NOT bounded by difficulty at all: their
+//     min-difficulty rule makes cheap headers legitimate. time-too-new caps how
+//     DEEP a cheap chain can run (about six headers) but not how WIDE, so a peer
+//     may still put many cheap siblings on one parent. SVNode has the same
+//     exposure on the same networks.
+//
+// Still unported, deliberately: the historic difficulty eras (see difficulty.go)
+// and the time-too-old rule (see acceptHeader).
 func (hs *HeaderSync) checkBlockHeaderPoW(header *wire.BlockHeader) bool {
 	var bits model.NBit
 
