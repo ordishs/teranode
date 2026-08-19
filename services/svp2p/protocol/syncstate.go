@@ -98,10 +98,25 @@ func (s *peerSyncState) updateBlockAvailability(idx *HeaderIndex, hash chainhash
 
 	// C++ additionally guards on pindex->nChainWork > 0, which detects a
 	// header accepted into mapBlockIndex but not yet linked to the
-	// genesis-rooted chain. No counterpart is needed here:
-	// HeaderIndex.AddHeader only ever attaches a node to a parent already in
-	// the tree, so every Lookup hit is genesis-rooted and already carries the
-	// accumulated proof of its whole branch.
+	// genesis-rooted chain. No counterpart is needed here, but it takes two
+	// guarantees rather than one:
+	//
+	//   - HeaderIndex.AddHeader only ever attaches a node to a parent already
+	//     in the tree, so every Lookup hit is genesis-rooted, unlike SVNode's
+	//     mapBlockIndex which can hold disconnected entries;
+	//   - every header reaching AddHeader has a valid target, so the proof
+	//     summed along that chain is non-zero.
+	//
+	// The second guarantee is not enforced by AddHeader, and genesis-rootedness
+	// alone does not imply it: a chain of headers whose nBits all encode an
+	// invalid target would accumulate zero work. It is enforced upstream, on
+	// both paths that write to the index. Peer headers pass
+	// HeaderSync.checkBlockHeaderPoW (headersync.go), whose target.Sign() <= 0
+	// test rejects exactly the negative and overflowing encodings that make
+	// GetBlockProof zero, before OnHeaders calls AddHeader. Headers from the
+	// blockchain subscription come from Teranode's own validated store. A
+	// future caller that writes to the index past both of those breaks this
+	// invariant and would need the guard restored.
 	node, ok := idx.Lookup(hash)
 	if ok {
 		// An actually better block was announced.
@@ -127,10 +142,25 @@ func (s *peerSyncState) processBlockAvailability(idx *HeaderIndex) {
 
 	// C++ additionally guards on pindex->nChainWork > 0, which detects a
 	// header accepted into mapBlockIndex but not yet linked to the
-	// genesis-rooted chain. No counterpart is needed here:
-	// HeaderIndex.AddHeader only ever attaches a node to a parent already in
-	// the tree, so every Lookup hit is genesis-rooted and already carries the
-	// accumulated proof of its whole branch.
+	// genesis-rooted chain. No counterpart is needed here, but it takes two
+	// guarantees rather than one:
+	//
+	//   - HeaderIndex.AddHeader only ever attaches a node to a parent already
+	//     in the tree, so every Lookup hit is genesis-rooted, unlike SVNode's
+	//     mapBlockIndex which can hold disconnected entries;
+	//   - every header reaching AddHeader has a valid target, so the proof
+	//     summed along that chain is non-zero.
+	//
+	// The second guarantee is not enforced by AddHeader, and genesis-rootedness
+	// alone does not imply it: a chain of headers whose nBits all encode an
+	// invalid target would accumulate zero work. It is enforced upstream, on
+	// both paths that write to the index. Peer headers pass
+	// HeaderSync.checkBlockHeaderPoW (headersync.go), whose target.Sign() <= 0
+	// test rejects exactly the negative and overflowing encodings that make
+	// GetBlockProof zero, before OnHeaders calls AddHeader. Headers from the
+	// blockchain subscription come from Teranode's own validated store. A
+	// future caller that writes to the index past both of those breaks this
+	// invariant and would need the guard restored.
 	node, ok := idx.Lookup(s.hashLastUnknownBlock)
 	if !ok {
 		return

@@ -126,6 +126,16 @@ func TestBlockProof(t *testing.T) {
 			want: "2",
 		},
 		{
+			// 0x03000001: exponent 3, mantissa 1. This is the small-exponent
+			// branch, where the mantissa is shifted right by 8 * (3 -
+			// exponent) instead of left — here by nothing, so target = 1.
+			// floor(2^256 / 2) = 2^255. No target this low is reachable from
+			// the network; the case is here so the branch is covered.
+			name: "smallest exponent, target 1",
+			bits: 0x03000001,
+			want: "57896044618658097711785492504343953926634992332820282019728792003956564819968",
+		},
+		{
 			// arith_uint256::SetCompact reports fNegative when the sign bit
 			// (0x00800000) is set on a non-zero mantissa, and GetBlockProof
 			// returns 0 for it.
@@ -794,7 +804,26 @@ func TestHeaderIndex_ConcurrentReadsDuringWrites(t *testing.T) {
 	// returned hash must always resolve via Lookup and Ancestor at its own
 	// height, at every point in the walk: AddHeader only ever appends nodes,
 	// so this invariant holds under any interleaving.
-	var readerInconsistent atomic.Bool
+	//
+	// Each snapshot's ChainWork is dereferenced rather than just fetched, and
+	// that read is the point. HeaderNode shares one *big.Int with the tree
+	// instead of copying it, on the promise that a node's chainWork is
+	// written once at insert and never again — a promise nothing in the type
+	// enforces. Reading the pointee here is what puts it under the race
+	// detector: a future write to a published node's chainWork races these
+	// loads, and with only the pointer copied around, -race would never see
+	// it. Cmp reads the whole magnitude, not just its length.
+	var (
+		readerInconsistent atomic.Bool
+
+		// Every node in this index carries at least genesis's own proof, so
+		// a snapshot below it is either uninitialised or torn.
+		minWork = big.NewInt(difficulty1Work)
+	)
+
+	workValid := func(n HeaderNode) bool {
+		return n.ChainWork != nil && n.ChainWork.Cmp(minWork) >= 0
+	}
 
 	const readerCount = 8
 
@@ -813,11 +842,13 @@ func TestHeaderIndex_ConcurrentReadsDuringWrites(t *testing.T) {
 
 				hash, height := idx.Tip()
 
-				if _, ok := idx.Lookup(hash); !ok {
+				n, ok := idx.Lookup(hash)
+				if !ok || !workValid(n) {
 					readerInconsistent.Store(true)
 				}
 
-				if _, ok := idx.Ancestor(hash, height); !ok {
+				anc, ok := idx.Ancestor(hash, height)
+				if !ok || !workValid(anc) {
 					readerInconsistent.Store(true)
 				}
 
@@ -838,4 +869,10 @@ func TestHeaderIndex_ConcurrentReadsDuringWrites(t *testing.T) {
 	hash, height := idx.Tip()
 	require.Equal(t, headers[len(headers)-1].BlockHash(), hash)
 	require.Equal(t, int32(chainLen), height)
+
+	// The whole chain runs at one difficulty, so the tip's accumulated work is
+	// the genesis node plus every header the writer added.
+	tip, ok := idx.Lookup(hash)
+	require.True(t, ok)
+	require.Equal(t, big.NewInt((chainLen+1)*difficulty1Work), tip.ChainWork)
 }

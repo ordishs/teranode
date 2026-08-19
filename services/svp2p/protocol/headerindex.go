@@ -212,6 +212,14 @@ func (idx *HeaderIndex) AddHeader(header *wire.BlockHeader) (connected bool, err
 	// This replaces the Phase 2 height rule (spec §6, header index), which
 	// left Tip() on the taller branch after a shorter, heavier one arrived.
 	// Upgraded by Phase 3 Task 1.
+	//
+	// SetBestHeader also gates on bestHeaderCandidate.IsValid(TREE), which
+	// this index has no status field for. The counterpart is upstream:
+	// HeaderSync.checkBlockHeaderPoW (headersync.go) runs before OnHeaders
+	// calls AddHeader, and headers from the blockchain subscription come from
+	// Teranode's own validated store. That gate is also what keeps a node's
+	// work non-zero — see the longer note on the availability compares in
+	// syncstate.go.
 	if n.chainWork.Cmp(idx.tip.chainWork) > 0 {
 		idx.tip = n
 	}
