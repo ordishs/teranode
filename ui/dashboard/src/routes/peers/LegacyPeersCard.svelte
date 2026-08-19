@@ -3,6 +3,10 @@
 <script lang="ts">
   import Card from '$internal/components/card/index.svelte'
   import Typo from '$internal/components/typo/index.svelte'
+  import Table from '$lib/components/table/index.svelte'
+  import RenderSpan from '$lib/components/table/renderers/render-span/index.svelte'
+  import RenderSpanWithTooltip from '$lib/components/table/renderers/render-span-with-tooltip/index.svelte'
+  import LegacyAddressCell from './LegacyAddressCell.svelte'
 
   interface LegacyDetail {
     inbound: boolean
@@ -31,7 +35,45 @@
 
   const connectedCount = $derived(peers.filter((p: LegacyPeer) => p.is_connected).length)
 
-  function formatBytes(value: number | undefined): string {
+  // The table sorts on the raw row values, so flatten the nested legacy detail
+  // up to the row and leave every formatting decision to the cell renderers.
+  const rows = $derived(
+    peers.map((peer: LegacyPeer) => ({
+      id: peer.id,
+      address: peer.network_address || String(peer.id || '').replace(/^legacy:/, ''),
+      client_name: peer.client_name || '',
+      dir: peer.legacy?.inbound ? 'in' : 'out',
+      protocol_version: peer.legacy?.protocol_version ?? 0,
+      service_flags: peer.legacy?.service_flags ?? 0,
+      ping_micros: peer.legacy?.ping_micros ?? 0,
+      time_offset_secs: peer.legacy?.time_offset_secs ?? 0,
+      starting_height: peer.legacy?.starting_height ?? 0,
+      height: peer.height ?? 0,
+      bytes_sent: peer.bytes_sent ?? 0,
+      bytes_received: peer.bytes_received ?? 0,
+      time_connected: peer.legacy?.time_connected ?? 0,
+      is_connected: peer.is_connected ?? false,
+      is_banned: peer.is_banned ?? false,
+      is_sync_peer: peer.legacy?.is_sync_peer ?? false,
+    })),
+  )
+
+  const colDefs = [
+    { id: 'address', name: 'Address', type: 'string', props: { width: '15%' } },
+    { id: 'client_name', name: 'User Agent', type: 'string', props: { width: '11%' } },
+    { id: 'dir', name: 'Dir', type: 'string', props: { width: '4%' } },
+    { id: 'protocol_version', name: 'Version', type: 'number', props: { width: '6%' } },
+    { id: 'service_flags', name: 'Services', type: 'number', props: { width: '6%' } },
+    { id: 'ping_micros', name: 'Ping', type: 'number', props: { width: '7%' } },
+    { id: 'time_offset_secs', name: 'Offset', type: 'number', props: { width: '6%' } },
+    { id: 'starting_height', name: 'Start Height', type: 'number', props: { width: '8%' } },
+    { id: 'height', name: 'Height', type: 'number', props: { width: '8%' } },
+    { id: 'bytes_sent', name: 'Sent', type: 'number', props: { width: '7%' } },
+    { id: 'bytes_received', name: 'Received', type: 'number', props: { width: '7%' } },
+    { id: 'time_connected', name: 'Connected', type: 'string', props: { width: '15%' } },
+  ]
+
+  function formatBytes(value: number): string {
     if (!value) return '0 B'
 
     const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -46,167 +88,184 @@
     return `${scaled.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
   }
 
-  function formatPing(micros: number | undefined): string {
+  function formatPing(micros: number): string {
     if (!micros) return '-'
 
     return `${(micros / 1000).toFixed(1)} ms`
   }
 
-  function formatOffset(seconds: number | undefined): string {
+  function formatOffset(seconds: number): string {
     if (!seconds) return '0s'
 
     return `${seconds > 0 ? '+' : ''}${seconds}s`
   }
 
-  function formatServiceFlags(flags: number | undefined): string {
+  function formatServiceFlags(flags: number): string {
     if (!flags) return '-'
 
     return `0x${flags.toString(16)}`
   }
 
-  function formatConnected(unixSeconds: number | undefined): string {
+  function formatConnected(unixSeconds: number): string {
     if (!unixSeconds || unixSeconds <= 0) return '-'
 
     return new Date(unixSeconds * 1000).toLocaleString()
   }
 
-  function peerAddress(peer: LegacyPeer): string {
-    return peer.network_address || String(peer.id || '').replace(/^legacy:/, '')
+  // The shared table renders rows itself and offers no per-row class hook, so a
+  // disconnected peer is dimmed cell by cell instead.
+  function cellClass(item, extra = '') {
+    const classes = extra ? [extra] : []
+    if (!item.is_connected) {
+      classes.push('dimmed')
+    }
+
+    return classes.join(' ')
+  }
+
+  function numCell(item, value: string) {
+    return {
+      component: RenderSpan,
+      props: { value, className: cellClass(item, 'num') },
+      value: '',
+    }
+  }
+
+  const renderCells = {
+    address: (idField, item) => ({
+      component: LegacyAddressCell,
+      props: {
+        value: item.address,
+        tooltip: item.id,
+        isSyncPeer: item.is_sync_peer,
+        isBanned: item.is_banned,
+        className: cellClass(item),
+      },
+      value: '',
+    }),
+    client_name: (idField, item) => ({
+      component: RenderSpanWithTooltip,
+      props: {
+        value: item.client_name || '-',
+        tooltip: item.client_name || '',
+        className: cellClass(item),
+      },
+      value: '',
+    }),
+    dir: (idField, item) => ({
+      component: RenderSpan,
+      props: { value: item.dir, className: cellClass(item) },
+      value: '',
+    }),
+    protocol_version: (idField, item) =>
+      numCell(item, item.protocol_version ? String(item.protocol_version) : '-'),
+    service_flags: (idField, item) => numCell(item, formatServiceFlags(item.service_flags)),
+    ping_micros: (idField, item) => numCell(item, formatPing(item.ping_micros)),
+    time_offset_secs: (idField, item) => numCell(item, formatOffset(item.time_offset_secs)),
+    starting_height: (idField, item) => numCell(item, item.starting_height.toLocaleString()),
+    height: (idField, item) => numCell(item, item.height.toLocaleString()),
+    bytes_sent: (idField, item) => numCell(item, formatBytes(item.bytes_sent)),
+    bytes_received: (idField, item) => numCell(item, formatBytes(item.bytes_received)),
+    time_connected: (idField, item) => ({
+      component: RenderSpan,
+      props: { value: formatConnected(item.time_connected), className: cellClass(item) },
+      value: '',
+    }),
   }
 </script>
 
-<Card contentPadding="16px">
-  <div class="legacy-header">
-    <Typo variant="title" size="h4" value="Legacy Peers (Bitcoin P2P)" />
-    <span class="legacy-count">{connectedCount} connected / {peers.length} known</span>
-  </div>
+<Card contentPadding="0" showFooter={false}>
+  {#snippet title()}
+    <div class="title">
+      <Typo variant="title" size="h4" value="Legacy Peers (Bitcoin P2P)" />
+    </div>
+  {/snippet}
+  {#snippet headerTools()}
+    <div class="stats">
+      <span class="stat-item">
+        <span class="stat-label">Connected:</span>
+        <span class="stat-value">{connectedCount}</span>
+      </span>
+      <span class="stat-item">
+        <span class="stat-label">Known:</span>
+        <span class="stat-value">{peers.length}</span>
+      </span>
+    </div>
+  {/snippet}
 
-  {#if peers.length === 0}
-    <div class="legacy-empty">
+  {#if rows.length === 0}
+    <div class="no-data">
       <p>No legacy peers</p>
       <p class="sub">The legacy service is not connected to any Bitcoin P2P peer.</p>
     </div>
   {:else}
-    <div class="legacy-scroll">
-      <table class="legacy-table">
-        <thead>
-          <tr>
-            <th>Address</th>
-            <th>User Agent</th>
-            <th>Dir</th>
-            <th class="lp-num">Version</th>
-            <th class="lp-num">Services</th>
-            <th class="lp-num">Ping</th>
-            <th class="lp-num">Offset</th>
-            <th class="lp-num">Start Height</th>
-            <th class="lp-num">Height</th>
-            <th class="lp-num">Sent</th>
-            <th class="lp-num">Received</th>
-            <th>Connected</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each peers as peer (peer.id)}
-            <tr class:disconnected={!peer.is_connected}>
-              <td class="addr">
-                {peerAddress(peer)}
-                {#if peer.legacy?.is_sync_peer}
-                  <span class="badge sync">SYNC</span>
-                {/if}
-                {#if peer.is_banned}
-                  <span class="badge banned">BANNED</span>
-                {/if}
-              </td>
-              <td class="agent" title={peer.client_name || ''}>{peer.client_name || '-'}</td>
-              <td>{peer.legacy?.inbound ? 'in' : 'out'}</td>
-              <td class="lp-num">{peer.legacy?.protocol_version || '-'}</td>
-              <td class="lp-num">{formatServiceFlags(peer.legacy?.service_flags)}</td>
-              <td class="lp-num">{formatPing(peer.legacy?.ping_micros)}</td>
-              <td class="lp-num">{formatOffset(peer.legacy?.time_offset_secs)}</td>
-              <td class="lp-num">{(peer.legacy?.starting_height || 0).toLocaleString()}</td>
-              <td class="lp-num">{(peer.height || 0).toLocaleString()}</td>
-              <td class="lp-num">{formatBytes(peer.bytes_sent)}</td>
-              <td class="lp-num">{formatBytes(peer.bytes_received)}</td>
-              <td>{formatConnected(peer.legacy?.time_connected)}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
+    <div class="legacy-table">
+      <Table
+        name="legacy-peers"
+        variant="dynamic"
+        idField="id"
+        {colDefs}
+        data={rows}
+        sortEnabled={true}
+        filtersEnabled={false}
+        paginationEnabled={false}
+        pager={false}
+        {renderCells}
+        getRenderProps={null}
+        getRowIconActions={null}
+      />
     </div>
   {/if}
 </Card>
 
 <style>
-  .legacy-header {
+  .title {
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 12px;
+    align-items: center;
+    gap: 8px;
   }
 
-  .legacy-count {
+  .stats {
+    display: flex;
+    gap: 20px;
+  }
+
+  .stat-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .stat-label {
+    color: var(--comp-label-color);
+    font-size: 13px;
+  }
+
+  .stat-value {
+    color: #1878ff;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .no-data {
+    padding: 40px 24px;
+    text-align: center;
+    color: var(--comp-label-color);
+  }
+
+  .no-data .sub {
     font-size: 0.85rem;
     opacity: 0.7;
   }
 
-  .legacy-empty {
-    padding: 24px 0;
-    text-align: center;
-  }
-
-  .legacy-empty .sub {
-    font-size: 0.85rem;
-    opacity: 0.6;
-  }
-
-  .legacy-scroll {
-    overflow-x: auto;
-  }
-
-  .legacy-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.85rem;
-  }
-
-  .legacy-table th,
-  .legacy-table td {
-    padding: 6px 10px;
-    text-align: left;
-    white-space: nowrap;
-    border-bottom: 1px solid rgba(128, 128, 128, 0.2);
-  }
-
-  .legacy-table th.lp-num,
-  .legacy-table td.lp-num {
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .legacy-table tr.disconnected {
+  .legacy-table :global(.dimmed) {
     opacity: 0.45;
   }
 
-  .legacy-table td.agent {
-    max-width: 220px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .badge {
-    margin-left: 6px;
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 0.7rem;
-    font-weight: 600;
-  }
-
-  .badge.sync {
-    background: rgba(56, 142, 60, 0.2);
-  }
-
-  .badge.banned {
-    background: rgba(198, 40, 40, 0.2);
+  /* Every legacy column is a short scalar, so a wrapped cell reads as a broken
+     row rather than as more information. */
+  .legacy-table :global(th),
+  .legacy-table :global(td) {
+    white-space: nowrap;
   }
 </style>

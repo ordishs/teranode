@@ -128,9 +128,11 @@ test.describe('smoke: /peers legacy card', () => {
     await expect(legacyTable).toContainText('198.51.100.9:8333')
     await expect(legacyTable).not.toContainText('12D3KooW')
 
-    // The sync peer is badged, and the disconnected peer is greyed.
+    // The sync peer is badged, and the disconnected peer's cells are dimmed.
     await expect(legacyTable.locator('.badge.sync')).toHaveCount(1)
-    await expect(legacyTable.locator('tr.disconnected')).toHaveCount(1)
+    await expect(
+      legacyTable.locator('tbody tr', { has: smokePage.locator('.dimmed') }),
+    ).toHaveCount(1)
 
     // Wire-protocol-only fields are surfaced.
     await expect(legacyTable).toContainText('70016')
