@@ -43,9 +43,10 @@ const defaultHeaderBatchSize = uint32(wire.MaxBlockHeadersPerMsg)
 
 // Deps carries the Teranode service dependencies the block-ingestion bridge
 // needs, in the same set legacy.New takes (daemon/daemon_services.go). They
-// are optional on this Server: the daemon injects them in Task 12, and until
-// it does, the service runs without block sync rather than with a faked
-// pipeline behind it.
+// are optional on this Server: the daemon always injects them via
+// NewWithDeps, but a caller that constructs the Server through New (tests,
+// or any depless caller) still gets a service that runs without block sync
+// rather than with a faked pipeline behind it.
 type Deps struct {
 	ValidationClient  validator.Interface
 	SubtreeStore      blob.Store
@@ -103,7 +104,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient b
 }
 
 // NewWithDeps is New plus the ingestion dependencies, which is what enables
-// block sync. The daemon switches to it in Task 12.
+// block sync. The daemon uses this constructor exclusively.
 func NewWithDeps(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, deps Deps) *Server {
 	srv := New(logger, tSettings, blockchainClient)
 	srv.deps = deps
@@ -304,10 +305,11 @@ func (s *Server) startSync(ctx context.Context) error {
 }
 
 // newBlockIngestor constructs the real bridge and its admission gate from the
-// injected dependencies, or returns nil when they are not injected yet. A nil
+// injected dependencies, or returns nil when they are not injected. A nil
 // ingestor leaves the manager with the header index and no block sync: the
 // service keeps serving the peer API and following the chain, and asks no peer
-// for a block it has nothing to ingest with. Task 12 injects the dependencies.
+// for a block it has nothing to ingest with. The daemon always injects the
+// dependencies; only a depless caller (New instead of NewWithDeps) hits this.
 func (s *Server) newBlockIngestor() (protocol.BlockIngestor, error) {
 	if !s.deps.complete() {
 		s.logger.Warnf("[svp2p] block sync disabled: the block ingestion dependencies are not injected")
