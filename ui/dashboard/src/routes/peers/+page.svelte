@@ -540,7 +540,12 @@
       const advertised = item.advertised_height ?? 0
       const display = advertised || syncHeight
 
-      let tooltip = `Advertised by peer: ${display.toLocaleString()}`
+      // For older peers (advertised_height not yet sent), display falls back
+      // to the capped sync height — that is not what the peer advertised, so
+      // the tooltip must not claim it is.
+      let tooltip = advertised
+        ? `Advertised by peer: ${display.toLocaleString()}`
+        : `Sync height (capped): ${display.toLocaleString()}`
       if (advertised && syncHeight && advertised !== syncHeight) {
         tooltip += `\nSync height (capped): ${syncHeight.toLocaleString()}`
         tooltip += '\nCapped while this node catches up; used for sync decisions only.'
@@ -1024,7 +1029,7 @@
           </div>
           <div class="metric-item">
             <span class="metric-label">Height</span>
-            <span class="metric-value">#{selectedPeer.height?.toLocaleString() || '0'}</span>
+            <span class="metric-value">#{(selectedPeer.advertised_height || selectedPeer.height)?.toLocaleString() || '0'}</span>
           </div>
           <div class="metric-item">
             <span class="metric-label">DataHub URL</span>
