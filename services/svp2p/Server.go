@@ -92,6 +92,13 @@ type Server struct {
 	// tests can shrink it on their own *Server to force a multi-batch
 	// forward walk without touching shared state.
 	headerBatchSize uint32
+
+	// syncTick and maxLastBlockTime are instance fields for the same reason:
+	// the end-to-end sync test drives the periodic send pass and the sync-peer
+	// rotation on its own *Server without waiting out the production windows.
+	// Zero on both means "keep the protocol package's own default".
+	syncTick         time.Duration
+	maxLastBlockTime time.Duration
 }
 
 func New(logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI) *Server {
@@ -297,6 +304,8 @@ func (s *Server) startSync(ctx context.Context) error {
 		Index:                            s.HeaderIndex(),
 		Ingestor:                         ingestor,
 		AllowSyncCandidateFromLocalPeers: s.settings.Legacy.AllowSyncCandidateFromLocalPeers,
+		TickInterval:                     s.syncTick,
+		MaxLastBlockTime:                 s.maxLastBlockTime,
 	}); err != nil {
 		return err
 	}
