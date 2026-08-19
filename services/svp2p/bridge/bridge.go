@@ -94,18 +94,14 @@ type HeaderEvent struct {
 // these exact field names via the "sm" receiver, unchanged from netsync's
 // SyncManager except for the receiver's type.
 //
-// IngestBlock is deliberately not implemented on svp2pBridge yet. The
-// relocated pipeline's entry point, HandleBlockDirect, still takes a fully
-// decoded *wire.MsgBlock — that is what "relocated with logic intact" means
-// for this task. Bridging IngestBlock's streaming (header, txCount,
-// txReader) contract onto that pipeline is the next task's job: the
-// streaming reader exists specifically so a multi-GB block is never
-// materialized in memory (see the extensive decode-arena-release comments
-// throughout handle_block.go), and building that bridge honestly requires
-// deciding how the pipeline consumes a stream instead of a *wire.MsgBlock —
-// work this task does not do. Declaring IngestBlock here without that work
-// would mean either faking it or fully buffering the stream into a
-// wire.MsgBlock first, defeating the reason the streaming interface exists.
+// It has two entry points into that pipeline. HandleBlockDirect takes a fully
+// decoded *wire.MsgBlock, which is the shape the relocated netsync code
+// arrived in. IngestBlock (ingest.go) is the streaming entry the transport
+// uses: it feeds the same pipeline from a reader, decoding one transaction at
+// a time, so a multi-GB block is never materialized in memory — the reason the
+// streaming interface exists at all (see the decode-arena-release comments
+// throughout handle_block.go). Both run the same checks and the same pipeline
+// stages; only the transaction source differs.
 type svp2pBridge struct {
 	logger      ulogger.Logger
 	settings    *settings.Settings
@@ -159,12 +155,13 @@ func New(
 	}
 }
 
-// HeaderEvents returns the bridge's tip-change notification channel. Nothing
-// publishes to it yet — svp2pBridge has no blockchain-subscription consumer
-// wired up in this task — so the channel is real (a genuine consumer can
-// range over it today without any adapter) but currently silent. Whichever
-// task adds the blockchain-service subscription (spec §4.4 "blockchain
-// subscription") sends HeaderEvent values into it.
+// HeaderEvents returns the bridge's tip-change notification channel. It is on
+// the interface because Decision 2 fixed the Phase 2 width there, not because
+// Phase 2 uses it: block sync pulls headers from peers, so nothing in this
+// phase needs telling that our own tip moved, and nothing publishes into the
+// channel. The channel is real rather than nil — a consumer can range over it
+// today without an adapter — but it stays silent until the Phase 3 relay work
+// wires the blockchain-service subscription (spec §4.4) that feeds it.
 func (b *svp2pBridge) HeaderEvents() <-chan HeaderEvent {
 	return b.headerEvents
 }

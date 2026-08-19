@@ -90,9 +90,10 @@ type IngestOutcome struct {
 	Rotate bool
 
 	// PeerFault reports that the peer is to blame: the pipeline rejected what
-	// it sent. It is the only thing that disconnects a peer, and it is set
-	// explicitly rather than derived from the absence of another flag, so a
-	// fault nobody classified cannot silently become a disconnect.
+	// it sent. It is the only INGEST OUTCOME that disconnects a peer — Peer.Run
+	// documents the other six ways a peer is dropped — and it is set explicitly
+	// rather than derived from the absence of another flag, so a fault nobody
+	// classified cannot silently become a disconnect.
 	PeerFault bool
 
 	// TransientLocal reports a local storage or service fault, including the
@@ -107,6 +108,11 @@ type IngestOutcome struct {
 // sync-state mutex). PeerManager implements it. Every method takes that mutex
 // itself, so the peer loop must call them WITHOUT holding the peer lock: the
 // package lock order is peer lock, then manager lock.
+//
+// Three of the methods below can end the connection by returning an error, and
+// none of them tears anything down itself — the caller disconnects. Peer.Run
+// carries the full list of what disconnects a peer, including the causes that
+// never pass through this interface.
 type syncDispatcher interface {
 	// Established is the SendMessages event for a finished handshake.
 	Established(sp *SyncPeer, services wire.ServiceFlag) []wire.Message
@@ -186,13 +192,15 @@ type Peer struct {
 	// ingestCh carries each finished ingest back to the Run goroutine.
 	ingestCh chan ingestReport
 
-	// ingest, ingestStarted and ingestActive are written by the Run goroutine
-	// and read by it plus the manager's stall ticker through IngestSnapshot,
-	// so they are guarded by mu like the rest of the peer's shared state.
-	// ingest is the newest running ingest's progress handle; ingestActive
-	// counts the ingests still to report.
+	// ingest, ingestStarted, ingestTxBytes and ingestActive are written by the
+	// Run goroutine and read by it plus the manager's stall ticker through
+	// IngestSnapshot, so they are guarded by mu like the rest of the peer's
+	// shared state. ingest is the newest running ingest's progress handle;
+	// ingestTxBytes is how many transaction bytes that ingest's stream yields
+	// in total; ingestActive counts the ingests still to report.
 	ingest        IngestProgress
 	ingestStarted time.Time
+	ingestTxBytes uint64
 	ingestActive  int
 }
 
@@ -220,6 +228,42 @@ func NewPeer(cfg PeerConfig) *Peer {
 	}
 }
 
+// Run drives one connection until it ends. Every error it returns closes the
+// connection, so this is the one place the whole disconnect contract is
+// visible. Seven judgements drop a peer, from four different sources:
+//
+//   - An unsolicited block, or any block when no ingestor is wired. startIngest
+//     refuses both (see the note there on why neither drains the stream).
+//   - An ingest that came back with IngestOutcome.PeerFault. The peer loop never
+//     reads that flag itself: syncDispatcher.BlockDone turns it into the error
+//     returned here, so the classification stays with the scheduler.
+//   - The idle timeout, when no running ingest excuses it (see ingestAlive).
+//   - StallActionDisconnect, the net_processing.cpp DetectStalling rule, decided
+//     by the manager's stall ticker (blockdownload.go CheckStall). It arrives as
+//     Disconnect from outside this loop, not as a returned error.
+//   - The ban threshold, reached by the handshake's own scoring or by a
+//     misbehavior delta a sync machine returned (checkBanThreshold).
+//   - HeaderSync's two round-ending errors, ErrCheckpointMismatch and
+//     ErrHeadersNoProgress, returned through syncDispatcher.Headers. The machine
+//     performs no teardown itself; the caller disconnects, and PeerDisconnected
+//     is what releases the round.
+//   - An unsupported inv type, returned through syncDispatcher.Inv
+//     (blockdownload.go).
+//
+// Two more exits are not judgements about the peer: the transport closing its
+// inbound channels (the socket failed) and ctx cancellation (we are shutting
+// down).
+//
+// Just as important is what does NOT disconnect. A sync-peer rotation
+// (IngestOutcome.Rotate, StallActionRotateSyncPeer) has already released the
+// slot and the peer's downloads, so disconnecting would run that release a
+// second time. IngestOutcome.TransientLocal and IngestOutcome.Duplicate are our
+// fault or nobody's. A send that could not be queued is dropped with a warning,
+// because the getdata pass and the rotation both run again.
+//
+// Run's deferred cancel is part of this contract: a disconnect cancels the
+// context every running ingest holds, so anything that drops a peer mid-ingest
+// aborts that ingest as well.
 func (p *Peer) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -497,6 +541,7 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) e
 	p.mu.Lock()
 	p.ingest = progress
 	p.ingestStarted = time.Now()
+	p.ingestTxBytes = txPayloadBytes(req.SizeBytes, req.TxCount)
 	p.ingestActive++
 	p.mu.Unlock()
 
@@ -549,23 +594,63 @@ func (p *Peer) IngestSnapshot() IngestSnapshot {
 	}
 }
 
-// ingestAlive reports whether a running ingest excuses the idle timer.
+// txPayloadBytes is how many transaction bytes a block stream yields in total:
+// the payload length the peer declared, less the prefix the transport already
+// took off it before handing the stream over — the 80 byte header and the
+// transaction-count varint. It is the count BytesRead converges on, so
+// comparing BytesRead against the declared payload length directly would never
+// match. A declared length no longer than its own prefix yields nothing, so
+// the count floors at zero rather than wrapping.
+func txPayloadBytes(sizeBytes, txCount uint64) uint64 {
+	prefix := uint64(wire.MaxBlockHeaderPayload) + uint64(wire.VarIntSerializeSize(txCount)) //nolint:gosec // both are small positive constants
+
+	if sizeBytes <= prefix {
+		return 0
+	}
+
+	return sizeBytes - prefix
+}
+
+// ingestAlive reports whether a running ingest excuses the idle timer. An
+// ingest is in one of three states, and each needs a different judgement.
 //
-// bridge.ProgressReader's contract, stated on the type: LastProgress is
-// seeded at construction, and BytesRead stays at 0 through IngestBlock's LOCAL
-// pre-read waits (WaitForBlockAssemblyReady, waitForPreviousBlockMined). A
-// peer must never be dropped for our own slowness, so zero bytes read counts
-// as alive; once bytes have moved, the stamp has to keep moving too.
+// The stream is fully consumed. The peer has delivered every byte it declared
+// and owes us nothing more, so ProgressReader's stamp is frozen for good. What
+// runs now is OUR post-stream pipeline tail — extendTransactions, createUtxos,
+// createSubtrees, ProcessBlock — which outlasts the idle window on a fat
+// block. Judging that tail on byte silence disconnects the peer mid-validation,
+// and Run's deferred cancel then aborts the ingest, so the block comes back
+// and stalls exactly the same way for ever. The tail is bounded by
+// MaxBlockDownloadTime instead: the same ceiling CheckStall puts on one block's
+// hold over the sync slot, so an ingest wedged for good still ends the peer.
+//
+// No byte has moved yet. bridge.ProgressReader's contract, stated on the type:
+// LastProgress is seeded at construction, and BytesRead stays at 0 through
+// IngestBlock's LOCAL pre-read waits (WaitForBlockAssemblyReady,
+// waitForPreviousBlockMined). A peer must never be dropped for our own
+// slowness, so this counts as alive.
+//
+// Bytes moved but the stream is short. This is the one state the peer is
+// answerable for: it started delivering and went quiet mid-payload. The stamp
+// has to keep moving inside the idle window.
 func (p *Peer) ingestAlive() bool {
 	p.mu.Lock()
 	ingest := p.ingest
+	txBytes := p.ingestTxBytes
+	started := p.ingestStarted
 	p.mu.Unlock()
 
 	if ingest == nil {
 		return false
 	}
 
-	if ingest.BytesRead() == 0 {
+	read := ingest.BytesRead()
+
+	if read >= txBytes {
+		return time.Since(started) < MaxBlockDownloadTime
+	}
+
+	if read == 0 {
 		return true
 	}
 

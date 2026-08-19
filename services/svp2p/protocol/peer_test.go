@@ -123,23 +123,41 @@ func newIngestingTestPeer(t *testing.T, idle, ping time.Duration, ingestor Block
 	return NewPeer(cfg), &scriptedPeer{nc: b}
 }
 
+// ingestPrefix is how much of the block stream a fake ingest consumes before
+// it stalls. It is the only thing that separates the three states the idle
+// timer has to tell apart.
+type ingestPrefix int
+
+const (
+	// ingestReadsNothing is IngestBlock parked in its LOCAL pre-read waits
+	// (WaitForBlockAssemblyReady, waitForPreviousBlockMined). The peer is not
+	// at fault.
+	ingestReadsNothing ingestPrefix = iota
+
+	// ingestReadsOneByte is a peer that started delivering the payload and
+	// then went silent mid-stream. The peer IS at fault.
+	ingestReadsOneByte
+
+	// ingestReadsAll is the whole payload delivered, with the pipeline's
+	// post-stream validation tail still to run. The peer is not at fault, and
+	// its progress stamp can never move again.
+	ingestReadsAll
+)
+
 // blockingIngestor holds a block stream open the way a real ingest of a fat
 // block does, so a test can drive the peer's idle timer against it.
 type blockingIngestor struct {
-	// readFirstByte makes the ingest take one payload byte before it stalls,
-	// which is what separates a stalled peer from our own local pre-read
-	// waits (bridge.ProgressReader's documented rule).
-	readFirstByte bool
+	prefix ingestPrefix
 
 	started chan struct{}
 	release chan struct{}
 }
 
-func newBlockingIngestor(readFirstByte bool) *blockingIngestor {
+func newBlockingIngestor(prefix ingestPrefix) *blockingIngestor {
 	return &blockingIngestor{
-		readFirstByte: readFirstByte,
-		started:       make(chan struct{}, 1),
-		release:       make(chan struct{}),
+		prefix:  prefix,
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
 	}
 }
 
@@ -150,10 +168,18 @@ func (b *blockingIngestor) WatchProgress(r io.ReadCloser) IngestProgress {
 func (b *blockingIngestor) Ingest(ctx context.Context, req BlockIngestRequest) IngestOutcome {
 	defer func() { _ = req.TxReader.Close() }()
 
-	if b.readFirstByte {
+	switch b.prefix {
+	case ingestReadsOneByte:
 		if _, err := io.ReadFull(req.TxReader, make([]byte, 1)); err != nil {
 			return IngestOutcome{Err: err}
 		}
+
+	case ingestReadsAll:
+		if _, err := io.Copy(io.Discard, req.TxReader); err != nil {
+			return IngestOutcome{Err: err}
+		}
+
+	case ingestReadsNothing:
 	}
 
 	select {
@@ -177,7 +203,7 @@ func (b *blockingIngestor) Ingest(ctx context.Context, req BlockIngestRequest) I
 func TestPeerIdleTimerToleratesLocalIngestWait(t *testing.T) {
 	const idle = 150 * time.Millisecond
 
-	ingestor := newBlockingIngestor(false)
+	ingestor := newBlockingIngestor(ingestReadsNothing)
 
 	p, far := newIngestingTestPeer(t, idle, time.Hour, ingestor)
 
@@ -213,7 +239,7 @@ func TestPeerIdleTimerToleratesLocalIngestWait(t *testing.T) {
 func TestPeerIdleTimerDropsStalledIngest(t *testing.T) {
 	const idle = 150 * time.Millisecond
 
-	ingestor := newBlockingIngestor(true)
+	ingestor := newBlockingIngestor(ingestReadsOneByte)
 
 	p, far := newIngestingTestPeer(t, idle, time.Hour, ingestor)
 
@@ -241,6 +267,146 @@ func TestPeerIdleTimerDropsStalledIngest(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("peer did not disconnect after the ingest stopped making progress")
 	}
+}
+
+// TestPeerIdleTimerToleratesValidationTail is the third state, and the one the
+// byte-silence window alone gets wrong. Once the ingest has taken every
+// declared payload byte the peer owes us nothing more, and ProgressReader's
+// stamp can never move again — yet the pipeline's post-stream tail
+// (extendTransactions, createUtxos, createSubtrees, ProcessBlock) still has
+// minutes to run on a fat block. Judged on byte silence the peer is dropped
+// mid-validation, Run's deferred cancel aborts the ingest, the block is
+// re-offered, and the same tail stalls the same way for ever.
+func TestPeerIdleTimerToleratesValidationTail(t *testing.T) {
+	const idle = 150 * time.Millisecond
+
+	ingestor := newBlockingIngestor(ingestReadsAll)
+
+	p, far := newIngestingTestPeer(t, idle, time.Hour, ingestor)
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- p.Run(context.Background()) }()
+
+	defer func() {
+		p.Disconnect("test teardown")
+		close(ingestor.release)
+	}()
+
+	completeHandshake(t, far)
+
+	genesis := syncGenesis()
+	far.writeAsync(blockFor(minedChild(genesis, testEasyBits, 11)))
+
+	select {
+	case <-ingestor.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the block never reached the ingestor")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("peer disconnected during the post-stream validation tail: %v", err)
+	case <-time.After(4 * idle):
+	}
+}
+
+// fixedProgress is an IngestProgress frozen at one observation, so a test can
+// put the idle timer in front of an exact ingest state — including ages no
+// test can wait out, such as the MaxBlockDownloadTime ceiling.
+type fixedProgress struct {
+	read uint64
+	last time.Time
+}
+
+func (f fixedProgress) Read([]byte) (int, error) { return 0, io.EOF }
+func (f fixedProgress) Close() error             { return nil }
+func (f fixedProgress) BytesRead() uint64        { return f.read }
+func (f fixedProgress) LastProgress() time.Time  { return f.last }
+
+func TestIngestAlive(t *testing.T) {
+	const idle = 30 * time.Second
+
+	// txBytes is the whole transaction payload of the ingest under test; read
+	// is how much of it has arrived; lastAge and startedAge are how long ago
+	// the stamp last moved and the ingest began.
+	tests := []struct {
+		name       string
+		txBytes    uint64
+		read       uint64
+		lastAge    time.Duration
+		startedAge time.Duration
+		want       bool
+	}{{
+		name:       "consumed stream survives its validation tail",
+		txBytes:    1000,
+		read:       1000,
+		lastAge:    4 * idle,
+		startedAge: 4 * idle,
+		want:       true,
+	}, {
+		name:       "consumed stream still ends at MaxBlockDownloadTime",
+		txBytes:    1000,
+		read:       1000,
+		lastAge:    MaxBlockDownloadTime + time.Second,
+		startedAge: MaxBlockDownloadTime + time.Second,
+		want:       false,
+	}, {
+		name:       "mid-stream silence past the idle window disconnects",
+		txBytes:    1000,
+		read:       500,
+		lastAge:    2 * idle,
+		startedAge: 2 * idle,
+		want:       false,
+	}, {
+		name:       "mid-stream progress inside the idle window survives",
+		txBytes:    1000,
+		read:       500,
+		lastAge:    idle / 2,
+		startedAge: 2 * idle,
+		want:       true,
+	}, {
+		name:       "local pre-read wait is never the peer's fault",
+		txBytes:    1000,
+		read:       0,
+		lastAge:    10 * idle,
+		startedAge: 10 * idle,
+		want:       true,
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+
+			p := &Peer{cfg: PeerConfig{IdleTimeout: idle}}
+			p.ingest = fixedProgress{read: tc.read, last: now.Add(-tc.lastAge)}
+			p.ingestStarted = now.Add(-tc.startedAge)
+			p.ingestTxBytes = tc.txBytes
+			p.ingestActive = 1
+
+			require.Equal(t, tc.want, p.ingestAlive())
+		})
+	}
+
+	t.Run("no ingest running", func(t *testing.T) {
+		p := &Peer{cfg: PeerConfig{IdleTimeout: idle}}
+
+		require.False(t, p.ingestAlive())
+	})
+}
+
+// TestTxPayloadBytes pins the count BytesRead converges on: the declared
+// payload length less the header and transaction-count varint the transport
+// consumed before the stream was handed over.
+func TestTxPayloadBytes(t *testing.T) {
+	require.Equal(t, uint64(919), txPayloadBytes(1000, 1),
+		"80 byte header plus a one byte count varint")
+	require.Equal(t, uint64(915), txPayloadBytes(1000, 70000),
+		"a count above 65535 takes a five byte varint")
+	require.Zero(t, txPayloadBytes(81, 0),
+		"a payload no longer than its own prefix yields no transaction bytes")
+	require.Zero(t, txPayloadBytes(10, 1),
+		"an under-length declaration must floor at zero, not wrap")
 }
 
 func completeHandshake(t *testing.T, far *scriptedPeer) {
