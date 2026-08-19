@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/url"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -17,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/svp2p/bridge/bsvutil"
+	"github.com/bsv-blockchain/teranode/services/svp2p/transport"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -305,6 +308,161 @@ func TestIngestBlock_ParityWithHandleBlockDirect_UTXOs(t *testing.T) {
 	}
 }
 
+// buildCoinbaseOnlyBlock makes the degenerate block: one transaction, which
+// takes prepareSubtrees' txCount <= 1 early return and produces no subtree.
+func buildCoinbaseOnlyBlock(t *testing.T) *bsvutil.Block {
+	t.Helper()
+
+	coinbase := wire.NewMsgTx(1)
+	coinbase.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: 0xffffffff},
+		SignatureScript:  []byte{0x51, 0x01, 0x66},
+		Sequence:         0xffffffff,
+	})
+	coinbase.AddTxOut(&wire.TxOut{Value: 5000000000, PkScript: []byte{0x76, 0xa9, 0x14, 0x02}})
+
+	msgBlock := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1, PrevBlock: chainhash.Hash{0x22}, Timestamp: time.Unix(1600000100, 0)},
+		Transactions: []*wire.MsgTx{coinbase},
+	}
+
+	grindEasyPoW(t, msgBlock)
+
+	return bsvutil.NewBlock(msgBlock)
+}
+
+// TestIngestBlock_ParityWithHandleBlockDirect_CoinbaseOnly covers the
+// single-transaction block: the streaming source must yield the coinbase it
+// decoded up front and nothing else, and the pipeline's early return must
+// leave both entries agreeing on an empty subtree list.
+func TestIngestBlock_ParityWithHandleBlockDirect_CoinbaseOnly(t *testing.T) {
+	ctx := context.Background()
+
+	block := buildCoinbaseOnlyBlock(t)
+	txs := block.Transactions()
+	require.Len(t, txs, 1)
+
+	buffered := newIngestHarness(ctx, t, "ingest_parity_cb_buffered", false, 0)
+	streamed := newIngestHarness(ctx, t, "ingest_parity_cb_streamed", false, 0)
+
+	require.NoError(t, buffered.sm.HandleBlockDirect(ctx, "peer-a", *block.Hash(), block.MsgBlock()))
+
+	header := block.MsgBlock().Header
+	require.NoError(t, streamed.sm.IngestBlock(ctx, &header, 1,
+		bytes.NewReader(serializeTxStream(t, txs)), "peer-b"))
+
+	requireSameIngestOutcome(ctx, t, buffered, streamed)
+
+	require.Empty(t, streamed.captured.block().Subtrees, "a coinbase-only block produces no subtree")
+	require.Empty(t, streamed.subtreeStore.ListKeys(), "a coinbase-only block writes no subtree file")
+}
+
+// TestIngestBlock_ReleasesARealBlockStream is the composition proof the rest of
+// the suite cannot give: it drives IngestBlock over a genuine
+// transport.BlockStream taken off a socket, in exactly the shape the protocol
+// layer will use it — weigh by the declared payload length, wrap the reader for
+// progress, ingest, release — and then requires that the transport's read loop
+// was actually freed, by parsing the message the peer sent after the block.
+//
+// The read loop parks on the connection for the whole payload and reads nothing
+// else from that peer until the stream closes, so a Close that fails to reach
+// BlockStream wedges the peer permanently. Only a real stream can catch that: a
+// synthetic io.Closer proves the mechanism, not the wiring.
+func TestIngestBlock_ReleasesARealBlockStream(t *testing.T) {
+	ctx := context.Background()
+
+	block := buildSpendableBlock(t)
+	txs := block.Transactions()
+	txStream := serializeTxStream(t, txs)
+
+	h := newIngestHarness(ctx, t, "ingest_real_stream", false, 0)
+
+	peerSide, nodeSide := net.Pipe()
+
+	conn := transport.New(nodeSide, transport.Config{
+		Net:             wire.MainNet,
+		ProtocolVersion: wire.ProtocolVersion,
+		SendBudgetBytes: 1 << 20,
+		RecvQueueLen:    4,
+		WriteTimeout:    5 * time.Second,
+	})
+
+	connCtx, cancelConn := context.WithCancel(ctx)
+	defer cancelConn()
+
+	conn.Start(connCtx)
+
+	t.Cleanup(func() { _ = conn.Close() })
+
+	const pingNonce = uint64(0x5150)
+
+	writeErr := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = peerSide.Close() }()
+
+		if _, err := wire.WriteMessageWithEncodingN(peerSide, block.MsgBlock(),
+			wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding); err != nil {
+			writeErr <- err
+			return
+		}
+
+		// Written only once the whole block payload has been taken off the
+		// socket. It can be parsed only after the read loop is released.
+		_, err := wire.WriteMessageWithEncodingN(peerSide, wire.NewMsgPing(pingNonce),
+			wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+		writeErr <- err
+	}()
+
+	var stream *transport.BlockStream
+
+	select {
+	case stream = <-conn.InboundBlocks():
+	case <-time.After(30 * time.Second):
+		t.Fatal("the transport never delivered the block stream")
+	}
+
+	require.NotNil(t, stream)
+	require.Equal(t, uint64(len(txs)), stream.TxCount())
+	require.Equal(t, uint64(block.MsgBlock().SerializeSize()), stream.Length(),
+		"Length must be the declared payload size the admission budget is keyed on")
+
+	header := stream.Header()
+	blockHash := header.BlockHash()
+
+	// The documented composition: the declared payload length is the admission
+	// weight, and the reader is wrapped so a watcher can see ingest progress.
+	admission := newTestAdmission(t, 256*1024*1024, 5*time.Second, 150*time.Second)
+
+	sizeHint, err := safeconversion.Uint64ToInt64(stream.Length())
+	require.NoError(t, err)
+
+	weight, err := admission.Acquire(ctx, nil, blockHash, sizeHint)
+	require.NoError(t, err)
+
+	progress := NewProgressReader(stream.TxReader())
+
+	ingestErr := h.sm.IngestBlock(ctx, &header, stream.TxCount(), progress, "peer")
+
+	admission.Release(blockHash, weight)
+	admission.ClearFailure(blockHash)
+
+	require.NoError(t, ingestErr)
+	require.Equal(t, uint64(len(txStream)), progress.BytesRead(),
+		"the ingest must have consumed every transaction byte of the payload")
+
+	select {
+	case msg := <-conn.Inbound():
+		ping, ok := msg.(*wire.MsgPing)
+		require.True(t, ok, "expected the ping that follows the block, got %T", msg)
+		require.Equal(t, pingNonce, ping.Nonce)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the read loop is still parked on the block stream: IngestBlock did not release it")
+	}
+
+	require.NoError(t, <-writeErr)
+}
+
 // TestIngestBlock_TruncatedStream proves a short payload fails cleanly: an
 // error out, and nothing written that the buffered entry would not also have
 // left behind (it writes nothing before the transaction map is complete).
@@ -511,7 +669,12 @@ func TestProgressReader(t *testing.T) {
 	pr := NewProgressReader(inner)
 
 	require.Zero(t, pr.BytesRead())
-	require.True(t, pr.LastProgress().IsZero(), "no progress has been made yet")
+
+	// The stamp is seeded at construction: an ingest sitting in its local
+	// pre-read waits must not look like a silent peer to the idle timer.
+	seeded := pr.LastProgress()
+	require.False(t, seeded.IsZero(), "the progress stamp must be seeded at construction")
+	require.WithinDuration(t, time.Now(), seeded, time.Minute)
 
 	buf := make([]byte, 4)
 
@@ -521,7 +684,7 @@ func TestProgressReader(t *testing.T) {
 	require.Equal(t, uint64(4), pr.BytesRead())
 
 	first := pr.LastProgress()
-	require.False(t, first.IsZero())
+	require.False(t, first.Before(seeded), "a read must not move the stamp backwards")
 
 	rest, err := io.ReadAll(pr)
 	require.NoError(t, err)

@@ -169,20 +169,36 @@ func (s *streamTxSource) blockSize(headerLen int) int64 {
 // goroutine. Wiring that poll into the idle timer is the next task's work;
 // this type is the surface it wires to.
 //
+// IMPORTANT for that wiring: BytesRead can sit at 0 for a long time without
+// the peer being at fault. IngestBlock performs two LOCAL waits before it
+// reads a single transaction byte — WaitForBlockAssemblyReady and
+// waitForPreviousBlockMined — and both hold the socket while they retry
+// against our own services. LastProgress is therefore stamped when the reader
+// is constructed, so a watcher sees a live ingest from the start rather than a
+// zero time it cannot distinguish from a silent peer. A stalled LastProgress
+// during that window means our own pipeline is slow, not the peer, and the
+// peer must NOT be rotated for it.
+//
 // Close is forwarded to the wrapped stream when it has one, so the wrapper
 // does not hide the transport's Closer from IngestBlock's release path.
 type ProgressReader struct {
 	r io.Reader
 
 	bytesRead atomic.Uint64
-	// lastProgress holds a UnixNano stamp; 0 means no bytes have arrived yet.
+	// lastProgress holds a UnixNano stamp, seeded at construction so it is
+	// never zero for a reader an ingest is actually holding.
 	lastProgress atomic.Int64
 }
 
 // NewProgressReader wraps r with a monotonic byte counter and a last-progress
-// stamp, both safe to read from any goroutine.
+// stamp, both safe to read from any goroutine. The stamp starts at the time of
+// construction: the caller builds the reader immediately before handing it to
+// IngestBlock, so that is the moment the ingest began.
 func NewProgressReader(r io.Reader) *ProgressReader {
-	return &ProgressReader{r: r}
+	p := &ProgressReader{r: r}
+	p.lastProgress.Store(time.Now().UnixNano())
+
+	return p
 }
 
 func (p *ProgressReader) Read(b []byte) (int, error) {
@@ -201,14 +217,12 @@ func (p *ProgressReader) BytesRead() uint64 {
 }
 
 // LastProgress reports when the ingest last took bytes off the stream, or the
-// zero time when nothing has arrived yet.
+// reader's construction time when no bytes have arrived yet. It is never the
+// zero time, so a watcher can always compute an age. Pair it with BytesRead to
+// tell the two silent states apart: BytesRead of 0 with a fresh stamp is an
+// ingest still in its local pre-read waits, not a silent peer.
 func (p *ProgressReader) LastProgress() time.Time {
-	stamp := p.lastProgress.Load()
-	if stamp == 0 {
-		return time.Time{}
-	}
-
-	return time.Unix(0, stamp)
+	return time.Unix(0, p.lastProgress.Load())
 }
 
 // Close releases the wrapped stream when it owns one.
@@ -216,11 +230,15 @@ func (p *ProgressReader) Close() error {
 	return closeIngestStream(p.r)
 }
 
-// closeIngestStream releases a transaction stream that owns a Closer. The
-// transport's BlockStream.Close drains whatever the consumer did not read, so
-// the connection stays aligned on the next message header, and it releases the
-// read loop that parks for the whole ingest. A plain reader with no Closer
-// (tests, replayed fixtures) is a no-op.
+// closeIngestStream releases a transaction stream that owns a Closer.
+//
+// The transport's BlockStream.TxReader is exactly that: its Close forwards to
+// BlockStream.Close, which drains whatever the consumer did not read so the
+// connection stays aligned on the next message header, and which frees the
+// read loop that stays parked for the whole ingest. Releasing it is not
+// optional — the peer delivers nothing else until it happens.
+//
+// A plain reader with no Closer (tests, replayed fixtures) is a no-op.
 func closeIngestStream(r io.Reader) error {
 	if closer, ok := r.(io.Closer); ok {
 		return closer.Close()

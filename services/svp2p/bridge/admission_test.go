@@ -208,6 +208,39 @@ func TestAdmission_DuplicateHashRejected(t *testing.T) {
 	a.Release(hash, weight)
 }
 
+// TestAdmission_ReleaseAfterRejectedAcquireKeepsDedupEntry pins the hardening
+// on Release: a caller that pairs Release with a REJECTED Acquire must not
+// evict the dedup entry belonging to the copy still being ingested. If it did,
+// a third copy of the same hash would be admitted against the same budget
+// while the first is still in flight.
+func TestAdmission_ReleaseAfterRejectedAcquireKeepsDedupEntry(t *testing.T) {
+	a := newTestAdmission(t, 8*minInFlightBlockWeight, 0, 0)
+	hash := admissionHash(5)
+
+	admitted, err := a.Acquire(context.Background(), nil, hash, minInFlightBlockWeight)
+	require.NoError(t, err)
+	require.Positive(t, admitted)
+
+	duplicateWeight, err := a.Acquire(context.Background(), nil, hash, minInFlightBlockWeight)
+	require.ErrorIs(t, err, ErrDuplicateBlockInFlight)
+	require.Zero(t, duplicateWeight, "a rejected acquire reserves nothing")
+
+	// The mistake: releasing what the rejected acquire returned.
+	a.Release(hash, duplicateWeight)
+
+	_, err = a.Acquire(context.Background(), nil, hash, minInFlightBlockWeight)
+	require.ErrorIs(t, err, ErrDuplicateBlockInFlight,
+		"the in-flight copy's dedup entry must survive a release paired with a rejected acquire")
+
+	// The real owner's release still frees both halves.
+	a.Release(hash, admitted)
+
+	reacquired, err := a.Acquire(context.Background(), nil, hash, minInFlightBlockWeight)
+	require.NoError(t, err, "the hash must be admissible once its real owner releases it")
+
+	a.Release(hash, reacquired)
+}
+
 // TestAdmission_CancelledAcquireDropsDedupSlot proves a cancelled wait reserves
 // nothing and leaves no stale hash behind.
 func TestAdmission_CancelledAcquireDropsDedupSlot(t *testing.T) {
