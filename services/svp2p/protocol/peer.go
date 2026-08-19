@@ -111,8 +111,13 @@ type syncDispatcher interface {
 	// disconnected.
 	Inv(sp *SyncPeer, msg *wire.MsgInv) ([]wire.Message, error)
 
-	// BlockDone reports one block's ingest outcome to the scheduler.
-	BlockDone(sp *SyncPeer, hash chainhash.Hash, outcome IngestOutcome)
+	// BlockExpected reports whether hash is in flight from this peer, which is
+	// what makes an inbound block solicited.
+	BlockExpected(sp *SyncPeer, hash chainhash.Hash) bool
+
+	// BlockDone reports one block's ingest outcome to the scheduler. A non-nil
+	// error means this peer must be disconnected.
+	BlockDone(sp *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) error
 }
 
 type PeerConfig struct {
@@ -173,11 +178,14 @@ type Peer struct {
 	// ingestCh carries each finished ingest back to the Run goroutine.
 	ingestCh chan ingestReport
 
-	// ingest and ingestActive are read and written by the Run goroutine only.
-	// ingest is the newest running ingest's progress handle, which the idle
-	// timer watches; ingestActive counts the ingests still to report.
-	ingest       IngestProgress
-	ingestActive int
+	// ingest, ingestStarted and ingestActive are written by the Run goroutine
+	// and read by it plus the manager's stall ticker through IngestSnapshot,
+	// so they are guarded by mu like the rest of the peer's shared state.
+	// ingest is the newest running ingest's progress handle; ingestActive
+	// counts the ingests still to report.
+	ingest        IngestProgress
+	ingestStarted time.Time
+	ingestActive  int
 }
 
 // ingestReport is one finished ingest, delivered to the Run goroutine so the
@@ -257,13 +265,12 @@ func (p *Peer) Run(ctx context.Context) error {
 			// as long as the ingest keeps taking bytes (see ingestAlive).
 			resetIdle()
 
-			p.startIngest(ctx, stream)
+			if err := p.startIngest(ctx, stream); err != nil {
+				return p.disconnect(err)
+			}
 
 		case report := <-p.ingestCh:
-			p.ingestActive--
-			if p.ingestActive == 0 {
-				p.ingest = nil
-			}
+			p.ingestFinished()
 
 			// An ingest that finishes is fresh evidence of a live peer, and
 			// the idle window must start from the end of it: the peer has been
@@ -271,7 +278,11 @@ func (p *Peer) Run(ctx context.Context) error {
 			resetIdle()
 
 			if p.cfg.Sync != nil {
-				p.cfg.Sync.BlockDone(p.cfg.SyncPeer, report.hash, report.outcome)
+				// A block the pipeline rejected is the peer's fault, and the
+				// dispatcher says so by returning an error.
+				if err := p.cfg.Sync.BlockDone(p.cfg.SyncPeer, report.hash, report.outcome); err != nil {
+					return p.disconnect(err)
+				}
 			}
 
 		case <-idle.C:
@@ -335,19 +346,28 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 	// The sync machines are dispatched with the peer lock released: they take
 	// PeerManager's sync-state mutex, and the package lock order is peer lock
 	// then manager lock.
-	return p.dispatchSync(msg, firstEstablished, info.Services)
+	return p.dispatchSync(msg, est, firstEstablished, info.Services)
 }
 
 // dispatchSync feeds one post-handshake message to the manager-owned sync
 // machines and sends what they return. The machines perform no I/O; this is
 // the only place their output reaches the wire (spec §4.3).
-func (p *Peer) dispatchSync(msg wire.Message, firstEstablished bool, services wire.ServiceFlag) error {
+func (p *Peer) dispatchSync(msg wire.Message, established, firstEstablished bool, services wire.ServiceFlag) error {
 	if p.cfg.Sync == nil {
 		return nil
 	}
 
 	if firstEstablished {
 		p.send(p.cfg.Sync.Established(p.cfg.SyncPeer, services))
+	}
+
+	// net_processing.cpp ProcessMessage drops everything that arrives before
+	// the handshake completes ("Must have a version message before anything
+	// else"), so nothing pre-handshake may reach the sync machines. The
+	// handshake already scores those messages; this only stops them from
+	// mutating sync state.
+	if !established {
+		return nil
 	}
 
 	switch m := msg.(type) {
@@ -417,18 +437,28 @@ func (p *Peer) checkBanThreshold(score int) error {
 // It must not run on the Run goroutine: an ingest takes minutes on a fat
 // block, and the loop still has to keep the idle timer honest, answer pings,
 // and observe shutdown while it runs.
-func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) {
+func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) error {
 	header := stream.Header()
 	hash := header.BlockHash()
 
 	if p.cfg.Ingestor == nil {
 		// Nothing can ingest this block. Closing drains the payload so the
 		// connection stays aligned and the parked read loop is released.
-		if err := stream.Close(); err != nil {
-			p.cfg.Logger.Warnf("[svp2p] failed to drain unhandled block %s from %s: %v", hash, p.cfg.Conn.RemoteAddr(), err)
-		}
+		p.drain(stream, hash)
 
-		return
+		return nil
+	}
+
+	// Reject an unsolicited block before it can consume admission budget
+	// (services/legacy/peer_server.go OnBlock, PR 1190: "Reject unrequested
+	// blocks before they can consume prefetch budget"). Without this gate a
+	// peer can push blocks nobody asked for straight into the shared byte
+	// budget and starve the real sync peer.
+	if p.cfg.Sync != nil && !p.cfg.Sync.BlockExpected(p.cfg.SyncPeer, hash) {
+		p.drain(stream, hash)
+
+		return errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+			"svp2p: unrequested block %s", hash, ErrProtocolViolation)
 	}
 
 	progress := p.cfg.Ingestor.WatchProgress(stream.TxReader())
@@ -442,8 +472,11 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) {
 		Quit:      p.gone,
 	}
 
+	p.mu.Lock()
 	p.ingest = progress
+	p.ingestStarted = time.Now()
 	p.ingestActive++
+	p.mu.Unlock()
 
 	go func() {
 		outcome := p.cfg.Ingestor.Ingest(ctx, req)
@@ -460,6 +493,47 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) {
 		case <-p.gone:
 		}
 	}()
+
+	return nil
+}
+
+// drain releases a block this peer's loop will not ingest. The transport read
+// loop stays parked until it happens, and the drain is what keeps the
+// connection aligned on the next message header.
+func (p *Peer) drain(stream *transport.BlockStream, hash chainhash.Hash) {
+	if err := stream.Close(); err != nil {
+		p.cfg.Logger.Warnf("[svp2p] failed to drain block %s from %s: %v", hash, p.cfg.Conn.RemoteAddr(), err)
+	}
+}
+
+func (p *Peer) ingestFinished() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.ingestActive--
+
+	if p.ingestActive == 0 {
+		p.ingest = nil
+	}
+}
+
+// IngestSnapshot reports what the peer's current block ingest has achieved, so
+// the manager's stall ticker can tell a large block still streaming in from a
+// peer that went quiet. It takes only the peer lock, and the package lock
+// order requires the caller to hold no manager lock when it calls this.
+func (p *Peer) IngestSnapshot() IngestSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.ingest == nil {
+		return IngestSnapshot{}
+	}
+
+	return IngestSnapshot{
+		Active:        true,
+		StartedMicros: p.ingestStarted.UnixMicro(),
+		BytesRead:     p.ingest.BytesRead(),
+	}
 }
 
 // ingestAlive reports whether a running ingest excuses the idle timer.
@@ -470,15 +544,19 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) {
 // peer must never be dropped for our own slowness, so zero bytes read counts
 // as alive; once bytes have moved, the stamp has to keep moving too.
 func (p *Peer) ingestAlive() bool {
-	if p.ingest == nil {
+	p.mu.Lock()
+	ingest := p.ingest
+	p.mu.Unlock()
+
+	if ingest == nil {
 		return false
 	}
 
-	if p.ingest.BytesRead() == 0 {
+	if ingest.BytesRead() == 0 {
 		return true
 	}
 
-	return time.Since(p.ingest.LastProgress()) < p.cfg.IdleTimeout
+	return time.Since(ingest.LastProgress()) < p.cfg.IdleTimeout
 }
 
 func (p *Peer) Established() <-chan struct{} { return p.established }

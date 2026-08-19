@@ -333,8 +333,15 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 	//
 	// The ignored batch is deliberately unscored: junk headers cost a peer
 	// nothing but our wire decode here, and any disconnect policy for
-	// unrequested headers belongs to the manager (Task 11), which knows what it
-	// asked each peer for.
+	// unrequested headers belongs to the manager, which knows what it asked
+	// each peer for.
+	//
+	// Task 11 deliberately did NOT add that policy, and this is where it would
+	// go. The peer loop gained the equivalent gate for unrequested BLOCKS,
+	// because those consume the shared admission budget and starve the sync
+	// peer; unrequested headers cost only a decode and are already bounded by
+	// MAX_HEADERS_RESULTS, so a disconnect policy for them is Phase 3 work,
+	// alongside the header-index hardening this file's PoW note describes.
 	if hs.headersFirstMode && !peer.State.fSyncStarted {
 		peer.State.updateBlockAvailability(hs.cfg.Index, headers[len(headers)-1].BlockHash())
 

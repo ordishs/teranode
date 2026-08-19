@@ -81,6 +81,11 @@ func (f *downloadFixture) peerAt(t *testing.T, addr string, h int) *SyncPeer {
 
 // micros converts a duration to the microsecond unit every timestamp in this
 // machine uses, the port of SVNode's GetTimeMicros.
+// noIngest is the "no block is being ingested from this peer" observation,
+// which is what every case in this file exercises: the ingest-aware
+// suppression has its own tests.
+var noIngest = IngestSnapshot{}
+
 func micros(d time.Duration) int64 { return int64(d / time.Microsecond) }
 
 // testNow is an arbitrary fixed microsecond timestamp. Every clock value in
@@ -440,15 +445,15 @@ func TestCheckStall_DisconnectsAStallingPeer(t *testing.T) {
 
 	peer.State.nStallingSince = testNow
 
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow+micros(BlockStallingTimeout)))
-	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, testNow+micros(BlockStallingTimeout)+1))
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(BlockStallingTimeout)))
+	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(BlockStallingTimeout)+1))
 }
 
 func TestCheckStall_IgnoresAPeerThatIsNotStalling(t *testing.T) {
 	f := newDownloadFixture(t, 3)
 	peer := f.peerAt(t, "1.2.3.4:8333", 3)
 
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow+micros(time.Hour)))
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(time.Hour)))
 }
 
 // TestCheckStall_RotatesTheSyncPeer pins the Teranode rotation carried from
@@ -469,10 +474,10 @@ func TestCheckStall_RotatesTheSyncPeer(t *testing.T) {
 
 	require.True(t, f.bd.MarkBlockAsInFlight(peer, best))
 
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow))
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow+micros(MaxLastBlockTime)))
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(MaxLastBlockTime)))
 
-	require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, testNow+micros(MaxLastBlockTime)+1))
+	require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, testNow+micros(MaxLastBlockTime)+1))
 
 	require.False(t, peer.State.fSyncStarted, "the sync slot must be released through HeaderSync.SyncPeerTimedOut")
 	require.False(t, f.hs.IsHeadersFirstMode(), "the header state must reset with the round")
@@ -481,12 +486,100 @@ func TestCheckStall_RotatesTheSyncPeer(t *testing.T) {
 	require.Nil(t, peer.State.pindexLastCommonBlock)
 }
 
+// syncingPeer returns a peer holding the sync slot with one block in flight,
+// which is the state the rotation rules are written against.
+func (f *downloadFixture) syncingPeer(t *testing.T, addr string) *SyncPeer {
+	t.Helper()
+
+	peer := fullNodePeer(addr)
+	require.Len(t, f.hs.PeerEstablished(peer), 1)
+
+	best := f.node(t, len(f.chain))
+	peer.State.pindexBestKnownBlock = &best
+	peer.State.pindexLastCommonBlock = &best
+
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, best))
+
+	return peer
+}
+
+// TestCheckStall_KeepsAPeerStillDeliveringALargeBlock covers the suppression
+// carried from legacy netsync manager.go:1052-1068: a block big enough to
+// outlast maxLastBlockTime must not cost the peer that is still streaming it
+// the sync slot. The rate floor and the wall-clock cap are both exercised.
+func TestCheckStall_KeepsAPeerStillDeliveringALargeBlock(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := f.syncingPeer(t, "1.2.3.4:8333")
+
+	const tick = 5 * time.Second
+
+	// Bytes arriving comfortably above MinBlockDownloadBytesPerSec.
+	perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
+
+	ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
+
+	// Seed the first sample, then run past the rotation window while the
+	// ingest keeps pulling bytes.
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+
+	for elapsed := tick; elapsed <= MaxLastBlockTime+2*tick; elapsed += tick {
+		ingest.BytesRead += perTick
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)),
+			"a peer still delivering at %d B/s must keep the sync slot at %s", MinBlockDownloadBytesPerSec, elapsed)
+	}
+
+	require.True(t, peer.State.fSyncStarted, "the sync slot must survive a long but healthy download")
+}
+
+func TestCheckStall_RotatesAnIngestThatStoppedMoving(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := f.syncingPeer(t, "1.2.3.4:8333")
+
+	// An ingest that took some bytes and then went quiet: the byte count stops
+	// rising, so it is a stalled peer, not a large block.
+	ingest := IngestSnapshot{Active: true, StartedMicros: testNow, BytesRead: 1 << 20}
+
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(MaxLastBlockTime)))
+
+	require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, ingest, testNow+micros(MaxLastBlockTime)+1),
+		"an ingest whose byte count stopped rising is a stall, whatever it read earlier")
+}
+
+func TestCheckStall_RotatesADribblingIngestPastTheDownloadCap(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := f.syncingPeer(t, "1.2.3.4:8333")
+
+	const tick = time.Minute
+
+	perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
+
+	ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
+
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+
+	// Healthy throughput holds the slot right up to the cap...
+	for elapsed := tick; elapsed < MaxBlockDownloadTime; elapsed += tick {
+		ingest.BytesRead += perTick
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)))
+	}
+
+	// ...and stops holding it there, so a peer cannot dribble bytes for ever
+	// to keep the single sync slot.
+	ingest.BytesRead += perTick
+
+	require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, ingest, testNow+micros(MaxBlockDownloadTime)),
+		"MaxBlockDownloadTime caps the suppression regardless of throughput")
+}
+
 func TestCheckStall_NeverRotatesANonSyncPeer(t *testing.T) {
 	f := newDownloadFixture(t, 3)
 	peer := f.peerAt(t, "1.2.3.4:8333", 3)
 
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow))
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow+micros(10*MaxLastBlockTime)))
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(10*MaxLastBlockTime)))
 }
 
 // TestCheckStall_ProgressKeepsTheSyncPeer covers both progress sources the
@@ -503,13 +596,13 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 		peer.State.pindexBestKnownBlock = &best
 		require.True(t, f.bd.MarkBlockAsInFlight(peer, best))
 
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow))
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
 
 		delivered := testNow + micros(100*time.Second)
 		require.True(t, f.bd.BlockReceived(peer, best.Hash, delivered))
 
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, delivered+micros(MaxLastBlockTime)))
-		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, delivered+micros(MaxLastBlockTime)+1))
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, delivered+micros(MaxLastBlockTime)))
+		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, delivered+micros(MaxLastBlockTime)+1))
 	})
 
 	t.Run("a headers-first round advancing the index tip refreshes the clock", func(t *testing.T) {
@@ -519,7 +612,7 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 		require.Len(t, f.hs.PeerEstablished(peer), 1)
 		require.True(t, f.hs.IsHeadersFirstMode())
 
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow))
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
 
 		// The round delivers headers: the index tip rises, which is the only
 		// progress signal available while no block is being downloaded.
@@ -528,12 +621,12 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 		require.True(t, connected)
 
 		advanced := testNow + micros(MaxLastBlockTime) - 1
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, advanced))
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, advanced))
 		require.True(t, peer.State.fSyncStarted)
 
 		// The clock restarted from the observation, not from testNow.
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, advanced+micros(MaxLastBlockTime)))
-		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, advanced+micros(MaxLastBlockTime)+1))
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, advanced+micros(MaxLastBlockTime)))
+		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, advanced+micros(MaxLastBlockTime)+1))
 	})
 
 	// Header progress may only stand in for block progress when there is no
@@ -554,7 +647,7 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 		require.Len(t, msgs, 1)
 		require.Equal(t, MaxBlocksInTransitPerPeer, peer.State.nBlocksInFlight)
 
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow))
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
 
 		// The peer keeps the header round moving but delivers no block.
 		prev := f.chain[len(f.chain)-1]
@@ -567,10 +660,10 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 
 			prev = header
 
-			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, testNow+micros(time.Duration(i+1)*time.Second)))
+			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(time.Duration(i+1)*time.Second)))
 		}
 
-		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, testNow+micros(MaxLastBlockTime)+1),
+		require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, testNow+micros(MaxLastBlockTime)+1),
 			"headers must not hold the sync slot while the peer sits on in-flight blocks")
 		require.False(t, peer.State.fSyncStarted)
 	})

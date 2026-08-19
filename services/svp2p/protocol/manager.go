@@ -555,26 +555,49 @@ func (m *PeerManager) Inv(syncPeer *SyncPeer, msg *wire.MsgInv) ([]wire.Message,
 	return m.blockDownloader.OnInv(syncPeer, msg)
 }
 
+// BlockExpected reports whether hash is in flight from this peer, which is
+// what makes an inbound block solicited.
+func (m *PeerManager) BlockExpected(syncPeer *SyncPeer, hash chainhash.Hash) bool {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	if m.blockDownloader == nil {
+		return false
+	}
+
+	return m.blockDownloader.IsInFlightFrom(syncPeer, hash)
+}
+
 // BlockDone reports one block's ingest outcome to the download scheduler:
 // in-flight is cleared, the peer's progress clock is fed, and a pre-admission
-// timeout rotates the sync peer.
-func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) {
+// timeout rotates the sync peer. A non-nil return means the peer must be
+// disconnected, which the caller does with no lock held.
+func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) error {
 	now := time.Now().UnixMicro()
 
-	var rotate bool
+	var (
+		rotate     bool
+		disconnect error
+	)
 
 	m.syncMu.Lock()
 
 	if m.blockDownloader == nil {
 		m.syncMu.Unlock()
-		return
+		return nil
 	}
 
 	switch {
 	case outcome.Duplicate:
-		// Another copy of this hash owns the download record and reports on
-		// its own completion; touching it here would clear an entry that is
-		// still live.
+		// Another copy of this hash won the admission race and owns the
+		// have-data record, so BlockFailed must not be used here — it would
+		// delete a record that copy may already have written. What must go is
+		// THIS peer's own in-flight claim: without it a block whose holder
+		// changed under a rotation stays in flight for ever and is never
+		// re-offered. BlockNotDelivered is guarded, so it does nothing when
+		// the holder is someone else.
+		m.blockDownloader.BlockNotDelivered(syncPeer, hash)
+
 		m.logger.Debugf("[svp2p] block %s was already in flight: %v", hash, outcome.Err)
 
 	case outcome.Err == nil:
@@ -594,6 +617,16 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 
 		rotate = outcome.Rotate
 
+		// services/legacy/peer_server.go shouldDisconnectOnBlockErr: a block
+		// the pipeline rejected is the peer's fault and the peer goes, so the
+		// sync peer actually rotates instead of the same bad block being
+		// re-offered to the same peer for ever. A transient LOCAL condition is
+		// ours, and rotating on it would only churn sync peers.
+		if !outcome.TransientLocal {
+			disconnect = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+				"svp2p: block %s was rejected", hash, outcome.Err)
+		}
+
 		m.logger.Warnf("[svp2p] block %s ingest failed: %v", hash, outcome.Err)
 	}
 
@@ -611,6 +644,8 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		m.logger.Warnf("[svp2p] rotating the sync peer after a pre-admission timeout on block %s", hash)
 		m.electSyncPeer(syncPeer)
 	}
+
+	return disconnect
 }
 
 // electSyncPeer offers the free sync slot to the first eligible candidate,
@@ -684,6 +719,14 @@ func (m *PeerManager) syncTickOnce() {
 	handles := m.peerHandles()
 	now := time.Now().UnixMicro()
 
+	// Sampled before the sync-state mutex is taken: IngestSnapshot takes the
+	// PEER lock, and the package lock order forbids reaching for a peer lock
+	// while holding a manager one.
+	ingests := make([]IngestSnapshot, len(handles))
+	for i, h := range handles {
+		ingests[i] = h.peer.IngestSnapshot()
+	}
+
 	var (
 		out        []outgoing
 		disconnect []*Peer
@@ -699,8 +742,8 @@ func (m *PeerManager) syncTickOnce() {
 
 	activeTip := m.activeTip
 
-	for _, h := range handles {
-		switch m.blockDownloader.CheckStall(h.sync, now) {
+	for i, h := range handles {
+		switch m.blockDownloader.CheckStall(h.sync, ingests[i], now) {
 		case StallActionDisconnect:
 			// The caller disconnects; runPeer then drives FinalizeNode, which
 			// is what releases the slot and the peer's downloads. The machine
@@ -726,6 +769,11 @@ func (m *PeerManager) syncTickOnce() {
 	}
 
 	if rotated != nil {
+		// Only one rotation is acted on per tick, because only one peer can
+		// hold the single sync slot: a second rotation in the same pass would
+		// be a peer that no longer holds it, and the election below already
+		// covers whoever is eligible now. If a second peer did somehow rotate
+		// in the same pass, the next tick elects for it.
 		out = append(out, m.electLocked(handles, rotated)...)
 	}
 

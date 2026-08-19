@@ -243,6 +243,16 @@ func (s *Server) Stop(_ context.Context) error {
 	// is ctx-owned: it exits on the Start ctx's cancellation, which the
 	// daemon triggers before calling Stop. Nothing to join here.
 	//
+	// Peers are joined FIRST: PeerManager.Stop waits for every peer goroutine,
+	// and a peer may still be running an ingest that goes through Admission.
+	// Releasing Admission's eviction goroutine before those callers are gone
+	// would stop the failure map underneath a live ingest.
+	if s.manager != nil {
+		if err := s.manager.Stop(); err != nil {
+			return err
+		}
+	}
+
 	// Admission is not ctx-owned: its failure map runs a background eviction
 	// goroutine that only Stop releases.
 	if s.admission != nil {
@@ -250,11 +260,7 @@ func (s *Server) Stop(_ context.Context) error {
 		s.admission = nil
 	}
 
-	if s.manager == nil {
-		return nil
-	}
-
-	return s.manager.Stop()
+	return nil
 }
 
 // HeaderIndex returns the server's header index, or nil before Start has

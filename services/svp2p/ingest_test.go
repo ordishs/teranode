@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
@@ -25,6 +26,33 @@ type stubBridge struct {
 	mu    sync.Mutex
 	calls int
 	err   error
+
+	// preAdmit is what the bounded pre-admission lookups answer, and
+	// preAdmitErr what they fail with. preAdmitBlock, when non-nil, holds
+	// those lookups until it is closed or the context ends, standing in for a
+	// wedged blockchain client.
+	preAdmit      bridge.PreAdmitResult
+	preAdmitErr   error
+	preAdmitBlock chan struct{}
+	preAdmitCalls int
+}
+
+func (s *stubBridge) PreAdmit(ctx context.Context, _ *wire.BlockHeader) (bridge.PreAdmitResult, error) {
+	s.mu.Lock()
+	s.preAdmitCalls++
+	block := s.preAdmitBlock
+	result, err := s.preAdmit, s.preAdmitErr
+	s.mu.Unlock()
+
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return bridge.PreAdmitResult{}, ctx.Err()
+		}
+	}
+
+	return result, err
 }
 
 func (s *stubBridge) IngestBlock(_ context.Context, _ *wire.BlockHeader, _ uint64, txReader io.Reader, _ string) error {
@@ -149,6 +177,108 @@ func TestBlockIngestorReportsDuplicate(t *testing.T) {
 	require.ErrorIs(t, outcome.Err, bridge.ErrDuplicateBlockInFlight)
 	require.Zero(t, br.callCount(), "a duplicate must never reach the pipeline")
 	require.Equal(t, 1, stream.closeCount(), "a rejected block still has to release the stream")
+}
+
+func TestBlockIngestorSkipsBlocksWeAlreadyHold(t *testing.T) {
+	br := &stubBridge{preAdmit: bridge.PreAdmitResult{Exists: true}}
+	ingestor, _ := newTestIngestor(t, br)
+
+	stream := &countingStream{Reader: bytes.NewReader(nil)}
+
+	outcome := ingestor.Ingest(context.Background(), testIngestRequest(testIngestHeader(), stream))
+
+	require.NoError(t, outcome.Err, "a block we already hold is a completed download, not a failure")
+	require.False(t, outcome.TransientLocal)
+	require.Zero(t, br.callCount(), "a block we already hold must not be re-ingested")
+	require.Equal(t, 1, stream.closeCount())
+}
+
+func TestBlockIngestorHoldsBackOrphans(t *testing.T) {
+	br := &stubBridge{preAdmit: bridge.PreAdmitResult{ParentMissing: true}}
+	ingestor, _ := newTestIngestor(t, br)
+
+	stream := &countingStream{Reader: bytes.NewReader(nil)}
+
+	outcome := ingestor.Ingest(context.Background(), testIngestRequest(testIngestHeader(), stream))
+
+	require.Error(t, outcome.Err)
+	require.True(t, outcome.TransientLocal, "our chain being behind is not the peer's fault")
+	require.False(t, outcome.Rotate)
+	require.Zero(t, br.callCount(), "an orphan must not run the pipeline")
+	require.Equal(t, 1, stream.closeCount())
+}
+
+// TestBlockIngestorRotatesOnPreAdmitDeadline pins which phase the pre-admission
+// deadline covers: the blockchain lookups, and only those.
+func TestBlockIngestorRotatesOnPreAdmitDeadline(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.PeerProcessingTimeout = 50 * time.Millisecond
+
+	admission := bridge.NewAdmission(ulogger.TestLogger{}, tSettings)
+	t.Cleanup(admission.Stop)
+
+	// A wedged blockchain client: the lookups never answer.
+	br := &stubBridge{preAdmitBlock: make(chan struct{})}
+	defer close(br.preAdmitBlock)
+
+	ingestor := &blockIngestor{logger: ulogger.TestLogger{}, bridge: br, admission: admission}
+
+	stream := &countingStream{Reader: bytes.NewReader(nil)}
+
+	outcome := ingestor.Ingest(context.Background(), testIngestRequest(testIngestHeader(), stream))
+
+	require.Error(t, outcome.Err)
+	require.True(t, outcome.Rotate, "a wedged lookup must rotate the sync peer rather than park the read loop")
+	require.False(t, outcome.TransientLocal, "a rotation is not also a stall-clock refresh")
+	require.Zero(t, br.callCount())
+	require.Equal(t, 1, stream.closeCount())
+}
+
+// TestBlockIngestorDoesNotDeadlineTheBudgetWait is the other half of the same
+// rule: a caller parked on the admission budget is waiting on OUR in-flight
+// blocks, so it must not inherit the pre-admission deadline and must never
+// rotate the delivering peer.
+func TestBlockIngestorDoesNotDeadlineTheBudgetWait(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.PeerProcessingTimeout = 50 * time.Millisecond
+	tSettings.Legacy.BlockPrefetchBufferBytes = 128 * 1024
+
+	admission := bridge.NewAdmission(ulogger.TestLogger{}, tSettings)
+	t.Cleanup(admission.Stop)
+
+	// Fill the whole budget with another block, so this ingest parks.
+	other := chainhash.Hash{0xaa}
+
+	weight, err := admission.Acquire(context.Background(), nil, other, tSettings.Legacy.BlockPrefetchBufferBytes)
+	require.NoError(t, err)
+
+	br := &stubBridge{}
+	ingestor := &blockIngestor{logger: ulogger.TestLogger{}, bridge: br, admission: admission}
+
+	stream := &countingStream{Reader: bytes.NewReader(nil)}
+
+	done := make(chan protocol.IngestOutcome, 1)
+	go func() {
+		done <- ingestor.Ingest(context.Background(), testIngestRequest(testIngestHeader(), stream))
+	}()
+
+	// Well past the pre-admission deadline: a budget wait must survive it.
+	select {
+	case outcome := <-done:
+		t.Fatalf("the budget wait inherited the pre-admission deadline: %+v", outcome)
+	case <-time.After(10 * tSettings.Legacy.PeerProcessingTimeout):
+	}
+
+	admission.Release(other, weight)
+
+	select {
+	case outcome := <-done:
+		require.NoError(t, outcome.Err)
+		require.False(t, outcome.Rotate, "our own backpressure must never rotate the delivering peer")
+		require.Equal(t, 1, br.callCount())
+	case <-time.After(5 * time.Second):
+		t.Fatal("the ingest never resumed after the budget drained")
+	}
 }
 
 func TestBlockIngestorBacksOffLocalFailures(t *testing.T) {
