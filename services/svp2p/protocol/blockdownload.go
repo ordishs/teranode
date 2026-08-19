@@ -31,9 +31,46 @@ const BlockStallingTimeout = 10 * time.Second
 // CheckStall.
 const MaxLastBlockTime = 180 * time.Second
 
+// MaxBlockDownloadTime carries services/legacy/peer/peer.go
+// MaxBlockDownloadTime (30 minutes): the wall-clock ceiling on how long a
+// single block download may hold off the sync-peer rotation on the strength of
+// its own throughput. Past it the peer rotates however fast it is delivering,
+// so a peer cannot dribble bytes just above the rate floor for ever and hold
+// the single sync slot.
+const MaxBlockDownloadTime = 30 * time.Minute
+
+// MinBlockDownloadBytesPerSec carries services/legacy/peer/peer.go
+// minBlockDownloadBytesPerSec (51200), which is also the legacy
+// -minsyncpeernetworkspeed default (services/legacy/config.go
+// defaultMinSyncPeerNetworkSpeed). It is the rate a block ingest must sustain
+// to count as progress for the rotation clock.
+const MinBlockDownloadBytesPerSec = 51200
+
 // microsPerSecond mirrors the net_processing.cpp MICROS_PER_SECOND used by
 // every GetTimeMicros comparison this file ports.
 const microsPerSecond = int64(time.Second / time.Microsecond)
+
+// IngestSnapshot is what the caller observed about the block this peer is
+// currently ingesting, sampled before the sync-state mutex is taken. It is the
+// counterpart of legacy netsync's per-tick association read-byte sample
+// (manager.go syncPeerState.assocReadBytes), which is what lets the rotation
+// clock tell a fat block still streaming in from a peer that went quiet.
+//
+// The zero value means no ingest is running, which is what every caller that
+// does not observe ingests passes.
+type IngestSnapshot struct {
+	// Active reports that a block ingest is in progress for this peer.
+	Active bool
+
+	// StartedMicros is when that ingest began, in microseconds since the Unix
+	// epoch. It is what MaxBlockDownloadTime is measured against.
+	StartedMicros int64
+
+	// BytesRead is the payload bytes the ingest has taken off the stream so
+	// far. It is monotonic within one ingest and restarts at zero for the
+	// next.
+	BytesRead uint64
+}
 
 // StallAction is what a periodic stall check decided about one peer. The
 // machine performs no teardown itself: it reports what the caller must do, the
@@ -564,6 +601,29 @@ func (bd *BlockDownloader) IsInFlight(hash chainhash.Hash) bool {
 	return busy
 }
 
+// IsInFlightFrom is BlockDownloadTracker::IsInFlight narrowed to one peer,
+// the lookup behind legacy netsync's BlockRequested check
+// (services/legacy/peer_server.go OnBlock, PR 1190): a block we did not ask
+// THIS peer for is unsolicited, and must be refused before it can consume the
+// admission budget.
+func (bd *BlockDownloader) IsInFlightFrom(peer *SyncPeer, hash chainhash.Hash) bool {
+	holder, busy := bd.inFlight[hash]
+
+	return busy && holder == peer
+}
+
+// BlockNotDelivered releases a block this peer will NOT deliver after all,
+// without recording it as held. It is removeFromFlight's guard on its own:
+// nothing happens unless this peer is the recorded holder.
+//
+// It exists for the duplicate-admission case, which BlockFailed cannot serve.
+// Both would re-offer the block, but BlockFailed also DELETES the have-data
+// record — and the copy that won the admission race may already have completed
+// and recorded it. Losing that record would re-download a block we hold.
+func (bd *BlockDownloader) BlockNotDelivered(peer *SyncPeer, hash chainhash.Hash) bool {
+	return bd.removeFromFlight(peer, hash)
+}
+
 // BlocksInFlight reports how many blocks are in flight across all peers.
 // Requires the caller to hold PeerManager's sync-state mutex.
 func (bd *BlockDownloader) BlocksInFlight() int { return len(bd.inFlight) }
@@ -758,12 +818,19 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 // blockchain-service subscription, so a rise can come from our own node rather
 // than from this peer. That can only ever delay a rotation, never cause a wrong
 // one, and only while the node is genuinely advancing.
-func (bd *BlockDownloader) CheckStall(peer *SyncPeer, nowMicros int64) StallAction {
+// ingest is what the caller observed about a block this peer is currently
+// ingesting; the zero value means none. It is the input to the large-block
+// suppression documented above the rotation branch.
+func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, nowMicros int64) StallAction {
 	if peer == nil || peer.State == nil {
 		return StallActionNone
 	}
 
 	state := peer.State
+
+	// Sampled on the way out, like legacy's deferred updateNetwork, so every
+	// read below compares against the PREVIOUS tick's sample.
+	defer sampleIngest(state, ingest, nowMicros)
 
 	if state.nStallingSince != 0 && state.nStallingSince < nowMicros-microsPerSecond*int64(BlockStallingTimeout/time.Second) {
 		// net_processing.cpp: "Peer=%d is stalling block download (current
@@ -797,6 +864,26 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, nowMicros int64) StallActi
 		return StallActionNone
 	}
 
+	// legacy netsync manager.go handleCheckSyncPeer (the suppression at
+	// manager.go:1052-1068): "A multi-GB block can take longer than
+	// maxLastBlockTime to arrive... Don't rotate a sync peer that is still
+	// pulling data at a healthy rate — it is making progress on a large block,
+	// not stalled." Legacy measures the association's read bytes per tick;
+	// here the ingest's own ProgressReader is the same measurement, taken
+	// closer to the truth — those bytes are the block payload leaving the
+	// socket.
+	//
+	// Without this a single block whose ingest outlives MaxLastBlockTime
+	// rotates the peer that is in the middle of delivering it, which is the
+	// one peer we most want to keep.
+	//
+	// The suppression is capped at MaxBlockDownloadTime
+	// (services/legacy/peer/peer.go), so a peer that dribbles bytes just above
+	// the rate floor cannot hold the sync slot for ever.
+	if ingestProgressing(state, ingest, nowMicros) {
+		return StallActionNone
+	}
+
 	// legacy netsync handleCheckSyncPeer: "sync peer %s is stalled due to %s,
 	// updating sync peer" → clearRequestedState then updateSyncPeer.
 	bd.clearPeer(peer)
@@ -805,4 +892,51 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, nowMicros int64) StallActi
 	state.nLastProgressTime = nowMicros
 
 	return StallActionRotateSyncPeer
+}
+
+// ingestProgressing ports legacy netsync syncPeerState.hasHealthyDownloadThroughput
+// (manager.go:302-329) together with the MaxBlockDownloadTime cap its caller
+// applies. It needs a prior sample to compute a delta, requires bytes to have
+// actually moved (a zero delta is not "downloading", whatever the rate floor
+// is configured to), and guards the unsigned subtraction — a count that went
+// backwards means a new ingest started, which is not evidence about this one.
+func ingestProgressing(state *peerSyncState, ingest IngestSnapshot, nowMicros int64) bool {
+	if !ingest.Active {
+		return false
+	}
+
+	if nowMicros-ingest.StartedMicros >= microsPerSecond*int64(MaxBlockDownloadTime/time.Second) {
+		return false
+	}
+
+	if state.nIngestSampleMicros == 0 || ingest.BytesRead < state.nIngestBytesLastSample {
+		return false
+	}
+
+	elapsed := nowMicros - state.nIngestSampleMicros
+	if elapsed <= 0 {
+		return false
+	}
+
+	delta := ingest.BytesRead - state.nIngestBytesLastSample
+	if delta == 0 {
+		return false
+	}
+
+	// delta bytes over elapsed microseconds, compared in bytes per second.
+	return delta*uint64(microsPerSecond) >= MinBlockDownloadBytesPerSec*uint64(elapsed) //nolint:gosec // both are positive here
+}
+
+// sampleIngest records this tick's ingest observation for the next tick's
+// rate calculation, the syncPeerState.assocReadBytesLastTick roll-forward.
+func sampleIngest(state *peerSyncState, ingest IngestSnapshot, nowMicros int64) {
+	if !ingest.Active {
+		state.nIngestBytesLastSample = 0
+		state.nIngestSampleMicros = 0
+
+		return
+	}
+
+	state.nIngestBytesLastSample = ingest.BytesRead
+	state.nIngestSampleMicros = nowMicros
 }

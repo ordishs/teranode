@@ -718,3 +718,75 @@ func TestIngestBlock_RejectsBadEnvelope(t *testing.T) {
 	require.Error(t, h.sm.IngestBlock(ctx, &header, 0, bytes.NewReader(full), "peer"),
 		"a block declaring no transactions must be rejected")
 }
+
+// TestPreAdmitAnswersTheBoundedLookups covers the entry the protocol layer
+// runs under its own deadline: it must answer the two questions IngestBlock
+// asks before it touches the payload, and it must separate an out-of-order
+// parent (an answer) from a lookup that failed (an error).
+func TestPreAdmitAnswersTheBoundedLookups(t *testing.T) {
+	ctx := context.Background()
+
+	block := buildCoinbaseOnlyBlock(t)
+	header := block.MsgBlock().Header
+
+	t.Run("admittable", func(t *testing.T) {
+		h := newIngestHarness(ctx, t, "preadmit_ok", false, 0)
+
+		result, err := h.sm.PreAdmit(ctx, &header)
+		require.NoError(t, err)
+		require.False(t, result.Exists)
+		require.False(t, result.ParentMissing)
+	})
+
+	t.Run("block already exists", func(t *testing.T) {
+		h := newIngestHarness(ctx, t, "preadmit_exists", false, 0)
+
+		exists := &blockchain.Mock{}
+		exists.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+		h.sm.blockchainClient = exists
+
+		result, err := h.sm.PreAdmit(ctx, &header)
+		require.NoError(t, err)
+		require.True(t, result.Exists)
+	})
+
+	t.Run("parent not found", func(t *testing.T) {
+		h := newIngestHarness(ctx, t, "preadmit_orphan", false, 0)
+
+		orphan := &blockchain.Mock{}
+		orphan.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+		orphan.On("GetBlockHeader", mock.Anything, mock.Anything).
+			Return((*model.BlockHeader)(nil), (*model.BlockHeaderMeta)(nil), errors.NewBlockNotFoundError("no parent"))
+		h.sm.blockchainClient = orphan
+
+		result, err := h.sm.PreAdmit(ctx, &header)
+		require.NoError(t, err, "an out-of-order parent is an answer, not a lookup failure")
+		require.True(t, result.ParentMissing)
+	})
+
+	t.Run("lookup failure", func(t *testing.T) {
+		h := newIngestHarness(ctx, t, "preadmit_broken", false, 0)
+
+		broken := &blockchain.Mock{}
+		broken.On("GetBlockExists", mock.Anything, mock.Anything).
+			Return(false, errors.NewServiceError("blockchain client is unavailable"))
+		h.sm.blockchainClient = broken
+
+		_, err := h.sm.PreAdmit(ctx, &header)
+		require.Error(t, err)
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		h := newIngestHarness(ctx, t, "preadmit_cancelled", false, 0)
+
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+
+		slow := &blockchain.Mock{}
+		slow.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, context.Canceled)
+		h.sm.blockchainClient = slow
+
+		_, err := h.sm.PreAdmit(cancelled, &header)
+		require.Error(t, err)
+	})
+}

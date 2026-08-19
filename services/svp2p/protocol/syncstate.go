@@ -63,6 +63,16 @@ type peerSyncState struct {
 	// scheduling (Task 6); not touched here.
 	nStallingSince int64
 
+	// nIngestBytesLastSample and nIngestSampleMicros have no CNodeState
+	// counterpart either. They carry legacy netsync manager.go
+	// syncPeerState.assocReadBytesLastTick and the tick it was taken on: the
+	// previous sample of how far the block this peer is ingesting has got,
+	// which is what lets CheckStall compute a byte rate and keep a peer that
+	// is still delivering a large block. Both are zero when no ingest is
+	// running. Populated and consumed by block download scheduling (Task 6).
+	nIngestBytesLastSample uint64
+	nIngestSampleMicros    int64
+
 	// nLastProgressTime has no CNodeState counterpart. It carries legacy
 	// netsync manager.go syncPeerState.lastBlockTime, the clock the Teranode
 	// sync-peer rotation measures against maxLastBlockTime (PR 1067), in

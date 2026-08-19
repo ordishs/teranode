@@ -247,6 +247,42 @@ func closeIngestStream(r io.Reader) error {
 	return nil
 }
 
+// PreAdmit performs the two blockchain lookups IngestBlock makes before it
+// reads a payload byte, so a caller can run them under a deadline it controls.
+// It touches no stream and reserves nothing.
+//
+// A missing parent is an answer (ParentMissing), not an error: it is the
+// expected out-of-order case, and it is reported so the caller can skip a
+// pipeline run that would fail on it.
+func (sm *svp2pBridge) PreAdmit(ctx context.Context, header *wire.BlockHeader) (PreAdmitResult, error) {
+	if header == nil {
+		return PreAdmitResult{}, errors.NewProcessingError("[PreAdmit] block message carries no header")
+	}
+
+	blockHash := header.BlockHash()
+
+	exists, err := sm.blockchainClient.GetBlockExists(ctx, &blockHash)
+	if err != nil {
+		return PreAdmitResult{}, errors.NewProcessingError("[PreAdmit][%s] failed to check if block exists", blockHash.String(), err)
+	}
+
+	if exists {
+		return PreAdmitResult{Exists: true}, nil
+	}
+
+	if _, _, err = sm.blockchainClient.GetBlockHeader(ctx, &header.PrevBlock); err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) {
+			sm.logger.Debugf("[PreAdmit][%s] previous block %s not found (out-of-order; the block is not admitted)", blockHash.String(), header.PrevBlock)
+
+			return PreAdmitResult{ParentMissing: true}, nil
+		}
+
+		return PreAdmitResult{}, errors.NewProcessingError("[PreAdmit][%s] failed to get the header of previous block %s", blockHash.String(), header.PrevBlock, err)
+	}
+
+	return PreAdmitResult{}, nil
+}
+
 // IngestBlock runs a streamed block through the relocated ingestion pipeline.
 // It is HandleBlockDirect's contract with the wire block replaced by the
 // transport's envelope: the same existence check, the same parent-height

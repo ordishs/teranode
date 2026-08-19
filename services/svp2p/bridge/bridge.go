@@ -32,6 +32,18 @@ import (
 // them — the spec's full five-method sketch is not built early as
 // unreachable no-ops.
 type Bridge interface {
+	// PreAdmit runs the two blockchain lookups IngestBlock makes before it
+	// touches the block payload — does this block already exist, and is its
+	// parent in our chain — so the caller can bound them on its own context.
+	// Legacy did exactly that (services/legacy/peer_server.go OnBlock, PR
+	// 1281): the pre-admission phase is deadline-bounded because a wedged
+	// blockchain client would otherwise park the transport read loop, while
+	// the admission budget wait deliberately is NOT bounded, being our own
+	// backpressure. IngestBlock still repeats both lookups, so it stays
+	// correct when called on its own; they are sub-millisecond on a healthy
+	// node.
+	PreAdmit(ctx context.Context, header *wire.BlockHeader) (PreAdmitResult, error)
+
 	// IngestBlock runs a received block through the relocated netsync
 	// ingestion pipeline: existence check, parent-height validation,
 	// block-assembly readiness wait, then createTxMap -> prepareSubtrees ->
@@ -47,6 +59,21 @@ type Bridge interface {
 	// blockchain service's subscription (spec §4.4). The channel is never
 	// closed by Bridge.
 	HeaderEvents() <-chan HeaderEvent
+}
+
+// PreAdmitResult is what the bounded pre-admission lookups found. Both fields
+// are answers, not failures: an error from PreAdmit means the lookup itself
+// did not complete.
+type PreAdmitResult struct {
+	// Exists reports that we already hold this block, so there is nothing to
+	// ingest and nothing to charge against the admission budget.
+	Exists bool
+
+	// ParentMissing reports that the block's parent is not in our chain yet.
+	// Under svp2p the download scheduler only ever requests blocks in chain
+	// order, so this means our own validation is behind the header index, not
+	// that the peer sent something it should not have.
+	ParentMissing bool
 }
 
 // HeaderEvent is a tip-change notification. It is kept deliberately minimal

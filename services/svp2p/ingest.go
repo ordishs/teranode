@@ -47,12 +47,52 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 		return protocol.IngestOutcome{Err: b.release(req.TxReader, err), TransientLocal: true}
 	}
 
-	// The pre-admission phase is bounded so a wedged local round-trip cannot
-	// strand a requested block: on its deadline the sync peer rotates.
+	// ONLY the pre-admission lookups read this deadline
+	// (services/legacy/peer_server.go OnBlock, PR 1281): they are
+	// sub-millisecond on a healthy node, so the deadline fires only on a
+	// genuinely wedged blockchain client, and a wedged one must rotate the
+	// sync peer instead of parking the transport read loop for ever.
 	preAdmitCtx, cancel := b.admission.PreAdmitContext(ctx)
 	defer cancel()
 
-	weight, err := b.admission.Acquire(preAdmitCtx, req.Quit, hash, int64(req.SizeBytes)) //nolint:gosec // a block payload is bounded by MaxBlockPayload
+	result, err := b.bridge.PreAdmit(preAdmitCtx, req.Header)
+	if err != nil {
+		// A deadline means our own lookup path is wedged, which strands a
+		// block the scheduler requested; legacy answers that by rotating the
+		// sync peer. A parent cancellation (shutdown, peer teardown) is not a
+		// timeout — the block is simply dropped. Neither is the peer's fault,
+		// so neither may disconnect it.
+		return protocol.IngestOutcome{
+			Err:            b.release(req.TxReader, err),
+			Rotate:         bridge.PreAdmitTimedOut(preAdmitCtx),
+			TransientLocal: !bridge.PreAdmitTimedOut(preAdmitCtx),
+		}
+	}
+
+	if result.Exists {
+		b.logger.Debugf("[svp2p] block %s already exists, not admitting it", hash)
+
+		// We hold the block, so the download is complete as far as the
+		// scheduler is concerned. Nothing was reserved and nothing ran.
+		return protocol.IngestOutcome{Err: b.release(req.TxReader, nil)}
+	}
+
+	if result.ParentMissing {
+		// Our own validation is behind the header index. The scheduler
+		// requests blocks in chain order, so the parent is already in flight
+		// or being validated; re-offer this one rather than running a pipeline
+		// that would fail on it, and never charge the peer for it.
+		return protocol.IngestOutcome{
+			Err: b.release(req.TxReader, errors.NewServiceUnavailableError(
+				"[svp2p] block %s cannot be admitted yet: its parent %s is not in our chain", hash, req.Header.PrevBlock)),
+			TransientLocal: true,
+		}
+	}
+
+	// The budget wait deliberately keeps ctx and Quit, with no deadline: a
+	// caller parked here is waiting on OUR in-flight blocks to drain, which is
+	// backpressure we created, never a fault of the delivering peer.
+	weight, err := b.admission.Acquire(ctx, req.Quit, hash, int64(req.SizeBytes)) //nolint:gosec // a block payload is bounded by MaxBlockPayload
 	if err != nil {
 		// Nothing was reserved on any of these paths, so nothing is released:
 		// pairing Release with a failed Acquire would evict the dedup entry
@@ -61,10 +101,9 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 			return protocol.IngestOutcome{Err: b.release(req.TxReader, err), Duplicate: true}
 		}
 
-		return protocol.IngestOutcome{
-			Err:    b.release(req.TxReader, err),
-			Rotate: bridge.PreAdmitTimedOut(preAdmitCtx),
-		}
+		// The only other outcomes are ctx cancellation and peer teardown,
+		// both local.
+		return protocol.IngestOutcome{Err: b.release(req.TxReader, err), TransientLocal: true}
 	}
 
 	// Released with the same weight Acquire returned, and only for a block it
@@ -90,7 +129,8 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 }
 
 // release closes a stream the pipeline never took ownership of, and keeps the
-// original failure as the reported one.
+// original failure as the reported one. A nil cause stays nil: the close of a
+// stream we deliberately did not ingest is not itself a failure to report.
 func (b *blockIngestor) release(r io.Closer, cause error) error {
 	if err := r.Close(); err != nil {
 		b.logger.Debugf("[svp2p] block stream closed with: %v", err)

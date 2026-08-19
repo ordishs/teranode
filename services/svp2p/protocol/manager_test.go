@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -273,6 +274,9 @@ func TestManagerDetectsSelfConnection(t *testing.T) {
 // behind the interface is covered by Tasks 9, 10 and 13. It records what the
 // peer loop handed it, in arrival order.
 type recordingIngestor struct {
+	// outcome is what every Ingest reports. The zero value is success.
+	outcome IngestOutcome
+
 	mu       sync.Mutex
 	ingested []chainhash.Hash
 	sizes    []uint64
@@ -304,7 +308,23 @@ func (r *recordingIngestor) Ingest(_ context.Context, req BlockIngestRequest) In
 	r.sizes = append(r.sizes, req.SizeBytes)
 	r.txBytes = append(r.txBytes, n)
 
-	return IngestOutcome{}
+	return r.outcome
+}
+
+func (r *recordingIngestor) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.ingested)
+}
+
+// envelope returns the declared payload size and the transaction bytes the
+// ingest actually read for call i.
+func (r *recordingIngestor) envelope(i int) (uint64, int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.sizes[i], r.txBytes[i]
 }
 
 func (r *recordingIngestor) hashes() []chainhash.Hash {
@@ -396,6 +416,46 @@ func syncTestManager(t *testing.T, idx *HeaderIndex, ingestor BlockIngestor) *Pe
 	return m
 }
 
+// connectSyncPeer runs a scripted peer up to the point where we have asked it
+// for every block in chain: handshake, our getheaders, its headers reply, and
+// our getdata. It asserts the request path on the way through.
+func connectSyncPeer(t *testing.T, m *PeerManager, genesis *wire.BlockHeader, chain []*wire.BlockHeader) *scriptedPeer {
+	t.Helper()
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+
+	version := remoteVersion(4321)
+	version.Services = wire.SFNodeNetwork
+	far.completeOutboundHandshakeAs(t, version)
+
+	// net_processing.cpp SendMessages: the initial getheaders goes out as soon
+	// as the handshake finishes, from a locator on our own tip.
+	getHeaders, ok := far.readUntil(t, wire.CmdGetHeaders).(*wire.MsgGetHeaders)
+	require.True(t, ok)
+	require.Len(t, getHeaders.BlockLocatorHashes, 1)
+	require.Equal(t, genesis.BlockHash(), *getHeaders.BlockLocatorHashes[0])
+
+	headers := wire.NewMsgHeaders()
+	for _, header := range chain {
+		require.NoError(t, headers.AddBlockHeader(header))
+	}
+
+	far.write(t, headers)
+
+	// The scheduler is the only thing that may request a block (Task 6), and
+	// it asks for exactly what it just learned about, in chain order.
+	getData, ok := far.readUntil(t, wire.CmdGetData).(*wire.MsgGetData)
+	require.True(t, ok)
+	require.Len(t, getData.InvList, len(chain))
+
+	for i, inv := range getData.InvList {
+		require.Equal(t, wire.InvTypeBlock, inv.Type)
+		require.Equal(t, chain[i].BlockHash(), inv.Hash, "getdata entry %d", i)
+	}
+
+	return far
+}
+
 // TestManagerDrivesHeadersFirstBlockSync is the whole Phase 2 path through the
 // live peer loop: handshake, our getheaders, the peer's headers, our getdata
 // for exactly those blocks, the blocks themselves, and one ingest per block in
@@ -417,46 +477,26 @@ func TestManagerDrivesHeadersFirstBlockSync(t *testing.T) {
 
 	defer func() { require.NoError(t, m.Stop()) }()
 
-	far := dialScripted(t, m.ListenAddrs()[0])
+	far := connectSyncPeer(t, m, genesis, chain)
 	defer func() { _ = far.nc.Close() }()
-
-	version := remoteVersion(4321)
-	version.Services = wire.SFNodeNetwork
-	far.completeOutboundHandshakeAs(t, version)
-
-	// net_processing.cpp SendMessages: the initial getheaders goes out as soon
-	// as the handshake finishes, from a locator on our own tip.
-	getHeaders, ok := far.readUntil(t, wire.CmdGetHeaders).(*wire.MsgGetHeaders)
-	require.True(t, ok)
-	require.Len(t, getHeaders.BlockLocatorHashes, 1)
-
-	genesisHash := genesis.BlockHash()
-	require.Equal(t, genesisHash, *getHeaders.BlockLocatorHashes[0])
-
-	headers := wire.NewMsgHeaders()
-	for _, header := range chain {
-		require.NoError(t, headers.AddBlockHeader(header))
-	}
-
-	far.write(t, headers)
-
-	// The scheduler is the only thing that may request a block (Task 6), and
-	// it asks for the three it just learned about, in chain order.
-	getData, ok := far.readUntil(t, wire.CmdGetData).(*wire.MsgGetData)
-	require.True(t, ok)
-	require.Len(t, getData.InvList, len(chain))
-
-	for i, inv := range getData.InvList {
-		require.Equal(t, wire.InvTypeBlock, inv.Type)
-		require.Equal(t, chain[i].BlockHash(), inv.Hash, "getdata entry %d", i)
-	}
 
 	for _, header := range chain {
 		far.write(t, blockFor(header))
 	}
 
-	require.Eventually(t, func() bool { return len(ingestor.hashes()) == len(chain) },
+	require.Eventually(t, func() bool { return ingestor.count() == len(chain) },
 		10*time.Second, 20*time.Millisecond, "not every block reached the ingest interface")
+
+	// The envelope the transport hands the ingestor is the block's own: the
+	// declared payload length (the honest admission weight) and the
+	// transactions after the 80 byte header and the count varint.
+	for i, header := range chain {
+		payload := int64(blockFor(header).SerializeSize())
+		size, txBytes := ingestor.envelope(i)
+
+		require.Equal(t, uint64(payload), size, "block %d: SizeBytes must be the declared payload length", i)
+		require.Equal(t, payload-80-1, txBytes, "block %d: the ingest reads the payload past the header and the tx count", i)
+	}
 
 	want := make([]chainhash.Hash, 0, len(chain))
 	for _, header := range chain {
@@ -473,6 +513,176 @@ func TestManagerDrivesHeadersFirstBlockSync(t *testing.T) {
 
 		return m.blockDownloader.BlocksInFlight() == 0 && len(m.blockDownloader.haveData) == len(chain)
 	}, 10*time.Second, 20*time.Millisecond, "block downloads were not released on ingest completion")
+}
+
+// TestManagerDisconnectsAPeerWhoseBlockIsRejected carries
+// services/legacy/peer_server.go shouldDisconnectOnBlockErr: a block the
+// pipeline rejected is the peer's fault, and the peer goes — otherwise the
+// same bad block is re-offered to the same peer for ever.
+func TestManagerDisconnectsAPeerWhoseBlockIsRejected(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 3)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	ingestor := &recordingIngestor{
+		outcome: IngestOutcome{Err: errors.New(errors.ERR_BLOCK_INVALID, "svp2p: test block is invalid")},
+	}
+
+	m := syncTestManager(t, idx, ingestor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := connectSyncPeer(t, m, genesis, chain)
+	defer func() { _ = far.nc.Close() }()
+
+	far.write(t, blockFor(chain[0]))
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 0 },
+		10*time.Second, 20*time.Millisecond, "a peer serving a rejected block must be disconnected")
+}
+
+// TestManagerKeepsAPeerAfterALocalFault is the other half of the same rule: a
+// transient LOCAL condition is ours, not the peer's, so the peer stays and the
+// block is simply re-offered.
+func TestManagerKeepsAPeerAfterALocalFault(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 4)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	ingestor := &recordingIngestor{
+		outcome: IngestOutcome{
+			Err:            errors.NewServiceError("svp2p: test utxo store is unavailable"),
+			TransientLocal: true,
+		},
+	}
+
+	m := syncTestManager(t, idx, ingestor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := connectSyncPeer(t, m, genesis, chain)
+	defer func() { _ = far.nc.Close() }()
+
+	far.write(t, blockFor(chain[0]))
+
+	require.Eventually(t, func() bool { return ingestor.count() == 1 },
+		10*time.Second, 20*time.Millisecond, "the block never reached the ingestor")
+
+	// The block goes back on offer, so the scheduler asks for it again — and
+	// the peer that delivered it is still there to ask.
+	getData, ok := far.readUntil(t, wire.CmdGetData).(*wire.MsgGetData)
+	require.True(t, ok)
+	require.Len(t, getData.InvList, 1)
+	require.Equal(t, chain[0].BlockHash(), getData.InvList[0].Hash)
+
+	require.Equal(t, int32(1), m.ConnectedCount(), "a local fault must not cost the peer its connection")
+}
+
+// TestManagerDisconnectsAnUnrequestedBlock carries
+// services/legacy/peer_server.go OnBlock: an unrequested block is refused
+// before it can consume admission budget, so a peer cannot flood the shared
+// budget and starve the real sync peer.
+func TestManagerDisconnectsAnUnrequestedBlock(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 5)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	ingestor := &recordingIngestor{}
+	m := syncTestManager(t, idx, ingestor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+	defer func() { _ = far.nc.Close() }()
+
+	version := remoteVersion(4321)
+	version.Services = wire.SFNodeNetwork
+	far.completeOutboundHandshakeAs(t, version)
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 1 }, 5*time.Second, 20*time.Millisecond)
+
+	// Nothing has been requested from this peer: this block is unsolicited.
+	far.write(t, blockFor(chain[0]))
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 0 },
+		10*time.Second, 20*time.Millisecond, "an unrequested block must cost the peer its connection")
+
+	require.Zero(t, ingestor.count(), "an unrequested block must never reach the ingest path")
+}
+
+// TestManagerDuplicateReleasesTheHolderRecord covers the exact leak sequence a
+// rotation opens: the sync peer A is rotated while block X is in flight from
+// it, the scheduler re-offers X to peer B, B is refused by the admission dedup
+// because A is still ingesting X, and A then completes. Without releasing B's
+// record on the duplicate report, X stays in flight from B for ever and is
+// never re-offered.
+func TestManagerDuplicateReleasesTheHolderRecord(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 6)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	connected, err := idx.AddHeader(chain[0])
+	require.NoError(t, err)
+	require.True(t, connected)
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+
+	block, ok := idx.Lookup(chain[0].BlockHash())
+	require.True(t, ok)
+
+	peerA := NewSyncPeer("1.1.1.1:8333", wire.SFNodeNetwork, newPeerSyncState())
+	peerB := NewSyncPeer("2.2.2.2:8333", wire.SFNodeNetwork, newPeerSyncState())
+
+	m.syncMu.Lock()
+	require.True(t, m.blockDownloader.MarkBlockAsInFlight(peerA, block))
+
+	// The rotation releases A's downloads while its ingest is still running.
+	m.blockDownloader.PeerDisconnected(peerA)
+
+	// The scheduler re-offers the block to B.
+	require.True(t, m.blockDownloader.MarkBlockAsInFlight(peerB, block))
+	m.syncMu.Unlock()
+
+	// B is refused by the admission dedup: A still holds the admission slot.
+	require.NoError(t, m.BlockDone(peerB, block.Hash, IngestOutcome{
+		Duplicate: true,
+		Err:       errors.NewServiceError("duplicate block already in flight"),
+	}))
+
+	// A's ingest completes.
+	require.NoError(t, m.BlockDone(peerA, block.Hash, IngestOutcome{}))
+
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	require.False(t, m.blockDownloader.IsInFlight(block.Hash),
+		"the duplicate must release the record of the peer that will not deliver")
+	require.Equal(t, 0, peerB.State.nBlocksInFlight)
+	require.Contains(t, m.blockDownloader.haveData, block.Hash,
+		"the copy that completed still counts as held")
 }
 
 // TestManagerAdvertisesHeaderIndexHeight covers the Phase 1 placeholder this
