@@ -161,6 +161,14 @@ type BlockDownloader struct {
 	// nothing else. Guarded by the caller's sync-state mutex like every other
 	// field here, so it needs no atomic.
 	txInvsReceived uint64
+
+	// maxLastBlockTime is the rotation window CheckStall measures against. It
+	// is an instance field rather than the MaxLastBlockTime constant used
+	// directly so an integration test can shrink it on its own downloader and
+	// observe a rotation without waiting out three real minutes. It is seeded
+	// with MaxLastBlockTime and is only ever narrowed, never widened, by the
+	// one caller that sets it (PeerManager.ConfigureSync).
+	maxLastBlockTime time.Duration
 }
 
 // NewBlockDownloader builds a downloader over the header index and the
@@ -179,11 +187,12 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 	_, tipHeight := idx.Tip()
 
 	return &BlockDownloader{
-		idx:           idx,
-		hs:            hs,
-		inFlight:      make(map[chainhash.Hash]*SyncPeer),
-		haveData:      make(map[chainhash.Hash]int32),
-		lastTipHeight: tipHeight,
+		idx:              idx,
+		hs:               hs,
+		inFlight:         make(map[chainhash.Hash]*SyncPeer),
+		haveData:         make(map[chainhash.Hash]int32),
+		lastTipHeight:    tipHeight,
+		maxLastBlockTime: MaxLastBlockTime,
 	}, nil
 }
 
@@ -860,7 +869,7 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 		return StallActionNone
 	}
 
-	if nowMicros-state.nLastProgressTime <= microsPerSecond*int64(MaxLastBlockTime/time.Second) {
+	if nowMicros-state.nLastProgressTime <= int64(bd.maxLastBlockTime/time.Microsecond) {
 		return StallActionNone
 	}
 

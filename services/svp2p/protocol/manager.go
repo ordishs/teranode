@@ -70,6 +70,12 @@ type SyncConfig struct {
 
 	// TickInterval overrides defaultSyncTick.
 	TickInterval time.Duration
+
+	// MaxLastBlockTime narrows the sync-peer rotation window from the
+	// MaxLastBlockTime constant. Zero keeps the constant. It exists so an
+	// integration test can observe a rotation in seconds instead of the three
+	// real minutes the production window costs.
+	MaxLastBlockTime time.Duration
 }
 
 // PeerManager owns listeners, the outbound dialer, the peer registry, and the
@@ -170,6 +176,10 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 	blockDownloader, err := NewBlockDownloader(cfg.Index, headerSync)
 	if err != nil {
 		return err
+	}
+
+	if cfg.MaxLastBlockTime > 0 {
+		blockDownloader.maxLastBlockTime = cfg.MaxLastBlockTime
 	}
 
 	m.headerSync = headerSync
