@@ -126,7 +126,11 @@ func buildFixtureChain(t *testing.T, tSettings *settings.Settings, count int) *f
 	require.NoError(t, err)
 
 	prevHash := genesisHash
-	baseTime := time.Now().Add(-2 * time.Hour).Unix()
+	// Headers are spaced ten minutes apart, and a block more than two hours in
+	// the future is rejected. Starting the run far enough back that its LAST
+	// header still lands in the past keeps that rule out of the way however
+	// long the fixture chain is.
+	baseTime := time.Now().Add(-time.Duration(count+2) * 10 * time.Minute).Unix()
 
 	for i := 0; i < count; i++ {
 		height := uint32(i + 1) //nolint:gosec // test heights are small
@@ -571,11 +575,16 @@ func (h *syncHarness) waitFor(t *testing.T, cond func() bool, timeout time.Durat
 
 // bestBlock reads the node's own blockchain store, which is the exit-criterion
 // witness: nothing but a completed ingest through ProcessBlock puts a block there.
+//
+// A store fault is reported rather than swallowed, so it cannot present later
+// as a plain height or hash mismatch.
 func (h *syncHarness) bestBlock(t *testing.T) (chainhash.Hash, uint32) {
 	t.Helper()
 
 	header, meta, err := h.blockchainStore.GetBestBlockHeader(context.Background())
 	if err != nil {
+		t.Logf("blockchain store GetBestBlockHeader failed: %v", err)
+
 		return chainhash.Hash{}, 0
 	}
 
@@ -749,12 +758,15 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 		return height == uint32(syncTestChainLength/2)
 	}, 60*time.Second, "the half the stalling peer did deliver never reached the blockchain store")
 
-	// The rotation is the mechanism under test: manager.go syncTickOnce logs
-	// exactly this line when BlockDownloader.CheckStall returns
-	// StallActionRotateSyncPeer.
-	h.waitFor(t, func() bool {
-		return h.logger.contains("rotating the sync peer") && h.logger.contains("no sync progress")
-	},
+	// The rotation is the mechanism under test. manager.go syncTickOnce formats
+	// exactly this line, naming the rotated peer, and only when
+	// BlockDownloader.CheckStall returns StallActionRotateSyncPeer. Matching the
+	// whole formatted line rather than two loose substrings is what keeps the
+	// other rotation log (the pre-admission timeout in BlockDone) and any
+	// unrelated peer-teardown line from satisfying it between them.
+	wantRotation := fmt.Sprintf("rotating the sync peer %s: no sync progress", stalled.addr)
+
+	h.waitFor(t, func() bool { return h.logger.contains(wantRotation) },
 		60*time.Second, "the sync peer was never rotated for making no progress")
 
 	// The rotation releases the sync slot and the peer's downloads without
@@ -772,6 +784,12 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 
 	replacement.Listen()
 
+	// The budget below has to cover the dial loop reaching a peer whose port was
+	// closed until now. That backoff starts at dialRetryBase (5 s) and DOUBLES
+	// per failed attempt with no reset until a connection completes, so the wait
+	// the replacement needs grows with how long the earlier waits above took.
+	// Two minutes covers roughly five failed attempts; if the earlier waits ever
+	// start running long, raise this budget rather than trimming them.
 	h.waitForHeight(t, uint32(syncTestChainLength), 120*time.Second, "sync after the replacement peer connected")
 
 	hash, _ := h.bestBlock(t)
