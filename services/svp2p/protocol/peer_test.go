@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -34,7 +35,41 @@ func (s *scriptedPeer) write(t *testing.T, msg wire.Message) {
 	require.NoError(t, err)
 }
 
+// writeAsync writes on its own goroutine and ignores the outcome. A block
+// message is bigger than net.Pipe's zero buffer, so the write only completes
+// once the consumer has taken the whole payload — which is exactly what a
+// stalled-ingest test is holding up.
+func (s *scriptedPeer) writeAsync(msg wire.Message) {
+	go func() {
+		_, _ = wire.WriteMessageWithEncodingN(s.nc, msg, wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+	}()
+}
+
+// readUntil reads messages until one carries the wanted command, so a test
+// can assert on a sync message without scripting every ping and sendheaders
+// that shares the lane with it.
+func (s *scriptedPeer) readUntil(t *testing.T, want string) wire.Message {
+	t.Helper()
+
+	for i := 0; i < 64; i++ {
+		msg := s.read(t)
+		if msg.Command() == want {
+			return msg
+		}
+	}
+
+	t.Fatalf("no %s message received", want)
+
+	return nil
+}
+
 func newTestPeer(t *testing.T, idle, ping time.Duration) (*Peer, *scriptedPeer) {
+	t.Helper()
+
+	return newIngestingTestPeer(t, idle, ping, nil)
+}
+
+func newIngestingTestPeer(t *testing.T, idle, ping time.Duration, ingestor BlockIngestor) (*Peer, *scriptedPeer) {
 	t.Helper()
 
 	a, b := net.Pipe()
@@ -53,9 +88,130 @@ func newTestPeer(t *testing.T, idle, ping time.Duration) (*Peer, *scriptedPeer) 
 		},
 		Conn: conn, Logger: ulogger.TestLogger{},
 		IdleTimeout: idle, PingInterval: ping, BanThreshold: 100,
+		Ingestor: ingestor,
 	}
 
 	return NewPeer(cfg), &scriptedPeer{nc: b}
+}
+
+// blockingIngestor holds a block stream open the way a real ingest of a fat
+// block does, so a test can drive the peer's idle timer against it.
+type blockingIngestor struct {
+	// readFirstByte makes the ingest take one payload byte before it stalls,
+	// which is what separates a stalled peer from our own local pre-read
+	// waits (bridge.ProgressReader's documented rule).
+	readFirstByte bool
+
+	started chan struct{}
+	release chan struct{}
+}
+
+func newBlockingIngestor(readFirstByte bool) *blockingIngestor {
+	return &blockingIngestor{
+		readFirstByte: readFirstByte,
+		started:       make(chan struct{}, 1),
+		release:       make(chan struct{}),
+	}
+}
+
+func (b *blockingIngestor) WatchProgress(r io.ReadCloser) IngestProgress {
+	return newTestProgress(r)
+}
+
+func (b *blockingIngestor) Ingest(ctx context.Context, req BlockIngestRequest) IngestOutcome {
+	defer func() { _ = req.TxReader.Close() }()
+
+	if b.readFirstByte {
+		if _, err := io.ReadFull(req.TxReader, make([]byte, 1)); err != nil {
+			return IngestOutcome{Err: err}
+		}
+	}
+
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+
+	select {
+	case <-b.release:
+	case <-req.Quit:
+	case <-ctx.Done():
+	}
+
+	return IngestOutcome{}
+}
+
+// TestPeerIdleTimerToleratesLocalIngestWait is the ProgressReader rule the
+// peer loop must honour: an ingest that has read no payload byte yet is
+// waiting on OUR services (WaitForBlockAssemblyReady,
+// waitForPreviousBlockMined), and the peer must not be dropped for it.
+func TestPeerIdleTimerToleratesLocalIngestWait(t *testing.T) {
+	const idle = 150 * time.Millisecond
+
+	ingestor := newBlockingIngestor(false)
+
+	p, far := newIngestingTestPeer(t, idle, time.Hour, ingestor)
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- p.Run(context.Background()) }()
+
+	defer func() {
+		p.Disconnect("test teardown")
+		close(ingestor.release)
+	}()
+
+	completeHandshake(t, far)
+
+	genesis := syncGenesis()
+	far.writeAsync(blockFor(minedChild(genesis, testEasyBits, 9)))
+
+	select {
+	case <-ingestor.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the block never reached the ingestor")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("peer disconnected during a local ingest wait: %v", err)
+	case <-time.After(4 * idle):
+	}
+}
+
+// TestPeerIdleTimerDropsStalledIngest is the other half of the rule: once
+// payload bytes have started moving, they have to keep moving.
+func TestPeerIdleTimerDropsStalledIngest(t *testing.T) {
+	const idle = 150 * time.Millisecond
+
+	ingestor := newBlockingIngestor(true)
+
+	p, far := newIngestingTestPeer(t, idle, time.Hour, ingestor)
+
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- p.Run(context.Background()) }()
+
+	defer close(ingestor.release)
+
+	completeHandshake(t, far)
+
+	genesis := syncGenesis()
+	far.writeAsync(blockFor(minedChild(genesis, testEasyBits, 10)))
+
+	select {
+	case <-ingestor.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the block never reached the ingestor")
+	}
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "idle")
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer did not disconnect after the ingest stopped making progress")
+	}
 }
 
 func completeHandshake(t *testing.T, far *scriptedPeer) {
