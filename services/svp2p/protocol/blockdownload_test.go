@@ -965,3 +965,327 @@ func TestPeerDisconnected_ReleasesEverythingThePeerHeld(t *testing.T) {
 	require.Equal(t, 1, other.State.nBlocksInFlight)
 	require.Equal(t, 1, f.bd.BlocksInFlight())
 }
+
+// multiPeerFixture is the world all-peer block scheduling happens in: three
+// branches off one genesis.
+//
+//   - main is the fixture chain, BlockDownloadWindow + 6 headers at difficulty 1.
+//     It is what every USEFUL peer announces, and none of it is downloaded.
+//   - ours is three heavy headers and stands for our own active chain.
+//   - light is five difficulty-1 headers. It stands TALLER than ours and carries
+//     LESS work.
+//
+// Three branches rather than one chain, because the useless-peer case is a WORK
+// test: Phase 3 Task 1 put ChainWork on HeaderNode and made the download gate
+// order by work. A peer whose best known block merely stood lower than our tip
+// would be refused by the last-common test instead, which proves nothing about
+// the gate.
+type multiPeerFixture struct {
+	*downloadFixture
+
+	ourTip   HeaderNode
+	mainTip  HeaderNode
+	lightTip HeaderNode
+}
+
+func newMultiPeerFixture(t *testing.T) *multiPeerFixture {
+	t.Helper()
+
+	f := newDownloadFixture(t, BlockDownloadWindow+6)
+
+	ours := buildChainBits(t, f.idx, &nonceCounter{next: 90000}, f.genesis, 3, heavyBits)
+	light := buildChainBits(t, f.idx, &nonceCounter{next: 95000}, f.genesis, 5, difficulty1Bits)
+
+	ourTip, ok := f.idx.Lookup(ours[len(ours)-1].BlockHash())
+	require.True(t, ok)
+
+	lightTip, ok := f.idx.Lookup(light[len(light)-1].BlockHash())
+	require.True(t, ok)
+
+	require.Positive(t, ourTip.ChainWork.Cmp(lightTip.ChainWork),
+		"test setup: the useless peer's branch must carry less work than our own tip")
+	require.Greater(t, lightTip.Height, ourTip.Height,
+		"test setup: the useless peer's branch must stand taller than our own tip, so height cannot be what refuses it")
+
+	return &multiPeerFixture{
+		downloadFixture: f,
+		ourTip:          ourTip,
+		mainTip:         f.node(t, len(f.chain)),
+		lightTip:        lightTip,
+	}
+}
+
+// usefulPeer returns a full-node peer whose best known block is the main
+// branch tip, which is the availability Task 4's promotion sweep supplies to a
+// peer that never held the sync slot.
+func (f *multiPeerFixture) usefulPeer(addr string) *SyncPeer {
+	peer := fullNodePeer(addr)
+	best := f.mainTip
+	peer.State.pindexBestKnownBlock = &best
+
+	return peer
+}
+
+// requestedBlocks runs SendGetDataBlocks once for each peer in turn, which is
+// the shape one sync tick has: net_processing.cpp drives SendMessages per peer
+// (net_processing.cpp:5865) and each peer takes its own pass over the same
+// window. It returns the hashes each peer was asked for, index-aligned with
+// peers.
+func requestedBlocks(t *testing.T, bd *BlockDownloader, activeTip HeaderNode, now int64, peers []*SyncPeer) [][]chainhash.Hash {
+	t.Helper()
+
+	asked := make([][]chainhash.Hash, len(peers))
+
+	for i, peer := range peers {
+		hashes := make([]chainhash.Hash, 0)
+
+		for _, msg := range bd.SendGetDataBlocks(peer, activeTip, now) {
+			getData, ok := msg.(*wire.MsgGetData)
+			require.True(t, ok, "the block pass may only produce getdata, got %T", msg)
+
+			for _, inv := range getData.InvList {
+				require.Equal(t, wire.InvTypeBlock, inv.Type)
+
+				hashes = append(hashes, inv.Hash)
+			}
+		}
+
+		asked[i] = hashes
+	}
+
+	return asked
+}
+
+// heightRange is the inclusive height slice from..to. It pairs with heightsOf
+// (headerindex_test.go) so a case can state the window slice it expects instead
+// of a list of hashes.
+func heightRange(from, to int32) []int32 {
+	out := make([]int32, 0, to-from+1)
+
+	for h := from; h <= to; h++ {
+		out = append(out, h)
+	}
+
+	return out
+}
+
+// TestSendGetDataBlocks_SchedulesAcrossEveryUsefulPeer is the multi-peer
+// contract: one sync tick offers the download window to EVERY peer that can
+// serve blocks, and the window walk itself is what keeps the offers apart —
+// peer B's walk skips whatever peer A took and carries on from there.
+//
+// It is the port of the per-peer getdata pass in net_processing.cpp SendMessages
+// (net_processing.cpp:5865 drives it per peer; the pass itself is
+// SendGetDataBlocks, net_processing.cpp:5662-5701, gated on
+// nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER). Phase 2 could not exercise
+// it: while a headers-first round ran, only the sync peer had a useful
+// pindexBestKnownBlock. Phase 3 Task 4's promotion sweep gives every peer one,
+// so the pass has more than one peer to distribute across.
+func TestSendGetDataBlocks_SchedulesAcrossEveryUsefulPeer(t *testing.T) {
+	tests := []struct {
+		name string
+		// peers builds the peers this tick runs over, in the order it reaches
+		// them.
+		peers func(t *testing.T, f *multiPeerFixture) []*SyncPeer
+		// prepare runs before the tick, on the peers peers returned.
+		prepare func(t *testing.T, f *multiPeerFixture, peers []*SyncPeer)
+		// wantHeights is the window slice each peer must be asked for.
+		wantHeights [][]int32
+		// wantStaller is the index of the peer whose nStallingSince clock this
+		// tick must start, or -1 when nobody may be named.
+		wantStaller int
+	}{
+		{
+			name: "two peers with the same best known block split the window",
+			peers: func(_ *testing.T, f *multiPeerFixture) []*SyncPeer {
+				return []*SyncPeer{f.usefulPeer("1.1.1.1:8333"), f.usefulPeer("2.2.2.2:8333")}
+			},
+			wantHeights: [][]int32{
+				heightRange(1, MaxBlocksInTransitPerPeer),
+				heightRange(MaxBlocksInTransitPerPeer+1, 2*MaxBlocksInTransitPerPeer),
+			},
+			wantStaller: -1,
+		},
+		{
+			name: "a taller peer carrying less work than our own tip gets nothing",
+			peers: func(_ *testing.T, f *multiPeerFixture) []*SyncPeer {
+				useless := fullNodePeer("3.3.3.3:8333")
+				best := f.lightTip
+				useless.State.pindexBestKnownBlock = &best
+
+				return []*SyncPeer{f.usefulPeer("1.1.1.1:8333"), useless, f.usefulPeer("2.2.2.2:8333")}
+			},
+			wantHeights: [][]int32{
+				heightRange(1, MaxBlocksInTransitPerPeer),
+				{},
+				heightRange(MaxBlocksInTransitPerPeer+1, 2*MaxBlocksInTransitPerPeer),
+			},
+			wantStaller: -1,
+		},
+		{
+			name: "the peer holding the window head is named the staller",
+			peers: func(_ *testing.T, f *multiPeerFixture) []*SyncPeer {
+				return []*SyncPeer{f.usefulPeer("1.1.1.1:8333"), f.usefulPeer("2.2.2.2:8333")}
+			},
+			prepare: func(t *testing.T, f *multiPeerFixture, peers []*SyncPeer) {
+				t.Helper()
+
+				// The first peer takes the head of the window and holds it: 16
+				// blocks is where a silent peer comes to rest, because
+				// SendGetDataBlocks is the only thing that marks blocks in flight
+				// and nothing decrements the count until a block arrives.
+				head := requestedBlocks(t, f.bd, f.ourTip, testNow-micros(time.Minute), peers[:1])
+				require.Len(t, head[0], MaxBlocksInTransitPerPeer)
+
+				// The second peer then downloads the whole rest of the window and
+				// still cannot move, which is the only thing that names a staller.
+				for h := MaxBlocksInTransitPerPeer + 1; h <= BlockDownloadWindow; h++ {
+					node := f.node(t, h)
+
+					require.True(t, f.bd.MarkBlockAsInFlight(peers[1], node))
+					require.True(t, f.bd.BlockReceived(peers[1], node.Hash, testNow-micros(time.Minute)))
+				}
+			},
+			wantHeights: [][]int32{{}, {}},
+			wantStaller: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMultiPeerFixture(t)
+			peers := tc.peers(t, f)
+
+			require.Len(t, tc.wantHeights, len(peers), "test setup: one expectation per peer")
+
+			if tc.prepare != nil {
+				tc.prepare(t, f, peers)
+			}
+
+			asked := requestedBlocks(t, f.bd, f.ourTip, testNow, peers)
+
+			for i := range peers {
+				require.Equal(t, tc.wantHeights[i], heightsOf(t, f.idx, asked[i]), "peer %d was asked for the wrong window slice", i)
+			}
+
+			// The invariants every tick owes, whatever the case: no block is
+			// requested from two peers, no peer is asked for more than the
+			// in-transit cap, and nothing outside the download window is asked
+			// for at all.
+			holders := make(map[chainhash.Hash]int, 2*MaxBlocksInTransitPerPeer)
+
+			for i, peer := range peers {
+				require.LessOrEqual(t, len(asked[i]), MaxBlocksInTransitPerPeer,
+					"peer %d was asked for more than MAX_BLOCKS_IN_TRANSIT_PER_PEER", i)
+
+				for _, hash := range asked[i] {
+					previous, dup := holders[hash]
+					require.False(t, dup, "block %s was requested from peer %d and peer %d", hash, previous, i)
+
+					holders[hash] = i
+
+					require.True(t, f.bd.IsInFlightFrom(peer, hash),
+						"a requested block must be recorded in flight from the peer it was requested from")
+
+					node, ok := f.idx.Lookup(hash)
+					require.True(t, ok)
+					require.Positive(t, node.Height)
+					require.LessOrEqual(t, node.Height, int32(BlockDownloadWindow),
+						"the download window must bound every peer's batch, not just the first peer's")
+				}
+			}
+
+			for i, peer := range peers {
+				if i == tc.wantStaller {
+					require.Equal(t, testNow, peer.State.nStallingSince, "peer %d must be named the staller", i)
+					continue
+				}
+
+				require.Zero(t, peer.State.nStallingSince, "peer %d must not be named the staller", i)
+			}
+		})
+	}
+}
+
+// TestSendGetDataBlocks_AdvancesEachPeersLastCommonBlockIndependently pins that
+// pindexLastCommonBlock is per-peer state, not shared. It is a CNodeState field
+// in the source (net_processing.cpp) and a peerSyncState field here, and the
+// multi-peer contract depends on it: two peers walk the same window from
+// different starting points, so one peer's progress must not move where another
+// peer's walk resumes.
+func TestSendGetDataBlocks_AdvancesEachPeersLastCommonBlockIndependently(t *testing.T) {
+	f := newMultiPeerFixture(t)
+
+	deliverer := f.usefulPeer("1.1.1.1:8333")
+	silent := f.usefulPeer("2.2.2.2:8333")
+	peers := []*SyncPeer{deliverer, silent}
+
+	asked := requestedBlocks(t, f.bd, f.ourTip, testNow, peers)
+	require.Len(t, asked[0], MaxBlocksInTransitPerPeer)
+	require.Len(t, asked[1], MaxBlocksInTransitPerPeer)
+
+	// Only the first peer delivers. Its whole batch is the unbroken run above
+	// the fork point, so its own last-common block may advance over it.
+	for _, hash := range asked[0] {
+		require.True(t, f.bd.BlockReceived(deliverer, hash, testNow))
+	}
+
+	requestedBlocks(t, f.bd, f.ourTip, testNow+micros(time.Second), peers)
+
+	require.NotNil(t, deliverer.State.pindexLastCommonBlock)
+	require.Equal(t, int32(MaxBlocksInTransitPerPeer), deliverer.State.pindexLastCommonBlock.Height,
+		"the delivering peer's window must move up over the run it completed")
+
+	// The silent peer's walk still resumes where it started: the fork point
+	// between our own branch and the branch both peers announced, which is
+	// genesis here.
+	require.NotNil(t, silent.State.pindexLastCommonBlock)
+	require.Equal(t, f.genesis.BlockHash(), silent.State.pindexLastCommonBlock.Hash,
+		"another peer's deliveries must not move where this peer's walk resumes")
+}
+
+// TestSendGetDataBlocks_ReSchedulesBlocksAPeerDisconnectReleased pins the
+// RELEASE path only: ClearPeer puts everything a departed peer was downloading
+// back on offer, and the next tick's pass hands those blocks to a peer that is
+// still here.
+//
+// It is NOT a claim that a silent peer's blocks come back on their own. A peer
+// that keeps its connection and answers nothing holds
+// MaxBlocksInTransitPerPeer blocks until something disconnects it — see the
+// cost note on CheckStall and
+// TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain. Taking single
+// blocks back from a peer that is still connected needs the per-block download
+// timeout, which this task does not carry.
+func TestSendGetDataBlocks_ReSchedulesBlocksAPeerDisconnectReleased(t *testing.T) {
+	f := newMultiPeerFixture(t)
+
+	going := f.usefulPeer("1.1.1.1:8333")
+	staying := f.usefulPeer("2.2.2.2:8333")
+	peers := []*SyncPeer{going, staying}
+
+	asked := requestedBlocks(t, f.bd, f.ourTip, testNow, peers)
+
+	released := asked[0]
+	require.Equal(t, heightRange(1, MaxBlocksInTransitPerPeer), heightsOf(t, f.idx, released))
+
+	// The peer that is staying finishes its own batch, so the in-transit cap is
+	// not what stops it taking the released blocks.
+	for _, hash := range asked[1] {
+		require.True(t, f.bd.BlockReceived(staying, hash, testNow))
+	}
+
+	f.bd.PeerDisconnected(going)
+
+	for _, hash := range released {
+		require.False(t, f.bd.IsInFlight(hash), "a departed peer's downloads must go back on offer")
+	}
+
+	next := requestedBlocks(t, f.bd, f.ourTip, testNow+micros(time.Second), []*SyncPeer{staying})
+
+	require.Equal(t, released, next[0],
+		"the blocks the disconnect released must be the head of the window the remaining peer takes next")
+
+	for _, hash := range released {
+		require.True(t, f.bd.IsInFlightFrom(staying, hash))
+	}
+}

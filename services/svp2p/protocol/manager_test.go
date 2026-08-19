@@ -890,7 +890,7 @@ type rotationFixture struct {
 	handles []peerHandle
 }
 
-func newRotationFixture(t *testing.T, height int) *rotationFixture {
+func newRotationFixture(t *testing.T, height int, checkpoints ...chaincfg.Checkpoint) *rotationFixture {
 	t.Helper()
 
 	genesis := testGenesis()
@@ -898,7 +898,47 @@ func newRotationFixture(t *testing.T, height int) *rotationFixture {
 	idx, err := NewHeaderIndex(genesis)
 	require.NoError(t, err)
 
-	m := syncTestManager(t, idx, &recordingIngestor{})
+	return newRotationFixtureFor(t, syncTestManager(t, idx, &recordingIngestor{}, checkpoints...), idx, genesis, height)
+}
+
+// newRegtestRotationFixture is newRotationFixture on the regression network with
+// the localhost restriction lifted, which is the one configuration where
+// isSyncCandidate (headersync.go) accepts a peer on nothing at all: no service
+// flag, and not even its address. That is what makes the handshake guard
+// load-bearing there. On every other network a peer that has not sent its
+// version has advertised no services, so isSyncCandidate refuses it anyway and
+// the hole never opens.
+func newRegtestRotationFixture(t *testing.T, height int) *rotationFixture {
+	t.Helper()
+
+	genesis := testGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	params := *syncTestParams(nil)
+	params.Net = wire.RegTestNet
+
+	tSettings := managerSettings()
+	tSettings.ChainCfgParams = &params
+
+	banList, err := NewBanList("")
+	require.NoError(t, err)
+
+	m := NewPeerManager(ulogger.TestLogger{}, tSettings, banList)
+
+	require.NoError(t, m.ConfigureSync(SyncConfig{
+		Index:                            idx,
+		Ingestor:                         &recordingIngestor{},
+		TickInterval:                     20 * time.Millisecond,
+		AllowSyncCandidateFromLocalPeers: true,
+	}))
+
+	return newRotationFixtureFor(t, m, idx, genesis, height)
+}
+
+func newRotationFixtureFor(t *testing.T, m *PeerManager, idx *HeaderIndex, genesis *wire.BlockHeader, height int) *rotationFixture {
+	t.Helper()
 
 	// The chain is built AFTER ConfigureSync sampled the index tip, so our own
 	// active tip stays at genesis and every header above it is a block still to
@@ -912,7 +952,10 @@ func newRotationFixture(t *testing.T, height int) *rotationFixture {
 
 		t.Cleanup(func() { _ = far.nc.Close() })
 
-		f.handles = append(f.handles, peerHandle{peer: peer, sync: fullNodePeer(addr)})
+		// established stands for what runPeer's handshake would have set: these
+		// peers are never run, and syncPass skips a peer that has not finished
+		// its version exchange.
+		f.handles = append(f.handles, peerHandle{peer: peer, sync: fullNodePeer(addr), established: true})
 	}
 
 	return f
@@ -948,6 +991,28 @@ func (f *rotationFixture) setup(fn func()) {
 // pass runs one sync tick at the given clock, with no peer ingesting.
 func (f *rotationFixture) pass(now int64) (out []outgoing, disconnect []*Peer) {
 	return f.m.syncPass(f.handles, make([]IngestSnapshot, len(f.handles)), now)
+}
+
+// getHeadersTo returns every getheaders one pass produced for peer, which is
+// how a test observes the header-sync eligibility sweep: PeerEstablished
+// answers an eligible peer with exactly that message and an ineligible one with
+// nothing.
+func getHeadersTo(out []outgoing, peer *Peer) []*wire.MsgGetHeaders {
+	msgs := make([]*wire.MsgGetHeaders, 0)
+
+	for _, o := range out {
+		if o.peer != peer {
+			continue
+		}
+
+		for _, msg := range o.msgs {
+			if getHeaders, ok := msg.(*wire.MsgGetHeaders); ok {
+				msgs = append(msgs, getHeaders)
+			}
+		}
+	}
+
+	return msgs
 }
 
 // getDataTo returns every block hash one pass asked peer for.
@@ -1036,14 +1101,17 @@ func TestSyncPass_RotationDoesNotReHandBlocksToTheRotatedPeer(t *testing.T) {
 	})
 }
 
-// TestSyncPass_ASingleCandidateNodeReElectsThePeerItJustRotated pins the one
-// case the post-rotation note on CheckStall has to carve out: electLocked runs
-// a second sweep that re-elects even the peer it was told to exclude, and
-// releaseSyncPeer already returned the slot, so a node with one candidate hands
-// it straight back and the rotation clause governs that peer again.
+// TestSyncPass_ASingleCandidateNodeTakesTheSlotBackOnTheNextTick pins the one
+// case the post-rotation note on CheckStall has to carve out: a node with a
+// single candidate must not stop syncing for ever because that candidate
+// rotated. The per-pass eligibility sweep is what hands the slot back, and it
+// hands it back on the NEXT tick, because the sweep runs ahead of the stall
+// check for the same peer — the SendMessages order (SendBlockSync at
+// net_processing.cpp:5865, DetectStalling at :5881).
 //
-// The skip still holds on that pass. The peer is asked for headers, not blocks.
-func TestSyncPass_ASingleCandidateNodeReElectsThePeerItJustRotated(t *testing.T) {
+// The pass that rotates therefore asks the peer for NOTHING: not blocks, which
+// is Task 3's skip, and not headers either.
+func TestSyncPass_ASingleCandidateNodeTakesTheSlotBackOnTheNextTick(t *testing.T) {
 	f := newRotationFixture(t, 40)
 
 	only := f.handles[0]
@@ -1065,15 +1133,402 @@ func TestSyncPass_ASingleCandidateNodeReElectsThePeerItJustRotated(t *testing.T)
 	require.Empty(t, disconnect)
 	require.Empty(t, getDataTo(out, only.peer),
 		"the skip must hold even when the rotated peer is the only candidate")
+	require.Empty(t, out,
+		"a peer that rotated on this pass must not be asked for anything on it")
 
+	f.setup(func() {
+		require.False(t, only.sync.State.fSyncStarted,
+			"the rotation must release the slot, and nothing on this pass may hand it back")
+	})
+
+	out, disconnect = f.pass(testNow + micros(time.Second))
+
+	require.Empty(t, disconnect)
 	require.Len(t, out, 1)
 	require.Equal(t, only.peer, out[0].peer)
-	requireGetHeaders(t, out[0].msgs)
+	require.Len(t, getHeadersTo(out, only.peer), 1,
+		"the next tick's sweep gives the only candidate the sync slot back")
+	require.Len(t, getDataTo(out, only.peer), MaxBlocksInTransitPerPeer,
+		"and the rotation left it schedulable, so it is a download peer again too")
 
 	f.setup(func() {
 		require.True(t, only.sync.State.fSyncStarted,
-			"the only candidate takes the sync slot straight back")
+			"the only candidate takes the sync slot back")
 	})
+}
+
+// TestSyncPass_SweepsHeaderSyncEligibilityOnEveryTick pins the per-pass shape of
+// the header-sync eligibility check. net_processing.cpp SendMessages calls
+// SendBlockSync for EVERY peer on EVERY pass (net_processing.cpp:5865, the
+// function at :5180-5222), so a peer that becomes eligible later starts header
+// sync without any event reaching the node. Before this, PeerEstablished was
+// reached only from the handshake and from a rotation or a peerGone.
+//
+// It also pins the Phase 2 Task 5 round invariant the sweep must not break:
+// while a headers-first round runs, no second peer gains fSyncStarted, so
+// roundAnchorHeight and the ErrHeadersNoProgress terminator stay
+// single-sourced.
+func TestSyncPass_SweepsHeaderSyncEligibilityOnEveryTick(t *testing.T) {
+	// A checkpoint far above our tip keeps the headers-first round running for
+	// the whole test.
+	cpHash := chainhash.Hash{0xC0}
+
+	f := newRotationFixture(t, 40, chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+	first, second := f.handles[0], f.handles[1]
+
+	// Nothing has been established: no handshake, no rotation, no peerGone. The
+	// sweep is the only thing that can start header sync here.
+	f.setup(func() {
+		require.False(t, first.sync.State.fSyncStarted)
+		require.False(t, second.sync.State.fSyncStarted)
+	})
+
+	out, disconnect := f.pass(testNow)
+
+	require.Empty(t, disconnect)
+	require.Len(t, getHeadersTo(out, first.peer), 1,
+		"the sweep must start header sync with an eligible peer on the tick alone")
+	require.Empty(t, getHeadersTo(out, second.peer),
+		"a headers-first round is single-slot: the second peer must not be asked for headers")
+
+	f.setup(func() {
+		require.True(t, f.m.headerSync.IsHeadersFirstMode())
+		require.True(t, first.sync.State.fSyncStarted)
+		require.False(t, second.sync.State.fSyncStarted,
+			"no second peer may gain fSyncStarted while a headers-first round runs")
+	})
+
+	// The sweep is idempotent for a peer that already holds the slot: it must
+	// not re-issue the initial getheaders on every tick.
+	out, disconnect = f.pass(testNow + micros(time.Second))
+
+	require.Empty(t, disconnect)
+	require.Empty(t, getHeadersTo(out, first.peer))
+	require.Empty(t, getHeadersTo(out, second.peer))
+
+	f.setup(func() {
+		require.True(t, first.sync.State.fSyncStarted)
+		require.False(t, second.sync.State.fSyncStarted)
+	})
+}
+
+// TestSyncPass_HeaderSyncBreadthRecoversAfterEveryPeerRotates is the regression
+// the per-pass sweep exists to close, and it is the cost Task 4 booked into this
+// task at PeerEstablished.
+//
+// Past the final checkpoint the near-tip relaxation lets several peers hold
+// fSyncStarted at once, and headers-first mode is off there, so CheckStall's
+// header-progress refresh is unreachable and nLastProgressTime moves only when a
+// block is delivered. Most rotation windows deliver no block, so EVERY header
+// peer rotates on the same pass. With the eligibility check reachable only from
+// an event, the one election that followed refilled exactly one slot and the node
+// fell to a single header peer until peers reconnected.
+//
+// The pass that rotates them still hands nothing back — the sweep runs ahead of
+// the stall check for the same peer, so a peer that rotated on this pass cannot
+// take the slot back on it.
+func TestSyncPass_HeaderSyncBreadthRecoversAfterEveryPeerRotates(t *testing.T) {
+	// No checkpoints: this is the steady state past the final one, where
+	// headersFirstMode is false and the 24 hour relaxation is the only gate.
+	f := newRotationFixture(t, 40)
+
+	a, b := f.handles[0], f.handles[1]
+	tip := f.node(t, len(f.chain))
+
+	f.setup(func() {
+		require.Len(t, f.m.headerSync.PeerEstablished(a.sync), 1)
+		require.Len(t, f.m.headerSync.PeerEstablished(b.sync), 1,
+			"the 24 hour near-tip relaxation admits a second header peer")
+		require.False(t, f.m.headerSync.IsHeadersFirstMode())
+
+		for _, h := range f.handles {
+			h.sync.State.pindexBestKnownBlock = &tip
+			h.sync.State.nLastProgressTime = testNow - micros(2*MaxLastBlockTime)
+		}
+	})
+
+	out, disconnect := f.pass(testNow)
+
+	require.Empty(t, disconnect, "a rotation must not disconnect anyone")
+	require.Empty(t, getHeadersTo(out, a.peer),
+		"a peer that rotated on this pass must not take the slot back on it")
+	require.Empty(t, getHeadersTo(out, b.peer),
+		"a peer that rotated on this pass must not take the slot back on it")
+
+	f.setup(func() {
+		require.False(t, a.sync.State.fSyncStarted)
+		require.False(t, b.sync.State.fSyncStarted)
+	})
+
+	// The next tick restores the breadth, with no event of any kind.
+	out, disconnect = f.pass(testNow + micros(time.Second))
+
+	require.Empty(t, disconnect)
+	require.Len(t, getHeadersTo(out, a.peer), 1)
+	require.Len(t, getHeadersTo(out, b.peer), 1,
+		"header sync must restart with EVERY eligible peer, not just the one an election reached")
+
+	f.setup(func() {
+		require.True(t, a.sync.State.fSyncStarted)
+		require.True(t, b.sync.State.fSyncStarted)
+	})
+}
+
+// TestSyncPass_ADisconnectUnwindsTheSlotTheSweepJustGranted pins the hazard the
+// SendMessages pass order carries, and the recovery that answers it.
+//
+// The sweep runs BEFORE the stall check for the same peer (SendBlockSync at
+// net_processing.cpp:5865, DetectStalling at :5881), so a peer holding no slot
+// but heading the download window is granted the slot and THEN disconnected on
+// the same pass. While it holds that slot every peer after it on the pass is
+// refused, because the single-slot guard in PeerEstablished reads the mode as it
+// stands. SVNode carries the same order and the same hazard, so this port keeps
+// it.
+//
+// What makes it safe is that the disconnect unwinds every piece of state the
+// sweep seeded: runPeer drives peerGone once Run returns, and
+// HeaderSync.PeerDisconnected reaches releaseSyncPeer, whose early return cannot
+// fire here — the sweep has just set fSyncStarted and the disconnect clause in
+// CheckStall mutates nothing. This test walks that path.
+func TestSyncPass_ADisconnectUnwindsTheSlotTheSweepJustGranted(t *testing.T) {
+	// A checkpoint far above our tip is what makes the sweep seed the round
+	// state, so the unwind has the most to undo.
+	cpHash := chainhash.Hash{0xC0}
+
+	f := newRotationFixture(t, 40, chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+	stalled, bystander := f.handles[0], f.handles[1]
+	tip := f.node(t, len(f.chain))
+
+	f.setup(func() {
+		// The state a rotation leaves behind: connected, no sync slot, and now
+		// heading the download window.
+		require.False(t, stalled.sync.State.fSyncStarted)
+
+		stalled.sync.State.pindexBestKnownBlock = &tip
+		stalled.sync.State.nStallingSince = testNow
+
+		require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(stalled.sync, f.node(t, 1)))
+
+		bystander.sync.State.pindexBestKnownBlock = &tip
+	})
+
+	_, disconnect := f.pass(testNow + micros(BlockStallingTimeout) + 1)
+
+	require.Equal(t, []*Peer{stalled.peer}, disconnect)
+
+	// THE HAZARD, pinned rather than argued: the doomed peer holds the slot and
+	// the round for the rest of this pass, and the peer after it is refused.
+	f.setup(func() {
+		require.True(t, stalled.sync.State.fSyncStarted,
+			"the sweep grants the slot before the stall check judges the peer")
+		require.Equal(t, 1, f.m.headerSync.nSyncStarted)
+		require.True(t, f.m.headerSync.IsHeadersFirstMode())
+		require.NotZero(t, f.m.headerSync.roundAnchorHeight)
+		require.NotNil(t, f.m.headerSync.nextCheckpoint)
+
+		require.False(t, bystander.sync.State.fSyncStarted,
+			"the doomed peer's slot refuses every peer after it on this pass")
+	})
+
+	// THE RECOVERY: what runPeer does once Run returns.
+	f.m.peerGone(stalled.sync)
+
+	f.setup(func() {
+		require.False(t, stalled.sync.State.fSyncStarted, "the slot must come back")
+		require.Zero(t, f.m.headerSync.nSyncStarted)
+		require.False(t, f.m.headerSync.IsHeadersFirstMode(), "the round must not outlive the peer driving it")
+		require.Zero(t, f.m.headerSync.roundAnchorHeight)
+		require.Equal(t, &cpHash, f.m.headerSync.nextCheckpoint.Hash, "resetHeaderState must re-seed the checkpoint")
+
+		require.Zero(t, stalled.sync.State.nBlocksInFlight)
+		require.Zero(t, stalled.sync.State.nStallingSince)
+		require.Nil(t, stalled.sync.State.pindexLastCommonBlock)
+		require.False(t, f.m.blockDownloader.IsInFlight(f.node(t, 1).Hash),
+			"the disconnected peer's downloads must go back on offer")
+	})
+}
+
+// TestSyncPass_SkipsAPeerThatHasNotFinishedItsHandshake pins the guard
+// net_processing.cpp SendMessages carries before it does anything at all for a
+// peer (:5835-5837, "Don't send anything until the version handshake is
+// complete"). runPeer puts a peer in the registry BEFORE it runs the handshake,
+// so a pass can reach one that is not ready, and the eligibility sweep would
+// otherwise give it the sync slot and a getheaders before its verack.
+//
+// The fixture is regtest with the localhost restriction lifted, because that is
+// where isSyncCandidate refuses nothing — see newRegtestRotationFixture.
+func TestSyncPass_SkipsAPeerThatHasNotFinishedItsHandshake(t *testing.T) {
+	f := newRegtestRotationFixture(t, 40)
+
+	f.handles[0].established = false
+
+	waiting, ready := f.handles[0], f.handles[1]
+	tip := f.node(t, len(f.chain))
+
+	f.setup(func() {
+		// Both peers announced the same chain and neither holds the slot, so the
+		// handshake is the only thing that can separate them on this pass.
+		waiting.sync.State.pindexBestKnownBlock = &tip
+		ready.sync.State.pindexBestKnownBlock = &tip
+	})
+
+	out, disconnect := f.pass(testNow)
+
+	require.Empty(t, disconnect)
+
+	require.Empty(t, getHeadersTo(out, waiting.peer),
+		"a peer that has not finished its handshake must not be given the sync slot")
+	require.Empty(t, getDataTo(out, waiting.peer),
+		"and must not be asked for blocks either")
+
+	f.setup(func() {
+		require.False(t, waiting.sync.State.fSyncStarted,
+			"nothing pre-handshake may reach the sync machines")
+		require.Zero(t, waiting.sync.State.nBlocksInFlight)
+	})
+
+	// The other peer, identical but for its handshake, takes both passes on that
+	// same tick. That is what shows the skip is the handshake and nothing else.
+	require.Len(t, getHeadersTo(out, ready.peer), 1)
+	require.Len(t, getDataTo(out, ready.peer), MaxBlocksInTransitPerPeer)
+}
+
+// TestPeerGone_DoesNotElectAPeerThatHasNotFinishedItsHandshake pins the same
+// SendMessages guard (:5835-5837) on the EVENT path. peerGone and BlockDone's
+// rotation both offer the freed slot through electLocked, and both read the same
+// registry, which holds a peer from before its handshake runs. The two differ
+// only in which peer they exclude, and the guard is orthogonal to that, so one
+// of them covers both.
+func TestPeerGone_DoesNotElectAPeerThatHasNotFinishedItsHandshake(t *testing.T) {
+	f := newRegtestRotationFixture(t, 3)
+
+	// A peer in the connection registry that has not completed its handshake,
+	// which is exactly the state runPeer registers it in.
+	candidate := f.handles[0]
+	registerPeer(f.m, candidate.peer, candidate.sync)
+
+	require.False(t, handshakeComplete(candidate.peer), "test setup: the peer must still be handshaking")
+
+	// The peer holding the slot then goes away, which is what frees it.
+	gone := fullNodePeer("3.3.3.3:8333")
+
+	f.setup(func() {
+		require.Len(t, f.m.headerSync.PeerEstablished(gone), 1)
+	})
+
+	f.m.peerGone(gone)
+
+	f.setup(func() {
+		require.False(t, candidate.sync.State.fSyncStarted,
+			"a peer that has not finished its handshake must not be elected the sync peer")
+		require.Zero(t, f.m.headerSync.nSyncStarted)
+
+		// The control: the candidate is eligible in every respect EXCEPT its
+		// handshake, so the guard is what refused it and not one of
+		// PeerEstablished's own rules.
+		require.Len(t, f.m.headerSync.PeerEstablished(candidate.sync), 1)
+	})
+}
+
+// TestSyncPass_SchedulesBlocksFromEveryPromotedPeerInOneTick is the
+// manager-level end of all-peer block scheduling, driven through the seam Task 4
+// built: two peers park an announcement they can do nothing with, the index
+// grows from our own chain, promoteBlockAvailabilityLocked resolves both parked
+// hashes, and ONE sync tick then asks both of them for blocks.
+//
+// Neither peer ever held the sync slot when its hash was parked, which is the
+// point: what makes a peer schedulable is pindexBestKnownBlock, not
+// fSyncStarted.
+func TestSyncPass_SchedulesBlocksFromEveryPromotedPeerInOneTick(t *testing.T) {
+	genesis := testGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+
+	// Built AFTER ConfigureSync sampled the index tip and left unindexed, so our
+	// own active chain stays at genesis and every header here is a block still to
+	// download.
+	nonces := &nonceCounter{}
+	chain := make([]*wire.BlockHeader, 0, 2*MaxBlocksInTransitPerPeer)
+
+	prev := genesis
+	for i := 0; i < 2*MaxBlocksInTransitPerPeer; i++ {
+		header := childOf(prev, nonces.take())
+		chain = append(chain, header)
+		prev = header
+	}
+
+	announced := chain[len(chain)-1].BlockHash()
+
+	handles := make([]peerHandle, 0, 2)
+
+	for _, addr := range []string{"1.1.1.1:8333", "2.2.2.2:8333"} {
+		peer, far := newTestPeer(t, time.Minute, time.Minute)
+
+		t.Cleanup(func() { _ = far.nc.Close() })
+
+		syncPeer := fullNodePeer(addr)
+		registerPeer(m, peer, syncPeer)
+
+		// An inv for a block whose header we do not hold parks the hash, which is
+		// the state a peer that never held the sync slot comes to rest in.
+		msgs, invErr := m.Inv(syncPeer, invMsg(t, wire.InvTypeBlock, announced))
+		require.NoError(t, invErr)
+		require.Len(t, msgs, 1, "an unknown block inv asks for the headers that place it")
+
+		handles = append(handles, peerHandle{peer: peer, sync: syncPeer, established: true})
+	}
+
+	m.syncMu.Lock()
+
+	for i, h := range handles {
+		require.Nil(t, h.sync.State.pindexBestKnownBlock, "peer %d: a parked hash is not availability yet", i)
+	}
+
+	m.syncMu.Unlock()
+
+	orphans, err := m.AddHeaders(chain)
+	require.NoError(t, err)
+	require.Empty(t, orphans)
+
+	m.syncMu.Lock()
+
+	for i, h := range handles {
+		require.NotNil(t, h.sync.State.pindexBestKnownBlock, "peer %d: the promotion sweep must resolve the parked hash", i)
+		require.Equal(t, announced, h.sync.State.pindexBestKnownBlock.Hash)
+		require.False(t, h.sync.State.fSyncStarted, "peer %d: neither peer has held the sync slot", i)
+	}
+
+	m.syncMu.Unlock()
+
+	out, disconnect := m.syncPass(handles, make([]IngestSnapshot, len(handles)), testNow)
+
+	require.Empty(t, disconnect)
+
+	batches := [][]chainhash.Hash{getDataTo(out, handles[0].peer), getDataTo(out, handles[1].peer)}
+
+	holders := make(map[chainhash.Hash]int, 2*MaxBlocksInTransitPerPeer)
+
+	for i, batch := range batches {
+		require.Len(t, batch, MaxBlocksInTransitPerPeer,
+			"peer %d must be asked for its full share of the window on the same pass", i)
+
+		for _, hash := range batch {
+			previous, dup := holders[hash]
+			require.False(t, dup, "block %s was requested from peer %d and peer %d", hash, previous, i)
+
+			holders[hash] = i
+		}
+	}
+
+	for _, header := range chain {
+		require.Contains(t, holders, header.BlockHash(),
+			"the two batches together must cover the whole chain neither peer has delivered")
+	}
 }
 
 // TestSyncPass_ARotatedPeerThatStallsTheWindowStillGoes is mechanism (b): a

@@ -569,6 +569,17 @@ func (m *PeerManager) peerGone(syncPeer *SyncPeer) {
 type peerHandle struct {
 	peer *Peer
 	sync *SyncPeer
+
+	// established is net_processing.cpp's fSuccessfullyConnected, which
+	// SendMessages tests before it does anything at all for a peer
+	// (net_processing.cpp:5835-5837, "Don't send anything until the version
+	// handshake is complete"). runPeer puts a peer in the registry BEFORE it runs
+	// the handshake, so a pass can reach one that is not ready.
+	//
+	// It is sampled here because everything a pass needs about a peer is sampled
+	// before syncMu is taken. The read is a non-blocking select on a channel the
+	// peer loop closes exactly once, so it takes no peer lock and cannot block.
+	established bool
 }
 
 func (m *PeerManager) peerHandles() []peerHandle {
@@ -577,10 +588,21 @@ func (m *PeerManager) peerHandles() []peerHandle {
 
 	handles := make([]peerHandle, 0, len(m.peers))
 	for peer, syncPeer := range m.peers {
-		handles = append(handles, peerHandle{peer: peer, sync: syncPeer})
+		handles = append(handles, peerHandle{peer: peer, sync: syncPeer, established: handshakeComplete(peer)})
 	}
 
 	return handles
+}
+
+// handshakeComplete reports whether peer finished its version/verack exchange,
+// without waiting for it.
+func handshakeComplete(peer *Peer) bool {
+	select {
+	case <-peer.Established():
+		return true
+	default:
+		return false
+	}
 }
 
 // outgoing is one peer's share of a send pass, collected under the sync-state
@@ -780,9 +802,28 @@ func (m *PeerManager) electSyncPeer(exclude *SyncPeer) {
 // the freed one included, so a single-peer node keeps syncing rather than
 // stopping for ever. PeerEstablished leaves a peer it refuses untouched, so
 // the second pass costs only the refusals of the first.
+//
+// It answers the two EVENT paths only — peerGone and BlockDone's rotation —
+// which have no SVNode counterpart at all: SendMessages simply reaches the peers
+// again on its next pass. Both fill the freed slot without waiting for a tick,
+// so they are kept. syncPass does NOT use it: the per-pass eligibility sweep
+// there is the port of SendBlockSync, and it offers the slot to every eligible
+// peer rather than to the first one an election reaches.
 func (m *PeerManager) electLocked(handles []peerHandle, exclude *SyncPeer) []outgoing {
 	for _, allowExcluded := range []bool{false, true} {
 		for _, h := range handles {
+			// The same guard syncPass carries, and for the same reason: this
+			// election reads the connection registry, which holds a peer from
+			// before its handshake runs, and net_processing.cpp SendMessages does
+			// nothing at all for such a peer (:5835-5837). Both event paths that
+			// reach here — peerGone and BlockDone's rotation — could otherwise
+			// give it the sync slot and a getheaders before its verack, wherever
+			// isSyncCandidate does not refuse it on the services flag (see the
+			// regtest branch of headersync.go isSyncCandidate).
+			if !h.established {
+				continue
+			}
+
 			if !allowExcluded && h.sync == exclude {
 				continue
 			}
@@ -841,8 +882,8 @@ func (m *PeerManager) syncTickOnce() {
 	sendAll(out)
 }
 
-// syncPass is the locked half of one tick: the stall check and the
-// block-download pass for every peer, plus the election a rotation triggers.
+// syncPass is the locked half of one tick: the header-sync eligibility sweep,
+// the stall check and the block-download pass, run for every peer in that order.
 // It RETURNS the work instead of doing it, because neither Conn.Send nor
 // Peer.Disconnect may run under syncMu — both can block on a peer. That is the
 // collect-then-act shape every sync path here keeps; syncTickOnce acts on the
@@ -857,8 +898,6 @@ func (m *PeerManager) syncTickOnce() {
 // before syncMu is taken: IngestSnapshot takes the PEER lock, and the package
 // lock order forbids reaching for a peer lock while holding a manager one.
 func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, now int64) (out []outgoing, disconnect []*Peer) {
-	var rotated *SyncPeer
-
 	m.syncMu.Lock()
 
 	if m.blockDownloader == nil {
@@ -869,11 +908,101 @@ func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, n
 	activeTip := m.activeTip
 
 	for i, h := range handles {
+		// net_processing.cpp SendMessages does nothing at all for a peer whose
+		// handshake has not finished (:5835-5837), and the sweep below is why that
+		// guard has to be carried. Outside regtest a handshaking peer has
+		// advertised no services yet, so isSyncCandidate refuses it on its own.
+		// The regtest branch refuses far less: it reads the address alone, and
+		// nothing whatsoever once AllowSyncCandidateFromLocalPeers is set. So
+		// without this, a peer could take the sync slot — and be sent a
+		// getheaders — before its verack. It is also what peer.go dispatchSync
+		// states for the inbound direction: nothing pre-handshake may reach the
+		// sync machines. electLocked carries the same guard for the event paths.
+		if !h.established {
+			continue
+		}
+
+		// THE ORDER OF THE THREE PASSES BELOW IS net_processing.cpp
+		// SendMessages' own (net_processing.cpp:5829-5897), which runs them for
+		// one peer at a time: SendBlockSync at :5865, DetectStalling at :5881,
+		// and SendGetDataBlocks at :5888. The eligibility sweep therefore comes
+		// FIRST, ahead of both the stall check and the getdata pass for the same
+		// peer.
+		//
+		// That order is what makes the rotate branch below hold without a second
+		// exclusion rule: a peer that rotates on this pass had its sweep before
+		// the rotation, and nothing sweeps it again, so it cannot take the slot
+		// back on the pass that took it away.
+		//
+		// The sweep is the per-pass half of net_processing.cpp SendBlockSync
+		// (net_processing.cpp:5180-5222). PeerEstablished was previously reached
+		// only from PeerManager.Established (the handshake) and from electLocked
+		// (a rotation or a peerGone), so a peer that became eligible later never
+		// started header sync — see the note at PeerEstablished for what that
+		// cost past the final checkpoint. Its per-tick cost is one bool read for a
+		// peer that already holds the slot; for any other peer one
+		// isSyncCandidate, plus — while somebody else holds the slot outside a
+		// headers-first round — one header-index tip read, one lookup and one
+		// clock read, which is the near-tip test.
+		//
+		// WHAT THE SWEEP COSTS IN STEADY STATE, past the final checkpoint, because
+		// it is not free and it is a divergence from SVNode. The 24 hour near-tip
+		// relaxation admits every eligible peer there, headersFirstMode is off so
+		// CheckStall's header-progress refresh is unreachable, and
+		// nLastProgressTime moves only on a delivered block. Mainnet blocks are
+		// about ten minutes apart against a 180 second rotation window, so most
+		// windows deliver nothing and EVERY header peer rotates, then the next
+		// tick's sweep re-admits all of them — for ever. Each cycle costs one
+		// getheaders per peer, one clearPeer per peer, which nils
+		// pindexLastCommonBlock and so buys a fresh lastCommonAncestor walk on the
+		// next download pass, and one resetHeaderState. SVNode pays none of it: it
+		// has no sync-peer rotation at all, and keeps a sync peer until it
+		// disconnects or its blocks time out. The rotation is the licensed legacy
+		// netsync deviation documented at CheckStall; the churn is what it costs
+		// once every eligible peer is swept rather than one being elected.
+		//
+		// Nothing here blocks, which is what lets it run under syncMu: any
+		// getheaders it produces joins out and is sent by syncTickOnce after the
+		// unlock, the collect-then-act shape this file keeps throughout.
+		msgs := m.headerSync.PeerEstablished(h.sync)
+
 		switch m.blockDownloader.CheckStall(h.sync, ingests[i], now) {
 		case StallActionDisconnect:
-			// The caller disconnects; runPeer then drives FinalizeNode, which
-			// is what releases the slot and the peer's downloads. The machine
-			// mutated nothing.
+			// The caller disconnects; runPeer then drives FinalizeNode, which is
+			// what releases the slot and the peer's downloads. CheckStall itself
+			// mutated nothing on this branch.
+			//
+			// THE SWEEP ABOVE MAY HAVE, THOUGH, and this is the hazard the source
+			// pass order carries. A peer holding no slot but heading the download
+			// window is granted the slot by the sweep and disconnected by this
+			// clause on the SAME pass, so as the first sync peer it has just
+			// seeded fSyncStarted, nSyncStarted, nextCheckpoint, headersFirstMode
+			// and roundAnchorHeight — for a peer that is about to go. While it
+			// holds that slot every peer after it on this pass is refused, because
+			// PeerEstablished's single-slot guard reads the mode as it stands.
+			//
+			// The order is not ours to change: SVNode runs SendBlockSync (:5865)
+			// before DetectStalling (:5881) and carries the same hazard.
+			//
+			// WHAT MAKES IT SAFE IS THE UNWIND, and the whole of it runs:
+			// Peer.Disconnect closes the connection, so Peer.Run returns and
+			// runPeer reaches peerGone unconditionally. peerGone calls
+			// BlockDownloader.PeerDisconnected, which releases the peer's
+			// downloads, and HeaderSync.PeerDisconnected, which reaches
+			// releaseSyncPeer. That clears fSyncStarted, decrements nSyncStarted
+			// and runs resetHeaderState, which clears headersFirstMode and
+			// roundAnchorHeight and re-seeds nextCheckpoint from the current tip.
+			// releaseSyncPeer's own !fSyncStarted early return cannot fire here:
+			// the sweep has just set the flag and nothing between clears it.
+			// TestSyncPass_ADisconnectUnwindsTheSlotTheSweepJustGranted walks that
+			// path and asserts each piece.
+			//
+			// Whatever the sweep produced for this peer is dropped with it.
+			// syncTickOnce disconnects before it sends, so the message would
+			// reach a closed peer; C++ has already pushed its getheaders by this
+			// point, but there PushMessage precedes the fDisconnect flag. It is
+			// the same reasoning OnInv states for its own error path: messages
+			// queued for a peer we are about to drop are not worth sending.
 			disconnect = append(disconnect, h.peer)
 
 			continue
@@ -881,15 +1010,13 @@ func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, n
 		case StallActionRotateSyncPeer:
 			// The slot and the peer's in-flight blocks are ALREADY released
 			// and the peer stays connected, so it must not be disconnected or
-			// finalized here — only a new sync peer chosen.
-			rotated = h.sync
-
+			// finalized here — only left to be swept again on a later tick.
 			m.logger.Warnf("[svp2p] rotating the sync peer %s: no sync progress", h.sync.Addr)
 
-			// The rest of this peer's pass is skipped. Without the skip,
-			// SendGetDataBlocks below hands the peer we have just judged
-			// non-progressing another MaxBlocksInTransitPerPeer blocks on THIS
-			// pass: clearPeer nils pindexLastCommonBlock but keeps
+			// This branch runs no getdata pass, so the rest of this peer's tick is
+			// skipped. Without the skip, SendGetDataBlocks hands the peer we have
+			// just judged non-progressing another MaxBlocksInTransitPerPeer blocks
+			// on THIS pass: clearPeer nils pindexLastCommonBlock but keeps
 			// pindexBestKnownBlock, so FindNextBlocksToDownload bootstraps the
 			// window from our own tip again and refills it.
 			//
@@ -907,53 +1034,28 @@ func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, n
 			// this pass, since that clock is started from inside
 			// SendGetDataBlocks. Every other peer on the pass still names one,
 			// and the next tick gives this peer the chance back.
-			continue
+			//
+			// THE SWEEP ABOVE CANNOT HAVE PRODUCED ANYTHING FOR THIS PEER, and
+			// that coupling is what makes "the rotating peer is asked for nothing"
+			// hold rather than the weaker "asked for no blocks". The rotation
+			// clause only ever judges a peer with fSyncStarted set — CheckStall's
+			// !fSyncStarted early return sits above it — and PeerEstablished
+			// returns nil for exactly that peer. So msgs is empty here, and the
+			// send list below gets no entry for this peer. Anything that ever
+			// lets PeerEstablished answer an fSyncStarted peer breaks that, and
+			// TestSyncPass_ASingleCandidateNodeTakesTheSlotBackOnTheNextTick is
+			// what would catch it.
+			//
+			// There is no continue in this branch: the switch itself is the skip,
+			// because only StallActionNone runs the getdata pass.
 
 		case StallActionNone:
+			msgs = append(msgs, m.blockDownloader.SendGetDataBlocks(h.sync, activeTip, now)...)
 		}
 
-		if msgs := m.blockDownloader.SendGetDataBlocks(h.sync, activeTip, now); len(msgs) > 0 {
+		if len(msgs) > 0 {
 			out = append(out, outgoing{peer: h.peer, msgs: msgs})
 		}
-	}
-
-	if rotated != nil {
-		// ONE election runs per tick, for the LAST rotation the loop saw. Every
-		// rotation still released its own peer's sync slot and its in-flight
-		// blocks inside the loop — that half is per peer and complete. What is
-		// capped at one per tick is the REPLACEMENT.
-		//
-		// THE SINGLE-SLOT PREMISE THIS ONCE RESTED ON IS GONE. It used to argue
-		// that only one peer can hold the slot, so a second rotation in the same
-		// pass had to be a peer that no longer held it. Task 4's 24 hour near-tip
-		// relaxation (headersync.go PeerEstablished) lets SEVERAL peers hold
-		// fSyncStarted at once, so several can return StallActionRotateSyncPeer on
-		// one pass, and rotated keeps only the last of them.
-		//
-		// WHAT THAT PERMITS, stated rather than argued away. electLocked excludes
-		// only the last rotation, and a peer rotated EARLIER in this same pass is
-		// eligible again: CheckStall's rotate path cleared its fSyncStarted and
-		// refreshed its nLastProgressTime. So map iteration order may hand the
-		// slot back to a peer this very pass judged non-progressing, ahead of a
-		// peer nothing has tried yet.
-		//
-		// It is bounded, not correct. A re-elected peer is measured again from
-		// that fresh nLastProgressTime and rotates once more within
-		// MaxLastBlockTime if it still does not deliver, and the next election
-		// sees a different map order. A rotation this election misses costs one
-		// tick of header-sync breadth and nothing else — the peer keeps
-		// pindexBestKnownBlock, so it stays a download candidate throughout.
-		//
-		// TASK 5 DISSOLVES IT rather than this branch doing so. Re-running the
-		// eligibility check for every peer on the sync tick — what SendMessages
-		// does, and what Task 5's all-peer scheduling needs anyway — starts header
-		// sync with every eligible peer, so which peer a rotation election happens
-		// to reach first stops mattering. See the transient-benefit note at
-		// PeerEstablished, which books the same sweep.
-		//
-		// The skip in the rotate branch is per peer, not per pass, so every
-		// rotating peer sat out its own download pass either way.
-		out = append(out, m.electLocked(handles, rotated)...)
 	}
 
 	m.syncMu.Unlock()

@@ -123,13 +123,29 @@ type BlockDownloader struct {
 	hs  *HeaderSync
 
 	// inFlight is the BlockDownloadTracker mMapBlocksInFlight port, mapping a
-	// block hash to the peer we requested it from. SVNode holds a multimap so a
-	// stalling block can be fetched from several peers at once; that parallel
-	// fetch is gated on per-peer bandwidth measurements
-	// (IsBlockDownloadStallingFromPeer), which this port has no source for, so
-	// Phase 2 requests each block from exactly one peer. The nodeStaller
-	// mechanism that names the peer holding up the window is kept, so a peer
-	// that sits on a block is disconnected rather than raced.
+	// block hash to the peer we requested it from.
+	//
+	// SINGLE ASSIGNMENT IS A PHASE 3 DECISION, NOT AN OVERSIGHT, AND IT IS WHAT
+	// MAKES MULTI-PEER SCHEDULING SAFE: the map is hash-keyed to one holder, so
+	// the per-peer walks in FindNextBlocksToDownload cannot hand one block to two
+	// peers however many peers a tick runs over.
+	//
+	// SVNode holds a multimap and DOES race one block to several peers, but only
+	// through a path this port has no data source for
+	// (net_processing.cpp:461-506): a block must have been in flight longer than
+	// GetBlockDownloadSlowFetchTimeout, IsBlockDownloadStallingFromPeer must then
+	// find every holder delivering nothing — a per-peer average-bandwidth read off
+	// the association — and the extra fetch is capped by
+	// GetBlockDownloadMaxParallelFetch. Without a per-peer bandwidth meter the
+	// first two tests cannot be answered, and racing every slow block instead
+	// would multiply IBD bandwidth by the parallel-fetch cap.
+	//
+	// WHAT REPLACES RACING IS RECOVERY, and only one half of it is here. The
+	// nodeStaller mechanism is kept, so a peer holding the head of the window is
+	// disconnected rather than raced (see CheckStall, which also states what that
+	// costs). The cheap half — SVNode's per-block download timeout, which takes
+	// one block back from a peer that is still connected — is Task 6's
+	// nDownloadingSince work and is NOT carried yet.
 	inFlight map[chainhash.Hash]*SyncPeer
 
 	// haveData ports CBlockIndex::getStatus().hasData(): the blocks whose full
@@ -239,10 +255,24 @@ func (bd *BlockDownloader) pruneHaveData(activeTipHeight int32) {
 // blockchain service. staller is the peer whose in-flight blocks are the only
 // reason this peer cannot fetch anything, the C++ nodeStaller out-parameter.
 //
-// During IBD exactly one peer — the sync peer — has a useful
-// pindexBestKnownBlock; every other peer has only parked a hashLastUnknownBlock
-// until headers-first ends. Those peers take the "nothing interesting" return
-// below and cost one map lookup, which is the behaviour the plan expects.
+// THE CONTRACT IS MULTI-PEER: EVERY peer that can serve blocks gets its own walk
+// over the same window on every sync tick. net_processing.cpp SendMessages drives
+// SendGetDataBlocks per peer (net_processing.cpp:5865 reaching :5662-5701), and
+// PeerManager.syncPass does the same. What keeps the walks apart is the walk
+// itself, not a rule above it: a block another peer already holds is skipped
+// through the bd.inFlight test below, so peer B resumes at the first block peer A
+// did not take. pindexLastCommonBlock is per-peer state (peerSyncState), so each
+// peer's window also advances on its own deliveries alone.
+//
+// WHAT MAKES A PEER SCHEDULABLE IS pindexBestKnownBlock, NOT THE SYNC SLOT. Phase
+// 2 could rely on exactly one peer having a useful pindexBestKnownBlock during
+// IBD, because a non-sync peer's announcement parked in hashLastUnknownBlock
+// until headers-first ended. Phase 3 Task 4 removed that:
+// PeerManager.promoteBlockAvailabilityLocked sweeps every peer's parked hash
+// through processBlockAvailability whenever the index grows, independently of
+// fSyncStarted, so a peer that has never held the sync slot is a download
+// candidate. A peer with nothing announced still takes the "nothing interesting"
+// return below and costs one map lookup.
 func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip HeaderNode, count int) (blocks []HeaderNode, staller *SyncPeer) {
 	// Before any of the early returns below: our chain moving on is what makes
 	// recorded blocks droppable, and most calls take one of those returns.
@@ -504,8 +534,8 @@ func (bd *BlockDownloader) SendGetDataBlocks(peer *SyncPeer, activeTip HeaderNod
 
 	// C++ gates on !pto->fClient && (fFetch || !IsInitialBlockDownload()) —
 	// "this peer can serve us blocks". isSyncCandidate is the reading of that
-	// predicate this port already made in Task 5, including the regtest
-	// exception, so it is reused rather than restated.
+	// predicate this port already made for headers-first sync (Phase 2 Task 5),
+	// including the regtest exception, so it is reused rather than restated.
 	if !bd.hs.isSyncCandidate(peer) {
 		return nil
 	}
@@ -549,8 +579,9 @@ func (bd *BlockDownloader) SendGetDataBlocks(peer *SyncPeer, activeTip HeaderNod
 
 // MarkBlockAsInFlight is BlockDownloadTracker::MarkBlockAsInFlight. It reports
 // false when the block is already in flight, the C++ short-circuit for the same
-// block from the same node — extended to any node, since Phase 2 fetches each
-// block from exactly one peer (see the inFlight field note).
+// block from the same node — extended to any node, since this port fetches each
+// block from exactly one peer whatever the tick's peer count (see the inFlight
+// field note).
 func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode) bool {
 	if peer == nil || peer.State == nil {
 		return false
@@ -841,8 +872,8 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 // in for block progress when there is no block progress to judge: a peer
 // sitting on in-flight blocks is measured on those blocks, so it cannot hold
 // the sync slot by trickling headers while withholding what we asked it for.
-// Second, the refresh is scoped to headers-first rounds, which Task 5 restricts
-// to the sync peer.
+// Second, the refresh is scoped to headers-first rounds, which Phase 2 Task 5
+// restricts to the sync peer.
 //
 // The tip is an imperfect witness even so: HeaderIndex is also fed by the
 // blockchain-service subscription, so a rise can come from our own node rather
@@ -852,15 +883,15 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 // What a rotation leaves behind is the third thing this method has to answer
 // for. A rotated peer stays connected, and SyncPeerTimedOut cleared its
 // fSyncStarted, so the rotation clause cannot fire for it again while it holds
-// no sync slot. It may take the slot back: PeerManager.electLocked runs a
-// second sweep that re-elects even the peer it just excluded when nobody else
-// is eligible, and PeerEstablished sets fSyncStarted again because
-// releaseSyncPeer already returned the slot. On a single-candidate node the
-// rotated peer is therefore re-elected inside the same tick, and the rotation
-// clause governs it once more. The paragraphs below are about the other case,
-// the conservative one: while it holds no slot, it is a PLAIN DOWNLOAD PEER.
-// It keeps no clock of its own, and the scheduler may hand it blocks on any
-// later tick. Two things govern it then, and the ORDER of the two clauses
+// no sync slot. It may take the slot back, but never on the pass that took it
+// away: PeerManager.syncPass runs the header-sync eligibility sweep BEFORE this
+// check for the same peer, which is the SendMessages order, so the sweep that
+// could re-elect it has already been and gone. A LATER tick's sweep does hand
+// the slot back — to this peer when it is the only candidate, and the rotation
+// clause then governs it once more. The paragraphs below are about the other
+// case, the conservative one: while it holds no slot, it is a PLAIN DOWNLOAD
+// PEER. It keeps no clock of its own, and the scheduler may hand it blocks on
+// any later tick. Two things govern it then, and the ORDER of the two clauses
 // below is what makes the first of them work:
 //
 //   - The DetectStalling clause runs BEFORE the fSyncStarted early-return, so

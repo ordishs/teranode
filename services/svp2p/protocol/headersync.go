@@ -290,40 +290,37 @@ func (hs *HeaderSync) PeerEstablished(peer *SyncPeer) []wire.Message {
 	// clock the time-too-new cap in acceptHeader reads — this machine has one
 	// clock and only one.
 	//
-	// THE BENEFIT IS TRANSIENT, BECAUSE THIS PORT MAKES THE TEST EVENT-DRIVEN
-	// INSTEAD OF PER-PASS. That is the same divergence Task 4's other mechanism
-	// carries (see PeerManager.promoteBlockAvailabilityLocked), but here it has a
-	// cost that one does not pay. SendBlockSync re-evaluates EVERY peer on EVERY
-	// SendMessages pass, so a peer that becomes eligible later still starts
-	// header sync. PeerEstablished is reached from only two places:
-	// PeerManager.Established, the handshake, and PeerManager.electLocked, which
-	// runs only after a rotation or a peerGone. Nothing re-runs it on the sync
-	// tick.
+	// THIS CHECK IS RE-RUN FOR EVERY PEER ON EVERY SYNC TICK, which is what
+	// SendBlockSync gets for free: SendMessages calls it per peer
+	// (net_processing.cpp:5865), so a peer that becomes eligible later still
+	// starts header sync. PeerManager.syncPass carries that sweep — its per-peer
+	// loop states the source order the sweep runs in and what it costs per tick.
+	// So this method now has three callers: PeerManager.Established (the
+	// handshake), PeerManager.electLocked (a rotation or a peerGone), and the
+	// sweep.
 	//
-	// WHAT THAT COSTS IN STEADY STATE, past the final checkpoint. headersFirstMode
-	// is false there, so CheckStall's header-progress refresh (blockdownload.go,
-	// the IsHeadersFirstMode branch) is unreachable, and nLastProgressTime moves
-	// only when a block is delivered — to the ONE peer that delivered it
+	// WHAT THE SWEEP PAYS OFF, because the cost was real while this check was
+	// event-driven only. Past the final checkpoint headersFirstMode is false, so
+	// CheckStall's header-progress refresh (blockdownload.go, the
+	// IsHeadersFirstMode branch) is unreachable and nLastProgressTime moves only
+	// when a block is delivered — to the ONE peer that delivered it
 	// (BlockReceived). With MaxLastBlockTime at 180 seconds and mainnet blocks
 	// about ten minutes apart, most 180 second windows deliver no block at all, so
-	// every fSyncStarted peer rotates in the same pass. That frees every slot,
-	// while electLocked returns on the FIRST peer that yields messages, so the one
-	// election refills exactly one. CheckStall's !fSyncStarted early return then
-	// stops a rotated-out peer from ever rotating again, so it triggers no further
-	// election of its own. A node that reached several header peers therefore
-	// falls to exactly ONE within about 180 seconds, and stays there until peers
-	// reconnect.
+	// every fSyncStarted peer rotates in the same pass. That freed every slot,
+	// while the single election that followed returned on the FIRST peer to yield
+	// messages and refilled exactly one; CheckStall's !fSyncStarted early return
+	// then stopped a rotated-out peer from ever rotating again, so it triggered no
+	// further election of its own. A node that reached several header peers fell to
+	// exactly ONE within about 180 seconds and stayed there until peers
+	// reconnected. The sweep restarts header sync with every eligible peer on the
+	// next tick instead, and
+	// TestSyncPass_HeaderSyncBreadthRecoversAfterEveryPeerRotates pins that.
 	//
-	// IT DOES NOT ENDANGER TASK 5's all-peer download scheduling. What that work
-	// needs from a peer is pindexBestKnownBlock, and Task 4's promotion mechanism
-	// supplies it from index growth alone, independently of fSyncStarted — a peer
-	// that never held the sync slot is still schedulable. The collapse costs
-	// header-sync breadth, not download breadth.
-	//
-	// THE FIX IS SCHEDULED INTO TASK 5, not lost: re-run this eligibility check on
-	// the sync tick, which is exactly what SendMessages does. Task 5's all-peer
-	// work needs that same per-pass sweep shape, so the two land together rather
-	// than building the sweep twice.
+	// IT WAS NEVER A THREAT TO ALL-PEER DOWNLOAD SCHEDULING, and is not one now.
+	// What that needs from a peer is pindexBestKnownBlock, and Task 4's promotion
+	// mechanism supplies it from index growth alone, independently of fSyncStarted
+	// — a peer that never held the sync slot is still schedulable. The collapse
+	// cost header-sync breadth, not download breadth.
 	//
 	// THE !headersFirstMode CONJUNCT HAS NO SVNODE COUNTERPART. It is a
 	// Teranode-specific structural guard, and SendBlockSync has nothing like
