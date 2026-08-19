@@ -337,14 +337,30 @@ type blockIdent struct {
 	timestamp time.Time
 }
 
+// prepareSubtrees is the buffered entry into the pipeline below: it adapts an
+// already-decoded block onto the same source-driven body the streaming entry
+// uses (ingest.go). Splitting the signature is the only change the streaming
+// adaptation needs here — the body below is unchanged apart from reading the
+// block's scalars from sourceBlock instead of re-deriving them from the
+// decoded block on every use.
 func (sm *svp2pBridge) prepareSubtrees(ctx context.Context, block *bsvutil.Block) (subtrees []*chainhash.Hash, subtreeSlices []*subtreepkg.Subtree, blockID uint32, err error) {
+	return sm.prepareSubtreesFromSource(ctx, sourceBlock{
+		hash:      *block.Hash(),
+		prevBlock: block.MsgBlock().Header.PrevBlock,
+		height:    block.Height(),
+		timestamp: block.MsgBlock().Header.Timestamp,
+		txCount:   len(block.Transactions()),
+	}, newSliceTxSource(block.Transactions()))
+}
+
+func (sm *svp2pBridge) prepareSubtreesFromSource(ctx context.Context, sb sourceBlock, src txSource) (subtrees []*chainhash.Hash, subtreeSlices []*subtreepkg.Subtree, blockID uint32, err error) {
 	ctx, _, deferFn := tracing.Tracer("svp2pBridge").Start(ctx, "prepareSubtrees",
 		tracing.WithLogMessage(
 			sm.logger,
 			"[prepareSubtrees][%s] processing subtree for block height %d, tx count %d",
-			block.Hash().String(),
-			block.Height(),
-			len(block.Transactions()),
+			sb.hash.String(),
+			sb.height,
+			sb.txCount,
 		),
 		tracing.WithHistogram(prometheusSvp2pBridgePrepareSubtrees),
 	)
@@ -358,7 +374,7 @@ func (sm *svp2pBridge) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 	subtrees = make([]*chainhash.Hash, 0)
 
-	txCount := len(block.Transactions())
+	txCount := sb.txCount
 	if txCount <= 1 {
 		return subtrees, nil, blockID, nil
 	}
@@ -405,25 +421,26 @@ func (sm *svp2pBridge) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 		subtreeMetas[i] = subtreepkg.NewSubtreeMeta(st)
 	}
 
-	blockHeight32, convErr := safeconversion.Int32ToUint32(block.Height())
+	blockHeight32, convErr := safeconversion.Int32ToUint32(sb.height)
 	if convErr != nil {
 		return nil, nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to convert block height", convErr)
 	}
 
 	// Scalar identity for every stage below createTxMap — see blockIdent.
 	bi := blockIdent{
-		hash:      *block.Hash(),
-		prevBlock: block.MsgBlock().Header.PrevBlock,
+		hash:      sb.hash,
+		prevBlock: sb.prevBlock,
 		height:    blockHeight32,
-		timestamp: block.MsgBlock().Header.Timestamp,
+		timestamp: sb.timestamp,
 	}
 
 	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](txCount)
 
-	// Last use of `block`: createTxMap clones every script into txMap and
-	// returns the block-order tx hash list. From here on the decoded wire
-	// block is unreferenced and its decode arena can be GC'd.
-	txOrder, err := sm.createTxMap(ctx, block, txMap)
+	// Last use of the transaction source: createTxMap clones every script into
+	// txMap and returns the block-order tx hash list. From here on the decoded
+	// wire block (buffered entry) is unreferenced and its decode arena can be
+	// GC'd; on the streaming entry the payload has been fully consumed.
+	txOrder, err := sm.createTxMapFromSource(ctx, sb, src, txMap)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -1821,19 +1838,37 @@ func calculateTransactionFee(tx *bt.Tx) (uint64, error) {
 // stages iterate instead of block.Transactions(), so this is the last function
 // that needs the decoded wire block.
 func (sm *svp2pBridge) createTxMap(ctx context.Context, block *bsvutil.Block, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) ([]chainhash.Hash, error) {
+	return sm.createTxMapFromSource(ctx, sourceBlock{
+		hash:    *block.Hash(),
+		height:  block.Height(),
+		txCount: len(block.Transactions()),
+	}, newSliceTxSource(block.Transactions()), txMap)
+}
+
+// createTxMapFromSource is createTxMap's body, driven by a txSource so the
+// streaming entry can feed it one transaction at a time straight off the wire.
+// The loop is bounded by the block's declared transaction count, so a payload
+// that carries fewer transactions than declared fails here rather than
+// producing a short block.
+func (sm *svp2pBridge) createTxMapFromSource(ctx context.Context, sb sourceBlock, src txSource, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) ([]chainhash.Hash, error) {
 	_, _, deferFn := tracing.Tracer("svp2pBridge").Start(ctx, "createTxMap",
 		tracing.WithDebugLogMessage(
 			sm.logger,
 			"[createTxMap][%s %d] processing transactions into map for block",
-			block.Hash().String(),
-			block.Height(),
+			sb.hash.String(),
+			sb.height,
 		),
 	)
 	defer deferFn()
 
-	txOrder := make([]chainhash.Hash, 0, len(block.Transactions()))
+	txOrder := make([]chainhash.Hash, 0, sb.txCount)
 
-	for _, wireTx := range block.Transactions() {
+	for i := 0; i < sb.txCount; i++ {
+		wireTx, err := src.Next()
+		if err != nil {
+			return nil, errors.NewBlockInvalidError("[createTxMap][%s] failed to read transaction %d of %d", sb.hash.String(), i, sb.txCount, err)
+		}
+
 		// Copy the hash value out of the bsvutil.Tx wrapper. bt.Tx.SetTxHash
 		// stores the pointer, so passing wireTx.Hash() directly would keep
 		// the wrapping wire.MsgTx (and its decode arena) alive through this
