@@ -89,7 +89,7 @@ func TestServer_PeerInfoToP2PProto_RoundTripFields(t *testing.T) {
 func TestServer_GetPeerRegistry_ReceivedCountersSurviveWire(t *testing.T) {
 	s, reg := newServerWithLocalRegistry(t)
 	pid := mustNewPeerID(t)
-	s.addConnectedPeer(pid, "miner/1.0", 10, 10, nil, "")
+	s.addConnectedPeer(pid, "miner/1.0", peerHeightClaim{Height: 10, AdvertisedHeight: 10}, nil, "")
 
 	reg.RecordBlockReceived(pid.String(), 5)
 	reg.RecordBlockReceived(pid.String(), 5)
