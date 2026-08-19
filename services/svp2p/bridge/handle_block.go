@@ -1839,9 +1839,11 @@ func calculateTransactionFee(tx *bt.Tx) (uint64, error) {
 // that needs the decoded wire block.
 func (sm *svp2pBridge) createTxMap(ctx context.Context, block *bsvutil.Block, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper]) ([]chainhash.Hash, error) {
 	return sm.createTxMapFromSource(ctx, sourceBlock{
-		hash:    *block.Hash(),
-		height:  block.Height(),
-		txCount: len(block.Transactions()),
+		hash:      *block.Hash(),
+		prevBlock: block.MsgBlock().Header.PrevBlock,
+		height:    block.Height(),
+		timestamp: block.MsgBlock().Header.Timestamp,
+		txCount:   len(block.Transactions()),
 	}, newSliceTxSource(block.Transactions()), txMap)
 }
 

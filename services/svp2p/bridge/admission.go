@@ -246,18 +246,25 @@ func (a *Admission) Acquire(ctx context.Context, quit <-chan struct{}, blockHash
 // Release returns budget reserved by Acquire and drops the hash from the dedup
 // set. Both halves are released together, on block completion rather than peer
 // lifetime, so the budget can never under-count and over-admit.
+//
+// Release ONLY what Acquire admitted. Pairing it with a failed Acquire is a
+// dedup-corrupting bug: on the ErrDuplicateBlockInFlight path the hash in the
+// set belongs to the copy still being ingested, so releasing it there would
+// evict a live entry and let a third copy in against the same budget. Legacy
+// relied on its single call site never doing that (netsync ReleaseBlockPrefetch
+// is reached only from awaitBlockResult, which the duplicate path never spawns);
+// this is an exported API any composer can call, so the weight guard below is
+// hoisted above the delete to make the mistake harmless rather than silent.
+// A zero weight means nothing was reserved, which is exactly the failed-Acquire
+// case, so it now touches neither half of the gate.
 func (a *Admission) Release(blockHash chainhash.Hash, weight int64) {
-	if a.budget == nil {
+	if a.budget == nil || weight <= 0 {
 		return
 	}
 
 	a.inFlightMu.Lock()
 	delete(a.inFlight, blockHash)
 	a.inFlightMu.Unlock()
-
-	if weight <= 0 {
-		return
-	}
 
 	a.budget.Release(weight)
 }
@@ -336,6 +343,13 @@ func (a *Admission) BackoffRemaining(blockHash chainhash.Hash) (time.Duration, i
 // NOT be rotated for it, because rotating in a fresh peer would only re-deliver
 // the same still-backed-off block. Carried from the skip in
 // services/legacy/netsync/manager.go handleBlockMsg (PR 1192).
+//
+// CALLER'S JOB: legacy also refreshed the delivering peer's lastBlockTime on
+// this path (manager.go:1668-1670), because the peer did deliver a block and
+// the fault is our local store. Admission holds no peer state, so protocol
+// must do it: map errors.IsTransientLocalError to "refresh the stall timer, do
+// not rotate". Without that refresh the backoff window itself looks like a
+// stalled peer and rotates one for a fault it had no part in.
 func (a *Admission) SkipForBackoff(blockHash chainhash.Hash) error {
 	remaining, attempts, skip := a.BackoffRemaining(blockHash)
 	if !skip {

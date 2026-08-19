@@ -132,10 +132,22 @@ func (b *BlockStream) Header() wire.BlockHeader { return b.header }
 // TxCount returns the transaction count the peer declared.
 func (b *BlockStream) TxCount() uint64 { return b.txCount }
 
+// Length returns the payload length the peer declared for this block. It is
+// known before a single transaction byte is read, which makes it the honest
+// weight for an admission budget keyed on block size — the consumer cannot
+// derive that from the header or the transaction count.
+func (b *BlockStream) Length() uint64 { return b.length }
+
 // TxReader returns the transaction bytes, bounded to the declared payload
 // length. It reports io.EOF at the payload boundary, so a payload that carries
 // fewer transactions than TxCount surfaces as a decode error to the consumer.
-func (b *BlockStream) TxReader() io.Reader { return txReader{b: b} }
+//
+// It is an io.ReadCloser, not a bare io.Reader, so a consumer that only ever
+// sees the reader can still release the stream: Close forwards to
+// BlockStream.Close. That matters because the read loop stays parked on this
+// connection until the stream closes, and a consumer handed only the reader
+// would otherwise have no way to release it.
+func (b *BlockStream) TxReader() io.ReadCloser { return txReader{b: b} }
 
 // Close drains any unread payload bytes so the connection stays aligned on the
 // next message header, and releases the read loop. It is idempotent: every
@@ -202,3 +214,8 @@ func (b *BlockStream) read(p []byte) (int, error) {
 type txReader struct{ b *BlockStream }
 
 func (t txReader) Read(p []byte) (int, error) { return t.b.read(p) }
+
+// Close releases the whole stream, not just this reader: it is the same
+// idempotent BlockStream.Close, so closing the reader drains any unread
+// payload and frees the parked read loop.
+func (t txReader) Close() error { return t.b.Close() }
