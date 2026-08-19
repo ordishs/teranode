@@ -120,7 +120,10 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 			return protocol.IngestOutcome{Err: err, TransientLocal: true}
 		}
 
-		return protocol.IngestOutcome{Err: err}
+		// Everything the pipeline rejects that is not a local fault is the
+		// peer's: a block that fails validation, or a payload that fails to
+		// decode.
+		return protocol.IngestOutcome{Err: err, PeerFault: true}
 	}
 
 	b.admission.ClearFailure(hash)

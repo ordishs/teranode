@@ -620,9 +620,16 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		// services/legacy/peer_server.go shouldDisconnectOnBlockErr: a block
 		// the pipeline rejected is the peer's fault and the peer goes, so the
 		// sync peer actually rotates instead of the same bad block being
-		// re-offered to the same peer for ever. A transient LOCAL condition is
-		// ours, and rotating on it would only churn sync peers.
-		if !outcome.TransientLocal {
+		// re-offered to the same peer for ever.
+		//
+		// Read from PeerFault alone, never from the absence of
+		// TransientLocal. A rotation is a LOCAL fault that has already
+		// released the slot and this peer's downloads; disconnecting it as
+		// well would drive that release a second time through peerGone, which
+		// is exactly the double-finalize the rotation contract forbids. An
+		// unclassified failure disconnects nobody either — the block goes back
+		// on offer and the stall rules deal with a peer that keeps failing.
+		if outcome.PeerFault {
 			disconnect = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
 				"svp2p: block %s was rejected", hash, outcome.Err)
 		}

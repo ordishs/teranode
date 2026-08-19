@@ -526,8 +526,14 @@ func TestManagerDisconnectsAPeerWhoseBlockIsRejected(t *testing.T) {
 	idx, err := NewHeaderIndex(genesis)
 	require.NoError(t, err)
 
+	// What the adapter reports for a block the pipeline rejected: the peer is
+	// at fault, and only that flag disconnects (see
+	// TestManagerBlockDoneDisconnectsOnlyOnPeerFault).
 	ingestor := &recordingIngestor{
-		outcome: IngestOutcome{Err: errors.New(errors.ERR_BLOCK_INVALID, "svp2p: test block is invalid")},
+		outcome: IngestOutcome{
+			Err:       errors.New(errors.ERR_BLOCK_INVALID, "svp2p: test block is invalid"),
+			PeerFault: true,
+		},
 	}
 
 	m := syncTestManager(t, idx, ingestor)
@@ -683,6 +689,135 @@ func TestManagerDuplicateReleasesTheHolderRecord(t *testing.T) {
 	require.Equal(t, 0, peerB.State.nBlocksInFlight)
 	require.Contains(t, m.blockDownloader.haveData, block.Hash,
 		"the copy that completed still counts as held")
+}
+
+// TestManagerRotationNeverDisconnects pins the rotation contract from the
+// outside: a pre-admission timeout releases the sync slot and this peer's
+// downloads, and the peer stays connected. Disconnecting it as well would
+// drive that same release a second time through peerGone.
+func TestManagerRotationNeverDisconnects(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 7)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	ingestor := &recordingIngestor{
+		outcome: IngestOutcome{
+			Err:    errors.New(errors.ERR_ERROR, "svp2p: test pre-admission timed out"),
+			Rotate: true,
+		},
+	}
+
+	m := syncTestManager(t, idx, ingestor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := connectSyncPeer(t, m, genesis, chain)
+	defer func() { _ = far.nc.Close() }()
+
+	far.write(t, blockFor(chain[0]))
+
+	require.Eventually(t, func() bool { return ingestor.count() == 1 },
+		10*time.Second, 20*time.Millisecond, "the block never reached the ingestor")
+
+	require.Never(t, func() bool { return m.ConnectedCount() == 0 }, time.Second, 20*time.Millisecond,
+		"a rotation must not disconnect the peer it rotated")
+}
+
+// TestManagerBlockDoneDisconnectsOnlyOnPeerFault is the same contract at the
+// dispatcher: the verdict reads PeerFault, and nothing else.
+func TestManagerBlockDoneDisconnectsOnlyOnPeerFault(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 8)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	connected, err := idx.AddHeader(chain[0])
+	require.NoError(t, err)
+	require.True(t, connected)
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+
+	block, ok := idx.Lookup(chain[0].BlockHash())
+	require.True(t, ok)
+
+	fault := errors.New(errors.ERR_ERROR, "svp2p: test failure")
+
+	for _, tc := range []struct {
+		name    string
+		outcome IngestOutcome
+		drops   bool
+	}{
+		{name: "pre-admission timeout", outcome: IngestOutcome{Err: fault, Rotate: true}},
+		{name: "transient local", outcome: IngestOutcome{Err: fault, TransientLocal: true}},
+		{name: "unclassified", outcome: IngestOutcome{Err: fault}},
+		{name: "peer fault", outcome: IngestOutcome{Err: fault, PeerFault: true}, drops: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			peer := NewSyncPeer("1.2.3.4:8333", wire.SFNodeNetwork, newPeerSyncState())
+
+			m.syncMu.Lock()
+			require.True(t, m.blockDownloader.MarkBlockAsInFlight(peer, block))
+			m.syncMu.Unlock()
+
+			err := m.BlockDone(peer, block.Hash, tc.outcome)
+
+			if tc.drops {
+				require.Error(t, err, "a block the pipeline rejected must cost the peer its connection")
+				return
+			}
+
+			require.NoError(t, err, "only a peer fault may disconnect")
+		})
+	}
+}
+
+// TestManagerDropsAnUnsolicitedStreamWithoutReadingIt covers the refusal path's
+// cost: a peer that declares a huge payload and then goes silent must not be
+// able to hold the peer loop, which is the goroutine servicing the idle timer
+// and shutdown.
+func TestManagerDropsAnUnsolicitedStreamWithoutReadingIt(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 9)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	ingestor := &recordingIngestor{}
+	m := syncTestManager(t, idx, ingestor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+	defer func() { _ = far.nc.Close() }()
+
+	version := remoteVersion(4321)
+	version.Services = wire.SFNodeNetwork
+	far.completeOutboundHandshakeAs(t, version)
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 1 }, 5*time.Second, 20*time.Millisecond)
+
+	// Nothing was requested from this peer, and the frame it sends declares
+	// 8 MiB of payload but carries only the block header and the transaction
+	// count. Reading the rest would never return.
+	far.writeStalledBlockFrame(t, chain[0], 8<<20)
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 0 }, 5*time.Second, 20*time.Millisecond,
+		"an unsolicited stream must be dropped unread, not drained on the peer loop")
+
+	require.Zero(t, ingestor.count())
 }
 
 // TestManagerAdvertisesHeaderIndexHeight covers the Phase 1 placeholder this

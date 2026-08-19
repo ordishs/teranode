@@ -1,7 +1,9 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"testing"
@@ -43,6 +45,33 @@ func (s *scriptedPeer) writeAsync(msg wire.Message) {
 	go func() {
 		_, _ = wire.WriteMessageWithEncodingN(s.nc, msg, wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
 	}()
+}
+
+// writeStalledBlockFrame writes a "block" message that declares `declared`
+// payload bytes but carries only what the streaming transport reads before it
+// hands the stream to its consumer: the 80 byte block header and the
+// transaction count. The rest never arrives, so anything that tries to read
+// the remaining payload blocks for ever.
+func (s *scriptedPeer) writeStalledBlockFrame(t *testing.T, header *wire.BlockHeader, declared uint32) {
+	t.Helper()
+
+	var payload bytes.Buffer
+
+	require.NoError(t, header.Serialize(&payload))
+	require.NoError(t, wire.WriteVarInt(&payload, wire.ProtocolVersion, 1))
+
+	frame := make([]byte, wire.MessageHeaderSize)
+	binary.LittleEndian.PutUint32(frame[0:4], uint32(wire.MainNet))
+	copy(frame[4:4+wire.CommandSize], wire.CmdBlock)
+	binary.LittleEndian.PutUint32(frame[16:20], declared)
+	// Bytes 20:24 are the payload checksum, which the streaming path does not
+	// verify (see the note on transport.BlockStream).
+
+	_, err := s.nc.Write(frame)
+	require.NoError(t, err)
+
+	_, err = s.nc.Write(payload.Bytes())
+	require.NoError(t, err)
 }
 
 // readUntil reads messages until one carries the wanted command, so a test
