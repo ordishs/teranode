@@ -281,6 +281,23 @@ func TestBlockIngestorDoesNotDeadlineTheBudgetWait(t *testing.T) {
 	}
 }
 
+// TestBlockIngestorFlagsPipelineRejectionAsPeerFault is the other end of the
+// disconnect contract: the adapter is what decides a failure is the peer's,
+// and the manager disconnects on that flag alone.
+func TestBlockIngestorFlagsPipelineRejectionAsPeerFault(t *testing.T) {
+	br := &stubBridge{err: errors.NewBlockInvalidError("svp2p: test block is invalid")}
+	ingestor, _ := newTestIngestor(t, br)
+
+	stream := &countingStream{Reader: bytes.NewReader(nil)}
+
+	outcome := ingestor.Ingest(context.Background(), testIngestRequest(testIngestHeader(), stream))
+
+	require.Error(t, outcome.Err)
+	require.True(t, outcome.PeerFault, "a block the pipeline rejected is the peer's fault")
+	require.False(t, outcome.TransientLocal)
+	require.False(t, outcome.Rotate)
+}
+
 func TestBlockIngestorBacksOffLocalFailures(t *testing.T) {
 	br := &stubBridge{err: errors.NewServiceError("utxo store is unavailable")}
 	ingestor, _ := newTestIngestor(t, br)

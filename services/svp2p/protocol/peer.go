@@ -84,8 +84,16 @@ type IngestOutcome struct {
 
 	// Rotate reports a pre-admission deadline (bridge.PreAdmitTimedOut): a
 	// wedged local round-trip stranded a requested block, so the sync peer
-	// must rotate. The peer stays connected.
+	// must rotate. The peer stays connected, and a rotation NEVER disconnects
+	// — the rotation has already released the slot and the peer's downloads,
+	// so disconnecting would run that release a second time.
 	Rotate bool
+
+	// PeerFault reports that the peer is to blame: the pipeline rejected what
+	// it sent. It is the only thing that disconnects a peer, and it is set
+	// explicitly rather than derived from the absence of another flag, so a
+	// fault nobody classified cannot silently become a disconnect.
+	PeerFault bool
 
 	// TransientLocal reports a local storage or service fault, including the
 	// admission backoff skip. Admission.SkipForBackoff's caller contract: the
@@ -441,12 +449,19 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) e
 	header := stream.Header()
 	hash := header.BlockHash()
 
+	// Neither refusal below drains the stream, and that is deliberate. A drain
+	// runs io.Copy over up to MaxBlockPayload bytes ON THIS GOROUTINE, which
+	// is the one servicing the idle timer and ctx cancellation — a peer that
+	// declares a huge payload and then dribbles would hold the loop for as
+	// long as it liked. Both refusals end in a disconnect instead, and
+	// Conn.Close releases the parked read loop through sockClosed without
+	// reading a byte. Byte alignment does not matter on a connection we are
+	// closing.
 	if p.cfg.Ingestor == nil {
-		// Nothing can ingest this block. Closing drains the payload so the
-		// connection stays aligned and the parked read loop is released.
-		p.drain(stream, hash)
-
-		return nil
+		// Nothing can ingest this block, and nothing asked for it either:
+		// without an ingestor this node never requests a block.
+		return errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+			"svp2p: unexpected block %s from a peer we cannot ingest for", hash, ErrProtocolViolation)
 	}
 
 	// Reject an unsolicited block before it can consume admission budget
@@ -454,9 +469,16 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) e
 	// blocks before they can consume prefetch budget"). Without this gate a
 	// peer can push blocks nobody asked for straight into the shared byte
 	// budget and starve the real sync peer.
+	//
+	// A sync-peer rotation releases the rotated peer's in-flight records while
+	// its blocks may still be on the wire, so an honest peer's next block can
+	// land here and cost it the connection. Legacy behaves the same way
+	// (clearRequestedState followed by handleBlockMsg's unrequested-block
+	// disconnect), and the cost is one reconnect of a peer we just stopped
+	// syncing from.
+	// Without a dispatcher there is no in-flight record to test against, which
+	// is only ever the shape of a test peer driving the ingest path directly.
 	if p.cfg.Sync != nil && !p.cfg.Sync.BlockExpected(p.cfg.SyncPeer, hash) {
-		p.drain(stream, hash)
-
 		return errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
 			"svp2p: unrequested block %s", hash, ErrProtocolViolation)
 	}
@@ -495,15 +517,6 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) e
 	}()
 
 	return nil
-}
-
-// drain releases a block this peer's loop will not ingest. The transport read
-// loop stays parked until it happens, and the drain is what keeps the
-// connection aligned on the next message header.
-func (p *Peer) drain(stream *transport.BlockStream, hash chainhash.Hash) {
-	if err := stream.Close(); err != nil {
-		p.cfg.Logger.Warnf("[svp2p] failed to drain block %s from %s: %v", hash, p.cfg.Conn.RemoteAddr(), err)
-	}
 }
 
 func (p *Peer) ingestFinished() {
