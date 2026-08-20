@@ -174,6 +174,72 @@ func New(logger ulogger.Logger,
 	}
 }
 
+// legacyPeerStats is the read-only view of a legacy peer that the registry
+// mirror needs. *serverPeer satisfies it through its embedded *peer.Peer; the
+// interface exists so the field mapping can be tested without a live server.
+type legacyPeerStats interface {
+	ID() int32
+	Addr() string
+	UserAgent() string
+	LastBlock() int32
+	BytesSent() uint64
+	BytesReceived() uint64
+	LastRecv() time.Time
+	Inbound() bool
+	ProtocolVersion() uint32
+	Services() wire.ServiceFlag
+	LastPingMicros() int64
+	TimeOffset() int64
+	StartingHeight() int32
+	TimeConnected() time.Time
+	IsStreamPeer() bool
+}
+
+// peerSnapshotFrom maps one legacy peer onto the registry sync view. It reports
+// false for a peer that must not produce a registry entry: a secondary
+// multistream peer (which shares its primary's address), or one whose address
+// cannot be split into host and port.
+func peerSnapshotFrom(sp legacyPeerStats, syncPeerID int32) (peerSnapshot, bool) {
+	// Secondary multistream peers share their primary's address and are not
+	// tracked in the main peer lists. Skip them so one connection produces one
+	// registry entry.
+	if sp.IsStreamPeer() {
+		return peerSnapshot{}, false
+	}
+
+	addr := sp.Addr()
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return peerSnapshot{}, false
+	}
+
+	var height uint32
+	if lastBlock := sp.LastBlock(); lastBlock > 0 {
+		height = uint32(lastBlock)
+	}
+
+	return peerSnapshot{
+		id:            legacyRegistryID(addr),
+		addr:          addr,
+		userAgent:     sp.UserAgent(),
+		height:        height,
+		bytesSent:     sp.BytesSent(),
+		bytesReceived: sp.BytesReceived(),
+		lastRecv:      sp.LastRecv(),
+		legacy: blockchain.LegacyPeerInfo{
+			Inbound:         sp.Inbound(),
+			ProtocolVersion: sp.ProtocolVersion(),
+			ServiceFlags:    uint64(sp.Services()),
+			PingMicros:      sp.LastPingMicros(),
+			TimeOffsetSecs:  sp.TimeOffset(),
+			StartingHeight:  sp.StartingHeight(),
+			// Peer IDs come from an atomic counter that starts at 1, so a zero
+			// syncPeerID (no sync peer) can never match a real peer.
+			IsSyncPeer:    syncPeerID != 0 && sp.ID() == syncPeerID,
+			TimeConnected: sp.TimeConnected(),
+		},
+	}, true
+}
+
 // legacyPeerSnapshots adapts the internal peer list to the registry sync view.
 // A nil return means the internal server could not answer, and the caller must
 // not read that as "no peers connected". An empty slice does mean "no peers".
@@ -199,45 +265,13 @@ func (s *Server) legacyPeerSnapshots() []peerSnapshot {
 			continue
 		}
 
-		// Secondary multistream peers share their primary's address and are not
-		// tracked in the main peer lists. Skip them so one connection produces
-		// one registry entry.
-		if sp.Peer.IsStreamPeer() {
+		snapshot, ok := peerSnapshotFrom(sp, syncPeerID)
+		if !ok {
+			s.logger.Debugf("[LegacyPeerRegistry] skipping peer %q", sp.Addr())
 			continue
 		}
 
-		addr := sp.Addr()
-		if _, _, err := net.SplitHostPort(addr); err != nil {
-			s.logger.Debugf("[LegacyPeerRegistry] skipping peer with unusable address %q: %v", addr, err)
-			continue
-		}
-
-		var height uint32
-		if lastBlock := sp.LastBlock(); lastBlock > 0 {
-			height = uint32(lastBlock)
-		}
-
-		snapshots = append(snapshots, peerSnapshot{
-			id:            legacyRegistryID(addr),
-			addr:          addr,
-			userAgent:     sp.UserAgent(),
-			height:        height,
-			bytesSent:     sp.BytesSent(),
-			bytesReceived: sp.BytesReceived(),
-			lastRecv:      sp.LastRecv(),
-			legacy: blockchain.LegacyPeerInfo{
-				Inbound:         sp.Inbound(),
-				ProtocolVersion: sp.ProtocolVersion(),
-				ServiceFlags:    uint64(sp.Services()),
-				PingMicros:      sp.LastPingMicros(),
-				TimeOffsetSecs:  sp.TimeOffset(),
-				StartingHeight:  sp.StartingHeight(),
-				// Peer IDs come from an atomic counter that starts at 1, so a
-				// zero syncPeerID (no sync peer) can never match a real peer.
-				IsSyncPeer:    syncPeerID != 0 && sp.ID() == syncPeerID,
-				TimeConnected: sp.TimeConnected(),
-			},
-		})
+		snapshots = append(snapshots, snapshot)
 	}
 
 	return snapshots
