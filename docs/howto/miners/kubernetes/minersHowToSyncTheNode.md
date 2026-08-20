@@ -30,7 +30,7 @@ The chain of block headers alone (80 bytes each) is sufficient to prove a node i
 
 Seeding instead bootstraps a node's UTXO set directly from a snapshot — exported from a Legacy SV Node or from an existing, already-synchronized Teranode instance — which reconstructs the current UTXO state in hours rather than days (see the per-method Expected Timeline tables under Methods 2 and 3). This is why Methods 2 and 3 are recommended for production deployments, while full P2P sync (Method 1) remains available for cases without an existing data source to seed from.
 
-Note the trust boundary. The export tooling checks its own output against the source node's chainstate tip and writes a `.sha256` sidecar next to each artifact, but the seeder imports whatever it is given: it performs no proof-of-work or previous-hash check on the imported headers, never reads the `.sha256` sidecars, and does not re-derive the UTXO set from the chain. Nothing in the import path can detect a snapshot whose UTXO set does not match the chain, because a block header commits to the block's transactions, not to the resulting UTXO state. Seed only from artifacts you exported yourself or from an operator you trust, and verify them against the `.sha256` files before importing. Method 1 is the option that requires no such trust.
+Note the trust boundary. The export tooling checks its own output against the source node's chainstate tip and writes a `.sha256` sidecar next to each artifact, but the seeder imports whatever it is given: it checks that each header links to a previously stored block, but performs no proof-of-work check on the imported headers, never reads the `.sha256` sidecars, and does not re-derive the UTXO set from the chain. A self-consistent forged chain still passes the linkage check, and nothing in the import path can detect a snapshot whose UTXO set does not match the chain, because a block header commits to the block's transactions, not to the resulting UTXO state. Seed only from artifacts you exported yourself or from an operator you trust, and verify them against the `.sha256` files before importing. Method 1 is the option that requires no such trust.
 
 ---
 
@@ -439,6 +439,11 @@ Ensure the required UTXO files are available in your target Teranode's export di
 ### Step 3: Run Seeder
 
 Use the same seeder process as described in Method 2:
+
+!!! warning "The hash is not validated against file contents"
+    `-hash` only selects the two files by name. The seeder does not compare it against the tip hash recorded inside either file, and it does not compare the headers file and the UTXO set against each other. It also does not read the `.sha256` sidecars written by the export tooling.
+
+    Confirm both artifacts come from the same export, and verify them against their `.sha256` files, before running the seeder. A mismatched or partially transferred pair has two possible outcomes: it imports with no complaint, or it fails at the final step — after the entire UTXO set has been written and `lastProcessed.dat` created — in which case a re-run needs `-force`.
 
 ```bash
 # Scale down services

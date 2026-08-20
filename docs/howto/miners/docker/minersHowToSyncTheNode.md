@@ -41,12 +41,14 @@ reserved for fresh installs that have no seed source.
 
 Note the trust boundary. The export tooling checks its own output against the
 source node's chainstate tip and writes a `.sha256` sidecar next to each
-artifact, but the seeder imports whatever it is given: it performs no
-proof-of-work or previous-hash check on the imported headers, never reads the
-`.sha256` sidecars, and does not re-derive the UTXO set from the chain. Nothing
-in the import path can detect a snapshot whose UTXO set does not match the
-chain, because a block header commits to the block's transactions, not to the
-resulting UTXO state. Seed only from artifacts you exported yourself or from an
+artifact, but the seeder imports whatever it is given: it checks that each
+header links to a previously stored block, but performs no proof-of-work check
+on the imported headers, never reads the `.sha256` sidecars, and does not
+re-derive the UTXO set from the chain. A self-consistent forged chain still
+passes the linkage check, and nothing in the import path can detect a snapshot
+whose UTXO set does not match the chain, because a block header commits to the
+block's transactions, not to the resulting UTXO state. Seed only from
+artifacts you exported yourself or from an
 operator you trust, and check them against the `.sha256` files before
 importing. Network Sync is the option that requires no such trust.
 
