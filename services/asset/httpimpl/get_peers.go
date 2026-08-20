@@ -80,6 +80,18 @@ func transportLabel(transport blockchain_api.TransportType) string {
 	return "libp2p"
 }
 
+// timeToUnix converts a timestamp to Unix seconds, mapping an unset time to 0.
+// The guard matters: time.Time{}.Unix() is -62135596800, which is truthy in
+// JavaScript, so the dashboard would render year 1 where it means to render
+// "Never". The p2p read path this endpoint replaced applied the same guard.
+func timeToUnix(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+
+	return t.Unix()
+}
+
 // peerInfoToResponse converts one registry peer to its JSON form.
 func peerInfoToResponse(peer *blockchain.PeerInfo) PeerInfoResponse {
 	blockHashStr := ""
@@ -98,25 +110,25 @@ func peerInfoToResponse(peer *blockchain.PeerInfo) PeerInfoResponse {
 		BanScore:        int(peer.BanScore),
 		IsBanned:        peer.IsBanned,
 		IsConnected:     peer.IsConnected,
-		ConnectedAt:     peer.ConnectedAt.Unix(),
+		ConnectedAt:     timeToUnix(peer.ConnectedAt),
 		BytesSent:       peer.BytesSent,
 		BytesReceived:   peer.BytesReceived,
-		LastBlockTime:   peer.LastBlockTime.Unix(),
-		LastMessageTime: peer.LastMessageTime.Unix(),
+		LastBlockTime:   timeToUnix(peer.LastBlockTime),
+		LastMessageTime: timeToUnix(peer.LastMessageTime),
 
 		// Catchup-specific counters. The timestamps remain the generic
 		// interaction ones; catchup-scoped timestamps are not tracked.
 		CatchupAttempts:        peer.CatchupAttempts,
 		CatchupSuccesses:       peer.CatchupSuccesses,
 		CatchupFailures:        peer.CatchupFailures,
-		CatchupLastAttempt:     peer.LastInteractionAttempt.Unix(),
-		CatchupLastSuccess:     peer.LastInteractionSuccess.Unix(),
-		CatchupLastFailure:     peer.LastInteractionFailure.Unix(),
+		CatchupLastAttempt:     timeToUnix(peer.LastInteractionAttempt),
+		CatchupLastSuccess:     timeToUnix(peer.LastInteractionSuccess),
+		CatchupLastFailure:     timeToUnix(peer.LastInteractionFailure),
 		CatchupReputationScore: peer.ReputationScore,
 		CatchupMaliciousCount:  peer.MaliciousCount,
 		CatchupAvgResponseTime: peer.AvgResponseTimeMs,
 		LastCatchupError:       peer.LastCatchupError,
-		LastCatchupErrorTime:   peer.LastCatchupErrorTime.Unix(),
+		LastCatchupErrorTime:   timeToUnix(peer.LastCatchupErrorTime),
 	}
 
 	if peer.Legacy != nil {
@@ -128,7 +140,7 @@ func peerInfoToResponse(peer *blockchain.PeerInfo) PeerInfoResponse {
 			TimeOffsetSecs:  peer.Legacy.TimeOffsetSecs,
 			StartingHeight:  peer.Legacy.StartingHeight,
 			IsSyncPeer:      peer.Legacy.IsSyncPeer,
-			TimeConnected:   peer.Legacy.TimeConnected.Unix(),
+			TimeConnected:   timeToUnix(peer.Legacy.TimeConnected),
 		}
 	}
 

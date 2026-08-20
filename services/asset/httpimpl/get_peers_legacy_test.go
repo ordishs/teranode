@@ -76,3 +76,64 @@ func TestPeerInfoToResponse_Libp2pPeerOmitsLegacy(t *testing.T) {
 	require.Nil(t, got.Legacy)
 	require.Equal(t, "http://198.51.100.4:8090", got.DataHubURL)
 }
+
+// TestPeerInfoToResponse_UnsetTimestampsAreZero is a regression test. The old
+// p2p read path passed every timestamp through a zero-guard closure
+// (services/p2p/Server.go peerInfoToP2PProto), so an unset time reached the
+// dashboard as 0. Reading the registry directly must keep that contract:
+// time.Time{}.Unix() is -62135596800, which is truthy in JavaScript, so the
+// dashboard would render year 1 instead of "Never".
+func TestPeerInfoToResponse_UnsetTimestampsAreZero(t *testing.T) {
+	got := peerInfoToResponse(&blockchain.PeerInfo{
+		ID:            "12D3KooWGRUEbFsXTBnpVRHtE3ZBSbSMd4x8hs9NfCVCNhqTFPHb",
+		TransportType: blockchain_api.TransportType_TRANSPORT_HTTP,
+		Height:        912350,
+	})
+
+	require.Zero(t, got.ConnectedAt, "unset ConnectedAt must serialise as 0")
+	require.Zero(t, got.LastBlockTime, "unset LastBlockTime must serialise as 0")
+	require.Zero(t, got.LastMessageTime, "unset LastMessageTime must serialise as 0")
+	require.Zero(t, got.CatchupLastAttempt, "unset catchup attempt must serialise as 0")
+	require.Zero(t, got.CatchupLastSuccess, "unset catchup success must serialise as 0")
+	require.Zero(t, got.CatchupLastFailure, "unset catchup failure must serialise as 0")
+	require.Zero(t, got.LastCatchupErrorTime, "unset catchup error time must serialise as 0")
+}
+
+// TestPeerInfoToResponse_UnsetLegacyTimeConnectedIsZero covers the same guard on
+// the nested legacy block.
+func TestPeerInfoToResponse_UnsetLegacyTimeConnectedIsZero(t *testing.T) {
+	got := peerInfoToResponse(&blockchain.PeerInfo{
+		ID:            "legacy:203.0.113.7:8333",
+		TransportType: blockchain_api.TransportType_TRANSPORT_WIRE_PROTOCOL,
+		Legacy:        &blockchain.LegacyPeerInfo{ProtocolVersion: 70016},
+	})
+
+	require.NotNil(t, got.Legacy)
+	require.Zero(t, got.Legacy.TimeConnected, "unset TimeConnected must serialise as 0")
+}
+
+// TestPeerInfoToResponse_SetTimestampsSurvive guards against a zero-guard that
+// swallows real values.
+func TestPeerInfoToResponse_SetTimestampsSurvive(t *testing.T) {
+	when := time.Unix(1750000000, 0).UTC()
+
+	got := peerInfoToResponse(&blockchain.PeerInfo{
+		ID:                     "12D3KooWGRUEbFsXTBnpVRHtE3ZBSbSMd4x8hs9NfCVCNhqTFPHb",
+		TransportType:          blockchain_api.TransportType_TRANSPORT_HTTP,
+		ConnectedAt:            when,
+		LastBlockTime:          when,
+		LastMessageTime:        when,
+		LastInteractionAttempt: when,
+		LastInteractionSuccess: when,
+		LastInteractionFailure: when,
+		LastCatchupErrorTime:   when,
+	})
+
+	require.Equal(t, when.Unix(), got.ConnectedAt)
+	require.Equal(t, when.Unix(), got.LastBlockTime)
+	require.Equal(t, when.Unix(), got.LastMessageTime)
+	require.Equal(t, when.Unix(), got.CatchupLastAttempt)
+	require.Equal(t, when.Unix(), got.CatchupLastSuccess)
+	require.Equal(t, when.Unix(), got.CatchupLastFailure)
+	require.Equal(t, when.Unix(), got.LastCatchupErrorTime)
+}
