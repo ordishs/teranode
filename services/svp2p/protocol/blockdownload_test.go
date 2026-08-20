@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -190,7 +191,7 @@ func TestFindNextBlocksToDownload_SkipsBlocksAlreadyInFlight(t *testing.T) {
 	activeTip := f.node(t, 4)
 
 	holder := f.peerAt(t, "5.6.7.8:8333", 10)
-	require.True(t, f.bd.MarkBlockAsInFlight(holder, f.node(t, 6)))
+	require.True(t, f.bd.MarkBlockAsInFlight(holder, f.node(t, 6), testNow))
 
 	peer := f.peerAt(t, "1.2.3.4:8333", 10)
 
@@ -341,7 +342,7 @@ func TestFindNextBlocksToDownload_WindowAdvancesOnlyOnContiguousCompletion(t *te
 	require.Equal(t, int32(BlockDownloadWindow), blocks[len(blocks)-1].Height)
 
 	for _, b := range blocks {
-		require.True(t, f.bd.MarkBlockAsInFlight(peer, b))
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, b, testNow))
 	}
 
 	// Out-of-order completion in the middle of the window.
@@ -424,7 +425,7 @@ func TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip(t *test
 	require.Len(t, blocks, 20)
 
 	for _, b := range blocks {
-		require.True(t, f.bd.MarkBlockAsInFlight(peer, b))
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, b, testNow))
 		require.True(t, f.bd.BlockReceived(peer, b.Hash, testNow))
 	}
 
@@ -446,7 +447,7 @@ func TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip(t *test
 	// A steady-state call that returns early must still prune: this peer has
 	// nothing interesting, which is the path that made the leak unbounded.
 	idle := fullNodePeer("9.9.9.9:8333")
-	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 25)))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 25), testNow))
 	require.True(t, f.bd.BlockReceived(peer, f.node(t, 25).Hash, testNow))
 	require.Len(t, f.bd.haveData, 1)
 
@@ -507,7 +508,7 @@ func TestSendGetDataBlocks_NamesTheStaller(t *testing.T) {
 
 	holder := f.peerAt(t, "5.6.7.8:8333", peerHeight)
 	for h := 1; h <= BlockDownloadWindow; h++ {
-		require.True(t, f.bd.MarkBlockAsInFlight(holder, f.node(t, h)))
+		require.True(t, f.bd.MarkBlockAsInFlight(holder, f.node(t, h), testNow))
 	}
 
 	waiter := f.peerAt(t, "1.2.3.4:8333", peerHeight)
@@ -571,7 +572,7 @@ func TestCheckStall_RotatesTheSyncPeer(t *testing.T) {
 	peer.State.pindexBestKnownBlock = &best
 	peer.State.pindexLastCommonBlock = &best
 
-	require.True(t, f.bd.MarkBlockAsInFlight(peer, best))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, best, testNow))
 
 	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
 	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(MaxLastBlockTime)))
@@ -597,7 +598,7 @@ func (f *downloadFixture) syncingPeer(t *testing.T, addr string) *SyncPeer {
 	peer.State.pindexBestKnownBlock = &best
 	peer.State.pindexLastCommonBlock = &best
 
-	require.True(t, f.bd.MarkBlockAsInFlight(peer, best))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, best, testNow))
 
 	return peer
 }
@@ -646,33 +647,6 @@ func TestCheckStall_RotatesAnIngestThatStoppedMoving(t *testing.T) {
 		"an ingest whose byte count stopped rising is a stall, whatever it read earlier")
 }
 
-func TestCheckStall_RotatesADribblingIngestPastTheDownloadCap(t *testing.T) {
-	f := newDownloadFixture(t, 3)
-	peer := f.syncingPeer(t, "1.2.3.4:8333")
-
-	const tick = time.Minute
-
-	perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
-
-	ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
-
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
-
-	// Healthy throughput holds the slot right up to the cap...
-	for elapsed := tick; elapsed < MaxBlockDownloadTime; elapsed += tick {
-		ingest.BytesRead += perTick
-
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)))
-	}
-
-	// ...and stops holding it there, so a peer cannot dribble bytes for ever
-	// to keep the single sync slot.
-	ingest.BytesRead += perTick
-
-	require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, ingest, testNow+micros(MaxBlockDownloadTime)),
-		"MaxBlockDownloadTime caps the suppression regardless of throughput")
-}
-
 func TestCheckStall_NeverRotatesANonSyncPeer(t *testing.T) {
 	f := newDownloadFixture(t, 3)
 	peer := f.peerAt(t, "1.2.3.4:8333", 3)
@@ -693,7 +667,7 @@ func TestCheckStall_ProgressKeepsTheSyncPeer(t *testing.T) {
 
 		best := f.node(t, 3)
 		peer.State.pindexBestKnownBlock = &best
-		require.True(t, f.bd.MarkBlockAsInFlight(peer, best))
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, best, testNow))
 
 		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
 
@@ -892,13 +866,13 @@ func TestMarkBlockAsInFlight_IsIdempotent(t *testing.T) {
 
 	block := f.node(t, 3)
 
-	require.True(t, f.bd.MarkBlockAsInFlight(peer, block))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, block, testNow))
 	require.Equal(t, 1, peer.State.nBlocksInFlight)
 
-	require.False(t, f.bd.MarkBlockAsInFlight(peer, block), "the same block from the same peer is a no-op")
+	require.False(t, f.bd.MarkBlockAsInFlight(peer, block, testNow), "the same block from the same peer is a no-op")
 	require.Equal(t, 1, peer.State.nBlocksInFlight)
 
-	require.False(t, f.bd.MarkBlockAsInFlight(other, block), "Phase 2 fetches each block from one peer only")
+	require.False(t, f.bd.MarkBlockAsInFlight(other, block, testNow), "Phase 2 fetches each block from one peer only")
 	require.Equal(t, 0, other.State.nBlocksInFlight)
 }
 
@@ -907,7 +881,7 @@ func TestBlockReceived_ClearsInFlightAndTheStallClock(t *testing.T) {
 	peer := f.peerAt(t, "1.2.3.4:8333", 3)
 
 	block := f.node(t, 3)
-	require.True(t, f.bd.MarkBlockAsInFlight(peer, block))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, block, testNow))
 
 	peer.State.nStallingSince = testNow
 
@@ -926,9 +900,9 @@ func TestBlockFailed_ReleasesTheBlockForAnotherPeer(t *testing.T) {
 
 	holder := f.peerAt(t, "5.6.7.8:8333", 10)
 	block := f.node(t, 5)
-	require.True(t, f.bd.MarkBlockAsInFlight(holder, block))
+	require.True(t, f.bd.MarkBlockAsInFlight(holder, block, testNow))
 
-	require.True(t, f.bd.BlockFailed(holder, block.Hash))
+	require.True(t, f.bd.BlockFailed(holder, block.Hash, testNow))
 	require.False(t, f.bd.IsInFlight(block.Hash))
 	require.Equal(t, 0, holder.State.nBlocksInFlight)
 
@@ -946,9 +920,9 @@ func TestPeerDisconnected_ReleasesEverythingThePeerHeld(t *testing.T) {
 	peer := f.peerAt(t, "1.2.3.4:8333", 10)
 	other := f.peerAt(t, "5.6.7.8:8333", 10)
 
-	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 5)))
-	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 6)))
-	require.True(t, f.bd.MarkBlockAsInFlight(other, f.node(t, 7)))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 5), testNow))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 6), testNow))
+	require.True(t, f.bd.MarkBlockAsInFlight(other, f.node(t, 7), testNow))
 
 	peer.State.nStallingSince = testNow
 	peer.State.pindexLastCommonBlock = &activeTip
@@ -1142,7 +1116,7 @@ func TestSendGetDataBlocks_SchedulesAcrossEveryUsefulPeer(t *testing.T) {
 				for h := MaxBlocksInTransitPerPeer + 1; h <= BlockDownloadWindow; h++ {
 					node := f.node(t, h)
 
-					require.True(t, f.bd.MarkBlockAsInFlight(peers[1], node))
+					require.True(t, f.bd.MarkBlockAsInFlight(peers[1], node, testNow))
 					require.True(t, f.bd.BlockReceived(peers[1], node.Hash, testNow-micros(time.Minute)))
 				}
 			},
@@ -1288,4 +1262,332 @@ func TestSendGetDataBlocks_ReSchedulesBlocksAPeerDisconnectReleased(t *testing.T
 	for _, hash := range released {
 		require.True(t, f.bd.IsInFlightFrom(staying, hash))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: per-block download timeout (nDownloadingSince)
+// ---------------------------------------------------------------------------
+
+// ibd forces the fixture out of the near-tip window, so CheckStall reads the
+// initial-block-download timeout base. The fixture's headers carry
+// wire.NewBlockHeader's own timestamp, which is the moment the test built them,
+// so the default fixture is always in the STEADY state; moving the adjusted
+// clock two days forward is what makes the tip look old.
+func (f *downloadFixture) ibd(t *testing.T) {
+	t.Helper()
+
+	require.True(t, f.hs.tipIsNearAdjustedTime(), "test setup: the fixture starts in the steady state")
+
+	real := f.hs.cfg.AdjustedTime
+	f.hs.cfg.AdjustedTime = func() int64 { return real() + 2*NearTipHeaderSyncWindow }
+
+	require.False(t, f.hs.tipIsNearAdjustedTime(), "test setup: the tip must now look older than the window")
+}
+
+// downloadingFrom marks one block in flight from a fresh peer at each of the
+// given heights, so the peer under test has that many OTHER peers downloading
+// validated blocks alongside it. It returns them.
+func (f *downloadFixture) downloadingFrom(t *testing.T, heights ...int) []*SyncPeer {
+	t.Helper()
+
+	peers := make([]*SyncPeer, 0, len(heights))
+
+	for i, h := range heights {
+		peer := f.peerAt(t, fmt.Sprintf("10.0.0.%d:8333", i+1), len(f.chain))
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, h), testNow))
+
+		peers = append(peers, peer)
+	}
+
+	return peers
+}
+
+// TestCheckStall_TimesOutTheFrontBlock is the DetectStalling second half
+// (net_processing.cpp:5629-5661): a block sitting at the head of a peer's
+// in-flight queue past maxDownloadTime costs the peer its connection, whether
+// or not any other peer has named it a staller.
+//
+// The expected windows are derived by hand from the C++ formula, not from the
+// implementation:
+//
+//	maxDownloadTime = nPowTargetSpacing * (timeoutBase + 50 * otherPeers) * 10000 microseconds
+//
+// with nPowTargetSpacing = 600 (mainnet, syncTestParams), timeoutBase = 100
+// percent in the steady state and 600 percent during initial block download
+// (validation.h:177-185). So 600 * 100 * 10000 microseconds is 10 minutes, and
+// every other downloading peer adds 600 * 50 * 10000, which is 5 minutes.
+func TestCheckStall_TimesOutTheFrontBlock(t *testing.T) {
+	tests := []struct {
+		name string
+		// ibd runs the case against the initial-block-download base.
+		ibd bool
+		// others is how many OTHER peers hold a block in flight.
+		others int
+		want   time.Duration
+	}{
+		{name: "steady state, no other downloading peer", want: 10 * time.Minute},
+		{name: "steady state, one other downloading peer", others: 1, want: 15 * time.Minute},
+		{name: "steady state, two other downloading peers", others: 2, want: 20 * time.Minute},
+		{name: "initial block download, no other downloading peer", ibd: true, want: 60 * time.Minute},
+		{name: "initial block download, one other downloading peer", ibd: true, others: 1, want: 65 * time.Minute},
+		{name: "initial block download, two other downloading peers", ibd: true, others: 2, want: 70 * time.Minute},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDownloadFixture(t, 10)
+
+			if tc.ibd {
+				f.ibd(t)
+			}
+
+			// Heights 8 and 9 keep the other peers' blocks clear of the one
+			// under test, since a block is only ever in flight from one peer.
+			f.downloadingFrom(t, []int{8, 9}[:tc.others]...)
+
+			peer := f.peerAt(t, "1.2.3.4:8333", 10)
+			require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 1), testNow))
+			require.Equal(t, testNow, peer.State.nDownloadingSince,
+				"the first block of a batch arms the clock (block_download_tracker.cpp:46-50)")
+
+			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)),
+				"the peer survives up to and including the timeout")
+
+			require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)+1),
+				"one microsecond past it, the front block has timed out")
+		})
+	}
+}
+
+// TestCheckStall_IgnoresAPeerOwingNothing pins the vBlocksInFlight.size() > 0
+// guard: the clock is meaningless for a peer with an empty queue, and a stale
+// nDownloadingSince from an earlier batch must not disconnect it.
+func TestCheckStall_IgnoresAPeerOwingNothing(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := f.peerAt(t, "1.2.3.4:8333", 3)
+
+	block := f.node(t, 1)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, block, testNow))
+	require.True(t, f.bd.BlockReceived(peer, block.Hash, testNow))
+	require.Empty(t, peer.State.vBlocksInFlight)
+
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Hour)),
+		"a peer that owes us nothing cannot time out on a block")
+}
+
+// TestBlockReceived_ReArmsTheClockOnlyForTheFrontBlock is
+// removeFromBlockMapNL's nDownloadingSince half
+// (block_download_tracker.cpp:311-315): the clock measures the FRONT of the
+// queue, so it restarts when the front leaves and stands still when anything
+// else does. Without the second half a peer could deliver its later blocks for
+// ever while withholding the one at the head and never time out; without the
+// first, a peer that delivers every block promptly would eventually be
+// disconnected on the age of a queue that has fully turned over.
+func TestBlockReceived_ReArmsTheClockOnlyForTheFrontBlock(t *testing.T) {
+	t.Run("the front block re-arms it", func(t *testing.T) {
+		f := newDownloadFixture(t, 5)
+		peer := f.peerAt(t, "1.2.3.4:8333", 5)
+
+		first, second := f.node(t, 1), f.node(t, 2)
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, first, testNow))
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, second, testNow))
+		require.Equal(t, testNow, peer.State.nDownloadingSince)
+
+		later := testNow + micros(9*time.Minute)
+		require.True(t, f.bd.BlockReceived(peer, first.Hash, later))
+
+		require.Equal(t, later, peer.State.nDownloadingSince,
+			"the next block's clock starts when the one ahead of it arrived")
+		require.Equal(t, []chainhash.Hash{second.Hash}, peer.State.vBlocksInFlight)
+
+		// The re-arm is what buys the second block its own full window.
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, later+micros(10*time.Minute)))
+		require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, later+micros(10*time.Minute)+1))
+	})
+
+	t.Run("a block behind the front does not", func(t *testing.T) {
+		f := newDownloadFixture(t, 5)
+		peer := f.peerAt(t, "1.2.3.4:8333", 5)
+
+		first, second := f.node(t, 1), f.node(t, 2)
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, first, testNow))
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, second, testNow))
+
+		later := testNow + micros(9*time.Minute)
+		require.True(t, f.bd.BlockReceived(peer, second.Hash, later))
+
+		require.Equal(t, testNow, peer.State.nDownloadingSince,
+			"delivering a later block must not buy the withheld front block more time")
+		require.Equal(t, []chainhash.Hash{first.Hash}, peer.State.vBlocksInFlight)
+
+		require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Minute)+1))
+	})
+
+	t.Run("the clock never moves backwards", func(t *testing.T) {
+		f := newDownloadFixture(t, 5)
+		peer := f.peerAt(t, "1.2.3.4:8333", 5)
+
+		first, second := f.node(t, 1), f.node(t, 2)
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, first, testNow))
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, second, testNow))
+
+		// C++ takes std::max of the old value and now, so an out-of-order or
+		// duplicate clock reading cannot lengthen the next block's window.
+		require.True(t, f.bd.BlockReceived(peer, first.Hash, testNow-micros(time.Minute)))
+
+		require.Equal(t, testNow, peer.State.nDownloadingSince)
+	})
+}
+
+// TestCheckStall_TimesOutARotatedPeerHoldingBlocks is the case Task 3 left
+// pending and the reason this timeout is load-bearing rather than a refinement.
+// A rotation clears fSyncStarted, so the rotation clause can never judge that
+// peer again while it holds no slot, and until now only another peer naming it
+// the staller could take its blocks back — which needs the whole rest of the
+// download window drained first, and a second eligible peer to do the draining.
+// The timeout reaches it with neither.
+func TestCheckStall_TimesOutARotatedPeerHoldingBlocks(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+	require.False(t, peer.State.fSyncStarted, "this is the state a rotation leaves behind")
+
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 1), testNow))
+
+	require.Equal(t, int64(0), peer.State.nStallingSince, "no other peer has named it a staller")
+
+	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Minute)+1),
+		"the timeout must run before the fSyncStarted early return")
+}
+
+// TestCheckStall_KeepsAPeerDeliveringPastTheTimeout covers this port's stated
+// deviation from SVNode. The C++ timeout clause is unconditional: it judges the
+// front block's wall clock and nothing else. Teranode blocks are large enough
+// that a peer delivering one honestly can outlast the steady-state window of
+// 10 minutes, and disconnecting it would restart the same download from zero on
+// another peer with no more time than the first had. So the timeout defers to
+// the same healthy-throughput evidence the rotation suppression already uses,
+// bounded by the same MaxBlockDownloadTime cap.
+func TestCheckStall_KeepsAPeerDeliveringPastTheTimeout(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 1), testNow))
+
+	const tick = 30 * time.Second
+
+	perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
+	ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
+
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+
+	// Well past the 10 minute steady-state window, still delivering.
+	for elapsed := tick; elapsed <= 20*time.Minute; elapsed += tick {
+		ingest.BytesRead += perTick
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)),
+			"a peer still delivering bytes must keep its blocks at %s", elapsed)
+	}
+
+	// The moment the bytes stop, the front block's own clock is what judges it,
+	// and that clock expired long ago. One tick is all it takes: the previous
+	// tick's sample is already recorded, so a delta of zero is evidence on the
+	// very next check.
+	frozen := testNow + micros(20*time.Minute+tick)
+
+	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, ingest, frozen))
+}
+
+// TestCheckStall_DisconnectsADribblingIngestPastTheDownloadCap pins which of
+// the two give-up rules wins where they meet, in the one regime where they can
+// both be due at once.
+//
+// The split: the SVNode timeout judges the FRONT block's wall clock; the
+// Teranode rotation judges a live ingest's byte rate. A peer dribbling bytes
+// just above the floor is suppressed by BOTH until MaxBlockDownloadTime, at
+// which point the suppression lapses and each rule is free to fire. The
+// timeout clause is above the rotation clause, mirroring DetectStalling's place
+// in SendMessages, so in the steady state — where the 10 minute window has long
+// since passed — the peer is DISCONNECTED rather than rotated. That is the
+// stronger of the two outcomes and it releases the blocks either way.
+//
+// During initial block download the 60 minute window has NOT passed at the
+// 30 minute cap, so the rotation is what fires, exactly as it did before this
+// timeout existed.
+func TestCheckStall_DisconnectsADribblingIngestPastTheDownloadCap(t *testing.T) {
+	tests := []struct {
+		name string
+		ibd  bool
+		want StallAction
+	}{
+		{name: "steady state: the front block timed out 20 minutes ago", want: StallActionDisconnect},
+		{name: "initial block download: the front block has 30 minutes left", ibd: true, want: StallActionRotateSyncPeer},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDownloadFixture(t, 3)
+
+			if tc.ibd {
+				f.ibd(t)
+			}
+
+			peer := f.syncingPeer(t, "1.2.3.4:8333")
+
+			const tick = time.Minute
+
+			perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
+			ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
+
+			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+
+			for elapsed := tick; elapsed < MaxBlockDownloadTime; elapsed += tick {
+				ingest.BytesRead += perTick
+
+				require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)))
+			}
+
+			ingest.BytesRead += perTick
+
+			require.Equal(t, tc.want, f.bd.CheckStall(peer, ingest, testNow+micros(MaxBlockDownloadTime)))
+		})
+	}
+}
+
+// TestPeerDisconnected_ClearsTheDownloadClock pins that the timeout state goes
+// with everything else a peer held, so a peer whose blocks were all released
+// cannot be judged on a clock that measures a queue it no longer owns. It is
+// the rotation path too: clearPeer serves both.
+func TestPeerDisconnected_ClearsTheDownloadClock(t *testing.T) {
+	f := newDownloadFixture(t, 5)
+	peer := f.peerAt(t, "1.2.3.4:8333", 5)
+
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 1), testNow))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 2), testNow))
+
+	f.bd.PeerDisconnected(peer)
+
+	require.Empty(t, peer.State.vBlocksInFlight)
+	require.Equal(t, int64(0), peer.State.nDownloadingSince)
+
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Hour)))
+}
+
+// TestBlockFailed_ReArmsTheClockLikeADelivery pins that a released front block
+// re-arms the clock the same way a delivered one does. C++ runs both through
+// removeFromBlockMapNL, so a rejected or cancelled front block must not leave
+// the next block in the queue measured from the failed one's request time.
+func TestBlockFailed_ReArmsTheClockLikeADelivery(t *testing.T) {
+	f := newDownloadFixture(t, 5)
+	peer := f.peerAt(t, "1.2.3.4:8333", 5)
+
+	first, second := f.node(t, 1), f.node(t, 2)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, first, testNow))
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, second, testNow))
+
+	later := testNow + micros(9*time.Minute)
+	require.True(t, f.bd.BlockFailed(peer, first.Hash, later))
+
+	require.Equal(t, later, peer.State.nDownloadingSince)
+	require.Equal(t, []chainhash.Hash{second.Hash}, peer.State.vBlocksInFlight)
 }

@@ -53,6 +53,27 @@ type peerSyncState struct {
 	// consumed by block download scheduling (Task 6); not touched here.
 	nBlocksInFlight int
 
+	// vBlocksInFlight mirrors CNodeState::vBlocksInFlight (node_state.h:80)
+	// reduced to what the timeout needs: the hashes this peer owes us, in the
+	// order they were requested. Only the FRONT entry is ever read —
+	// DetectStalling names it in the timeout log line and nDownloadingSince
+	// measures it — but the whole order has to be kept, because which entry is
+	// the front changes as blocks arrive out of order. The C++ list carries a
+	// QueuedBlock per entry (the CBlockIndex pointer and the partial-block
+	// buffer for compact blocks); neither has a consumer in this port.
+	//
+	// It is a slice rather than a linked list: removals are O(n) over a list
+	// capped at MaxBlocksInTransitPerPeer, which is 16.
+	vBlocksInFlight []chainhash.Hash
+
+	// nDownloadingSince mirrors CNodeState::nDownloadingSince
+	// (node_state.h:81-83): "When the first entry in vBlocksInFlight started
+	// downloading. Don't care when vBlocksInFlight is empty." In microseconds
+	// since the Unix epoch. It is armed when the peer's in-flight queue goes
+	// from empty to one entry, and re-armed when the front entry leaves the
+	// queue, so it always measures the block at the head.
+	nDownloadingSince int64
+
 	// fSyncStarted mirrors CNodeState::fSyncStarted: whether we've started
 	// headers synchronization with this peer. Populated and consumed by
 	// headers-first sync (Task 5); not touched here.

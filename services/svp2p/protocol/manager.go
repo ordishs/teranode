@@ -715,7 +715,7 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		// changed under a rotation stays in flight for ever and is never
 		// re-offered. BlockNotDelivered is guarded, so it does nothing when
 		// the holder is someone else.
-		m.blockDownloader.BlockNotDelivered(syncPeer, hash)
+		m.blockDownloader.BlockNotDelivered(syncPeer, hash, now)
 
 		m.logger.Debugf("[svp2p] block %s was already in flight: %v", hash, outcome.Err)
 
@@ -724,7 +724,7 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 
 	default:
 		// The block is back on offer to any peer, including this one.
-		m.blockDownloader.BlockFailed(syncPeer, hash)
+		m.blockDownloader.BlockFailed(syncPeer, hash, now)
 
 		if outcome.TransientLocal && syncPeer != nil && syncPeer.State != nil {
 			// Admission.SkipForBackoff's caller contract: our own store

@@ -31,6 +31,32 @@ const BlockStallingTimeout = 10 * time.Second
 // CheckStall.
 const MaxLastBlockTime = 180 * time.Second
 
+// BlockDownloadTimeoutBase mirrors validation.h
+// DEFAULT_BLOCK_DOWNLOAD_TIMEOUT_BASE (100): the per-block download timeout in
+// the steady state, as a PERCENTAGE of the block interval. SVNode makes it
+// configurable with -blockdownloadtimeoutbase; this port carries the default.
+const BlockDownloadTimeoutBase int64 = 100
+
+// BlockDownloadTimeoutBaseIBD mirrors validation.h
+// DEFAULT_BLOCK_DOWNLOAD_TIMEOUT_BASE_IBD (600): the same timeout during
+// initial block download, where a peer is forgiven six block intervals rather
+// than one because the whole chain is in flight rather than one new tip.
+const BlockDownloadTimeoutBaseIBD int64 = 600
+
+// BlockDownloadTimeoutPerPeer mirrors validation.h
+// DEFAULT_BLOCK_DOWNLOAD_TIMEOUT_PER_PEER (50): the extra allowance, again as a
+// percentage of the block interval, granted for every OTHER peer we are
+// downloading blocks from. C++: "We compensate for other peers to prevent
+// killing off peers due to our own downstream link being saturated."
+const BlockDownloadTimeoutPerPeer int64 = 50
+
+// percentOfBlockIntervalMicros converts the percentage-of-block-interval unit
+// the three constants above are expressed in into microseconds, given a block
+// interval in seconds. It is the C++ comment's own arithmetic
+// (net_processing.cpp:5652-5654): "to get seconds we must multiply by 1000000
+// and divide by 100 which is equivalent to multiply by 10000".
+const percentOfBlockIntervalMicros = 10000
+
 // MaxBlockDownloadTime carries services/legacy/peer/peer.go
 // MaxBlockDownloadTime (30 minutes): the wall-clock ceiling on how long a
 // single block download may hold off the sync-peer rotation on the strength of
@@ -140,12 +166,13 @@ type BlockDownloader struct {
 	// first two tests cannot be answered, and racing every slow block instead
 	// would multiply IBD bandwidth by the parallel-fetch cap.
 	//
-	// WHAT REPLACES RACING IS RECOVERY, and only one half of it is here. The
+	// WHAT REPLACES RACING IS RECOVERY, and both halves of it are here. The
 	// nodeStaller mechanism is kept, so a peer holding the head of the window is
-	// disconnected rather than raced (see CheckStall, which also states what that
-	// costs). The cheap half — SVNode's per-block download timeout, which takes
-	// one block back from a peer that is still connected — is Task 6's
-	// nDownloadingSince work and is NOT carried yet.
+	// disconnected rather than raced. The cheaper half is SVNode's per-block
+	// download timeout (nDownloadingSince), which reaches a peer on the age of
+	// the block at the head of its own queue, without needing a second peer to
+	// name it or the rest of the window to be drained first. Both live in
+	// CheckStall, which states what each of them costs.
 	inFlight map[chainhash.Hash]*SyncPeer
 
 	// haveData ports CBlockIndex::getStatus().hasData(): the blocks whose full
@@ -560,7 +587,7 @@ func (bd *BlockDownloader) SendGetDataBlocks(peer *SyncPeer, activeTip HeaderNod
 		}
 
 		// net_processing.cpp: "Requesting block %s (%d) peer=%d".
-		bd.MarkBlockAsInFlight(peer, blocks[i])
+		bd.MarkBlockAsInFlight(peer, blocks[i], nowMicros)
 	}
 
 	// Checked after the marking, as C++ does: staller is only ever set when the
@@ -582,7 +609,7 @@ func (bd *BlockDownloader) SendGetDataBlocks(peer *SyncPeer, activeTip HeaderNod
 // block from the same node — extended to any node, since this port fetches each
 // block from exactly one peer whatever the tick's peer count (see the inFlight
 // field note).
-func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode) bool {
+func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode, nowMicros int64) bool {
 	if peer == nil || peer.State == nil {
 		return false
 	}
@@ -592,7 +619,14 @@ func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode)
 	}
 
 	bd.inFlight[block.Hash] = peer
+	peer.State.vBlocksInFlight = append(peer.State.vBlocksInFlight, block.Hash)
 	peer.State.nBlocksInFlight++
+
+	if peer.State.nBlocksInFlight == 1 {
+		// block_download_tracker.cpp:46-50: "We're starting a block download
+		// (batch) from this peer."
+		peer.State.nDownloadingSince = nowMicros
+	}
 
 	return true
 }
@@ -617,22 +651,22 @@ func (bd *BlockDownloader) BlockReceived(peer *SyncPeer, hash chainhash.Hash, no
 		peer.State.nLastProgressTime = nowMicros
 	}
 
-	return bd.removeFromFlight(peer, hash)
+	return bd.removeFromFlight(peer, hash, nowMicros)
 }
 
 // BlockFailed is BlockDownloadTracker::MarkBlockAsFailed: the download was
 // cancelled, timed out, or the block was rejected. The block goes back on
 // offer to any peer, including this one.
-func (bd *BlockDownloader) BlockFailed(peer *SyncPeer, hash chainhash.Hash) bool {
+func (bd *BlockDownloader) BlockFailed(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
 	delete(bd.haveData, hash)
 
-	return bd.removeFromFlight(peer, hash)
+	return bd.removeFromFlight(peer, hash, nowMicros)
 }
 
 // removeFromFlight is BlockDownloadTracker::removeFromBlockMapNL. It only fires
 // for the peer the block was requested from, matching the C++ getBlockFromNodeNL
 // lookup by node.
-func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash) bool {
+func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
 	holder, busy := bd.inFlight[hash]
 	if !busy || holder != peer {
 		return false
@@ -641,11 +675,31 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash)
 	delete(bd.inFlight, hash)
 
 	if holder.State != nil {
-		if holder.State.nBlocksInFlight > 0 {
-			holder.State.nBlocksInFlight--
+		state := holder.State
+
+		for i, queued := range state.vBlocksInFlight {
+			if queued != hash {
+				continue
+			}
+
+			if i == 0 && nowMicros > state.nDownloadingSince {
+				// block_download_tracker.cpp:311-315: "First block on the
+				// queue was received, update the start download time for the
+				// next one" — std::max, so a clock reading older than the one
+				// already held cannot lengthen the next block's window.
+				state.nDownloadingSince = nowMicros
+			}
+
+			state.vBlocksInFlight = append(state.vBlocksInFlight[:i], state.vBlocksInFlight[i+1:]...)
+
+			break
 		}
 
-		holder.State.nStallingSince = 0
+		if state.nBlocksInFlight > 0 {
+			state.nBlocksInFlight--
+		}
+
+		state.nStallingSince = 0
 	}
 
 	return true
@@ -679,8 +733,8 @@ func (bd *BlockDownloader) IsInFlightFrom(peer *SyncPeer, hash chainhash.Hash) b
 // Both would re-offer the block, but BlockFailed also DELETES the have-data
 // record — and the copy that won the admission race may already have completed
 // and recorded it. Losing that record would re-download a block we hold.
-func (bd *BlockDownloader) BlockNotDelivered(peer *SyncPeer, hash chainhash.Hash) bool {
-	return bd.removeFromFlight(peer, hash)
+func (bd *BlockDownloader) BlockNotDelivered(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
+	return bd.removeFromFlight(peer, hash, nowMicros)
 }
 
 // BlocksInFlight reports how many blocks are in flight across all peers.
@@ -717,6 +771,8 @@ func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
 
 	if peer.State != nil {
 		peer.State.nBlocksInFlight = 0
+		peer.State.vBlocksInFlight = nil
+		peer.State.nDownloadingSince = 0
 		peer.State.nStallingSince = 0
 		peer.State.pindexLastCommonBlock = nil
 	}
@@ -902,24 +958,25 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 //     rotated-but-connected peer becomes ungovernable: blocks re-handed to it
 //     would never come back. TestCheckStall_DisconnectsAStallerThatHoldsNoSyncSlot
 //     pins the order.
-//   - SVNode also takes single blocks back on a per-block download timeout,
-//     which reaches a silent peer without costing it its connection and
-//     without needing a second peer to name it the staller. That timeout is
-//     NOT carried here yet, so the staller rule above is the whole of the
-//     recovery today.
+//   - The per-block download timeout, the second DetectStalling clause below,
+//     also runs before that early return. It reaches such a peer on the age of
+//     the block at the head of its own queue, so it needs neither a second
+//     peer nor a drained window.
 //
-// Know what that costs before relying on it. A silent peer comes to rest
-// holding MaxBlocksInTransitPerPeer blocks and no more, because
+// Both are needed, because the staller rule alone is expensive. A silent peer
+// comes to rest holding MaxBlocksInTransitPerPeer blocks and no more, because
 // SendGetDataBlocks is the only thing that marks blocks in flight and it asks
 // for at most the remainder of that cap. nStallingSince cannot start until
 // another peer has downloaded the whole rest of the download window and STILL
 // cannot move, since that empty batch is the only thing that names a staller.
-// So the recovery is bounded by the download time for up to
+// So that recovery is bounded by the download time for up to
 // BlockDownloadWindow blocks — our own tip stuck behind the hole for all of it
 // — and only then by BlockStallingTimeout. With no second eligible peer it
-// never completes at all. The per-block timeout is what would make this cheap,
-// and TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain
-// (manager_test.go) pins the expensive path it must replace.
+// never completes at all.
+// TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain
+// (manager_test.go) pins that expensive path, and
+// TestSyncPass_TimesOutASilentRotatedPeerAndRehomesItsBlocks beside it pins the
+// cheap one: one timeout, no second peer, no drained window.
 //
 // ingest is what the caller observed about a block this peer is currently
 // ingesting; the zero value means none. It is the input to the large-block
@@ -941,10 +998,50 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 		return StallActionDisconnect
 	}
 
+	// DetectStalling's second half (net_processing.cpp:5629-5661): the block at
+	// the head of this peer's queue has been owed for longer than
+	// maxDownloadTime, so the peer goes and its blocks return to the pool. Like
+	// the staller clause above it sits BELOW nothing and ABOVE the fSyncStarted
+	// return, because it must judge every peer holding blocks — including one a
+	// rotation stripped of the sync slot, which no other rule can reach.
+	//
+	// One deviation, and it is deliberate: C++ judges the front block's wall
+	// clock alone, while this port first asks whether the peer is still
+	// delivering. Teranode blocks are large enough that an honest delivery can
+	// outlast the steady-state window of one block interval, and disconnecting
+	// mid-transfer would restart the same download on another peer with no more
+	// time than this one had — a livelock, not a recovery. The evidence and its
+	// bound are the ones the rotation suppression below already uses:
+	// MinBlockDownloadBytesPerSec, capped at MaxBlockDownloadTime, so a peer
+	// cannot dribble its way out of the timeout for ever.
+	//
+	// The residual: the evidence is per PEER, not per block, so a peer
+	// delivering one block honestly holds off the clock on the whole queue,
+	// front block included. A peer reads one block at a time off its single
+	// connection and the blocks arrive in the order they were requested, so the
+	// block being ingested IS the front block in every case this port can
+	// produce. A future serving path that interleaved two block streams on one
+	// connection would break that, and would need the ingest attributed to a
+	// hash rather than to a peer.
+	//
+	// Where the two rules meet, this one wins, being the stronger: past the
+	// suppression cap a dribbling SYNC peer is disconnected rather than rotated
+	// whenever its front block has also timed out. During initial block
+	// download the window is six block intervals and outlasts the cap, so the
+	// rotation still fires there first. TestCheckStall_DisconnectsADribblingIngestPastTheDownloadCap
+	// pins both regimes.
+	if len(state.vBlocksInFlight) > 0 && !ingestProgressing(state, ingest, nowMicros) {
+		if nowMicros > state.nDownloadingSince+bd.maxDownloadTimeMicros(peer) {
+			// net_processing.cpp: "Timeout downloading block %s from peer=%d,
+			// disconnecting".
+			return StallActionDisconnect
+		}
+	}
+
 	// legacy netsync handleCheckSyncPeer only ever examines the sync peer. This
-	// return MUST stay below the DetectStalling clause above: a rotated peer
-	// reaches here with fSyncStarted cleared, and the staller rule is the only
-	// thing left that can release the blocks it was re-handed. See the note on
+	// return MUST stay below the DetectStalling clauses above: a rotated peer
+	// reaches here with fSyncStarted cleared, and those two rules are the only
+	// things left that can release the blocks it was re-handed. See the note on
 	// what a rotation leaves behind.
 	if !state.fSyncStarted {
 		return StallActionNone
@@ -1032,6 +1129,57 @@ func ingestProgressing(state *peerSyncState, ingest IngestSnapshot, nowMicros in
 
 	// delta bytes over elapsed microseconds, compared in bytes per second.
 	return delta*uint64(microsPerSecond) >= MinBlockDownloadBytesPerSec*uint64(elapsed) //nolint:gosec // both are positive here
+}
+
+// maxDownloadTimeMicros is the DetectStalling budget for the block at the head
+// of peer's queue (net_processing.cpp:5645-5654):
+//
+//	maxDownloadTime = nPowTargetSpacing * (timeoutBase + timeoutPeers) * 10000
+//
+// The base is chosen by the initial-block-download predicate; the per-peer term
+// forgives a peer for our own saturated downlink.
+func (bd *BlockDownloader) maxDownloadTimeMicros(peer *SyncPeer) int64 {
+	timeoutBase := BlockDownloadTimeoutBase
+
+	// C++ asks IsInitialBlockDownload(), which weighs our tip's work against
+	// nMinimumChainWork and its age against DEFAULT_MAX_TIP_AGE. Neither this
+	// module's go-chaincfg version nor this machine carries the work half (see
+	// the note in FindNextBlocksToDownload), so the predicate reduces to the age
+	// half: a header index tip older than 24 hours means we are still catching
+	// up. It is the same clock and the same window Task 4's second header-sync
+	// slot uses, so the two relaxations agree on when the node is near the tip.
+	if !bd.hs.tipIsNearAdjustedTime() {
+		timeoutBase = BlockDownloadTimeoutBaseIBD
+	}
+
+	timeoutPeers := BlockDownloadTimeoutPerPeer * int64(bd.otherPeersWithDownloads(peer))
+
+	return targetSpacingSeconds(bd.hs.cfg.Params) * (timeoutBase + timeoutPeers) * percentOfBlockIntervalMicros
+}
+
+// otherPeersWithDownloads is
+// BlockDownloadTracker::GetPeersWithValidatedDownloadsCount() minus this peer,
+// the nOtherPeersWithValidatedDownloads of net_processing.cpp:5638-5642.
+//
+// C++ keeps a running counter because its in-flight multimap can hold blocks
+// whose headers are not validated, and it deliberately counts only the
+// validated ones "so peers can't advertise non-existing block hashes to
+// unreasonably increase our timeout". Here the distinct holders in inFlight ARE
+// that set: FindNextBlocksToDownload only ever walks headers the index already
+// holds, so every in-flight block has a validated header, and the map is
+// single-assignment. Counting the map therefore needs no second counter to
+// drift out of step with it, at the cost of one pass over at most
+// BlockDownloadWindow entries per check.
+func (bd *BlockDownloader) otherPeersWithDownloads(peer *SyncPeer) int {
+	holders := make(map[*SyncPeer]struct{}, len(bd.inFlight))
+
+	for _, holder := range bd.inFlight {
+		if holder != peer {
+			holders[holder] = struct{}{}
+		}
+	}
+
+	return len(holders)
 }
 
 // sampleIngest records this tick's ingest observation for the next tick's
