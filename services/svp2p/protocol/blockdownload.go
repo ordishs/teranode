@@ -218,6 +218,17 @@ type BlockDownloader struct {
 	// with MaxLastBlockTime and is only ever narrowed, never widened, by the
 	// one caller that sets it (PeerManager.ConfigureSync).
 	maxLastBlockTime time.Duration
+
+	// timeoutBasePercent, timeoutBaseIBDPercent and timeoutPerPeerPercent are
+	// the three DetectStalling percentages, held per instance for the reason
+	// SVNode holds them in config rather than in validation.h: an operator whose
+	// blocks outgrow the default window has to be able to widen it. They are
+	// seeded with the SVNode defaults and overridden from settings by
+	// PeerManager.ConfigureSync. See the clause in CheckStall for why this
+	// timeout, alone among the rules here, is worth a dial.
+	timeoutBasePercent    int64
+	timeoutBaseIBDPercent int64
+	timeoutPerPeerPercent int64
 }
 
 // NewBlockDownloader builds a downloader over the header index and the
@@ -242,6 +253,10 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 		haveData:         make(map[chainhash.Hash]int32),
 		lastTipHash:      tipHash,
 		maxLastBlockTime: MaxLastBlockTime,
+
+		timeoutBasePercent:    BlockDownloadTimeoutBase,
+		timeoutBaseIBDPercent: BlockDownloadTimeoutBaseIBD,
+		timeoutPerPeerPercent: BlockDownloadTimeoutPerPeer,
 	}, nil
 }
 
@@ -1001,41 +1016,43 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 	// DetectStalling's second half (net_processing.cpp:5629-5661): the block at
 	// the head of this peer's queue has been owed for longer than
 	// maxDownloadTime, so the peer goes and its blocks return to the pool. Like
-	// the staller clause above it sits BELOW nothing and ABOVE the fSyncStarted
-	// return, because it must judge every peer holding blocks — including one a
-	// rotation stripped of the sync slot, which no other rule can reach.
+	// the staller clause above it sits ABOVE the fSyncStarted return, because it
+	// must judge every peer holding blocks — including one a rotation stripped
+	// of the sync slot, which no other rule can reach.
 	//
-	// One deviation, and it is deliberate: C++ judges the front block's wall
-	// clock alone, while this port first asks whether the peer is still
-	// delivering. Teranode blocks are large enough that an honest delivery can
-	// outlast the steady-state window of one block interval, and disconnecting
-	// mid-transfer would restart the same download on another peer with no more
-	// time than this one had — a livelock, not a recovery. The evidence and its
-	// bound are the ones the rotation suppression below already uses:
-	// MinBlockDownloadBytesPerSec, capped at MaxBlockDownloadTime, so a peer
-	// cannot dribble its way out of the timeout for ever.
+	// IT IS UNCONDITIONAL, AND THAT IS THE POINT. Every other rule that governs
+	// a slow peer — the staller clause above, SVNode's parallel-fetch trigger,
+	// this port's own rotation suppression below — weighs throughput, and
+	// throughput evidence is gameable: a peer trickling bytes at the floor
+	// satisfies all of them for ever. This clause is the one bound that cannot
+	// be talked out of, and SVNode pays a real price for it — the partial block
+	// is discarded, and it discards it even when another peer has already
+	// delivered the same block, since MarkBlockAsReceived
+	// (net_processing.cpp:4058) clears only the delivering peer's entry. The
+	// window moving matters more than the bytes already spent.
 	//
-	// The residual: the evidence is per PEER, not per block, so a peer
-	// delivering one block honestly holds off the clock on the whole queue,
-	// front block included. A peer reads one block at a time off its single
-	// connection and the blocks arrive in the order they were requested, so the
-	// block being ingested IS the front block in every case this port can
-	// produce. A future serving path that interleaved two block streams on one
-	// connection would break that, and would need the ingest attributed to a
-	// hash rather than to a peer.
+	// WHAT THAT COSTS HERE, and why the constants are configurable when
+	// BlockDownloadWindow and BlockStallingTimeout are not. SVNode can afford to
+	// burn a slow peer because it races the block to up to
+	// DEFAULT_MAX_BLOCK_PARALLEL_FETCH peers, so the block still arrives while
+	// the slow holder is dropped. This port does not race (see the inFlight
+	// field note), so a disconnect restarts the download from zero on another
+	// peer with no more time than this one had. In the steady state the window
+	// is one bare block interval — the per-peer term is zero precisely then,
+	// because one block in flight means no other downloading peer — which is
+	// ten minutes on mainnet, or 6.7 MB/s for a 4 GB block. A block that cannot
+	// be fetched inside the window from ANY peer would never complete.
 	//
-	// Where the two rules meet, this one wins, being the stronger: past the
-	// suppression cap a dribbling SYNC peer is disconnected rather than rotated
-	// whenever its front block has also timed out. During initial block
-	// download the window is six block intervals and outlasts the cap, so the
-	// rotation still fires there first. TestCheckStall_DisconnectsADribblingIngestPastTheDownloadCap
-	// pins both regimes.
-	if len(state.vBlocksInFlight) > 0 && !ingestProgressing(state, ingest, nowMicros) {
-		if nowMicros > state.nDownloadingSince+bd.maxDownloadTimeMicros(peer) {
-			// net_processing.cpp: "Timeout downloading block %s from peer=%d,
-			// disconnecting".
-			return StallActionDisconnect
-		}
+	// SVNode leaves exactly this dial in the operator's hands
+	// (-blockdownloadtimeoutbasepercent and its two siblings), and so does this
+	// port, through the settings the three fields below are seeded from. The
+	// defaults are SVNode's own, so out of the box the behavior is its
+	// behavior; an operator running large blocks over a modest link raises the
+	// base rather than patching the binary.
+	if len(state.vBlocksInFlight) > 0 && nowMicros > state.nDownloadingSince+bd.maxDownloadTimeMicros(peer) {
+		// net_processing.cpp: "Timeout downloading block %s from peer=%d,
+		// disconnecting".
+		return StallActionDisconnect
 	}
 
 	// legacy netsync handleCheckSyncPeer only ever examines the sync peer. This
@@ -1139,7 +1156,7 @@ func ingestProgressing(state *peerSyncState, ingest IngestSnapshot, nowMicros in
 // The base is chosen by the initial-block-download predicate; the per-peer term
 // forgives a peer for our own saturated downlink.
 func (bd *BlockDownloader) maxDownloadTimeMicros(peer *SyncPeer) int64 {
-	timeoutBase := BlockDownloadTimeoutBase
+	timeoutBase := bd.timeoutBasePercent
 
 	// C++ asks IsInitialBlockDownload(), which weighs our tip's work against
 	// nMinimumChainWork and its age against DEFAULT_MAX_TIP_AGE. Neither this
@@ -1149,10 +1166,10 @@ func (bd *BlockDownloader) maxDownloadTimeMicros(peer *SyncPeer) int64 {
 	// up. It is the same clock and the same window Task 4's second header-sync
 	// slot uses, so the two relaxations agree on when the node is near the tip.
 	if !bd.hs.tipIsNearAdjustedTime() {
-		timeoutBase = BlockDownloadTimeoutBaseIBD
+		timeoutBase = bd.timeoutBaseIBDPercent
 	}
 
-	timeoutPeers := BlockDownloadTimeoutPerPeer * int64(bd.otherPeersWithDownloads(peer))
+	timeoutPeers := bd.timeoutPerPeerPercent * int64(bd.otherPeersWithDownloads(peer))
 
 	return targetSpacingSeconds(bd.hs.cfg.Params) * (timeoutBase + timeoutPeers) * percentOfBlockIntervalMicros
 }

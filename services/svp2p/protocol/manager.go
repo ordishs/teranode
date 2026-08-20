@@ -76,6 +76,15 @@ type SyncConfig struct {
 	// integration test can observe a rotation in seconds instead of the three
 	// real minutes the production window costs.
 	MaxLastBlockTime time.Duration
+
+	// BlockDownloadTimeoutBasePercent, BlockDownloadTimeoutBaseIBDPercent and
+	// BlockDownloadTimeoutPerPeerPercent carry the three DetectStalling
+	// percentages from settings.Legacy. Anything at or below zero keeps the
+	// SVNode default the downloader is built with, so a caller that leaves them
+	// unset gets SVNode's behavior rather than a zero-length timeout.
+	BlockDownloadTimeoutBasePercent    int64
+	BlockDownloadTimeoutBaseIBDPercent int64
+	BlockDownloadTimeoutPerPeerPercent int64
 }
 
 // PeerManager owns listeners, the outbound dialer, the peer registry, and the
@@ -180,6 +189,26 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 
 	if cfg.MaxLastBlockTime > 0 {
 		blockDownloader.maxLastBlockTime = cfg.MaxLastBlockTime
+	}
+
+	// A zero here means "not configured", not "no timeout": a zero base would
+	// disconnect every peer holding a block on the first check.
+	if cfg.BlockDownloadTimeoutBasePercent > 0 {
+		blockDownloader.timeoutBasePercent = cfg.BlockDownloadTimeoutBasePercent
+	}
+
+	if cfg.BlockDownloadTimeoutBaseIBDPercent > 0 {
+		blockDownloader.timeoutBaseIBDPercent = cfg.BlockDownloadTimeoutBaseIBDPercent
+	}
+
+	// Zero means unset for this one too, so the per-peer compensation cannot be
+	// turned off from settings the way SVNode's own flag allows. That is the
+	// price of the zero-means-unset convention this struct already uses for
+	// TickInterval and MaxLastBlockTime, and turning the compensation off is not
+	// something an operator has a reason to want: it only ever widens a window,
+	// and only for peers whose blocks we asked for.
+	if cfg.BlockDownloadTimeoutPerPeerPercent > 0 {
+		blockDownloader.timeoutPerPeerPercent = cfg.BlockDownloadTimeoutPerPeerPercent
 	}
 
 	m.headerSync = headerSync

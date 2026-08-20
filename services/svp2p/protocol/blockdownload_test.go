@@ -1460,15 +1460,23 @@ func TestCheckStall_TimesOutARotatedPeerHoldingBlocks(t *testing.T) {
 		"the timeout must run before the fSyncStarted early return")
 }
 
-// TestCheckStall_KeepsAPeerDeliveringPastTheTimeout covers this port's stated
-// deviation from SVNode. The C++ timeout clause is unconditional: it judges the
-// front block's wall clock and nothing else. Teranode blocks are large enough
-// that a peer delivering one honestly can outlast the steady-state window of
-// 10 minutes, and disconnecting it would restart the same download from zero on
-// another peer with no more time than the first had. So the timeout defers to
-// the same healthy-throughput evidence the rotation suppression already uses,
-// bounded by the same MaxBlockDownloadTime cap.
-func TestCheckStall_KeepsAPeerDeliveringPastTheTimeout(t *testing.T) {
+// TestCheckStall_TheTimeoutIgnoresThroughput pins the clause's defining
+// property: it is a pure wall clock. A peer delivering bytes at any rate is
+// disconnected when the block at the head of its queue runs out of time, and
+// the partial download is discarded.
+//
+// That is deliberate in SVNode and it is kept deliberately here. Every other
+// rule governing a slow peer weighs throughput — the staller clause, SVNode's
+// parallel-fetch trigger, the rotation suppression below — and throughput
+// evidence is gameable: a peer trickling bytes at the floor satisfies all of
+// them for ever. This clause is the one bound that cannot be talked out of.
+// SVNode discards the bytes even when another peer has already delivered the
+// same block, because keeping the download window moving is worth more than the
+// bytes already spent.
+//
+// The operator's relief is the window itself, not an exception to it:
+// TestCheckStall_HonoursTheConfiguredTimeoutWindow covers that.
+func TestCheckStall_TheTimeoutIgnoresThroughput(t *testing.T) {
 	f := newDownloadFixture(t, 10)
 	peer := f.peerAt(t, "1.2.3.4:8333", 10)
 
@@ -1476,82 +1484,152 @@ func TestCheckStall_KeepsAPeerDeliveringPastTheTimeout(t *testing.T) {
 
 	const tick = 30 * time.Second
 
-	perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
+	// Bytes arriving at ten times the rate floor, every tick, without a pause.
+	perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 10
 	ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
 
-	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+	var last StallAction
 
-	// Well past the 10 minute steady-state window, still delivering.
-	for elapsed := tick; elapsed <= 20*time.Minute; elapsed += tick {
+	for elapsed := time.Duration(0); elapsed <= 10*time.Minute; elapsed += tick {
 		ingest.BytesRead += perTick
+		last = f.bd.CheckStall(peer, ingest, testNow+micros(elapsed))
 
-		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)),
-			"a peer still delivering bytes must keep its blocks at %s", elapsed)
+		require.Equal(t, StallActionNone, last, "inside the window the peer is kept, at %s", elapsed)
 	}
 
-	// The moment the bytes stop, the front block's own clock is what judges it,
-	// and that clock expired long ago. One tick is all it takes: the previous
-	// tick's sample is already recorded, so a delta of zero is evidence on the
-	// very next check.
-	frozen := testNow + micros(20*time.Minute+tick)
+	ingest.BytesRead += perTick
 
-	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, ingest, frozen))
+	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, ingest, testNow+micros(10*time.Minute)+1),
+		"past the window a peer in full flow goes anyway, partial block and all")
 }
 
-// TestCheckStall_DisconnectsADribblingIngestPastTheDownloadCap pins which of
-// the two give-up rules wins where they meet, in the one regime where they can
-// both be due at once.
+// TestCheckStall_HonoursTheConfiguredTimeoutWindow is the operator's relief
+// valve, and the reason these three percentages are settings rather than
+// constants like BlockDownloadWindow beside them.
 //
-// The split: the SVNode timeout judges the FRONT block's wall clock; the
-// Teranode rotation judges a live ingest's byte rate. A peer dribbling bytes
-// just above the floor is suppressed by BOTH until MaxBlockDownloadTime, at
-// which point the suppression lapses and each rule is free to fire. The
-// timeout clause is above the rotation clause, mirroring DetectStalling's place
-// in SendMessages, so in the steady state — where the 10 minute window has long
-// since passed — the peer is DISCONNECTED rather than rotated. That is the
-// stronger of the two outcomes and it releases the blocks either way.
-//
-// During initial block download the 60 minute window has NOT passed at the
-// 30 minute cap, so the rotation is what fires, exactly as it did before this
-// timeout existed.
-func TestCheckStall_DisconnectsADribblingIngestPastTheDownloadCap(t *testing.T) {
+// SVNode can disconnect a slow peer cheaply because it races the block to
+// several peers at once, so the block still arrives. This port does not race,
+// so a disconnect restarts the download from zero with no more time than the
+// attempt before it — and in the steady state the window is one bare block
+// interval, because one block in flight means no other downloading peer to be
+// compensated for. Ten minutes is 6.7 MB/s for a 4 GB block. An operator whose
+// blocks outgrow that widens the window, exactly as an SVNode operator does
+// with -blockdownloadtimeoutbasepercent.
+func TestCheckStall_HonoursTheConfiguredTimeoutWindow(t *testing.T) {
 	tests := []struct {
-		name string
-		ibd  bool
-		want StallAction
+		name    string
+		base    int64
+		ibdBase int64
+		perPeer int64
+		ibd     bool
+		// others is how many OTHER peers hold a block in flight.
+		others int
+		want   time.Duration
 	}{
-		{name: "steady state: the front block timed out 20 minutes ago", want: StallActionDisconnect},
-		{name: "initial block download: the front block has 30 minutes left", ibd: true, want: StallActionRotateSyncPeer},
+		{name: "the default steady-state window", want: 10 * time.Minute},
+		{name: "a base of 300 percent triples it", base: 300, want: 30 * time.Minute},
+		{name: "the initial-block-download base is separate", base: 300, ibdBase: 1200, ibd: true, want: 120 * time.Minute},
+		{name: "the per-peer term is configurable too", perPeer: 200, others: 2, want: 50 * time.Minute},
+		{name: "zero reads as unset, never as no window", base: 0, want: 10 * time.Minute},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newDownloadFixture(t, 3)
+			f := newDownloadFixture(t, 10)
+
+			// The path an operator's settings actually travel: SyncConfig into
+			// ConfigureSync. Applied to the fixture's own downloader here, by the
+			// same rules, so the case reads as a window rather than as plumbing;
+			// TestConfigureSync_CarriesTheBlockDownloadTimeoutSettings
+			// (manager_test.go) walks the plumbing itself.
+			if tc.base > 0 {
+				f.bd.timeoutBasePercent = tc.base
+			}
+
+			if tc.ibdBase > 0 {
+				f.bd.timeoutBaseIBDPercent = tc.ibdBase
+			}
+
+			if tc.perPeer > 0 {
+				f.bd.timeoutPerPeerPercent = tc.perPeer
+			}
 
 			if tc.ibd {
 				f.ibd(t)
 			}
 
-			peer := f.syncingPeer(t, "1.2.3.4:8333")
+			f.downloadingFrom(t, []int{8, 9}[:tc.others]...)
 
-			const tick = time.Minute
+			peer := f.peerAt(t, "1.2.3.4:8333", 10)
+			require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 1), testNow))
 
-			perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
-			ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
-
-			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
-
-			for elapsed := tick; elapsed < MaxBlockDownloadTime; elapsed += tick {
-				ingest.BytesRead += perTick
-
-				require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)))
-			}
-
-			ingest.BytesRead += perTick
-
-			require.Equal(t, tc.want, f.bd.CheckStall(peer, ingest, testNow+micros(MaxBlockDownloadTime)))
+			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)))
+			require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)+1))
 		})
 	}
+}
+
+// TestCheckStall_TimeoutAndRotationOrder pins which of the two give-up rules
+// reaches a dribbling peer first, in both regimes.
+//
+// The split between them: the SVNode timeout judges the FRONT block's wall
+// clock and nothing else; the Teranode rotation judges a live ingest's byte
+// rate and gives up on it at MaxBlockDownloadTime. So which one fires is
+// decided by whether the front block's window is shorter than that cap.
+//
+// Steady state, one block interval: the timeout is due at 10 minutes and the
+// cap is irrelevant — the peer is disconnected while still dribbling, which is
+// the whole point of an unconditional clause. Initial block download, six
+// intervals: the 60 minute window outlasts the 30 minute cap, so the rotation
+// fires first, exactly as it did before this timeout existed. Both release the
+// peer's blocks; the disconnect also costs it the connection.
+func TestCheckStall_TimeoutAndRotationOrder(t *testing.T) {
+	// dribble runs a healthy-but-slow ingest from a sync peer, tick by tick,
+	// and returns the first action that is not None along with when it came.
+	dribble := func(t *testing.T, f *downloadFixture, until time.Duration) (StallAction, time.Duration) {
+		t.Helper()
+
+		peer := f.syncingPeer(t, "1.2.3.4:8333")
+
+		const tick = time.Minute
+
+		perTick := uint64(MinBlockDownloadBytesPerSec) * uint64(tick/time.Second) * 2
+		ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+
+		for elapsed := tick; elapsed <= until; elapsed += tick {
+			ingest.BytesRead += perTick
+
+			if action := f.bd.CheckStall(peer, ingest, testNow+micros(elapsed)); action != StallActionNone {
+				return action, elapsed
+			}
+		}
+
+		return StallActionNone, 0
+	}
+
+	t.Run("steady state: the timeout fires at one block interval", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		action, when := dribble(t, f, 2*MaxBlockDownloadTime)
+
+		require.Equal(t, StallActionDisconnect, action,
+			"a dribbling peer goes on the front block's clock, not on the throughput cap")
+		require.Equal(t, 11*time.Minute, when,
+			"the first tick past the 10 minute window is what catches it")
+	})
+
+	t.Run("initial block download: the rotation fires at the throughput cap", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+		f.ibd(t)
+
+		action, when := dribble(t, f, 2*MaxBlockDownloadTime)
+
+		require.Equal(t, StallActionRotateSyncPeer, action,
+			"the 60 minute window has not expired, so the legacy cap is what gives up")
+		require.Equal(t, MaxBlockDownloadTime, when)
+	})
 }
 
 // TestPeerDisconnected_ClearsTheDownloadClock pins that the timeout state goes

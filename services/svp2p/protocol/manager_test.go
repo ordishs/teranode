@@ -1930,3 +1930,62 @@ func TestSyncPass_TimesOutASilentRotatedPeerAndRehomesItsBlocks(t *testing.T) {
 	require.Subset(t, getDataTo(out, other.peer), []chainhash.Hash{hole.Hash},
 		"the block at the head of the hole must reach the surviving peer on its next walk")
 }
+
+// TestConfigureSync_CarriesTheBlockDownloadTimeoutSettings walks the plumbing
+// the three DetectStalling percentages travel: settings.Legacy through
+// SyncConfig into the downloader that reads them. The behavior they produce is
+// covered by TestCheckStall_HonoursTheConfiguredTimeoutWindow; what this pins is
+// that an operator's value arrives at all, and that leaving one unset does not
+// silently become a zero-length download window.
+func TestConfigureSync_CarriesTheBlockDownloadTimeoutSettings(t *testing.T) {
+	newManager := func(t *testing.T, cfg SyncConfig) *BlockDownloader {
+		t.Helper()
+
+		genesis := testGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		tSettings := managerSettings()
+		tSettings.ChainCfgParams = syncTestParams(nil)
+
+		banList, err := NewBanList("")
+		require.NoError(t, err)
+
+		m := NewPeerManager(ulogger.TestLogger{}, tSettings, banList)
+
+		cfg.Index = idx
+		cfg.Ingestor = &recordingIngestor{}
+		cfg.TickInterval = 20 * time.Millisecond
+
+		require.NoError(t, m.ConfigureSync(cfg))
+
+		return m.blockDownloader
+	}
+
+	t.Run("configured values reach the downloader", func(t *testing.T) {
+		bd := newManager(t, SyncConfig{
+			BlockDownloadTimeoutBasePercent:    250,
+			BlockDownloadTimeoutBaseIBDPercent: 1500,
+			BlockDownloadTimeoutPerPeerPercent: 75,
+		})
+
+		require.Equal(t, int64(250), bd.timeoutBasePercent)
+		require.Equal(t, int64(1500), bd.timeoutBaseIBDPercent)
+		require.Equal(t, int64(75), bd.timeoutPerPeerPercent)
+	})
+
+	t.Run("unset keeps the SVNode defaults, never zero", func(t *testing.T) {
+		bd := newManager(t, SyncConfig{})
+
+		require.Equal(t, BlockDownloadTimeoutBase, bd.timeoutBasePercent)
+		require.Equal(t, BlockDownloadTimeoutBaseIBD, bd.timeoutBaseIBDPercent)
+		require.Equal(t, BlockDownloadTimeoutPerPeer, bd.timeoutPerPeerPercent)
+	})
+
+	t.Run("a negative value is refused like an unset one", func(t *testing.T) {
+		bd := newManager(t, SyncConfig{BlockDownloadTimeoutBasePercent: -1})
+
+		require.Equal(t, BlockDownloadTimeoutBase, bd.timeoutBasePercent)
+	})
+}

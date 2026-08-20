@@ -306,6 +306,10 @@ func (s *Server) startSync(ctx context.Context) error {
 		AllowSyncCandidateFromLocalPeers: s.settings.Legacy.AllowSyncCandidateFromLocalPeers,
 		TickInterval:                     s.syncTick,
 		MaxLastBlockTime:                 s.maxLastBlockTime,
+
+		BlockDownloadTimeoutBasePercent:    s.settings.Legacy.BlockDownloadTimeoutBasePercent,
+		BlockDownloadTimeoutBaseIBDPercent: s.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent,
+		BlockDownloadTimeoutPerPeerPercent: s.settings.Legacy.BlockDownloadTimeoutPerPeerPercent,
 	}); err != nil {
 		return err
 	}
