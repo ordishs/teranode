@@ -85,6 +85,13 @@ type SyncConfig struct {
 	BlockDownloadTimeoutBasePercent    int64
 	BlockDownloadTimeoutBaseIBDPercent int64
 	BlockDownloadTimeoutPerPeerPercent int64
+
+	// BlockDownloadSlowFetchTimeout and BlockDownloadMaxParallelFetch carry the
+	// parallel-fetch fuse and cap from settings.Legacy. Zero or less keeps the
+	// SVNode default, as above. A cap of 1 is the way to turn racing off, since
+	// one stalled holder already reaches it.
+	BlockDownloadSlowFetchTimeout time.Duration
+	BlockDownloadMaxParallelFetch int
 }
 
 // PeerManager owns listeners, the outbound dialer, the peer registry, and the
@@ -209,6 +216,14 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 	// and only for peers whose blocks we asked for.
 	if cfg.BlockDownloadTimeoutPerPeerPercent > 0 {
 		blockDownloader.timeoutPerPeerPercent = cfg.BlockDownloadTimeoutPerPeerPercent
+	}
+
+	if cfg.BlockDownloadSlowFetchTimeout > 0 {
+		blockDownloader.slowFetchTimeout = cfg.BlockDownloadSlowFetchTimeout
+	}
+
+	if cfg.BlockDownloadMaxParallelFetch > 0 {
+		blockDownloader.maxParallelFetch = cfg.BlockDownloadMaxParallelFetch
 	}
 
 	m.headerSync = headerSync

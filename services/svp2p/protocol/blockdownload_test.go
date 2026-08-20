@@ -149,7 +149,7 @@ func TestFindNextBlocksToDownload_PeerWithNothingUseful(t *testing.T) {
 			peer := fullNodePeer("1.2.3.4:8333")
 			tc.setup(peer)
 
-			blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer)
+			blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer, testNow)
 
 			require.Empty(t, blocks)
 			require.Nil(t, staller)
@@ -163,7 +163,7 @@ func TestFindNextBlocksToDownload_ReturnsSuccessorsInOrder(t *testing.T) {
 	peer := f.peerAt(t, "1.2.3.4:8333", 10)
 
 	t.Run("every missing successor up to the peer's best known block", func(t *testing.T) {
-		blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer)
+		blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer, testNow)
 
 		require.Nil(t, staller)
 		require.Len(t, blocks, 6)
@@ -177,7 +177,7 @@ func TestFindNextBlocksToDownload_ReturnsSuccessorsInOrder(t *testing.T) {
 	t.Run("count caps the batch", func(t *testing.T) {
 		peer.State.pindexLastCommonBlock = nil
 
-		blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, 3)
+		blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, 3, testNow)
 
 		require.Nil(t, staller)
 		require.Len(t, blocks, 3)
@@ -195,7 +195,7 @@ func TestFindNextBlocksToDownload_SkipsBlocksAlreadyInFlight(t *testing.T) {
 
 	peer := f.peerAt(t, "1.2.3.4:8333", 10)
 
-	blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer)
+	blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer, testNow)
 
 	// The window never ran out, so nobody is named as a staller.
 	require.Nil(t, staller)
@@ -263,7 +263,7 @@ func TestFindNextBlocksToDownload_ComparesChainWorkNotHeight(t *testing.T) {
 		peer := fullNodePeer("1.2.3.4:8333")
 		peer.State.pindexBestKnownBlock = &lightTip
 
-		blocks, staller := bd.FindNextBlocksToDownload(peer, heavyTip, MaxBlocksInTransitPerPeer)
+		blocks, staller := bd.FindNextBlocksToDownload(peer, heavyTip, MaxBlocksInTransitPerPeer, testNow)
 
 		require.Empty(t, blocks, "a branch with less work than our tip must not be scheduled")
 		require.Nil(t, staller)
@@ -275,7 +275,7 @@ func TestFindNextBlocksToDownload_ComparesChainWorkNotHeight(t *testing.T) {
 		peer := fullNodePeer("1.2.3.4:8333")
 		peer.State.pindexBestKnownBlock = &heavyTip
 
-		blocks, staller := bd.FindNextBlocksToDownload(peer, lightTip, MaxBlocksInTransitPerPeer)
+		blocks, staller := bd.FindNextBlocksToDownload(peer, lightTip, MaxBlocksInTransitPerPeer, testNow)
 
 		require.Nil(t, staller)
 		require.Len(t, blocks, heavyLen, "the whole heavier branch is missing and must be fetched")
@@ -308,7 +308,7 @@ func TestFindNextBlocksToDownload_FollowsAPeerReorg(t *testing.T) {
 	stale := f.node(t, 5)
 	peer.State.pindexLastCommonBlock = &stale
 
-	blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer)
+	blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer, testNow)
 
 	require.Nil(t, staller)
 	require.Equal(t, int32(2), peer.State.pindexLastCommonBlock.Height, "last common must rewind to the fork point")
@@ -335,7 +335,7 @@ func TestFindNextBlocksToDownload_WindowAdvancesOnlyOnContiguousCompletion(t *te
 
 	// The first sweep offers exactly the window: heights 1..1024, never the
 	// blocks above it, even though the peer has them.
-	blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, 4096)
+	blocks, staller := f.bd.FindNextBlocksToDownload(peer, activeTip, 4096, testNow)
 	require.Nil(t, staller)
 	require.Len(t, blocks, BlockDownloadWindow)
 	require.Equal(t, int32(1), blocks[0].Height)
@@ -348,7 +348,7 @@ func TestFindNextBlocksToDownload_WindowAdvancesOnlyOnContiguousCompletion(t *te
 	// Out-of-order completion in the middle of the window.
 	require.True(t, f.bd.BlockReceived(peer, f.node(t, 500).Hash, testNow))
 
-	blocks, staller = f.bd.FindNextBlocksToDownload(peer, activeTip, 4096)
+	blocks, staller = f.bd.FindNextBlocksToDownload(peer, activeTip, 4096, testNow)
 	require.Nil(t, staller, "the peer is waiting on its own in-flight blocks, so it is not its own staller")
 	require.Empty(t, blocks, "a mid-window completion must not release blocks beyond the window end")
 	require.Equal(t, int32(0), peer.State.pindexLastCommonBlock.Height, "the window must not move over a hole")
@@ -361,12 +361,12 @@ func TestFindNextBlocksToDownload_WindowAdvancesOnlyOnContiguousCompletion(t *te
 	// net_processing.cpp computes nWindowEnd once, before the walk that
 	// advances pindexLastCommonBlock, so this pass records the advance and the
 	// next one gets the wider window.
-	blocks, staller = f.bd.FindNextBlocksToDownload(peer, activeTip, 4096)
+	blocks, staller = f.bd.FindNextBlocksToDownload(peer, activeTip, 4096, testNow)
 	require.Nil(t, staller)
 	require.Empty(t, blocks)
 	require.Equal(t, int32(500), peer.State.pindexLastCommonBlock.Height)
 
-	blocks, staller = f.bd.FindNextBlocksToDownload(peer, activeTip, 4096)
+	blocks, staller = f.bd.FindNextBlocksToDownload(peer, activeTip, 4096, testNow)
 	require.Nil(t, staller)
 	require.Len(t, blocks, 6, "the window end moved to 500+1024, exposing the remaining blocks")
 	require.Equal(t, int32(BlockDownloadWindow+1), blocks[0].Height)
@@ -421,7 +421,7 @@ func TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip(t *test
 	// Our chain is still at genesis while 20 blocks arrive.
 	activeTip := f.node(t, 0)
 
-	blocks, _ := f.bd.FindNextBlocksToDownload(peer, activeTip, 20)
+	blocks, _ := f.bd.FindNextBlocksToDownload(peer, activeTip, 20, testNow)
 	require.Len(t, blocks, 20)
 
 	for _, b := range blocks {
@@ -432,7 +432,7 @@ func TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip(t *test
 	require.Equal(t, 20, len(f.bd.haveData), "every delivered block is recorded until our chain covers it")
 
 	// Our chain connects the first 12 of them.
-	f.bd.FindNextBlocksToDownload(peer, f.node(t, 12), MaxBlocksInTransitPerPeer)
+	f.bd.FindNextBlocksToDownload(peer, f.node(t, 12), MaxBlocksInTransitPerPeer, testNow)
 
 	require.Equal(t, 8, len(f.bd.haveData), "everything at or below the active tip must be dropped")
 
@@ -441,7 +441,7 @@ func TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip(t *test
 	}
 
 	// The whole run connects.
-	f.bd.FindNextBlocksToDownload(peer, f.node(t, 20), MaxBlocksInTransitPerPeer)
+	f.bd.FindNextBlocksToDownload(peer, f.node(t, 20), MaxBlocksInTransitPerPeer, testNow)
 	require.Empty(t, f.bd.haveData)
 
 	// A steady-state call that returns early must still prune: this peer has
@@ -451,7 +451,7 @@ func TestFindNextBlocksToDownload_PrunesReceivedBlocksBehindTheActiveTip(t *test
 	require.True(t, f.bd.BlockReceived(peer, f.node(t, 25).Hash, testNow))
 	require.Len(t, f.bd.haveData, 1)
 
-	f.bd.FindNextBlocksToDownload(idle, f.node(t, 25), MaxBlocksInTransitPerPeer)
+	f.bd.FindNextBlocksToDownload(idle, f.node(t, 25), MaxBlocksInTransitPerPeer, testNow)
 	require.Empty(t, f.bd.haveData, "the prune must run before the nothing-interesting return")
 }
 
@@ -465,7 +465,7 @@ func TestFindNextBlocksToDownload_RefusesAnActiveTipOutsideTheIndex(t *testing.T
 	stranger := HeaderNode{Hash: chainhash.Hash{0xFE}, Height: 4}
 
 	t.Run("on the bootstrap path", func(t *testing.T) {
-		blocks, staller := f.bd.FindNextBlocksToDownload(peer, stranger, MaxBlocksInTransitPerPeer)
+		blocks, staller := f.bd.FindNextBlocksToDownload(peer, stranger, MaxBlocksInTransitPerPeer, testNow)
 
 		require.Empty(t, blocks)
 		require.Nil(t, staller)
@@ -475,7 +475,7 @@ func TestFindNextBlocksToDownload_RefusesAnActiveTipOutsideTheIndex(t *testing.T
 		known := f.node(t, 2)
 		peer.State.pindexLastCommonBlock = &known
 
-		blocks, staller := f.bd.FindNextBlocksToDownload(peer, stranger, MaxBlocksInTransitPerPeer)
+		blocks, staller := f.bd.FindNextBlocksToDownload(peer, stranger, MaxBlocksInTransitPerPeer, testNow)
 
 		require.Empty(t, blocks, "an unplaceable active tip must not re-request the branch")
 		require.Nil(t, staller)
@@ -517,8 +517,11 @@ func TestSendGetDataBlocks_NamesTheStaller(t *testing.T) {
 	require.Equal(t, testNow, holder.State.nStallingSince, "the peer blocking the window starts stalling")
 	require.Equal(t, int64(0), waiter.State.nStallingSince, "the waiting peer is not the staller")
 
-	// net_processing.cpp only starts the clock once.
-	require.Empty(t, f.bd.SendGetDataBlocks(waiter, activeTip, testNow+micros(time.Minute)))
+	// net_processing.cpp only starts the clock once. The second pass stays inside
+	// the slow-fetch fuse, because past it the walk races the contested block and
+	// the waiter is handed work instead of naming a staller — the case
+	// TestSendGetDataBlocks_SchedulesAcrossEveryUsefulPeer covers.
+	require.Empty(t, f.bd.SendGetDataBlocks(waiter, activeTip, testNow+micros(BlockDownloadSlowFetchTimeout/2)))
 	require.Equal(t, testNow, holder.State.nStallingSince)
 }
 
@@ -930,7 +933,7 @@ func TestBlockFailed_ReleasesTheBlockForAnotherPeer(t *testing.T) {
 	require.Equal(t, 0, holder.State.nBlocksInFlight)
 
 	peer := f.peerAt(t, "1.2.3.4:8333", 10)
-	blocks, _ := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer)
+	blocks, _ := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer, testNow)
 
 	require.NotEmpty(t, blocks)
 	require.Equal(t, block.Hash, blocks[0].Hash, "a failed download must be offered again")
@@ -1131,7 +1134,12 @@ func TestSendGetDataBlocks_SchedulesAcrossEveryUsefulPeer(t *testing.T) {
 				// blocks is where a silent peer comes to rest, because
 				// SendGetDataBlocks is the only thing that marks blocks in flight
 				// and nothing decrements the count until a block arrives.
-				head := requestedBlocks(t, f.bd, f.ourTip, testNow-micros(time.Minute), peers[:1])
+				//
+				// It is asked one second before the pass under test, INSIDE the
+				// slow-fetch fuse, so the parallel fetch does not fire and the
+				// staller rule is what the case exercises. The case below is the
+				// same window with an older claim, where racing fires instead.
+				head := requestedBlocks(t, f.bd, f.ourTip, testNow-micros(time.Second), peers[:1])
 				require.Len(t, head[0], MaxBlocksInTransitPerPeer)
 
 				// The second peer then downloads the whole rest of the window and
@@ -1145,6 +1153,34 @@ func TestSendGetDataBlocks_SchedulesAcrossEveryUsefulPeer(t *testing.T) {
 			},
 			wantHeights: [][]int32{{}, {}},
 			wantStaller: 0,
+		},
+		{
+			// The same shut window as the case above, with the head claimed long
+			// enough ago to be raced. Two things follow, and they are the point
+			// of the parallel fetch: the waiting peer is handed the contested
+			// block instead of nothing, and NO staller is named — C++ sets
+			// nodeStaller only when it reaches the window end with vBlocks empty
+			// (net_processing.cpp FetchBlock), and the raced block is in vBlocks.
+			// So the race replaces the disconnect rather than preceding it.
+			name: "a stale claim on the window head is raced instead of naming a staller",
+			peers: func(_ *testing.T, f *multiPeerFixture) []*SyncPeer {
+				return []*SyncPeer{f.usefulPeer("1.1.1.1:8333"), f.usefulPeer("2.2.2.2:8333")}
+			},
+			prepare: func(t *testing.T, f *multiPeerFixture, peers []*SyncPeer) {
+				t.Helper()
+
+				head := requestedBlocks(t, f.bd, f.ourTip, testNow-micros(time.Minute), peers[:1])
+				require.Len(t, head[0], MaxBlocksInTransitPerPeer)
+
+				for h := MaxBlocksInTransitPerPeer + 1; h <= BlockDownloadWindow; h++ {
+					node := f.node(t, h)
+
+					require.True(t, f.bd.MarkBlockAsInFlight(peers[1], node, testNow))
+					require.True(t, f.bd.BlockReceived(peers[1], node.Hash, testNow-micros(time.Minute)))
+				}
+			},
+			wantHeights: [][]int32{{}, {1}},
+			wantStaller: -1,
 		},
 	}
 
@@ -1691,4 +1727,270 @@ func TestBlockFailed_ReArmsTheClockLikeADelivery(t *testing.T) {
 
 	require.Equal(t, later, peer.State.nDownloadingSince)
 	require.Equal(t, []chainhash.Hash{second.Hash}, peer.State.vBlocksInFlight)
+}
+
+// ---------------------------------------------------------------------------
+// Task 6b: parallel block fetch
+// ---------------------------------------------------------------------------
+
+// deliveringPeer returns a peer whose cached delivery rate is bytesPerSec as of
+// nowMicros, arranged the way production arranges it: two CheckStall ticks with
+// an ingest whose byte count rose between them.
+func (f *downloadFixture) deliveringPeer(t *testing.T, addr string, bytesPerSec uint64, nowMicros int64) *SyncPeer {
+	t.Helper()
+
+	peer := f.peerAt(t, addr, len(f.chain))
+
+	const tick = time.Second
+
+	ingest := IngestSnapshot{Active: true, StartedMicros: nowMicros - micros(tick)}
+
+	f.bd.CheckStall(peer, ingest, nowMicros-micros(tick))
+
+	ingest.BytesRead = bytesPerSec
+
+	f.bd.CheckStall(peer, ingest, nowMicros)
+
+	return peer
+}
+
+// TestCheckStall_CachesThePeerDeliveryRate pins the meter the parallel-fetch
+// branch reads. SVNode asks the association for a per-peer block bandwidth
+// average (net_processing.cpp:105-109); this port has no such accessor, so
+// CheckStall computes the rate from the ingest it is already given and leaves it
+// on the peer's state, where any later reader can find it.
+func TestCheckStall_CachesThePeerDeliveryRate(t *testing.T) {
+	t.Run("a delivering peer's rate is readable afterwards", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := f.deliveringPeer(t, "1.2.3.4:8333", 4*BlockStallingMinDownloadRate, testNow)
+
+		require.Equal(t, uint64(4*BlockStallingMinDownloadRate), peer.State.nIngestBytesPerSec)
+		require.Equal(t, testNow, peer.State.nIngestRateMicros)
+		require.False(t, f.bd.downloadStallingFrom(peer, testNow))
+	})
+
+	t.Run("a peer with no ingest is stalling", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+		peer := f.peerAt(t, "1.2.3.4:8333", 3)
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
+
+		require.Equal(t, uint64(0), peer.State.nIngestBytesPerSec)
+		require.True(t, f.bd.downloadStallingFrom(peer, testNow),
+			"a peer delivering nothing is what the C++ zero-bandwidth case is")
+	})
+
+	t.Run("a rate below the floor is stalling", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := f.deliveringPeer(t, "1.2.3.4:8333", BlockStallingMinDownloadRate-1, testNow)
+
+		require.True(t, f.bd.downloadStallingFrom(peer, testNow))
+	})
+
+	t.Run("a stale sample reads as stalling, not as its old rate", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := f.deliveringPeer(t, "1.2.3.4:8333", 10*BlockStallingMinDownloadRate, testNow)
+
+		require.False(t, f.bd.downloadStallingFrom(peer, testNow))
+		require.True(t, f.bd.downloadStallingFrom(peer, testNow+micros(BlockDownloadSlowFetchTimeout)+1),
+			"a rate nobody has measured this recently is not evidence the peer is alive")
+	})
+
+	t.Run("the rotation floor is not the racing floor", func(t *testing.T) {
+		// A peer between the two thresholds: above legacy's rotation floor, so
+		// it keeps the sync slot, and below SVNode's racing floor, so its blocks
+		// may be raced. Both rules are meant to be true at once here.
+		require.Less(t, uint64(MinBlockDownloadBytesPerSec), uint64(BlockStallingMinDownloadRate))
+
+		f := newDownloadFixture(t, 3)
+
+		peer := f.deliveringPeer(t, "1.2.3.4:8333", MinBlockDownloadBytesPerSec*3/2, testNow)
+
+		require.True(t, f.bd.downloadStallingFrom(peer, testNow))
+	})
+}
+
+// TestFindNextBlocksToDownload_RacesASlowBlock is the parallel-fetch branch,
+// net_processing.cpp:461-506. It fires on the first already-in-flight block a
+// walk meets, and only when EVERY holder of it has been sitting on it past the
+// slow-fetch timeout while delivering below the rate floor. One holder inside
+// the timeout, or one holder still delivering, cancels the race.
+func TestFindNextBlocksToDownload_RacesASlowBlock(t *testing.T) {
+	// The contested block is the first one above our tip, so it is the first
+	// already-in-flight block any walk meets.
+	const contested = 1
+
+	tests := []struct {
+		name string
+		// holders describes the peers already fetching the contested block:
+		// how long ago each was asked, and what rate each is delivering at.
+		holders []struct {
+			askedAgo time.Duration
+			rate     uint64
+		}
+		maxParallel int
+		wantRaced   bool
+		reason      string
+	}{
+		{
+			name: "one silent holder past the timeout is raced",
+			holders: []struct {
+				askedAgo time.Duration
+				rate     uint64
+			}{{askedAgo: BlockDownloadSlowFetchTimeout + time.Second, rate: 0}},
+			wantRaced: true,
+			reason:    "this is the case the branch exists for",
+		},
+		{
+			name: "a holder inside the timeout is given more time",
+			holders: []struct {
+				askedAgo time.Duration
+				rate     uint64
+			}{{askedAgo: BlockDownloadSlowFetchTimeout - time.Second, rate: 0}},
+			wantRaced: false,
+			reason:    "C++ breaks out of the loop: give this peer more time",
+		},
+		{
+			name: "a holder still delivering is not raced however long it has held it",
+			holders: []struct {
+				askedAgo time.Duration
+				rate     uint64
+			}{{askedAgo: 10 * BlockDownloadSlowFetchTimeout, rate: 4 * BlockStallingMinDownloadRate}},
+			wantRaced: false,
+			reason:    "this peer seems active currently",
+		},
+		{
+			name: "one live holder among two stalled ones cancels the race",
+			holders: []struct {
+				askedAgo time.Duration
+				rate     uint64
+			}{
+				{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 0},
+				{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 4 * BlockStallingMinDownloadRate},
+			},
+			wantRaced: false,
+			reason:    "the block is coming; a second copy would be waste",
+		},
+		{
+			name: "two stalled holders are raced, since the cap is three",
+			holders: []struct {
+				askedAgo time.Duration
+				rate     uint64
+			}{
+				{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 0},
+				{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 0},
+			},
+			wantRaced: true,
+		},
+		{
+			name: "the cap is honoured",
+			holders: []struct {
+				askedAgo time.Duration
+				rate     uint64
+			}{
+				{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 0},
+				{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 0},
+				{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 0},
+			},
+			wantRaced: false,
+			reason:    "three holders already, and DEFAULT_MAX_BLOCK_PARALLEL_FETCH is three",
+		},
+		{
+			name: "a lower cap bites sooner",
+			holders: []struct {
+				askedAgo time.Duration
+				rate     uint64
+			}{{askedAgo: 2 * BlockDownloadSlowFetchTimeout, rate: 0}},
+			maxParallel: 1,
+			wantRaced:   false,
+			reason:      "one staller already reaches a cap of one",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDownloadFixture(t, 10)
+
+			if tc.maxParallel > 0 {
+				f.bd.maxParallelFetch = tc.maxParallel
+			}
+
+			block := f.node(t, contested)
+
+			for i, h := range tc.holders {
+				holder := f.deliveringPeer(t, fmt.Sprintf("10.0.0.%d:8333", i+1), h.rate, testNow)
+				require.True(t, f.bd.MarkBlockAsInFlight(holder, block, testNow-micros(h.askedAgo)))
+			}
+
+			// The peer doing the walk has an empty ingest of its own, which is
+			// no bar to it being handed work.
+			walker := f.peerAt(t, "1.2.3.4:8333", 10)
+
+			blocks, _ := f.bd.FindNextBlocksToDownload(walker, f.node(t, 0), MaxBlocksInTransitPerPeer, testNow)
+
+			raced := false
+
+			for _, b := range blocks {
+				if b.Hash == block.Hash {
+					raced = true
+				}
+			}
+
+			require.Equal(t, tc.wantRaced, raced, tc.reason)
+
+			// Whatever it decided about the contested block, the walk carries on
+			// past it: the blocks above are not in flight and must be offered.
+			require.NotEmpty(t, blocks)
+		})
+	}
+}
+
+// TestFindNextBlocksToDownload_NeverRacesABlockToItsOwnHolder pins the
+// IsInFlight({hash, nodeid}) half of the C++ guard. Without it a peer sitting on
+// a block past the timeout would be asked for the very block it is failing to
+// deliver, every tick, for ever.
+func TestFindNextBlocksToDownload_NeverRacesABlockToItsOwnHolder(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+
+	block := f.node(t, 1)
+
+	// One silent holder, which is also the peer taking the walk.
+	holder := f.deliveringPeer(t, "1.2.3.4:8333", 0, testNow)
+	require.True(t, f.bd.MarkBlockAsInFlight(holder, block, testNow-micros(2*BlockDownloadSlowFetchTimeout)))
+
+	blocks, _ := f.bd.FindNextBlocksToDownload(holder, f.node(t, 0), MaxBlocksInTransitPerPeer, testNow)
+
+	for _, b := range blocks {
+		require.NotEqual(t, block.Hash, b.Hash, "a peer must not be raced against itself")
+	}
+}
+
+// TestSendGetDataBlocks_ARacedBlockCostsAnInTransitSlot pins that racing is not
+// free of the in-transit cap: the raced block goes through the same
+// MarkBlockAsInFlight the walk's own blocks do, so it counts against
+// MaxBlocksInTransitPerPeer like any other.
+func TestSendGetDataBlocks_ARacedBlockCostsAnInTransitSlot(t *testing.T) {
+	f := newDownloadFixture(t, BlockDownloadWindow+6)
+
+	block := f.node(t, 1)
+
+	holder := f.deliveringPeer(t, "5.6.7.8:8333", 0, testNow)
+	require.True(t, f.bd.MarkBlockAsInFlight(holder, block, testNow-micros(2*BlockDownloadSlowFetchTimeout)))
+
+	walker := f.peerAt(t, "1.2.3.4:8333", BlockDownloadWindow+6)
+
+	msgs := f.bd.SendGetDataBlocks(walker, f.node(t, 0), testNow)
+	require.Len(t, msgs, 1)
+
+	getData, ok := msgs[0].(*wire.MsgGetData)
+	require.True(t, ok)
+
+	require.Len(t, getData.InvList, MaxBlocksInTransitPerPeer)
+	require.Equal(t, MaxBlocksInTransitPerPeer, walker.State.nBlocksInFlight)
+	require.Equal(t, block.Hash, getData.InvList[0].Hash, "the raced block leads the batch, being lowest")
+	require.True(t, f.bd.IsInFlightFrom(walker, block.Hash))
+	require.True(t, f.bd.IsInFlightFrom(holder, block.Hash), "the original holder keeps its claim")
 }

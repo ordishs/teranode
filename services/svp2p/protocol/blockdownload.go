@@ -65,6 +65,30 @@ const percentOfBlockIntervalMicros = 10000
 // the single sync slot.
 const MaxBlockDownloadTime = 30 * time.Minute
 
+// BlockStallingMinDownloadRate mirrors validation.h
+// DEFAULT_MIN_BLOCK_STALLING_RATE (100 Kbytes/s): the block delivery rate below
+// which IsBlockDownloadStallingFromPeer calls a peer stalled. SVNode makes it
+// configurable with -blockstallingmindownloadspeed, where 0 disables stall
+// detection entirely.
+//
+// It is deliberately NOT MinBlockDownloadBytesPerSec below, which is half this
+// and governs the sync-peer rotation. Two rules from two sources with two
+// thresholds: legacy's rotation asks "is this peer worth the sync slot", the
+// SVNode rule asks "is this peer worth waiting for rather than racing". Folding
+// them into one constant would silently move whichever of the two it was not
+// taken from.
+const BlockStallingMinDownloadRate = 100 * 1024
+
+// BlockDownloadSlowFetchTimeout mirrors net.h
+// DEFAULT_BLOCK_DOWNLOAD_SLOW_FETCH_TIMEOUT (30 seconds): how long a block may
+// be in flight from a peer before that peer's delivery rate is judged and the
+// block becomes a candidate for a parallel fetch elsewhere.
+const BlockDownloadSlowFetchTimeout = 30 * time.Second
+
+// BlockDownloadMaxParallelFetch mirrors net.h DEFAULT_MAX_BLOCK_PARALLEL_FETCH
+// (3): how many peers we will have fetching one block at once.
+const BlockDownloadMaxParallelFetch = 3
+
 // MinBlockDownloadBytesPerSec carries services/legacy/peer/peer.go
 // minBlockDownloadBytesPerSec (51200), which is also the legacy
 // -minsyncpeernetworkspeed default (services/legacy/config.go
@@ -232,6 +256,14 @@ type BlockDownloader struct {
 	timeoutBasePercent    int64
 	timeoutBaseIBDPercent int64
 	timeoutPerPeerPercent int64
+
+	// slowFetchTimeout and maxParallelFetch govern the parallel-fetch branch,
+	// held per instance for the same reason as the three above: SVNode exposes
+	// both as flags (-blockdownloadslowfetchtimeout,
+	// -blockdownloadmaxparallelfetch), and a node whose blocks take minutes to
+	// deliver honestly wants a longer fuse than one on a fast link.
+	slowFetchTimeout time.Duration
+	maxParallelFetch int
 }
 
 // NewBlockDownloader builds a downloader over the header index and the
@@ -260,6 +292,9 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 		timeoutBasePercent:    BlockDownloadTimeoutBase,
 		timeoutBaseIBDPercent: BlockDownloadTimeoutBaseIBD,
 		timeoutPerPeerPercent: BlockDownloadTimeoutPerPeer,
+
+		slowFetchTimeout: BlockDownloadSlowFetchTimeout,
+		maxParallelFetch: BlockDownloadMaxParallelFetch,
 	}, nil
 }
 
@@ -318,7 +353,7 @@ func (bd *BlockDownloader) pruneHaveData(activeTipHeight int32) {
 // fSyncStarted, so a peer that has never held the sync slot is a download
 // candidate. A peer with nothing announced still takes the "nothing interesting"
 // return below and costs one map lookup.
-func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip HeaderNode, count int) (blocks []HeaderNode, staller *SyncPeer) {
+func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip HeaderNode, count int, nowMicros int64) (blocks []HeaderNode, staller *SyncPeer) {
 	// Before any of the early returns below: our chain moving on is what makes
 	// recorded blocks droppable, and most calls take one of those returns.
 	bd.pruneHaveData(activeTip.Height)
@@ -455,11 +490,20 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 
 		if holders := bd.inFlight[node.Hash]; len(holders) > 0 {
 			// "This is the first already-in-flight block."
-			if waitingFor == nil {
-				waitingFor = holders[0].peer
+			if waitingFor != nil {
+				continue
 			}
 
-			continue
+			waitingFor = holders[0].peer
+
+			if !bd.shouldRace(peer, holders, nowMicros) {
+				continue
+			}
+
+			// net_processing.cpp: "Triggering parallel block download for %s to
+			// peer=%d". It falls through into the same FetchBlock lambda the
+			// walk's own blocks go through, so the window end, the batch size
+			// and the in-transit cap all apply to a raced block unchanged.
 		}
 
 		// The C++ FetchBlock lambda, inlined. SVNode also drops blocks above
@@ -590,7 +634,7 @@ func (bd *BlockDownloader) SendGetDataBlocks(peer *SyncPeer, activeTip HeaderNod
 		return nil
 	}
 
-	blocks, staller := bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer-state.nBlocksInFlight)
+	blocks, staller := bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer-state.nBlocksInFlight, nowMicros)
 
 	getData := wire.NewMsgGetDataSizeHint(uint(len(blocks)))
 
@@ -938,11 +982,14 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 // clock has run past BlockStallingTimeout is holding the head of the download
 // window and is disconnected. C++ additionally re-arms that clock instead of
 // disconnecting when the peer is still delivering bytes at a healthy rate
-// (IsBlockDownloadStallingFromPeer); this port has no per-peer bandwidth meter,
-// so it always takes the disconnect branch — the branch C++ takes for a peer
-// delivering nothing. The bound on that gap is narrow: nStallingSince is only
-// ever set on a peer that is blocking the window, and any block it delivers
-// clears it (see removeFromFlight).
+// (IsBlockDownloadStallingFromPeer); this port always takes the disconnect
+// branch — the branch C++ takes for a peer delivering nothing. Task 6b built the
+// meter that half needs (downloadStallingFrom), so carrying the re-arm here is
+// now a small, separate change; it is left alone because the bound on the gap is
+// narrow either way. nStallingSince is only ever set on a peer that is blocking
+// the window, any block it delivers clears it (see removeFromFlight), and a peer
+// that is genuinely delivering now has its block raced to someone else long
+// before this clock expires.
 //
 // The second is the Teranode sync-peer rotation, carried from legacy netsync
 // manager.go handleCheckSyncPeer and maxLastBlockTime (PR 1067). It is a
@@ -1063,17 +1110,18 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 	// (net_processing.cpp:4058) clears only the delivering peer's entry. The
 	// window moving matters more than the bytes already spent.
 	//
-	// WHAT THAT COSTS HERE, and why the constants are configurable when
-	// BlockDownloadWindow and BlockStallingTimeout are not. SVNode can afford to
-	// burn a slow peer because it races the block to up to
-	// DEFAULT_MAX_BLOCK_PARALLEL_FETCH peers, so the block still arrives while
-	// the slow holder is dropped. This port does not race (see the inFlight
-	// field note), so a disconnect restarts the download from zero on another
-	// peer with no more time than this one had. In the steady state the window
+	// WHY THE CONSTANTS ARE CONFIGURABLE when BlockDownloadWindow and
+	// BlockStallingTimeout are not. SVNode can afford to burn a slow peer
+	// because it races the block to up to BlockDownloadMaxParallelFetch peers,
+	// so the block still arrives while the slow holder is dropped. Task 6b
+	// ported that racing, which is what makes this clause affordable here too —
+	// but the two do not cover each other completely. Racing needs a peer
+	// willing to serve the block; with one useful peer, or with every holder
+	// stalled at the cap, a disconnect still restarts the download from zero
+	// with no more time than the attempt before. In the steady state the window
 	// is one bare block interval — the per-peer term is zero precisely then,
 	// because one block in flight means no other downloading peer — which is
-	// ten minutes on mainnet, or 6.7 MB/s for a 4 GB block. A block that cannot
-	// be fetched inside the window from ANY peer would never complete.
+	// ten minutes on mainnet, or 6.7 MB/s for a 4 GB block.
 	//
 	// SVNode leaves exactly this dial in the operator's hands
 	// (-blockdownloadtimeoutbasepercent and its two siblings), and so does this
@@ -1180,6 +1228,72 @@ func ingestProgressing(state *peerSyncState, ingest IngestSnapshot, nowMicros in
 	return delta*uint64(microsPerSecond) >= MinBlockDownloadBytesPerSec*uint64(elapsed) //nolint:gosec // both are positive here
 }
 
+// shouldRace is the parallel-fetch decision of net_processing.cpp:461-506, asked
+// of the first already-in-flight block a walk meets.
+//
+// A block is raced only when EVERY holder has had it longer than the slow-fetch
+// timeout and is delivering below the rate floor. Either test failing for any one
+// holder cancels the race outright — C++ sets stalling = false and breaks — on
+// the reasoning that a copy is already on its way and a second would be waste.
+// The count of stalled holders is then capped by maxParallelFetch, and a peer is
+// never raced against itself.
+func (bd *BlockDownloader) shouldRace(peer *SyncPeer, holders []inFlightHolder, nowMicros int64) bool {
+	stallers := 0
+
+	for _, holder := range holders {
+		if holder.peer == peer {
+			// Already fetching it: IsInFlight({hash, nodeid}) in the C++ guard.
+			// Without this the walk would re-offer a peer the very block it is
+			// failing to deliver, on every tick.
+			return false
+		}
+
+		if nowMicros-holder.since < micros64(bd.slowFetchTimeout) {
+			// "Give this peer more time."
+			return false
+		}
+
+		if !bd.downloadStallingFrom(holder.peer, nowMicros) {
+			// "This peer seems active currently."
+			return false
+		}
+
+		stallers++
+	}
+
+	// "Should we ask someone else for this block?"
+	return stallers > 0 && stallers < bd.maxParallelFetch
+}
+
+// downloadStallingFrom is IsBlockDownloadStallingFromPeer
+// (net_processing.cpp:105-109): is this peer delivering block bytes below the
+// rate floor?
+//
+// C++ reads a live average off the association. This port reads the rate
+// CheckStall cached on the peer's state, which means it can be stale — a peer
+// nobody has ticked recently carries an old number. A sample older than the
+// slow-fetch timeout is therefore treated as no evidence at all, and no evidence
+// counts as stalling: the conservative reading, and the one that matches a C++
+// association whose bandwidth average has decayed to zero because nothing has
+// arrived.
+func (bd *BlockDownloader) downloadStallingFrom(peer *SyncPeer, nowMicros int64) bool {
+	if peer == nil || peer.State == nil {
+		return true
+	}
+
+	state := peer.State
+
+	if state.nIngestRateMicros == 0 || nowMicros-state.nIngestRateMicros > micros64(bd.slowFetchTimeout) {
+		return true
+	}
+
+	return state.nIngestBytesPerSec < BlockStallingMinDownloadRate
+}
+
+// micros64 converts a duration to the microsecond unit every clock in this
+// machine uses.
+func micros64(d time.Duration) int64 { return int64(d / time.Microsecond) }
+
 // maxDownloadTimeMicros is the DetectStalling budget for the block at the head
 // of peer's queue (net_processing.cpp:5645-5654):
 //
@@ -1215,10 +1329,10 @@ func (bd *BlockDownloader) maxDownloadTimeMicros(peer *SyncPeer) int64 {
 // validated ones "so peers can't advertise non-existing block hashes to
 // unreasonably increase our timeout". Here the distinct holders in inFlight ARE
 // that set: FindNextBlocksToDownload only ever walks headers the index already
-// holds, so every in-flight block has a validated header, and the map is
-// single-assignment. Counting the map therefore needs no second counter to
-// drift out of step with it, at the cost of one pass over at most
-// BlockDownloadWindow entries per check.
+// holds, so every in-flight block has a validated header. Counting them
+// therefore needs no second counter to drift out of step with the map, at the
+// cost of one pass over at most BlockDownloadWindow entries — plus their extra
+// holders, which the parallel fetch caps at BlockDownloadMaxParallelFetch each.
 func (bd *BlockDownloader) otherPeersWithDownloads(peer *SyncPeer) int {
 	holders := make(map[*SyncPeer]struct{}, len(bd.inFlight))
 
@@ -1240,7 +1354,27 @@ func sampleIngest(state *peerSyncState, ingest IngestSnapshot, nowMicros int64) 
 		state.nIngestBytesLastSample = 0
 		state.nIngestSampleMicros = 0
 
+		// A peer with no ingest is delivering no block bytes, which is a rate of
+		// zero rather than an unknown rate: the reading is current, and it is
+		// what the racing test wants to see. Stamping the clock is what keeps it
+		// from being mistaken for a stale sample.
+		state.nIngestBytesPerSec = 0
+		state.nIngestRateMicros = nowMicros
+
 		return
+	}
+
+	// The rate for the interval just closed, computed here because this is the
+	// one place holding both samples. The guards match ingestProgressing's: a
+	// count that went backwards means a new ingest started and says nothing
+	// about this one.
+	if state.nIngestSampleMicros > 0 && ingest.BytesRead >= state.nIngestBytesLastSample {
+		if elapsed := nowMicros - state.nIngestSampleMicros; elapsed > 0 {
+			delta := ingest.BytesRead - state.nIngestBytesLastSample
+
+			state.nIngestBytesPerSec = delta * uint64(microsPerSecond) / uint64(elapsed) //nolint:gosec // both are positive here
+			state.nIngestRateMicros = nowMicros
+		}
 	}
 
 	state.nIngestBytesLastSample = ingest.BytesRead

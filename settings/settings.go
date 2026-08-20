@@ -702,6 +702,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlockDownloadTimeoutBasePercent:    getInt64("legacy_blockDownloadTimeoutBasePercent", 100, alternativeContext...),
 			BlockDownloadTimeoutBaseIBDPercent: getInt64("legacy_blockDownloadTimeoutBaseIBDPercent", 600, alternativeContext...),
 			BlockDownloadTimeoutPerPeerPercent: getInt64("legacy_blockDownloadTimeoutPerPeerPercent", 50, alternativeContext...),
+			// The parallel-fetch fuse and cap, defaults as SVNode's net.h:161
+			// and net.h:163.
+			BlockDownloadSlowFetchTimeout: getDuration("legacy_blockDownloadSlowFetchTimeout", 30*time.Second, alternativeContext...),
+			BlockDownloadMaxParallelFetch: getInt("legacy_blockDownloadMaxParallelFetch", 3, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

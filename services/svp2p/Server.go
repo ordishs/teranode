@@ -310,6 +310,9 @@ func (s *Server) startSync(ctx context.Context) error {
 		BlockDownloadTimeoutBasePercent:    s.settings.Legacy.BlockDownloadTimeoutBasePercent,
 		BlockDownloadTimeoutBaseIBDPercent: s.settings.Legacy.BlockDownloadTimeoutBaseIBDPercent,
 		BlockDownloadTimeoutPerPeerPercent: s.settings.Legacy.BlockDownloadTimeoutPerPeerPercent,
+
+		BlockDownloadSlowFetchTimeout: s.settings.Legacy.BlockDownloadSlowFetchTimeout,
+		BlockDownloadMaxParallelFetch: s.settings.Legacy.BlockDownloadMaxParallelFetch,
 	}); err != nil {
 		return err
 	}

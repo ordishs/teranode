@@ -95,6 +95,21 @@ type peerSyncState struct {
 	nIngestBytesLastSample uint64
 	nIngestSampleMicros    int64
 
+	// nIngestBytesPerSec and nIngestRateMicros have no CNodeState counterpart
+	// either. They are this port's stand-in for what SVNode reads off the
+	// association: CAssociation::GetAverageBandwidth(BLOCK), the per-peer block
+	// delivery rate IsBlockDownloadStallingFromPeer tests
+	// (net_processing.cpp:105-109). Two consumers need that rate at moments when
+	// no IngestSnapshot is to hand — the parallel-fetch branch asks it of every
+	// holder of a block, not just the peer being walked — so CheckStall computes
+	// it once per peer per tick and leaves it here.
+	//
+	// nIngestRateMicros is when it was computed, which is what lets a reader tell
+	// a rate of zero from a rate nobody has measured lately. Both are zero when
+	// no ingest has been sampled.
+	nIngestBytesPerSec uint64
+	nIngestRateMicros  int64
+
 	// nLastProgressTime has no CNodeState counterpart. It carries legacy
 	// netsync manager.go syncPeerState.lastBlockTime, the clock the Teranode
 	// sync-peer rotation measures against maxLastBlockTime (PR 1067), in

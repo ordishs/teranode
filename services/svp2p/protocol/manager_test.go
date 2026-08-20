@@ -1905,30 +1905,42 @@ func TestSyncPass_TimesOutASilentRotatedPeerAndRehomesItsBlocks(t *testing.T) {
 	require.Equal(t, []*Peer{silent.peer}, disconnect, "the front block's clock is what disconnects it")
 	require.Equal(t, int64(0), silent.sync.State.nStallingSince, "no staller rule was involved")
 
-	// The same pass hands the healthy peer the next slice of the window, which
-	// fills its in-flight cap. Delivering it is what leaves room for the freed
-	// blocks below — MaxBlocksInTransitPerPeer is a hard gate on the getdata
-	// pass, so a peer already holding sixteen is offered nothing whatever came
-	// free.
+	// The head of the hole reaches the healthy peer on this very pass, and by
+	// the parallel fetch rather than by the disconnect: the silent peer has held
+	// it far longer than the slow-fetch fuse and is delivering nothing, so the
+	// walk races it. The recovery therefore does not wait for the disconnect it
+	// happens to coincide with here.
+	hole := f.node(t, 1)
+
+	require.Subset(t, getDataTo(out, other.peer), []chainhash.Hash{hole.Hash},
+		"the contested block is raced to the healthy peer")
+	require.True(t, f.m.blockDownloader.IsInFlightFrom(other.sync, hole.Hash))
+	require.True(t, f.m.blockDownloader.IsInFlightFrom(silent.sync, hole.Hash),
+		"racing does not release the original claim; the disconnect below does")
+
+	// The disconnect the manager then performs releases the silent peer's claims
+	// and leaves the healthy peer's alone.
+	f.m.peerGone(silent.sync)
+	f.handles = f.handles[1:]
+
+	require.False(t, f.m.blockDownloader.IsInFlightFrom(silent.sync, hole.Hash))
+	require.True(t, f.m.blockDownloader.IsInFlightFrom(other.sync, hole.Hash),
+		"the block is still coming, from the peer that is actually delivering")
+	require.Empty(t, silent.sync.State.vBlocksInFlight)
+	require.Equal(t, 0, silent.sync.State.nBlocksInFlight)
+
+	// Nothing was dropped on the floor: every block the silent peer held is
+	// either in flight from the healthy peer or back on offer to it.
 	f.setup(func() {
 		for _, hash := range getDataTo(out, other.peer) {
 			require.True(t, f.m.blockDownloader.BlockReceived(other.sync, hash, timedOut))
 		}
 	})
 
-	// The disconnect the manager then performs releases the blocks.
-	hole := f.node(t, 1)
-	require.True(t, f.m.blockDownloader.IsInFlight(hole.Hash), "still held by the peer being dropped")
-
-	f.m.peerGone(silent.sync)
-	f.handles = f.handles[1:]
-
-	require.False(t, f.m.blockDownloader.IsInFlight(hole.Hash), "the disconnect put it back on offer")
-
 	out, _ = f.pass(timedOut + micros(time.Second))
 
-	require.Subset(t, getDataTo(out, other.peer), []chainhash.Hash{hole.Hash},
-		"the block at the head of the hole must reach the surviving peer on its next walk")
+	require.Subset(t, getDataTo(out, other.peer), []chainhash.Hash{f.node(t, 2).Hash},
+		"the rest of the released window follows on the next walk")
 }
 
 // TestConfigureSync_CarriesTheBlockDownloadTimeoutSettings walks the plumbing
@@ -1987,5 +1999,68 @@ func TestConfigureSync_CarriesTheBlockDownloadTimeoutSettings(t *testing.T) {
 		bd := newManager(t, SyncConfig{BlockDownloadTimeoutBasePercent: -1})
 
 		require.Equal(t, BlockDownloadTimeoutBase, bd.timeoutBasePercent)
+	})
+}
+
+// TestBlockDone_ARacedBlockDeliveredTwiceLosesNothing is the case parallel fetch
+// creates and nothing else does: two peers stream the same block, so one of the
+// two ingests loses the admission race.
+//
+// The bookkeeping has to come out right whichever way round they land. The
+// winner's have-data record must stand, both peers' in-flight claims must clear,
+// and the loser must not delete the record the winner just wrote — which is why
+// the duplicate path uses BlockNotDelivered rather than BlockFailed
+// (manager.go, the Duplicate case).
+func TestBlockDone_ARacedBlockDeliveredTwiceLosesNothing(t *testing.T) {
+	const height = 5
+
+	f := newRotationFixture(t, height)
+
+	winner, loser := f.handles[0], f.handles[1]
+	block := f.node(t, 1)
+	tip := f.node(t, height)
+
+	f.setup(func() {
+		winner.sync.State.pindexBestKnownBlock = &tip
+		loser.sync.State.pindexBestKnownBlock = &tip
+
+		// The shape the parallel fetch leaves behind: one block, two holders.
+		require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(winner.sync, block, testNow))
+		require.True(t, f.m.blockDownloader.MarkBlockAsInFlight(loser.sync, block, testNow+micros(time.Minute)))
+	})
+
+	require.Equal(t, 1, f.m.blockDownloader.BlocksInFlight(), "one block")
+	require.True(t, f.m.BlockExpected(winner.sync, block.Hash))
+	require.True(t, f.m.BlockExpected(loser.sync, block.Hash),
+		"a raced block is solicited from BOTH holders, or the second copy would be refused as unsolicited")
+
+	// The winning ingest completes.
+	require.NoError(t, f.m.BlockDone(winner.sync, block.Hash, IngestOutcome{}))
+
+	require.False(t, f.m.blockDownloader.IsInFlightFrom(winner.sync, block.Hash))
+	require.True(t, f.m.blockDownloader.IsInFlightFrom(loser.sync, block.Hash),
+		"the loser is still streaming; its claim goes when its ingest reports")
+
+	// The losing copy arrives and is refused by the admission gate as a
+	// duplicate.
+	require.NoError(t, f.m.BlockDone(loser.sync, block.Hash, IngestOutcome{Duplicate: true}))
+
+	require.False(t, f.m.blockDownloader.IsInFlight(block.Hash), "no claim survives either ingest")
+	require.Equal(t, 0, winner.sync.State.nBlocksInFlight)
+	require.Equal(t, 0, loser.sync.State.nBlocksInFlight)
+	require.Empty(t, winner.sync.State.vBlocksInFlight)
+	require.Empty(t, loser.sync.State.vBlocksInFlight)
+
+	// The block is held, so the next walk must not ask for it again. That is the
+	// assertion the Duplicate path exists for: BlockFailed would have deleted the
+	// winner's record here and bought a redundant download.
+	f.setup(func() {
+		blocks, _ := f.m.blockDownloader.FindNextBlocksToDownload(winner.sync, f.node(t, 0), MaxBlocksInTransitPerPeer, testNow+micros(2*time.Minute))
+
+		for _, b := range blocks {
+			require.NotEqual(t, block.Hash, b.Hash, "a block we hold must not be re-requested")
+		}
+
+		require.NotEmpty(t, blocks, "the rest of the chain is still wanted")
 	})
 }

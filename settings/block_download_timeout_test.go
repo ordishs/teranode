@@ -2,6 +2,7 @@ package settings
 
 import (
 	"testing"
+	"time"
 
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/require"
@@ -51,6 +52,9 @@ func TestBlockDownloadTimeout_LoaderReadsAllKeys(t *testing.T) {
 
 	ctx := gocore.Config().GetContext()
 
+	// The parallel-fetch pair is checked the same way below; they share this
+	// test because they share the failure mode.
+
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
 			// Default contract, only under a context that carries no .conf
@@ -74,4 +78,48 @@ func TestBlockDownloadTimeout_LoaderReadsAllKeys(t *testing.T) {
 				"loader must read %s under context %q", tc.key, ctx)
 		})
 	}
+}
+
+// TestBlockDownloadParallelFetch_LoaderReadsAllKeys is the same guard for the
+// parallel-fetch fuse and cap. A zero fuse would race every block the instant it
+// was requested; a zero cap would stop the walk from ever racing one, since the
+// cap is compared against a staller count of at least one.
+func TestBlockDownloadParallelFetch_LoaderReadsAllKeys(t *testing.T) {
+	ctx := gocore.Config().GetContext()
+
+	winKey := func(key string) string {
+		if ctx == "" {
+			return key
+		}
+
+		return key + "." + ctx
+	}
+
+	t.Run("legacy_blockDownloadSlowFetchTimeout", func(t *testing.T) {
+		const key = "legacy_blockDownloadSlowFetchTimeout"
+
+		if ctx == "" || ctx == "dev" {
+			require.Equal(t, 30*time.Second, NewSettings().Legacy.BlockDownloadSlowFetchTimeout)
+		}
+
+		gocore.Config().Set(winKey(key), "90s")
+		t.Cleanup(func() { gocore.Config().Set(winKey(key), "") })
+
+		require.Equal(t, 90*time.Second, NewSettings().Legacy.BlockDownloadSlowFetchTimeout,
+			"loader must read %s under context %q", key, ctx)
+	})
+
+	t.Run("legacy_blockDownloadMaxParallelFetch", func(t *testing.T) {
+		const key = "legacy_blockDownloadMaxParallelFetch"
+
+		if ctx == "" || ctx == "dev" {
+			require.Equal(t, 3, NewSettings().Legacy.BlockDownloadMaxParallelFetch)
+		}
+
+		gocore.Config().Set(winKey(key), "5")
+		t.Cleanup(func() { gocore.Config().Set(winKey(key), "") })
+
+		require.Equal(t, 5, NewSettings().Legacy.BlockDownloadMaxParallelFetch,
+			"loader must read %s under context %q", key, ctx)
+	})
 }
