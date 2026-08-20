@@ -87,6 +87,11 @@ func (p *peerRegistrySync) run(ctx context.Context) {
 
 	p.logger.Infof("[LegacyPeerRegistry] started, interval %s", p.interval)
 
+	// Reconcile once up front so a node with live legacy peers is not shown as
+	// empty for a whole interval. If the internal server is not answering yet,
+	// the snapshot is nil and this tick is skipped.
+	p.reconcile(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -141,8 +146,27 @@ func (p *peerRegistrySync) reconcile(ctx context.Context) {
 			}
 		}
 
-		sentDelta := byteDelta(snap.bytesSent, previous.bytesSent, known)
-		recvDelta := byteDelta(snap.bytesReceived, previous.bytesReceived, known)
+		// Baseline the byte deltas. A registry entry can outlive our tracking:
+		// a vanished peer leaves lastSeen but its entry survives until TTL
+		// cleanup. UpdatePeerMetrics ADDS deltas, so a peer we are seeing for
+		// the first time must baseline against what the registry already holds,
+		// or its running total gets added on top of itself.
+		sentBaseline, recvBaseline := previous.bytesSent, previous.bytesReceived
+		haveBaseline := known
+
+		if !known {
+			stored, found, err := p.registry.GetPeer(ctx, snap.id)
+			switch {
+			case err != nil:
+				p.logger.Warnf("[LegacyPeerRegistry] byte baseline %s failed: %v", snap.id, err)
+			case found:
+				sentBaseline, recvBaseline = stored.BytesSent, stored.BytesReceived
+				haveBaseline = true
+			}
+		}
+
+		sentDelta := byteDelta(snap.bytesSent, sentBaseline, haveBaseline)
+		recvDelta := byteDelta(snap.bytesReceived, recvBaseline, haveBaseline)
 
 		if sentDelta > 0 || recvDelta > 0 {
 			if err := p.registry.UpdatePeerMetrics(ctx, snap.id, 0, sentDelta, recvDelta,
@@ -177,17 +201,15 @@ func (p *peerRegistrySync) reconcile(ctx context.Context) {
 	}
 }
 
-// byteDelta converts an absolute counter into the increase since the previous
-// tick. A first sighting contributes the whole total. A counter that went
-// backwards means the peer reconnected and reset it, so the delta clamps to
-// zero rather than wrapping around uint64.
-func byteDelta(current, previous uint64, known bool) uint64 {
-	if !known {
+// byteDelta converts an absolute counter into bytes not yet reported.
+//
+// With no baseline the whole current total is new. A counter that went backwards
+// means the peer's connection object was replaced — legacy counters only ever
+// climb within one connection — so the current total again belongs entirely to
+// the new connection. Both cases return current, which never wraps uint64.
+func byteDelta(current, previous uint64, haveBaseline bool) uint64 {
+	if !haveBaseline || current < previous {
 		return current
-	}
-
-	if current < previous {
-		return 0
 	}
 
 	return current - previous

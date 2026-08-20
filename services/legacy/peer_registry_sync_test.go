@@ -214,14 +214,15 @@ func TestReconcile_ByteCountersAreDeltas(t *testing.T) {
 	got, _ := reg.Get("legacy:203.0.113.7:8333")
 	require.Equal(t, uint64(1200), got.BytesReceived, "500 then a delta of 700")
 
-	// A reconnect resets the peer's counters. The delta must clamp to zero
-	// rather than wrap around uint64.
+	// A reconnect resets the peer's counters. The delta must treat the reset
+	// total as new bytes rather than wrapping around uint64.
 	current.bytesReceived = 10
 	current.lastRecv = time.Unix(1750000300, 0)
 	sync.reconcile(context.Background())
 
 	got, _ = reg.Get("legacy:203.0.113.7:8333")
-	require.Equal(t, uint64(1200), got.BytesReceived, "a backwards counter adds nothing")
+	require.Equal(t, uint64(1210), got.BytesReceived,
+		"a backwards counter means a replaced connection, so its 10 bytes are new")
 }
 
 // TestReconcile_RegistryErrorDoesNotStopTheLoop checks that a failing registry
@@ -252,4 +253,117 @@ func TestReconcile_RegistryErrorDoesNotStopTheLoop(t *testing.T) {
 func TestLegacyRegistryID(t *testing.T) {
 	require.Equal(t, "legacy:203.0.113.7:8333", legacyRegistryID("203.0.113.7:8333"))
 	require.Equal(t, "legacy:[2001:db8::1]:8333", legacyRegistryID("[2001:db8::1]:8333"))
+}
+
+// TestReconcile_ReconnectDoesNotDoubleCountBytes is a regression test. A
+// vanished peer is dropped from lastSeen, but its registry entry survives until
+// TTL cleanup. Byte counters travel as deltas that UpdateMetrics ADDS, so a peer
+// seen "for the first time" against a surviving entry must not re-add its whole
+// running total. getPeers() only returns peers whose Connected() is true, so a
+// peer can leave one snapshot and return with its counters still climbing.
+func TestReconcile_ReconnectDoesNotDoubleCountBytes(t *testing.T) {
+	reg := blockchain.NewCentralizedPeerRegistry(blockchain.DefaultBanConfig())
+	counting := newCountingRegistry(reg)
+
+	snap := testSnapshot("203.0.113.7:8333", 1000, time.Unix(1750000100, 0))
+	present := true
+	sync := newPeerRegistrySync(ulogger.TestLogger{}, testSyncSettings(), counting,
+		func() []peerSnapshot {
+			if present {
+				return []peerSnapshot{snap}
+			}
+
+			return []peerSnapshot{}
+		})
+
+	sync.reconcile(context.Background())
+
+	got, _ := reg.Get("legacy:203.0.113.7:8333")
+	require.Equal(t, uint64(1000), got.BytesReceived)
+
+	// The peer drops out of one snapshot, then returns with its counters still
+	// running. The registry entry survived the gap.
+	present = false
+	sync.reconcile(context.Background())
+
+	present = true
+	snap.bytesReceived = 1200
+	snap.lastRecv = time.Unix(1750000200, 0)
+	sync.reconcile(context.Background())
+
+	got, _ = reg.Get("legacy:203.0.113.7:8333")
+	require.Equal(t, uint64(1200), got.BytesReceived,
+		"the running total must not be re-added on top of the surviving entry")
+	require.True(t, got.IsConnected, "the peer must be marked connected again")
+}
+
+// TestReconcile_ReconnectWithResetCountersDoesNotRegress covers the other
+// reappearance shape: a genuinely new TCP connection whose counters restart at
+// zero must not drag the stored total backwards.
+func TestReconcile_ReconnectWithResetCountersDoesNotRegress(t *testing.T) {
+	reg := blockchain.NewCentralizedPeerRegistry(blockchain.DefaultBanConfig())
+	counting := newCountingRegistry(reg)
+
+	snap := testSnapshot("203.0.113.7:8333", 1000, time.Unix(1750000100, 0))
+	present := true
+	sync := newPeerRegistrySync(ulogger.TestLogger{}, testSyncSettings(), counting,
+		func() []peerSnapshot {
+			if present {
+				return []peerSnapshot{snap}
+			}
+
+			return []peerSnapshot{}
+		})
+
+	sync.reconcile(context.Background())
+	present = false
+	sync.reconcile(context.Background())
+
+	// Fresh connection: the peer's own counters start again from near zero.
+	present = true
+	snap.bytesReceived = 50
+	snap.lastRecv = time.Unix(1750000300, 0)
+	sync.reconcile(context.Background())
+
+	got, _ := reg.Get("legacy:203.0.113.7:8333")
+	require.Equal(t, uint64(1050), got.BytesReceived,
+		"a reset counter contributes its new bytes on top of the stored lifetime total")
+
+	// Subsequent growth on the new connection is tracked normally.
+	snap.bytesReceived = 90
+	snap.lastRecv = time.Unix(1750000400, 0)
+	sync.reconcile(context.Background())
+
+	got, _ = reg.Get("legacy:203.0.113.7:8333")
+	require.Equal(t, uint64(1090), got.BytesReceived)
+}
+
+// failingGetPeer wraps a registry client and fails only GetPeer, so the byte
+// baseline fallback can be exercised.
+type failingGetPeer struct {
+	blockchain.PeerRegistryClientI
+}
+
+func (f failingGetPeer) GetPeer(_ context.Context, _ string) (*blockchain.PeerInfo, bool, error) {
+	return nil, false, context.DeadlineExceeded
+}
+
+// TestReconcile_BaselineLookupFailureStillReports checks that a failed byte
+// baseline lookup degrades to reporting the whole total rather than dropping the
+// peer or skipping its metrics.
+func TestReconcile_BaselineLookupFailureStillReports(t *testing.T) {
+	reg := blockchain.NewCentralizedPeerRegistry(blockchain.DefaultBanConfig())
+	client := failingGetPeer{blockchain.NewLocalPeerRegistryClient(reg)}
+
+	snap := testSnapshot("203.0.113.7:8333", 500, time.Unix(1750000100, 0))
+	sync := newPeerRegistrySync(ulogger.TestLogger{}, testSyncSettings(), client,
+		func() []peerSnapshot { return []peerSnapshot{snap} })
+
+	sync.reconcile(context.Background())
+
+	got, ok := reg.Get("legacy:203.0.113.7:8333")
+	require.True(t, ok, "the peer must still be registered")
+	require.True(t, got.IsConnected)
+	require.Equal(t, uint64(500), got.BytesReceived,
+		"without a baseline the whole total is reported")
 }
