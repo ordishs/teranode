@@ -42,7 +42,9 @@
       id: peer.id,
       address: peer.network_address || String(peer.id || '').replace(/^legacy:/, ''),
       client_name: peer.client_name || '',
-      dir: peer.legacy?.inbound ? 'in' : 'out',
+      // A payload with transport 'legacy' but no nested block has an unknown
+      // direction; do not report it as outbound.
+      dir: peer.legacy ? (peer.legacy.inbound ? 'in' : 'out') : '-',
       protocol_version: peer.legacy?.protocol_version ?? 0,
       service_flags: peer.legacy?.service_flags ?? 0,
       ping_micros: peer.legacy?.ping_micros ?? 0,
@@ -196,7 +198,7 @@
   {#if rows.length === 0}
     <div class="no-data">
       <p>No legacy peers</p>
-      <p class="sub">The legacy service is not connected to any Bitcoin P2P peer.</p>
+      <p class="sub">No Bitcoin P2P (legacy) peers are registered.</p>
     </div>
   {:else}
     <div class="legacy-table">
