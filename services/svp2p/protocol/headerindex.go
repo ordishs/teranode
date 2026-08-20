@@ -410,3 +410,207 @@ func locatorFromLocked(n *node) []chainhash.Hash {
 
 	return have
 }
+
+// containsLocked mirrors chain.h CChain::Contains (chain.h:53-56): "Efficiently
+// check whether a block is present in this chain." The C++ tests
+// (*this)[pindex->nHeight] == pindex against the vector of the active chain;
+// this index has no such vector, so the same question is asked of the branch
+// ending at tip — the node at start's own height on that branch is start
+// itself, or start sits on another branch. Called with idx.mu held.
+func containsLocked(tip, n *node) bool {
+	anc, ok := ancestorLocked(tip, n.height)
+
+	return ok && anc == n
+}
+
+// ForkPoint mirrors validation.cpp FindForkInGlobalIndex (validation.cpp:202-217):
+// "Find the first block the caller has in the main chain." It walks the
+// locator in the order the peer sent it (newest first, by the locator
+// convention) and answers the first hash we hold that sits on the branch
+// ending at tip. A hash we hold that instead DESCENDS from tip answers tip
+// itself — the peer is ahead of us on our own chain, so our tip is the fork
+// point. A locator naming nothing we hold answers genesis, which is what
+// makes an unknown locator restart the peer from the bottom of the chain.
+//
+// tip is our own active chain tip (PeerManager.activeTip), not the header
+// index tip: this port serves blocks and headers from the chain the
+// blockchain service has validated, not from the header tree that headers-first
+// sync has run ahead to.
+//
+// ok is false only when tip is not in the index, in which case there is no
+// active chain to locate anything on and the caller must serve nothing.
+func (idx *HeaderIndex) ForkPoint(tip chainhash.Hash, locator []chainhash.Hash) (HeaderNode, bool) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	tipNode, ok := idx.nodes[tip]
+	if !ok {
+		return HeaderNode{}, false
+	}
+
+	for _, hash := range locator {
+		n, ok := idx.nodes[hash]
+		if !ok {
+			continue
+		}
+
+		if containsLocked(tipNode, n) {
+			return exportNode(n), true
+		}
+
+		// C++: `if (pindex->GetAncestor(chain.Height()) == chain.Tip())
+		// return chain.Tip();` — the peer named a block that descends from
+		// our tip, so everything we have is already common with it.
+		if anc, ok := ancestorLocked(n, tipNode.height); ok && anc == tipNode {
+			return exportNode(tipNode), true
+		}
+	}
+
+	// C++: `return chain.Genesis();`
+	genesis, ok := ancestorLocked(tipNode, 0)
+	if !ok {
+		return HeaderNode{}, false
+	}
+
+	return exportNode(genesis), true
+}
+
+// ActiveChainNext mirrors chain.h CChain::Next (chain.h:58-68): the block
+// that follows hash on the branch ending at tip, or nothing when hash is the
+// tip or sits off that branch. It is what both serving machines apply to a
+// fork point before they start serving, the C++ `pindex = chainActive.Next(pindex)`.
+func (idx *HeaderIndex) ActiveChainNext(tip, hash chainhash.Hash) (HeaderNode, bool) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	tipNode, ok := idx.nodes[tip]
+	if !ok {
+		return HeaderNode{}, false
+	}
+
+	n, ok := idx.nodes[hash]
+	if !ok {
+		return HeaderNode{}, false
+	}
+
+	if !containsLocked(tipNode, n) {
+		return HeaderNode{}, false
+	}
+
+	next, ok := ancestorLocked(tipNode, n.height+1)
+	if !ok {
+		return HeaderNode{}, false
+	}
+
+	return exportNode(next), true
+}
+
+// activeChainRangeLocked returns at most limit nodes beginning at start and
+// following the branch that ends at tip, start first. It is the walk both
+// serving loops run — the C++ `for(; pindex; pindex = chainActive.Next(pindex))`
+// bounded by that loop's own nLimit.
+//
+// A start that sits OFF the branch yields start alone, because CChain::Next
+// answers nullptr for an index the active chain does not hold, which ends the
+// C++ loop after its first iteration. That case is reachable: a getheaders
+// with an empty locator names its start by hashStop, and the peer may name a
+// header on a branch we did not take.
+//
+// The walk goes backwards from the far end rather than forwards from start:
+// one skiplist descent places the last node, then prev links collect the
+// range in O(limit) steps. Walking forwards would need one descent per step.
+// Called with idx.mu held.
+func activeChainRangeLocked(tip, start *node, limit int) []*node {
+	if limit <= 0 {
+		return nil
+	}
+
+	if !containsLocked(tip, start) {
+		return []*node{start}
+	}
+
+	// int64 throughout: start.height + limit is not representable in int32
+	// near the top of the height range, and the clamp below is what brings it
+	// back into it.
+	end := int64(start.height) + int64(limit) - 1
+	if end > int64(tip.height) {
+		end = int64(tip.height)
+	}
+
+	last, ok := ancestorLocked(tip, int32(end))
+	if !ok {
+		return []*node{start}
+	}
+
+	out := make([]*node, end-int64(start.height)+1)
+
+	n := last
+
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = n
+		n = n.prev
+	}
+
+	return out
+}
+
+// ActiveChainHeaders returns at most limit headers beginning at start and
+// following the active chain that ends at tip. It is the getheaders serving
+// range, and the one place a stored wire.BlockHeader leaves the index.
+// It returns nil when either hash is unknown.
+func (idx *HeaderIndex) ActiveChainHeaders(tip, start chainhash.Hash, limit int) []wire.BlockHeader {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	tipNode, startNode, ok := rangeEndsLocked(idx, tip, start)
+	if !ok {
+		return nil
+	}
+
+	nodes := activeChainRangeLocked(tipNode, startNode, limit)
+
+	out := make([]wire.BlockHeader, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n.header)
+	}
+
+	return out
+}
+
+// ActiveChainHashes is ActiveChainHeaders returning the hashes instead, for
+// the getblocks inv. The hashes are already in the index, so this exists to
+// keep the inv path from re-hashing every header it serves.
+func (idx *HeaderIndex) ActiveChainHashes(tip, start chainhash.Hash, limit int) []chainhash.Hash {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	tipNode, startNode, ok := rangeEndsLocked(idx, tip, start)
+	if !ok {
+		return nil
+	}
+
+	nodes := activeChainRangeLocked(tipNode, startNode, limit)
+
+	out := make([]chainhash.Hash, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n.hash)
+	}
+
+	return out
+}
+
+// rangeEndsLocked resolves the two hashes the range accessors take. Called
+// with idx.mu held.
+func rangeEndsLocked(idx *HeaderIndex, tip, start chainhash.Hash) (tipNode, startNode *node, ok bool) {
+	tipNode, ok = idx.nodes[tip]
+	if !ok {
+		return nil, nil, false
+	}
+
+	startNode, ok = idx.nodes[start]
+	if !ok {
+		return nil, nil, false
+	}
+
+	return tipNode, startNode, true
+}

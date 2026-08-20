@@ -2064,3 +2064,66 @@ func TestBlockDone_ARacedBlockDeliveredTwiceLosesNothing(t *testing.T) {
 		require.NotEmpty(t, blocks, "the rest of the chain is still wanted")
 	})
 }
+
+// TestManagerServesChainQueries drives Task 8 through the live peer loop: a
+// connected peer's getheaders and getblocks reach the serving machine and its
+// replies come back down the same connection. It also pins the active-tip
+// bound end to end — the index holds five headers while the blockchain service
+// has reported a tip at three, and neither reply may run past three.
+func TestManagerServesChainQueries(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 5, 1)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	for _, header := range chain {
+		connected, addErr := idx.AddHeader(header)
+		require.NoError(t, addErr)
+		require.True(t, connected)
+	}
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+	require.True(t, m.SetActiveTip(chain[2].BlockHash()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+	defer func() { _ = far.nc.Close() }()
+
+	version := remoteVersion(4321)
+	version.Services = wire.SFNodeNetwork
+	far.completeOutboundHandshakeAs(t, version)
+
+	genesisHash := genesis.BlockHash()
+
+	getHeaders := wire.NewMsgGetHeaders()
+	require.NoError(t, getHeaders.AddBlockLocatorHash(&genesisHash))
+	far.write(t, getHeaders)
+
+	headers, ok := far.readUntil(t, wire.CmdHeaders).(*wire.MsgHeaders)
+	require.True(t, ok)
+	require.Len(t, headers.Headers, 3)
+
+	for i, header := range headers.Headers {
+		require.Equal(t, chain[i].BlockHash(), header.BlockHash(), "header %d", i)
+	}
+
+	getBlocks := wire.NewMsgGetBlocks(&chainhash.Hash{})
+	require.NoError(t, getBlocks.AddBlockLocatorHash(&genesisHash))
+	far.write(t, getBlocks)
+
+	inv, ok := far.readUntil(t, wire.CmdInv).(*wire.MsgInv)
+	require.True(t, ok)
+	require.Len(t, inv.InvList, 3)
+
+	for i, iv := range inv.InvList {
+		require.Equal(t, wire.InvTypeBlock, iv.Type)
+		require.Equal(t, chain[i].BlockHash(), iv.Hash, "inv %d", i)
+	}
+}

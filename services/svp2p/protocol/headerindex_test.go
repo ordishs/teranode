@@ -876,3 +876,176 @@ func TestHeaderIndex_ConcurrentReadsDuringWrites(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, big.NewInt((chainLen+1)*difficulty1Work), tip.ChainWork)
 }
+
+// TestForkPoint pins validation.cpp FindForkInGlobalIndex's three answers
+// against the branch ending at the tip the caller names.
+func TestForkPoint(t *testing.T) {
+	genesis := testGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	nc := &nonceCounter{}
+	main := buildChain(t, idx, nc, genesis, 8)
+	side := buildChain(t, idx, nc, main[2], 3) // forks off height 3
+
+	tip := main[7].BlockHash() // height 8, the active tip for every case below
+
+	t.Run("the first locator hash on the active chain wins", func(t *testing.T) {
+		// Locators are newest-first, and the walk takes the first hit, so a
+		// locator naming heights 6 then 4 forks at 6.
+		fork, ok := idx.ForkPoint(tip, []chainhash.Hash{main[5].BlockHash(), main[3].BlockHash()})
+		require.True(t, ok)
+		require.Equal(t, main[5].BlockHash(), fork.Hash)
+		require.Equal(t, int32(6), fork.Height)
+	})
+
+	t.Run("a hash we hold off the active chain is skipped", func(t *testing.T) {
+		fork, ok := idx.ForkPoint(tip, []chainhash.Hash{side[2].BlockHash(), main[1].BlockHash()})
+		require.True(t, ok)
+		require.Equal(t, main[1].BlockHash(), fork.Hash)
+	})
+
+	t.Run("a hash descending from the tip answers the tip", func(t *testing.T) {
+		// The peer is ahead of us on our own chain: serving resumes at our tip.
+		fork, ok := idx.ForkPoint(main[4].BlockHash(), []chainhash.Hash{main[7].BlockHash()})
+		require.True(t, ok)
+		require.Equal(t, main[4].BlockHash(), fork.Hash)
+	})
+
+	t.Run("a locator naming nothing we hold answers genesis", func(t *testing.T) {
+		fork, ok := idx.ForkPoint(tip, []chainhash.Hash{{0x01}, {0x02}})
+		require.True(t, ok)
+		require.Equal(t, genesis.BlockHash(), fork.Hash)
+		require.Equal(t, int32(0), fork.Height)
+	})
+
+	t.Run("an empty locator answers genesis", func(t *testing.T) {
+		fork, ok := idx.ForkPoint(tip, nil)
+		require.True(t, ok)
+		require.Equal(t, genesis.BlockHash(), fork.Hash)
+	})
+
+	t.Run("an unknown tip has no chain to locate on", func(t *testing.T) {
+		_, ok := idx.ForkPoint(chainhash.Hash{0xFF}, []chainhash.Hash{genesis.BlockHash()})
+		require.False(t, ok)
+	})
+}
+
+// TestActiveChainNext pins chain.h CChain::Next: "the successor of a block in
+// this chain, or nullptr if the given index is not found or is the tip".
+func TestActiveChainNext(t *testing.T) {
+	genesis := testGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	nc := &nonceCounter{}
+	main := buildChain(t, idx, nc, genesis, 5)
+	side := buildChain(t, idx, nc, main[1], 2)
+
+	tip := main[4].BlockHash()
+
+	next, ok := idx.ActiveChainNext(tip, main[1].BlockHash())
+	require.True(t, ok)
+	require.Equal(t, main[2].BlockHash(), next.Hash)
+
+	next, ok = idx.ActiveChainNext(tip, genesis.BlockHash())
+	require.True(t, ok)
+	require.Equal(t, main[0].BlockHash(), next.Hash)
+
+	// The tip itself has no successor.
+	_, ok = idx.ActiveChainNext(tip, tip)
+	require.False(t, ok)
+
+	// A header we hold on another branch is not on this chain.
+	_, ok = idx.ActiveChainNext(tip, side[0].BlockHash())
+	require.False(t, ok)
+
+	// Neither hash may be unknown.
+	_, ok = idx.ActiveChainNext(tip, chainhash.Hash{0xAA})
+	require.False(t, ok)
+
+	_, ok = idx.ActiveChainNext(chainhash.Hash{0xAA}, tip)
+	require.False(t, ok)
+}
+
+// TestActiveChainRange pins the serving walk: the range starts at start, is
+// bounded by both limit and the tip, and stops dead at a start that sits off
+// the branch.
+func TestActiveChainRange(t *testing.T) {
+	genesis := testGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	nc := &nonceCounter{}
+	main := buildChain(t, idx, nc, genesis, 20)
+	side := buildChain(t, idx, nc, main[2], 4)
+
+	tip := main[19].BlockHash()
+
+	hashesOf := func(headers []*wire.BlockHeader) []chainhash.Hash {
+		out := make([]chainhash.Hash, 0, len(headers))
+		for _, h := range headers {
+			out = append(out, h.BlockHash())
+		}
+
+		return out
+	}
+
+	headerHashes := func(headers []wire.BlockHeader) []chainhash.Hash {
+		out := make([]chainhash.Hash, 0, len(headers))
+		for i := range headers {
+			out = append(out, headers[i].BlockHash())
+		}
+
+		return out
+	}
+
+	t.Run("limit bounds the range", func(t *testing.T) {
+		got := idx.ActiveChainHeaders(tip, main[4].BlockHash(), 6)
+		require.Equal(t, hashesOf(main[4:10]), headerHashes(got))
+
+		require.Equal(t, hashesOf(main[4:10]), idx.ActiveChainHashes(tip, main[4].BlockHash(), 6))
+	})
+
+	t.Run("the tip bounds the range", func(t *testing.T) {
+		got := idx.ActiveChainHashes(tip, main[17].BlockHash(), 500)
+		require.Equal(t, hashesOf(main[17:20]), got)
+	})
+
+	t.Run("a shorter active tip bounds the range", func(t *testing.T) {
+		got := idx.ActiveChainHashes(main[9].BlockHash(), main[4].BlockHash(), 500)
+		require.Equal(t, hashesOf(main[4:10]), got)
+	})
+
+	t.Run("genesis is a valid start", func(t *testing.T) {
+		got := idx.ActiveChainHashes(tip, genesis.BlockHash(), 3)
+		require.Equal(t, []chainhash.Hash{genesis.BlockHash(), main[0].BlockHash(), main[1].BlockHash()}, got)
+	})
+
+	t.Run("a start off the branch yields that header alone", func(t *testing.T) {
+		// CChain::Next answers nullptr for an index the chain does not hold,
+		// which ends the serving loop after its first iteration.
+		got := idx.ActiveChainHashes(tip, side[1].BlockHash(), 500)
+		require.Equal(t, []chainhash.Hash{side[1].BlockHash()}, got)
+	})
+
+	t.Run("a non-positive limit yields nothing", func(t *testing.T) {
+		require.Empty(t, idx.ActiveChainHashes(tip, main[0].BlockHash(), 0))
+		require.Empty(t, idx.ActiveChainHeaders(tip, main[0].BlockHash(), -1))
+	})
+
+	t.Run("an unknown hash yields nothing", func(t *testing.T) {
+		require.Nil(t, idx.ActiveChainHashes(tip, chainhash.Hash{0xAA}, 10))
+		require.Nil(t, idx.ActiveChainHeaders(chainhash.Hash{0xAA}, main[0].BlockHash(), 10))
+	})
+
+	t.Run("the headers carry the stored header, not just its hash", func(t *testing.T) {
+		got := idx.ActiveChainHeaders(tip, main[6].BlockHash(), 2)
+		require.Len(t, got, 2)
+		require.Equal(t, *main[6], got[0])
+		require.Equal(t, *main[7], got[1])
+	})
+}

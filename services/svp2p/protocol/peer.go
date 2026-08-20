@@ -134,6 +134,13 @@ type syncDispatcher interface {
 	// disconnected.
 	Inv(sp *SyncPeer, msg *wire.MsgInv) ([]wire.Message, error)
 
+	// GetHeaders and GetBlocks dispatch the two chain-query messages. Neither
+	// can end the connection: SVNode answers both from the block index and
+	// scores nothing, and the one refusal either of them has (headers-first
+	// catch-up) is a decision about US, not about the peer.
+	GetHeaders(sp *SyncPeer, msg *wire.MsgGetHeaders) []wire.Message
+	GetBlocks(sp *SyncPeer, msg *wire.MsgGetBlocks) []wire.Message
+
 	// BlockExpected reports whether hash is in flight from this peer, which is
 	// what makes an inbound block solicited.
 	BlockExpected(sp *SyncPeer, hash chainhash.Hash) bool
@@ -455,6 +462,12 @@ func (p *Peer) dispatchSync(msg wire.Message, established, firstEstablished bool
 		}
 
 		p.send(out)
+
+	case *wire.MsgGetHeaders:
+		p.send(p.cfg.Sync.GetHeaders(p.cfg.SyncPeer, m))
+
+	case *wire.MsgGetBlocks:
+		p.send(p.cfg.Sync.GetBlocks(p.cfg.SyncPeer, m))
 	}
 
 	return nil

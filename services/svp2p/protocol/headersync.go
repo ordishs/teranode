@@ -160,6 +160,17 @@ type SyncPeer struct {
 	// headers messages this peer has sent whose first header has no known
 	// parent.
 	nUnconnectingHeaders int
+
+	// hashContinue mirrors CNode::hashContinue (net.h) and the legacy
+	// service's serverPeer.continueHash (services/legacy/peer_server.go:375):
+	// the last hash of a getblocks inv that filled to MaxGetBlocksResults. When
+	// the peer asks for that block we answer the body and then an inv of our
+	// tip, which is what makes it send the next getblocks — the continue-inv
+	// convention. Serving.OnGetBlocks writes it; the getdata path (Task 10)
+	// reads and clears it, as pushBlockMsg does (peer_server.go:2121-2144).
+	// The zero chainhash.Hash means no continuation is pending, matching the
+	// C++ SetNull() sentinel.
+	hashContinue chainhash.Hash
 }
 
 func NewSyncPeer(addr string, services wire.ServiceFlag, state *peerSyncState) *SyncPeer {

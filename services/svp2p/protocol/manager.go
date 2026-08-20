@@ -128,6 +128,7 @@ type PeerManager struct {
 	headerIndex     *HeaderIndex
 	headerSync      *HeaderSync
 	blockDownloader *BlockDownloader
+	serving         *Serving
 	ingestor        BlockIngestor
 	// activeTip is our own best chain tip (the chainActive counterpart),
 	// fed from the blockchain service and always a header present in the
@@ -226,8 +227,14 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 		blockDownloader.maxParallelFetch = cfg.BlockDownloadMaxParallelFetch
 	}
 
+	serving, err := NewServing(cfg.Index, headerSync)
+	if err != nil {
+		return err
+	}
+
 	m.headerSync = headerSync
 	m.blockDownloader = blockDownloader
+	m.serving = serving
 	m.ingestor = cfg.Ingestor
 
 	// Until the blockchain service reports a tip, our own chain is whatever
@@ -716,6 +723,42 @@ func (m *PeerManager) Inv(syncPeer *SyncPeer, msg *wire.MsgInv) ([]wire.Message,
 	}
 
 	return m.blockDownloader.OnInv(syncPeer, msg)
+}
+
+// GetHeaders dispatches the NetMsgType::GETHEADERS event. The refusal is
+// logged here rather than in the machine, which holds no logger, and the log
+// line is the one the legacy service wrote (services/legacy/peer_server.go:1585).
+func (m *PeerManager) GetHeaders(syncPeer *SyncPeer, msg *wire.MsgGetHeaders) []wire.Message {
+	m.syncMu.Lock()
+
+	if m.serving == nil || syncPeer == nil {
+		m.syncMu.Unlock()
+		return nil
+	}
+
+	out, refused := m.serving.OnGetHeaders(syncPeer, m.activeTip, msg)
+
+	m.syncMu.Unlock()
+
+	// Logged with no lock held: the package lock order forbids reaching a peer
+	// while a manager lock is taken, and a logger sink is outside this package.
+	if refused {
+		m.logger.Debugf("[svp2p] ignoring getheaders from %s: node is syncing in headers-first mode", syncPeer.Addr)
+	}
+
+	return out
+}
+
+// GetBlocks dispatches the NetMsgType::GETBLOCKS event.
+func (m *PeerManager) GetBlocks(syncPeer *SyncPeer, msg *wire.MsgGetBlocks) []wire.Message {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	if m.serving == nil || syncPeer == nil {
+		return nil
+	}
+
+	return m.serving.OnGetBlocks(syncPeer, m.activeTip, msg)
 }
 
 // BlockExpected reports whether hash is in flight from this peer, which is
