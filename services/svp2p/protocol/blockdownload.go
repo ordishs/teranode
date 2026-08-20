@@ -133,6 +133,15 @@ func (a StallAction) String() string {
 	}
 }
 
+// inFlightHolder is one entry of BlockDownloadTracker::InFlightBlock: a peer we
+// have asked for a block, and when we asked it. The per-holder clock is what the
+// slow-fetch trigger measures, and it is distinct from peerSyncState's
+// nDownloadingSince, which measures the head of one peer's whole queue.
+type inFlightHolder struct {
+	peer  *SyncPeer
+	since int64
+}
+
 // BlockDownloader is the net_processing.cpp block download scheduler: the
 // FindNextBlocksToDownload window walk, the BlockDownloadTracker in-flight
 // map, the INV handler's block half, and the stall rules. It performs no I/O
@@ -148,32 +157,26 @@ type BlockDownloader struct {
 	idx *HeaderIndex
 	hs  *HeaderSync
 
-	// inFlight is the BlockDownloadTracker mMapBlocksInFlight port, mapping a
-	// block hash to the peer we requested it from.
+	// inFlight is the BlockDownloadTracker mMapBlocksInFlight port: every block
+	// we have asked for, mapped to every peer we asked, in the order we asked
+	// them.
 	//
-	// SINGLE ASSIGNMENT IS A PHASE 3 DECISION, NOT AN OVERSIGHT, AND IT IS WHAT
-	// MAKES MULTI-PEER SCHEDULING SAFE: the map is hash-keyed to one holder, so
-	// the per-peer walks in FindNextBlocksToDownload cannot hand one block to two
-	// peers however many peers a tick runs over.
+	// THE ORDER IS LOAD-BEARING, which is why this is a slice and not a set. C++
+	// holds a multimap, whose equal_range walks the holders of one hash in
+	// insertion order, and GetPeerForBlock (block_download_tracker.cpp:232-244)
+	// returns the FIRST of them. That first holder is the one the download walk
+	// records as `waitingfor`, and therefore the one it may name as the staller.
+	// A Go map carries no order at all, so a set would make staller naming
+	// depend on hash iteration order.
 	//
-	// SVNode holds a multimap and DOES race one block to several peers, but only
-	// through a path this port has no data source for
-	// (net_processing.cpp:461-506): a block must have been in flight longer than
-	// GetBlockDownloadSlowFetchTimeout, IsBlockDownloadStallingFromPeer must then
-	// find every holder delivering nothing — a per-peer average-bandwidth read off
-	// the association — and the extra fetch is capped by
-	// GetBlockDownloadMaxParallelFetch. Without a per-peer bandwidth meter the
-	// first two tests cannot be answered, and racing every slow block instead
-	// would multiply IBD bandwidth by the parallel-fetch cap.
-	//
-	// WHAT REPLACES RACING IS RECOVERY, and both halves of it are here. The
-	// nodeStaller mechanism is kept, so a peer holding the head of the window is
-	// disconnected rather than raced. The cheaper half is SVNode's per-block
-	// download timeout (nDownloadingSince), which reaches a peer on the age of
-	// the block at the head of its own queue, without needing a second peer to
-	// name it or the rest of the window to be drained first. Both live in
-	// CheckStall, which states what each of them costs.
-	inFlight map[chainhash.Hash]*SyncPeer
+	// Phase 3 up to Task 6 held ONE peer per block and called it a decision, on
+	// the grounds that racing needs a per-peer bandwidth meter this port did not
+	// have. Task 6 built the meter — IngestSnapshot reaches CheckStall for every
+	// peer on every tick — so Task 6b ported the racing (see the parallel-fetch
+	// branch in FindNextBlocksToDownload). Racing is also what makes the
+	// unconditional download timeout affordable: SVNode can discard a partial
+	// block because the block still arrives from someone else.
+	inFlight map[chainhash.Hash][]inFlightHolder
 
 	// haveData ports CBlockIndex::getStatus().hasData(): the blocks whose full
 	// data we hold, mapped to their height so the watermark prune below can
@@ -249,7 +252,7 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 	return &BlockDownloader{
 		idx:              idx,
 		hs:               hs,
-		inFlight:         make(map[chainhash.Hash]*SyncPeer),
+		inFlight:         make(map[chainhash.Hash][]inFlightHolder),
 		haveData:         make(map[chainhash.Hash]int32),
 		lastTipHash:      tipHash,
 		maxLastBlockTime: MaxLastBlockTime,
@@ -450,10 +453,10 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 
 		contiguous = false
 
-		if holder, busy := bd.inFlight[node.Hash]; busy {
+		if holders := bd.inFlight[node.Hash]; len(holders) > 0 {
 			// "This is the first already-in-flight block."
 			if waitingFor == nil {
-				waitingFor = holder
+				waitingFor = holders[0].peer
 			}
 
 			continue
@@ -629,11 +632,11 @@ func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode,
 		return false
 	}
 
-	if _, busy := bd.inFlight[block.Hash]; busy {
+	if bd.IsInFlightFrom(peer, block.Hash) {
 		return false
 	}
 
-	bd.inFlight[block.Hash] = peer
+	bd.inFlight[block.Hash] = append(bd.inFlight[block.Hash], inFlightHolder{peer: peer, since: nowMicros})
 	peer.State.vBlocksInFlight = append(peer.State.vBlocksInFlight, block.Hash)
 	peer.State.nBlocksInFlight++
 
@@ -682,15 +685,29 @@ func (bd *BlockDownloader) BlockFailed(peer *SyncPeer, hash chainhash.Hash, nowM
 // for the peer the block was requested from, matching the C++ getBlockFromNodeNL
 // lookup by node.
 func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
-	holder, busy := bd.inFlight[hash]
-	if !busy || holder != peer {
+	holders := bd.inFlight[hash]
+
+	at := -1
+
+	for i := range holders {
+		if holders[i].peer == peer {
+			at = i
+			break
+		}
+	}
+
+	if at < 0 {
 		return false
 	}
 
-	delete(bd.inFlight, hash)
+	if len(holders) == 1 {
+		delete(bd.inFlight, hash)
+	} else {
+		bd.inFlight[hash] = append(holders[:at], holders[at+1:]...)
+	}
 
-	if holder.State != nil {
-		state := holder.State
+	if peer.State != nil {
+		state := peer.State
 
 		for i, queued := range state.vBlocksInFlight {
 			if queued != hash {
@@ -724,9 +741,7 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash,
 // reads shared state and requires the caller to already hold PeerManager's
 // sync-state mutex; it is a plain map read, not a synchronized one.
 func (bd *BlockDownloader) IsInFlight(hash chainhash.Hash) bool {
-	_, busy := bd.inFlight[hash]
-
-	return busy
+	return len(bd.inFlight[hash]) > 0
 }
 
 // IsInFlightFrom is BlockDownloadTracker::IsInFlight narrowed to one peer,
@@ -735,9 +750,13 @@ func (bd *BlockDownloader) IsInFlight(hash chainhash.Hash) bool {
 // THIS peer for is unsolicited, and must be refused before it can consume the
 // admission budget.
 func (bd *BlockDownloader) IsInFlightFrom(peer *SyncPeer, hash chainhash.Hash) bool {
-	holder, busy := bd.inFlight[hash]
+	for _, holder := range bd.inFlight[hash] {
+		if holder.peer == peer {
+			return true
+		}
+	}
 
-	return busy && holder == peer
+	return false
 }
 
 // BlockNotDelivered releases a block this peer will NOT deliver after all,
@@ -778,10 +797,23 @@ func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
 		return
 	}
 
-	for hash, holder := range bd.inFlight {
-		if holder == peer {
-			delete(bd.inFlight, hash)
+	// Only this peer's claims go; a block another peer is also fetching stays in
+	// flight from that peer. C++ ClearPeer walks the same multimap the same way.
+	for hash, holders := range bd.inFlight {
+		kept := holders[:0]
+
+		for _, holder := range holders {
+			if holder.peer != peer {
+				kept = append(kept, holder)
+			}
 		}
+
+		if len(kept) == 0 {
+			delete(bd.inFlight, hash)
+			continue
+		}
+
+		bd.inFlight[hash] = kept
 	}
 
 	if peer.State != nil {
@@ -1190,9 +1222,11 @@ func (bd *BlockDownloader) maxDownloadTimeMicros(peer *SyncPeer) int64 {
 func (bd *BlockDownloader) otherPeersWithDownloads(peer *SyncPeer) int {
 	holders := make(map[*SyncPeer]struct{}, len(bd.inFlight))
 
-	for _, holder := range bd.inFlight {
-		if holder != peer {
-			holders[holder] = struct{}{}
+	for _, entry := range bd.inFlight {
+		for _, holder := range entry {
+			if holder.peer != peer {
+				holders[holder.peer] = struct{}{}
+			}
 		}
 	}
 

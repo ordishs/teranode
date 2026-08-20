@@ -859,7 +859,7 @@ func TestOnInv_UnsupportedInvTypeIsAProtocolViolation(t *testing.T) {
 	}
 }
 
-func TestMarkBlockAsInFlight_IsIdempotent(t *testing.T) {
+func TestMarkBlockAsInFlight_RefusesTheSamePeerAndAdmitsAnother(t *testing.T) {
 	f := newDownloadFixture(t, 3)
 	peer := f.peerAt(t, "1.2.3.4:8333", 3)
 	other := f.peerAt(t, "5.6.7.8:8333", 3)
@@ -872,8 +872,31 @@ func TestMarkBlockAsInFlight_IsIdempotent(t *testing.T) {
 	require.False(t, f.bd.MarkBlockAsInFlight(peer, block, testNow), "the same block from the same peer is a no-op")
 	require.Equal(t, 1, peer.State.nBlocksInFlight)
 
-	require.False(t, f.bd.MarkBlockAsInFlight(other, block, testNow), "Phase 2 fetches each block from one peer only")
-	require.Equal(t, 0, other.State.nBlocksInFlight)
+	// The C++ short-circuit is per (block, peer), not per block
+	// (block_download_tracker.cpp:18-30): a second peer may be asked for the
+	// same block, which is what the parallel-fetch branch does. Task 6b reversed
+	// the single-assignment rule Phase 2 asserted here.
+	later := testNow + micros(time.Minute)
+
+	require.True(t, f.bd.MarkBlockAsInFlight(other, block, later), "a second peer may hold the same block")
+	require.Equal(t, 1, other.State.nBlocksInFlight)
+
+	// Both holders are recorded, in the order they were asked, each with its own
+	// clock. The order decides which of them the walk may name as the staller.
+	require.Equal(t, []inFlightHolder{{peer: peer, since: testNow}, {peer: other, since: later}},
+		f.bd.inFlight[block.Hash])
+
+	require.True(t, f.bd.IsInFlightFrom(peer, block.Hash))
+	require.True(t, f.bd.IsInFlightFrom(other, block.Hash))
+	require.Equal(t, 1, f.bd.BlocksInFlight(), "one block, two holders")
+
+	// Releasing one holder leaves the other in flight.
+	require.True(t, f.bd.BlockNotDelivered(peer, block.Hash, later))
+	require.False(t, f.bd.IsInFlightFrom(peer, block.Hash))
+	require.True(t, f.bd.IsInFlightFrom(other, block.Hash))
+	require.True(t, f.bd.IsInFlight(block.Hash))
+	require.Equal(t, 0, peer.State.nBlocksInFlight)
+	require.Equal(t, 1, other.State.nBlocksInFlight)
 }
 
 func TestBlockReceived_ClearsInFlightAndTheStallClock(t *testing.T) {
