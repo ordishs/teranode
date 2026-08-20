@@ -197,6 +197,12 @@ type scriptedServingPeer struct {
 	served     int
 	serveLimit int // negative means "serve everything"
 	closed     bool
+
+	// requested is every block hash this peer has been asked for, whether or
+	// not it answered. It is what lets a leg see a parallel fetch: the same
+	// hash asked of two peers is the race, and no log line is needed to
+	// observe it.
+	requested map[chainhash.Hash]int
 }
 
 // newScriptedServingPeer reserves an address and, when listen is true, starts
@@ -217,6 +223,7 @@ func newScriptedServingPeer(t *testing.T, chain *fixtureChain, netMagic wire.Bit
 		net:        netMagic,
 		addr:       addr,
 		serveLimit: serveLimit,
+		requested:  make(map[chainhash.Hash]int),
 	}
 
 	require.NoError(t, ln.Close())
@@ -289,6 +296,30 @@ func (p *scriptedServingPeer) Close() {
 	for _, conn := range conns {
 		_ = conn.Close()
 	}
+}
+
+// wasRequested reports whether this peer has been asked for hash.
+func (p *scriptedServingPeer) wasRequested(hash chainhash.Hash) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.requested[hash] > 0
+}
+
+// requestedCount reports how many distinct blocks this peer has been asked for.
+func (p *scriptedServingPeer) requestedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return len(p.requested)
+}
+
+// recordRequest notes that this peer was asked for hash.
+func (p *scriptedServingPeer) recordRequest(hash chainhash.Hash) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.requested[hash]++
 }
 
 func (p *scriptedServingPeer) servedCount() int {
@@ -370,6 +401,11 @@ func (p *scriptedServingPeer) serve(conn net.Conn) {
 					continue
 				}
 
+				// Recorded before the serve limit is consulted: being ASKED is
+				// the event a race is visible in, and a peer that never answers
+				// must still show what it was asked for.
+				p.recordRequest(inv.Hash)
+
 				if !p.claimServe() {
 					// The stall: the peer keeps the connection up and simply
 					// stops answering for the blocks it was asked for.
@@ -434,7 +470,13 @@ type syncHarness struct {
 // harnesses sharing a context would share a listener.
 var syncHarnessCounter atomic.Uint64
 
-func newSyncHarness(t *testing.T, name string, connectPeers []string, maxLastBlockTime time.Duration) *syncHarness {
+// newSyncHarness builds a node. tweaks run against the settings before anything
+// is constructed from them, which is how a leg shrinks a production window — the
+// download timeout, the slow-fetch fuse — to something a test can wait out. They
+// are the same dials an operator has.
+func newSyncHarness(t *testing.T, name string, connectPeers []string, maxLastBlockTime time.Duration,
+	tweaks ...func(*settings.Settings),
+) *syncHarness {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -463,6 +505,10 @@ func newSyncHarness(t *testing.T, name string, connectPeers []string, maxLastBlo
 	// the bridge's waitForPreviousBlockMined is a genuine gate on this path and
 	// it must be a real setMined that opens it.
 	tSettings.BlockValidation.PeriodicProcessingInterval = 200 * time.Millisecond
+
+	for _, tweak := range tweaks {
+		tweak(tSettings)
+	}
 
 	blockchainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
 	require.NoError(t, err)
@@ -735,10 +781,16 @@ func TestIntegrationHeadersFirstSyncFromScriptedPeer(t *testing.T) {
 
 // TestIntegrationSyncPeerRotationRecoversFromAStalledPeer covers the
 // adversarial leg: the serving peer answers headers and half the blocks, then
-// stops answering getdata while staying connected. Only the sync-peer rotation
-// (blockdownload.go CheckStall -> StallActionRotateSyncPeer) can catch that
-// peer, because nothing is ever in flight at the download window's edge, so
-// DetectStalling's nStallingSince clock never starts.
+// stops answering getdata while staying connected.
+//
+// The sync-peer rotation (blockdownload.go CheckStall ->
+// StallActionRotateSyncPeer) is what catches that peer here, and the leg is
+// arranged so that it is the only thing that can. DetectStalling's
+// nStallingSince clock never starts, because nothing is ever in flight at the
+// download window's edge. The parallel fetch has nobody to race to while the
+// replacement peer is still down. The per-block download timeout would take ten
+// minutes, far outside this leg's budget. Each of those three is asserted below
+// rather than left to inference.
 func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	chain := buildFixtureChain(t, tSettings, syncTestChainLength)
@@ -778,6 +830,17 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	require.False(t, h.logger.contains("stalling block download"),
 		"the stall must be caught by the rotation, not by the block-stalling disconnect")
 
+	// Nor is it the parallel fetch, which after Task 6b is the mechanism that
+	// normally reaches a peer sitting on a block first — its fuse is 30 seconds
+	// against the rotation's window, shrunk to 3 here. It cannot fire in this
+	// leg for a structural reason rather than a lucky one: the replacement peer
+	// is not listening yet, so the stalling peer is the ONLY holder available
+	// and there is nobody to race to. That is exactly the case the rotation and
+	// the download timeout are the fallbacks for, and this leg is where the
+	// rotation half of it is covered.
+	require.Zero(t, replacement.requestedCount(),
+		"the replacement is not up yet, so no block can have been raced to it")
+
 	// The stalling peer then goes away, which is what releases the blocks it
 	// re-claimed while it was still the only candidate on offer.
 	stalled.Close()
@@ -795,4 +858,192 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	hash, _ := h.bestBlock(t)
 	require.Equal(t, chain.tip(), hash)
 	require.Positive(t, replacement.servedCount(), "the replacement peer must have served the rest of the chain")
+}
+
+// twoPeerChainLength is longer than one getdata batch on purpose: a peer may
+// hold at most MaxBlocksInTransitPerPeer blocks at a time, so a chain of more
+// than that CANNOT be taken by one peer in a single pass. That is what makes the
+// distribution below a property of the scheduler rather than a race between two
+// goroutines.
+const twoPeerChainLength = 2*protocol.MaxBlocksInTransitPerPeer + 4
+
+// TestIntegrationBlockDownloadSpreadsAcrossTwoPeers is the multi-peer leg:
+// headers from one sync peer, blocks from several, which is the model Phase 3
+// exists to deliver. Both peers serve everything, so nothing here is adversarial
+// — the claim is only that the download window is offered to every useful peer
+// and that the chain completes.
+//
+// The slow-fetch fuse is pushed out of reach so that parallel FETCH cannot be
+// what puts work on the second peer. Whatever both peers are asked for here,
+// they are asked for because the walk distributed the window, not because a
+// stalled block was raced.
+func TestIntegrationBlockDownloadSpreadsAcrossTwoPeers(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	chain := buildFixtureChain(t, tSettings, twoPeerChainLength)
+
+	first := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, true)
+	second := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, true)
+
+	h := newSyncHarness(t, "spread", []string{first.addr, second.addr}, 0, func(s *settings.Settings) {
+		s.Legacy.BlockDownloadSlowFetchTimeout = time.Hour
+	})
+	h.start(t)
+
+	h.waitForHeight(t, uint32(twoPeerChainLength), 120*time.Second, "two-peer block download")
+
+	hash, height := h.bestBlock(t)
+	require.Equal(t, uint32(twoPeerChainLength), height)
+	require.Equal(t, chain.tip(), hash)
+
+	require.Positive(t, first.requestedCount(), "the first peer must have been asked for blocks")
+	require.Positive(t, second.requestedCount(), "the second peer must have been asked for blocks")
+	require.Positive(t, first.servedCount())
+	require.Positive(t, second.servedCount())
+
+	// Every block of the chain was fetched from one peer or the other, and both
+	// contributed. That union is the distribution claim; which peer got which
+	// slice is the scheduler's business and not fixed.
+	fetched := make(map[chainhash.Hash]struct{}, twoPeerChainLength)
+
+	for _, header := range chain.headers {
+		hash := header.BlockHash()
+
+		if first.wasRequested(hash) || second.wasRequested(hash) {
+			fetched[hash] = struct{}{}
+		}
+	}
+
+	require.Len(t, fetched, twoPeerChainLength, "every block must have been requested from some peer")
+
+	// WHAT THIS LEG DOES NOT ASSERT, and why. The two peers serve far MORE than
+	// the chain length between them — 512 serves for 36 blocks when this was
+	// written, about fourteen times over. It is not racing: the fuse above is an
+	// hour, so no block here is ever raced.
+	//
+	// It is the ParentMissing re-request loop, and multi-peer download is what
+	// makes it bite. Blocks are handed to two peers at once, so they arrive out
+	// of order; a block whose parent is not in our chain yet is refused before
+	// admission (bridge/ingest.go PreAdmit) and BlockDone puts it straight back
+	// on offer, so the next tick fetches it again, and again, until the parent
+	// lands. The diagnosis, measured on this leg: 476 pre-admit refusals against
+	// 36 real ingests.
+	//
+	// Task 21 is the fix (a per-hash retryAfter stamp the walk honours), and it
+	// is where this becomes an assertion rather than a comment: with it, the
+	// serve total should collapse to the chain length. The number matters more
+	// than it looks — on mainnet these are gigabyte blocks, not coinbases, so
+	// the waste is real bandwidth multiplied by the peer count.
+	t.Logf("block serves for a %d-block chain: first=%d second=%d total=%d (Task 21: ParentMissing re-request loop)",
+		twoPeerChainLength, first.servedCount(), second.servedCount(), first.servedCount()+second.servedCount())
+}
+
+// raceChainLength is short on purpose. The walk considers only the FIRST
+// already-in-flight block it meets, so it races at most one block per pass, and
+// a shorter chain keeps the leg quick without weakening it.
+const raceChainLength = 6
+
+// TestIntegrationRacesABlockAwayFromASilentPeer is the adversarial leg the
+// parallel fetch exists for: a peer accepts a getdata and then never sends the
+// block.
+//
+// Before Task 6b the only answers to that were the staller disconnect, which
+// needs the whole download window drained first, and the per-block timeout,
+// which needs ten minutes and throws the connection away with it. The race needs
+// neither: after the slow-fetch fuse the block is simply asked of somebody else,
+// and the silent peer keeps its connection and its other work.
+//
+// The silent peer is brought up ALONE so that it is certainly the peer holding
+// the chain when the second one arrives. Which peer wins the sync slot is not
+// deterministic when both are connected from the start, and this leg needs the
+// blocks parked on the peer that will not serve them.
+func TestIntegrationRacesABlockAwayFromASilentPeer(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	chain := buildFixtureChain(t, tSettings, raceChainLength)
+
+	// serveLimit 0: it answers version, ping and getheaders, and never a block.
+	silent := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, 0, true)
+	rescuer := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, false)
+
+	h := newSyncHarness(t, "race", []string{silent.addr, rescuer.addr}, 0, func(s *settings.Settings) {
+		// The fuse, shrunk from 30 seconds so the leg does not have to wait one
+		// out. Everything else keeps its production window, which is the point:
+		// the rotation (180 s) and the download timeout (10 minutes) are both
+		// out of reach inside this test, so the race is the only mechanism that
+		// can finish the sync.
+		s.Legacy.BlockDownloadSlowFetchTimeout = 500 * time.Millisecond
+	})
+	h.start(t)
+
+	// The silent peer takes the chain and sits on it.
+	h.waitFor(t, func() bool { return silent.requestedCount() > 0 },
+		60*time.Second, "the silent peer was never asked for a block")
+
+	require.Zero(t, silent.servedCount(), "this peer answers headers and no blocks")
+
+	firstBlock := chain.headers[0].BlockHash()
+
+	h.waitFor(t, func() bool { return silent.wasRequested(firstBlock) },
+		60*time.Second, "the head of the chain was never requested from the silent peer")
+
+	// Only now does anyone else exist to race to.
+	rescuer.Listen()
+
+	h.waitFor(t, func() bool { return h.server.manager.ConnectedCount() == 2 },
+		120*time.Second, "the second peer never connected")
+
+	h.waitForHeight(t, uint32(raceChainLength), 120*time.Second, "sync through raced block downloads")
+
+	hash, _ := h.bestBlock(t)
+	require.Equal(t, chain.tip(), hash)
+
+	// THE RACE ITSELF: a block the silent peer was asked for, and never served,
+	// was asked of the other peer too.
+	require.True(t, rescuer.wasRequested(firstBlock),
+		"the block the silent peer sat on must be raced to the peer that can serve it")
+	require.Positive(t, rescuer.servedCount())
+	require.Zero(t, silent.servedCount(), "the silent peer served nothing at any point")
+
+	// What the race did NOT need. The silent peer is still connected: no
+	// disconnect, no rotation, no partial download thrown away but its own.
+	require.Equal(t, int32(2), h.server.manager.ConnectedCount(),
+		"a race must not cost the slow peer its connection")
+	require.False(t, h.logger.contains("stalling block download"),
+		"the recovery here is the race, not the stall or timeout disconnect")
+}
+
+// TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer covers what the race
+// CANNOT do, and is therefore the leg that keeps Task 6's timeout honest: with
+// one useful peer there is nobody to race to, and the front block's own clock is
+// the only thing left.
+//
+// The disconnect here is unambiguously the timeout rather than the staller rule.
+// nStallingSince is only ever started by ANOTHER peer's empty batch naming this
+// one — SendGetDataBlocks excludes the walking peer from being its own staller —
+// so with a single peer that clock can never start.
+func TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	chain := buildFixtureChain(t, tSettings, raceChainLength)
+
+	silent := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, 0, true)
+
+	h := newSyncHarness(t, "timeout", []string{silent.addr}, 0, func(s *settings.Settings) {
+		// One percent of the ten minute block interval is six seconds. This is
+		// the operator's dial, used here to make a ten minute rule testable
+		// rather than to change what is being tested.
+		s.Legacy.BlockDownloadTimeoutBasePercent = 1
+		s.Legacy.BlockDownloadTimeoutBaseIBDPercent = 1
+	})
+	h.start(t)
+
+	h.waitFor(t, func() bool { return silent.requestedCount() > 0 },
+		60*time.Second, "the silent peer was never asked for a block")
+
+	want := fmt.Sprintf("disconnecting %s: stalling block download", silent.addr)
+
+	h.waitFor(t, func() bool { return h.logger.contains(want) },
+		60*time.Second, "the silent peer was never disconnected by the download timeout")
+
+	require.Zero(t, silent.servedCount())
+	require.False(t, h.logger.contains("rotating the sync peer"),
+		"the rotation window is 180 seconds and must not be what fired here")
 }
