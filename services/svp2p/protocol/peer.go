@@ -96,6 +96,15 @@ type IngestOutcome struct {
 	// classified cannot silently become a disconnect.
 	PeerFault bool
 
+	// ParentMissing reports that the block's parent is not in our chain yet, so
+	// the pre-admission check refused it (bridge PreAdmit). It is a local fault
+	// like TransientLocal, which is also set, and it carries the extra fact the
+	// scheduler needs: this block is worth having, and worth asking for again,
+	// but not until its parent is here. Without the distinction the block goes
+	// straight back on offer and is fetched again every tick until the parent
+	// lands — see ParentMissingRetryDelay.
+	ParentMissing bool
+
 	// TransientLocal reports a local storage or service fault, including the
 	// admission backoff skip. Admission.SkipForBackoff's caller contract: the
 	// delivering peer did its job, so refresh its stall clock and never

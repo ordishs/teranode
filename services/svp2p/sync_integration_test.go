@@ -915,26 +915,33 @@ func TestIntegrationBlockDownloadSpreadsAcrossTwoPeers(t *testing.T) {
 
 	require.Len(t, fetched, twoPeerChainLength, "every block must have been requested from some peer")
 
-	// WHAT THIS LEG DOES NOT ASSERT, and why. The two peers serve far MORE than
-	// the chain length between them — 512 serves for 36 blocks when this was
-	// written, about fourteen times over. It is not racing: the fuse above is an
-	// hour, so no block here is ever raced.
+	// The serve total is bounded, which it was not before Task 21. Multi-peer
+	// download means blocks arrive out of order, and a block whose parent is not
+	// in our chain yet is refused before admission (bridge PreAdmit) and
+	// released. Nothing held it back, and re-requests are tick-driven, so it was
+	// fetched again on the next tick and every tick after until the parent
+	// landed: 526 serves for this 36-block chain, about fourteen times over,
+	// with 476 pre-admit refusals against 36 real ingests.
 	//
-	// It is the ParentMissing re-request loop, and multi-peer download is what
-	// makes it bite. Blocks are handed to two peers at once, so they arrive out
-	// of order; a block whose parent is not in our chain yet is refused before
-	// admission (bridge/ingest.go PreAdmit) and BlockDone puts it straight back
-	// on offer, so the next tick fetches it again, and again, until the parent
-	// lands. The diagnosis, measured on this leg: 476 pre-admit refusals against
-	// 36 real ingests.
+	// The scheduler now defers such a block until its parent is held, so each
+	// one is fetched at most twice: once too early, and once when the chain is
+	// ready for it. Measured here after the fix: 55 to 59, so the bound below
+	// has room without being vacuous — it would have failed nine times over on
+	// the old behavior.
 	//
-	// Task 21 is the fix (a per-hash retryAfter stamp the walk honours), and it
-	// is where this becomes an assertion rather than a comment: with it, the
-	// serve total should collapse to the chain length. The number matters more
-	// than it looks — on mainnet these are gigabyte blocks, not coinbases, so
-	// the waste is real bandwidth multiplied by the peer count.
-	t.Logf("block serves for a %d-block chain: first=%d second=%d total=%d (Task 21: ParentMissing re-request loop)",
-		twoPeerChainLength, first.servedCount(), second.servedCount(), first.servedCount()+second.servedCount())
+	// Closing the remaining gap means keeping the early block's bytes instead of
+	// discarding them, which is orphan-block retention and a different piece of
+	// work. On mainnet these are gigabyte blocks, so it is worth having: the
+	// residual is one wasted transfer per out-of-order arrival.
+	served := first.servedCount() + second.servedCount()
+
+	t.Logf("block serves for a %d-block chain: first=%d second=%d total=%d",
+		twoPeerChainLength, first.servedCount(), second.servedCount(), served)
+
+	require.LessOrEqual(t, served, 2*twoPeerChainLength,
+		"a parent-missing block must be re-fetched once at most, not once per tick")
+	require.GreaterOrEqual(t, served, twoPeerChainLength,
+		"every block has to cross the wire at least once")
 }
 
 // raceChainLength is short on purpose. The walk considers only the FIRST

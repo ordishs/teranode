@@ -65,6 +65,25 @@ const percentOfBlockIntervalMicros = 10000
 // the single sync slot.
 const MaxBlockDownloadTime = 30 * time.Minute
 
+// ParentMissingRetryDelay is how long a block whose parent we could not admit
+// waits before the download walk will offer it again.
+//
+// It has no SVNode counterpart, because SVNode has no such refusal: it accepts
+// an out-of-order block and connects it later. Here the pre-admission check
+// refuses one (bridge PreAdmit) and the download is released, so without a delay
+// the walk re-requests it on the very next tick and keeps doing so until the
+// parent lands — 476 refusals against 36 real ingests when this was measured on
+// the two-peer integration leg, each one a whole block pulled across the wire
+// and dropped.
+//
+// The clock is only the safety valve. What normally releases a deferred block is
+// holding its parent, which is the condition whose absence refused it, so this
+// value is not a latency in the common path. It is sized to be far longer than a
+// sync tick, or it would not break the loop at all, and far shorter than the
+// per-block download timeout, so a block whose parent never arrives is retried
+// and re-refused rather than silently abandoned.
+const ParentMissingRetryDelay = 5 * time.Second
+
 // BlockStallingMinDownloadRate mirrors validation.h
 // DEFAULT_MIN_BLOCK_STALLING_RATE (100 Kbytes/s): the block delivery rate below
 // which IsBlockDownloadStallingFromPeer calls a peer stalled. SVNode makes it
@@ -166,6 +185,14 @@ type inFlightHolder struct {
 	since int64
 }
 
+// deferredBlock is one entry of the parent-missing deferral: when the walk may
+// offer this block again, and the height the index knew for it, which is what
+// lets the same watermark prune that drops have-data records drop these too.
+type deferredBlock struct {
+	until  int64
+	height int32
+}
+
 // BlockDownloader is the net_processing.cpp block download scheduler: the
 // FindNextBlocksToDownload window walk, the BlockDownloadTracker in-flight
 // map, the INV handler's block half, and the stall rules. It performs no I/O
@@ -215,6 +242,12 @@ type BlockDownloader struct {
 	// pruneHaveData for why the walk cannot do it and what the height rule
 	// costs.
 	haveData map[chainhash.Hash]int32
+
+	// retryAfter holds the blocks the ingest path refused because their parent
+	// is not in our chain yet. The walk skips them until their parent is held or
+	// the stamp expires; see ParentMissingRetryDelay for why they need holding
+	// back at all. Bounded exactly like haveData, by the same height prune.
+	retryAfter map[chainhash.Hash]deferredBlock
 
 	// haveDataWatermark is the highest active-chain tip height haveData has
 	// been pruned against. It keeps the prune O(1) while our chain stands
@@ -286,6 +319,7 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 		hs:               hs,
 		inFlight:         make(map[chainhash.Hash][]inFlightHolder),
 		haveData:         make(map[chainhash.Hash]int32),
+		retryAfter:       make(map[chainhash.Hash]deferredBlock),
 		lastTipHash:      tipHash,
 		maxLastBlockTime: MaxLastBlockTime,
 
@@ -324,6 +358,14 @@ func (bd *BlockDownloader) pruneHaveData(activeTipHeight int32) {
 	for hash, height := range bd.haveData {
 		if height <= activeTipHeight {
 			delete(bd.haveData, hash)
+		}
+	}
+
+	// A deferral at or below our own tip is dead: either we hold the block, or
+	// the walk will never look that low again.
+	for hash, deferred := range bd.retryAfter {
+		if deferred.height <= activeTipHeight {
+			delete(bd.retryAfter, hash)
 		}
 	}
 }
@@ -468,16 +510,32 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 		contiguous = true
 	)
 
+	// parentHeld is whether we hold the block below the one being visited. The
+	// walk runs the branch in ascending height, so the PREVIOUS iteration's
+	// answer is this node's parent's answer — no second lookup, and no reliance
+	// on contiguous, which answers a different question (the unbroken run from
+	// the start, which cannot distinguish a hole two blocks back from one
+	// directly below). It starts true because the walk begins at the block after
+	// the last-common block, which we hold by definition.
+	parentHeld := true
+
 	for i := range branch {
 		node := branch[i]
 		inActiveChain := node.Height <= forkHeight
 
 		_, have := bd.haveData[node.Hash]
 
+		held := have || inActiveChain
+
+		// Read before the loop can overwrite it, and rolled forward at the end
+		// of every path below.
+		hadParent := parentHeld
+		parentHeld = held
+
 		// "update pindexLastCommonBlock as long as all ancestors are already
 		// downloaded, or if it's already part of our chain (and therefore don't
 		// need it even if pruned)."
-		if have || inActiveChain {
+		if held {
 			if contiguous {
 				advanced := node
 				state.pindexLastCommonBlock = &advanced
@@ -504,6 +562,13 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 			// peer=%d". It falls through into the same FetchBlock lambda the
 			// walk's own blocks go through, so the window end, the batch size
 			// and the in-transit cap all apply to a raced block unchanged.
+		}
+
+		// A block the ingest path refused for a missing parent waits rather than
+		// being pulled across the wire again to be refused again. Holding its
+		// parent is the normal release; the stamp is the safety valve.
+		if bd.deferredForParent(node.Hash, hadParent, nowMicros) {
+			continue
 		}
 
 		// The C++ FetchBlock lambda, inlined. SVNode also drops blocks above
@@ -776,6 +841,48 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash,
 		}
 
 		state.nStallingSince = 0
+	}
+
+	return true
+}
+
+// BlockParentMissing releases a block the ingest path refused because its parent
+// is not in our chain yet, and holds it back from the next walk.
+//
+// It is BlockFailed plus the deferral: the block was never held, so the
+// have-data record must go the same way, and the peer is not at fault — it
+// delivered what it was asked for, and our own validation is simply behind the
+// header index. Only a hash the index can place is stamped, the same rule
+// haveData keeps, because a stamp with no height could never be pruned.
+func (bd *BlockDownloader) BlockParentMissing(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
+	released := bd.BlockFailed(peer, hash, nowMicros)
+	if !released {
+		return false
+	}
+
+	if node, known := bd.idx.Lookup(hash); known {
+		bd.retryAfter[hash] = deferredBlock{
+			until:  nowMicros + micros64(ParentMissingRetryDelay),
+			height: node.Height,
+		}
+	}
+
+	return true
+}
+
+// deferredForParent reports whether the walk must skip this block, and clears
+// the stamp on the way out when it must not. parentHeld is whether we hold the
+// block below it, which is the condition the refusal was about.
+func (bd *BlockDownloader) deferredForParent(hash chainhash.Hash, parentHeld bool, nowMicros int64) bool {
+	deferred, stamped := bd.retryAfter[hash]
+	if !stamped {
+		return false
+	}
+
+	if parentHeld || nowMicros > deferred.until {
+		delete(bd.retryAfter, hash)
+
+		return false
 	}
 
 	return true

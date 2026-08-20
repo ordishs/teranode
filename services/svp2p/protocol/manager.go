@@ -766,6 +766,24 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 	case outcome.Err == nil:
 		m.blockDownloader.BlockReceived(syncPeer, hash, now)
 
+	case outcome.ParentMissing:
+		// The block is wanted and the peer delivered it; our own chain is just
+		// not ready for it. Release the claim, hold the block back from the next
+		// walk, and refresh the peer's stall clock as any other local fault
+		// does. Deliberately NOT the default branch below: nothing here is a
+		// rotation, a disconnect or a warning.
+		m.blockDownloader.BlockParentMissing(syncPeer, hash, now)
+
+		if syncPeer != nil && syncPeer.State != nil {
+			syncPeer.State.nLastProgressTime = now
+		}
+
+		// Debug, not Warn. This is an expected consequence of asking several
+		// peers for blocks at once, and at Warn it buried the ingest failures
+		// that are not expected: 476 of these against 36 real ingests on the
+		// two-peer integration leg.
+		m.logger.Debugf("[svp2p] block %s is waiting for its parent: %v", hash, outcome.Err)
+
 	default:
 		// The block is back on offer to any peer, including this one.
 		m.blockDownloader.BlockFailed(syncPeer, hash, now)

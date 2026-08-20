@@ -1994,3 +1994,141 @@ func TestSendGetDataBlocks_ARacedBlockCostsAnInTransitSlot(t *testing.T) {
 	require.True(t, f.bd.IsInFlightFrom(walker, block.Hash))
 	require.True(t, f.bd.IsInFlightFrom(holder, block.Hash), "the original holder keeps its claim")
 }
+
+// ---------------------------------------------------------------------------
+// Task 21: defer re-request of parent-missing blocks
+// ---------------------------------------------------------------------------
+
+// requestedHeights runs one walk and returns the heights it would ask this peer
+// for, which is what a deferral is visible in.
+func (f *downloadFixture) requestedHeights(t *testing.T, peer *SyncPeer, activeTip HeaderNode, nowMicros int64) []int32 {
+	t.Helper()
+
+	blocks, _ := f.bd.FindNextBlocksToDownload(peer, activeTip, MaxBlocksInTransitPerPeer, nowMicros)
+
+	heights := make([]int32, len(blocks))
+	for i := range blocks {
+		heights[i] = blocks[i].Height
+	}
+
+	return heights
+}
+
+// TestBlockParentMissing_DefersTheReRequest is the loop this task closes.
+//
+// A block whose parent is not in our chain yet is refused before admission
+// (bridge PreAdmit) and goes back on offer. Nothing throttled that, and
+// re-requests are tick-driven, so the walk asked for it again on the very next
+// pass — and again, until the parent landed. Measured on the Task 7 distribution
+// leg before this change: 476 pre-admit refusals against 36 real ingests, about
+// twenty-four fetches of every block that arrived early.
+//
+// The bytes are what makes it matter. Each of those refusals is a whole block
+// pulled across the wire and dropped, and on mainnet a block is gigabytes.
+func TestBlockParentMissing_DefersTheReRequest(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+	activeTip := f.node(t, 0)
+
+	// The walk asks for the window from our tip up.
+	require.Equal(t, heightRange(1, 10), f.requestedHeights(t, peer, activeTip, testNow))
+
+	// Block 3 arrives ahead of its parent and is refused.
+	third := f.node(t, 3)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, third, testNow))
+	require.True(t, f.bd.BlockParentMissing(peer, third.Hash, testNow))
+
+	// The next pass must not ask for it again: its parent is still missing and
+	// the round-trip would fail exactly as it just did.
+	next := testNow + micros(time.Second)
+
+	got := f.requestedHeights(t, peer, activeTip, next)
+	require.NotContains(t, got, int32(3), "a parent-missing block must not be re-requested immediately")
+	require.Contains(t, got, int32(1), "the rest of the window is unaffected")
+	require.Contains(t, got, int32(4), "including the blocks above the deferred one")
+}
+
+// TestBlockParentMissing_ReleasesAsSoonAsTheParentIsHeld pins the load-bearing
+// half of the rule. The stamp's clock is only a safety valve; what actually
+// makes a deferred block eligible again is holding its parent, because that is
+// the condition whose absence refused it.
+func TestBlockParentMissing_ReleasesAsSoonAsTheParentIsHeld(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+	activeTip := f.node(t, 0)
+
+	third := f.node(t, 3)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, third, testNow))
+	require.True(t, f.bd.BlockParentMissing(peer, third.Hash, testNow))
+
+	// Blocks 1 and 2 then arrive in order, so block 3's parent is now held.
+	for h := 1; h <= 2; h++ {
+		node := f.node(t, h)
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, node, testNow))
+		require.True(t, f.bd.BlockReceived(peer, node.Hash, testNow))
+	}
+
+	// Well inside the stamp's window: the parent test, not the clock, is what
+	// releases it.
+	next := testNow + micros(time.Second)
+	require.Less(t, next, testNow+micros(ParentMissingRetryDelay))
+
+	require.Contains(t, f.requestedHeights(t, peer, activeTip, next), int32(3),
+		"holding the parent must make the block eligible at once")
+}
+
+// TestBlockParentMissing_TheStampExpires covers the safety valve: a parent that
+// never lands must not defer its child for ever. The child is retried once the
+// stamp runs out, refused again if the parent is still missing, and re-stamped —
+// one round-trip per delay instead of one per tick.
+func TestBlockParentMissing_TheStampExpires(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+	activeTip := f.node(t, 0)
+
+	third := f.node(t, 3)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, third, testNow))
+	require.True(t, f.bd.BlockParentMissing(peer, third.Hash, testNow))
+
+	require.NotContains(t, f.requestedHeights(t, peer, activeTip, testNow+micros(ParentMissingRetryDelay)),
+		int32(3), "still deferred at the boundary")
+
+	require.Contains(t, f.requestedHeights(t, peer, activeTip, testNow+micros(ParentMissingRetryDelay)+1),
+		int32(3), "past the boundary it is offered again, parent or no parent")
+}
+
+// TestBlockParentMissing_StampsArePrunedByHeight pins that the map cannot grow
+// without bound. It is pruned by the same height watermark as haveData, on the
+// same call, which is why the stamp carries the height the index knew for it.
+func TestBlockParentMissing_StampsArePrunedByHeight(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+
+	for h := 1; h <= 5; h++ {
+		node := f.node(t, h)
+		require.True(t, f.bd.MarkBlockAsInFlight(peer, node, testNow))
+		require.True(t, f.bd.BlockParentMissing(peer, node.Hash, testNow))
+	}
+
+	require.Len(t, f.bd.retryAfter, 5)
+
+	// A walk whose active tip has moved past them prunes them, exactly as it
+	// prunes the have-data records at the same heights.
+	f.bd.FindNextBlocksToDownload(peer, f.node(t, 5), MaxBlocksInTransitPerPeer, testNow)
+
+	require.Empty(t, f.bd.retryAfter, "stamps at or below the active tip are dead and must be dropped")
+}
+
+// TestBlockParentMissing_AnUnknownHashIsNotStamped pins the same rule haveData
+// keeps: a hash the index cannot place has no height, so it could never be
+// pruned, so it is never recorded.
+func TestBlockParentMissing_AnUnknownHashIsNotStamped(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := f.peerAt(t, "1.2.3.4:8333", 3)
+
+	stranger := chainhash.Hash{0xAB}
+
+	require.False(t, f.bd.BlockParentMissing(peer, stranger, testNow),
+		"a hash this peer does not hold in flight releases nothing")
+	require.Empty(t, f.bd.retryAfter)
+}

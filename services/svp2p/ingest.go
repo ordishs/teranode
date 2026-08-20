@@ -78,13 +78,20 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 	}
 
 	if result.ParentMissing {
-		// Our own validation is behind the header index. The scheduler
-		// requests blocks in chain order, so the parent is already in flight
-		// or being validated; re-offer this one rather than running a pipeline
-		// that would fail on it, and never charge the peer for it.
+		// Our own validation is behind the header index. The scheduler requests
+		// blocks in chain order, so the parent is already in flight or being
+		// validated; re-offer this one rather than running a pipeline that would
+		// fail on it, and never charge the peer for it.
+		//
+		// ParentMissing is what stops the re-offer becoming a re-download on the
+		// next tick, every tick, until the parent lands: the scheduler holds the
+		// block back instead. TransientLocal stays set alongside it, because
+		// this IS our own fault and the delivering peer's stall clock must still
+		// be refreshed.
 		return protocol.IngestOutcome{
 			Err: b.release(req.TxReader, errors.NewServiceUnavailableError(
 				"[svp2p] block %s cannot be admitted yet: its parent %s is not in our chain", hash, req.Header.PrevBlock)),
+			ParentMissing:  true,
 			TransientLocal: true,
 		}
 	}
