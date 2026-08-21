@@ -71,6 +71,18 @@ func (s *stubBridge) IngestBlock(_ context.Context, _ *wire.BlockHeader, _ uint6
 
 func (s *stubBridge) HeaderEvents() <-chan bridge.HeaderEvent { return nil }
 
+// FetchBlock and FetchTx are Task 9's read-side additions to bridge.Bridge.
+// Nothing in this file exercises them — this suite is about the admission
+// gate and IngestBlock composition (see the comment above) — so the stub
+// only needs to satisfy the interface.
+func (s *stubBridge) FetchBlock(context.Context, *chainhash.Hash) (io.ReadCloser, uint64, error) {
+	panic("stubBridge: FetchBlock is not exercised by this suite")
+}
+
+func (s *stubBridge) FetchTx(context.Context, *chainhash.Hash) ([]byte, error) {
+	panic("stubBridge: FetchTx is not exercised by this suite")
+}
+
 func (s *stubBridge) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

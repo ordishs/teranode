@@ -71,7 +71,13 @@ type ingestHarness struct {
 // newIngestHarness builds a bridge whose stores are real (sqlitememory UTXO +
 // in-memory blob) and whose blockchain / blockvalidation edges are mocked, so
 // both ingestion entries can be driven over identical inputs and compared.
-func newIngestHarness(ctx context.Context, t *testing.T, dbName string, unified bool, maxMerkleItems int) *ingestHarness {
+//
+// parentHeightOverride, when given, replaces the package's fixed parentHeight
+// (100) as the mocked parent's height — every ingested test block otherwise
+// lands at parentHeight+1. A caller that needs its block chained directly off
+// a real store's own genesis block (height 0) passes 0 here (fetch_test.go's
+// A1 proof does this); every other caller omits it and gets the usual 100.
+func newIngestHarness(ctx context.Context, t *testing.T, dbName string, unified bool, maxMerkleItems int, parentHeightOverride ...uint32) *ingestHarness {
 	t.Helper()
 
 	initPrometheusMetrics()
@@ -95,10 +101,15 @@ func newIngestHarness(ctx context.Context, t *testing.T, dbName string, unified 
 
 	t.Cleanup(func() { _ = store.Close(ctx) })
 
+	mockedParentHeight := parentHeight
+	if len(parentHeightOverride) > 0 {
+		mockedParentHeight = parentHeightOverride[0]
+	}
+
 	mockBC := &blockchain.Mock{}
 	mockBC.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 	mockBC.On("GetBlockHeader", mock.Anything, mock.Anything).
-		Return((*model.BlockHeader)(nil), &model.BlockHeaderMeta{Height: parentHeight}, nil).Maybe()
+		Return((*model.BlockHeader)(nil), &model.BlockHeaderMeta{Height: mockedParentHeight}, nil).Maybe()
 	mockBC.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(4242), nil).Maybe()
 	mockBC.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil).Maybe()
 

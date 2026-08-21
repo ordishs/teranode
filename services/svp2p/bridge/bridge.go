@@ -26,11 +26,12 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
-// Bridge is the Phase 2 width of the spec §4.4 interface (Decision 2, svp2p
-// Phase 2 plan): only the two methods a block-sync-only exit needs.
-// IngestTx, FetchBlock, and FetchTx are added in the phase that implements
-// them — the spec's full five-method sketch is not built early as
-// unreachable no-ops.
+// Bridge grows one phase at a time (Decision 2, svp2p Phase 2 plan): a
+// method is added only in the phase that implements it, never early as an
+// unreachable no-op. Phase 2 shipped PreAdmit, IngestBlock and HeaderEvents;
+// Phase 3 (this task) adds the two read-side methods a getdata answerer
+// needs, FetchBlock and FetchTx. IngestTx is still unimplemented — it is
+// Task 14's.
 type Bridge interface {
 	// PreAdmit runs the two blockchain lookups IngestBlock makes before it
 	// touches the block payload — does this block already exist, and is its
@@ -59,6 +60,19 @@ type Bridge interface {
 	// blockchain service's subscription (spec §4.4). The channel is never
 	// closed by Bridge.
 	HeaderEvents() <-chan HeaderEvent
+
+	// FetchBlock streams a block's legacy-wire bytes (header + varint(txCount)
+	// + transactions) from the asset service, and reports the declared length
+	// the caller (Task 10) is to write into the wire message header before
+	// streaming the body. See fetch.go for why the length comes from the
+	// blockchain service rather than the HTTP response.
+	FetchBlock(ctx context.Context, hash *chainhash.Hash) (io.ReadCloser, uint64, error)
+
+	// FetchTx returns a transaction's serialized bytes from the UTXO store.
+	// A missing or not-fully-retained transaction is reported as a typed
+	// not-found error (errors.ErrTxNotFound) rather than legacy's silence —
+	// see fetch.go.
+	FetchTx(ctx context.Context, hash *chainhash.Hash) ([]byte, error)
 }
 
 // PreAdmitResult is what the bounded pre-admission lookups found. Both fields
