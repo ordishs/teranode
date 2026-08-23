@@ -14,6 +14,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -30,8 +31,7 @@ import (
 // method is added only in the phase that implements it, never early as an
 // unreachable no-op. Phase 2 shipped PreAdmit, IngestBlock and HeaderEvents;
 // Phase 3 (this task) adds the two read-side methods a getdata answerer
-// needs, FetchBlock and FetchTx. IngestTx is still unimplemented — it is
-// Task 14's.
+// needs, FetchBlock and FetchTx. Task 14 adds IngestTx and TxRejected.
 type Bridge interface {
 	// PreAdmit runs the two blockchain lookups IngestBlock makes before it
 	// touches the block payload — does this block already exist, and is its
@@ -55,6 +55,24 @@ type Bridge interface {
 	// identifies the sending peer for logging only; the pipeline has no
 	// other use for it (no peer-liveness or per-peer state lives in bridge).
 	IngestBlock(ctx context.Context, header *wire.BlockHeader, txCount uint64, txReader io.Reader, peerAddr string) error
+
+	// IngestTx runs one inbound transaction through the relocated netsync
+	// handleTxMsg core (services/legacy/netsync/manager.go:1194-1310, no
+	// SVNode counterpart): rejected-txns short-circuit, validation, and
+	// outcome classification (accepted / orphan / rejected). txBytes is the
+	// transaction's wire-serialized bytes; peerAddr identifies the sending
+	// peer for logging only. See ingest_tx.go for the full classification
+	// and the reject message construction — bridge stays I/O-free toward
+	// peers, so a rejected tx's wire.MsgReject is returned for the caller to
+	// send, never written to a socket here.
+	IngestTx(ctx context.Context, txBytes []byte, peerAddr string) (IngestTxResult, error)
+
+	// TxRejected reports whether hash is in the rejected-transaction set
+	// IngestTx maintains. This is Task 16's seam (see ingest_tx.go's own doc
+	// comment): the inv handler's "already rejected, skip the getdata"
+	// suppression (netsync/manager.go:2400) is made reachable here but
+	// deliberately not wired to anything in this task.
+	TxRejected(hash chainhash.Hash) bool
 
 	// HeaderEvents delivers tip-change notifications sourced from the
 	// blockchain service's subscription (spec §4.4). The channel is never
@@ -144,6 +162,14 @@ type svp2pBridge struct {
 	blockAssembly     blockassembly.ClientI
 
 	headerEvents chan HeaderEvent
+
+	// rejectedTxns is IngestTx's short-circuit set (ingest_tx.go), ported
+	// from legacy's own sm.rejectedTxns (netsync/manager.go:489, bounded at
+	// construction :3167 with maxRejectedTxns). Owned once here, not
+	// per-peer: see maxRejectedTxns's doc comment for the aggregate-cost
+	// reasoning. Cleared on the accepted-block path (ingest.go IngestBlock,
+	// mirroring manager.go:1855).
+	rejectedTxns *txmap.SyncedMap[chainhash.Hash, struct{}]
 }
 
 // New constructs the bridge with its eight injected Teranode dependencies,
@@ -179,6 +205,7 @@ func New(
 		blockValidation:   blockValidation,
 		blockAssembly:     blockAssemblyClient,
 		headerEvents:      make(chan HeaderEvent, 16),
+		rejectedTxns:      txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns),
 	}
 }
 

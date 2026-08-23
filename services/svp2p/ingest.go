@@ -1,9 +1,12 @@
 package svp2p
 
 import (
+	"bytes"
 	"context"
 	"io"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/svp2p/bridge"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
@@ -156,4 +159,72 @@ func (b *blockIngestor) release(r io.Closer, cause error) error {
 	}
 
 	return cause
+}
+
+// txIngestor is the tx-side counterpart to blockIngestor: the one place
+// protocol.TxIngestor (spec §4.4) and bridge.Bridge meet for Task 14. It also
+// owns the composition Task 13's announce seam needs — announce matches
+// txAnnouncer.put's signature exactly (txrelay.go), so Server.startSync
+// passes that method straight through with no adapter-specific shape
+// leaking into it.
+type txIngestor struct {
+	bridge bridge.Bridge
+
+	// announce feeds an accepted tx into the tx announcement relay. In
+	// production this is *txAnnouncer.put, wired at the one place a
+	// *txIngestor is built, Server.startSync (Server.go). There is no
+	// separate newTxIngestor constructor — an earlier version of this
+	// comment claimed one that never existed (review round 1, Minor 4);
+	// Ingest nil-guards this field regardless, so a *txIngestor built
+	// without it (a test, most likely) cannot panic rather than relying on
+	// that claim.
+	announce func(hash chainhash.Hash, fee, size uint64)
+}
+
+var _ protocol.TxIngestor = (*txIngestor)(nil)
+
+// Ingest serializes msg and runs it through bridge.IngestTx, then feeds the
+// announce seam for an accepted tx. Every other outcome (orphan, rejected,
+// already-rejected) announces nothing.
+//
+// Latency divergence, disclosed rather than silent (review round 1, Minor
+// 9): legacy's handleTxMsg announces an accepted peer-sourced tx
+// immediately, in the same call (netsync/manager.go:1305,
+// AnnounceNewTransactions). Here, announce is txAnnouncer.put
+// (services/svp2p/txrelay.go), which queues into the same 1 second batcher
+// Task 13's Kafka-sourced path already flushes through — so a peer-sourced
+// accepted tx can sit up to txAnnounceBatchTimeout before it is relayed
+// onward, where legacy relays it the instant Validate returns. Almost
+// certainly intended, since both producers sharing one batcher (and one
+// canRelay gate — see txAnnouncer.put) is the whole point of the seam this
+// task was asked to feed, but it is a real, measurable behavior change from
+// legacy's own timing and is recorded here rather than assumed obvious.
+func (t *txIngestor) Ingest(ctx context.Context, msg *wire.MsgTx, peerAddr string) protocol.TxIngestOutcome {
+	var buf bytes.Buffer
+	if err := msg.Serialize(&buf); err != nil {
+		return protocol.TxIngestOutcome{
+			Err: errors.NewProcessingError("[svp2p] failed to serialize inbound tx from %s", peerAddr, err),
+		}
+	}
+
+	result, err := t.bridge.IngestTx(ctx, buf.Bytes(), peerAddr)
+	if err != nil {
+		return protocol.TxIngestOutcome{Err: err}
+	}
+
+	if result.Accepted && t.announce != nil {
+		t.announce(result.TxHash, result.Fee, result.Size)
+	}
+
+	return protocol.TxIngestOutcome{
+		Accepted: result.Accepted,
+		Orphan:   result.Orphan,
+		Reject:   result.Reject,
+	}
+}
+
+// Rejected delegates to bridge.Bridge.TxRejected — Task 16's seam (see that
+// method's own doc comment in ingest_tx.go).
+func (t *txIngestor) Rejected(hash chainhash.Hash) bool {
+	return t.bridge.TxRejected(hash)
 }

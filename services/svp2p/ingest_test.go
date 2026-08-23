@@ -71,6 +71,18 @@ func (s *stubBridge) IngestBlock(_ context.Context, _ *wire.BlockHeader, _ uint6
 
 func (s *stubBridge) HeaderEvents() <-chan bridge.HeaderEvent { return nil }
 
+// IngestTx and TxRejected are Task 14's additions to bridge.Bridge. Nothing
+// in this file exercises them — this suite is about the block-ingest
+// admission/release composition (see the type doc comment above); the tx
+// adapter has its own suite in ingest_tx_test.go.
+func (s *stubBridge) IngestTx(context.Context, []byte, string) (bridge.IngestTxResult, error) {
+	panic("stubBridge: IngestTx is not exercised by this suite")
+}
+
+func (s *stubBridge) TxRejected(chainhash.Hash) bool {
+	panic("stubBridge: TxRejected is not exercised by this suite")
+}
+
 // FetchBlock and FetchTx are Task 9's read-side additions to bridge.Bridge.
 // Nothing in this file exercises them — this suite is about the admission
 // gate and IngestBlock composition (see the comment above) — so the stub

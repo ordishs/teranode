@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -112,6 +113,58 @@ type IngestOutcome struct {
 	TransientLocal bool
 }
 
+// TxIngestor is this package's whole view of Teranode-side transaction
+// ingestion, the TxIngestor counterpart to BlockIngestor above. Spec §4.4
+// forbids protocol from importing the bridge or any Teranode client, so this
+// interface is declared here, where the peer loop consumes it, and
+// implemented by a thin adapter in the svp2p package over bridge.Bridge
+// (services/svp2p/ingest.go).
+type TxIngestor interface {
+	// Ingest runs one inbound transaction through the validator. It must
+	// never be called from the peer's Run goroutine directly: validation is
+	// slow, and Run has to keep servicing pings, the idle timer and shutdown
+	// while it happens. See txIngestLoop for where this actually runs and
+	// why that keeps Run unblocked.
+	Ingest(ctx context.Context, msg *wire.MsgTx, peerAddr string) TxIngestOutcome
+
+	// Rejected reports whether hash is in the ingest-side rejected-tx set
+	// (bridge.Bridge.TxRejected). This is Task 16's seam: the inv handler's
+	// "already rejected, skip the getdata" suppression
+	// (services/legacy/netsync/manager.go:2400) is made reachable through
+	// this method but is not called from anywhere in this package today —
+	// BlockDownloader.OnInv's InvTypeTx case stops at Decision 1 (Phase 2)
+	// and Task 16 is who extends it.
+	Rejected(hash chainhash.Hash) bool
+}
+
+// TxIngestOutcome is what one Ingest call reports. Unlike IngestOutcome
+// (blocks), no outcome here ever disconnects the peer: legacy's own
+// handleTxMsg neither scores nor disconnects a peer for an invalid or
+// unsolicited transaction (services/legacy/netsync/manager.go:1208-1215, the
+// BitcoinJ-interop comment — carried here, not reinvented; Task 11's own
+// review turned on the same principle, that a false-positive ban is worse
+// than a miss).
+type TxIngestOutcome struct {
+	// Err is a local/processing failure (e.g. malformed tx bytes). Logged
+	// only; never treated as the peer's fault.
+	Err error
+
+	// Accepted reports the transaction validated and fed the tx
+	// announcement relay (Task 13's txAnnouncer.put seam, composed in the
+	// svp2p-package adapter that implements this interface).
+	Accepted bool
+
+	// Orphan reports a missing-parent/locked classification. Task 15 owns
+	// the orphan transaction pool; nothing further happens here.
+	Orphan bool
+
+	// Reject is the wire.MsgReject to send to the peer, or nil when nothing
+	// should be sent: accepted, orphan, or an already-rejected tx that
+	// legacy deliberately does not re-reject
+	// (services/legacy/netsync/manager.go:1218-1224).
+	Reject *wire.MsgReject
+}
+
 // syncDispatcher is the peer loop's view of the manager-owned sync machines
 // (HeaderSync and BlockDownloader, both behind PeerManager's shared
 // sync-state mutex). PeerManager implements it. Every method takes that mutex
@@ -183,6 +236,19 @@ type PeerConfig struct {
 	// nil when it is not wired. Without it a getdata is ignored: see
 	// queueGetData.
 	Fetcher BlockTxFetcher
+
+	// TxIngestor is the Teranode-side transaction ingestion path, or nil when
+	// it is not wired. Without it an inbound tx is dropped before it is even
+	// queued (queueTx).
+	TxIngestor TxIngestor
+
+	// MarkTxKnown records that this peer is the origin of an inbound tx, so
+	// the tx announcement relay (PeerManager.RelayTxs) never re-announces it
+	// back to the peer that sent it — legacy's own AddKnownInventory-before-
+	// queueing rule (services/legacy/peer_server.go:906-908), the tx-side
+	// counterpart of PeerManager.Inv's unconditional knownBlocks.mark for
+	// blocks. nil when sync is not wired; dispatchTx no-ops in that case.
+	MarkTxKnown func(sp *SyncPeer, hash chainhash.Hash)
 }
 
 type PeerSnapshot struct {
@@ -196,6 +262,13 @@ type PeerSnapshot struct {
 	ConnectedAt      time.Time
 	LastRecv         time.Time
 	MisbehaviorScore int
+
+	// TxDropped counts inbound txs this peer had refused entry to txMsgCh
+	// because it was already full (queueTx) — sustained loss that would
+	// otherwise be invisible in production (review round 1, Minor 5). Not
+	// yet surfaced over the peer_api gRPC surface (GetPeers); that is a
+	// natural follow-up, not done here, disclosed rather than silent.
+	TxDropped uint64
 }
 
 // Peer owns one connection's runtime: it feeds inbound messages through the
@@ -241,7 +314,58 @@ type Peer struct {
 	ingestStarted time.Time
 	ingestTxBytes uint64
 	ingestActive  int
+
+	// txMsgCh carries inbound tx messages to txIngestLoop, the single
+	// per-peer worker goroutine that actually calls TxIngestor.Ingest. See
+	// txIngestQueueDepth for the bound and its rationale.
+	txMsgCh chan *wire.MsgTx
+
+	// txDropped counts queueTx's own drops (txMsgCh full). Surfaced through
+	// PeerSnapshot.TxDropped; see that field's own doc comment.
+	txDropped atomic.Uint64
 }
+
+// txIngestQueueDepth bounds how many not-yet-validated txs one peer can have
+// queued before a further tx from it is dropped rather than piling up
+// unboundedly in memory (queueTx). Legacy has no true per-peer analogue:
+// its whole SyncManager is served by ONE global goroutine draining one
+// shared channel across every peer and every message type
+// (services/legacy/netsync/manager.go:130, maxMsgQueueSize = 10_000). This
+// package instead gives each peer its own worker (txIngestLoop) so one
+// peer's slow validation cannot starve another's, at the cost of a bound
+// chosen per peer rather than once for the whole node.
+//
+// The bound is on message COUNT, not bytes (review round 1, Important 3):
+// each of the 100 slots retains a whole *wire.MsgTx, decoded, not a fixed-
+// size record, so "100 pointers, negligible" — this comment's own earlier,
+// incorrect claim — understated the real cost by ignoring what each
+// pointer keeps alive. The honest per-entry ceiling is whatever go-wire
+// currently allows one MsgTx to declare: MsgTx.MaxPayloadLength returns
+// MaxBlockPayload() (go-wire msg_tx.go), i.e. a tx has NO size limit of its
+// own distinct from a block's. That ceiling tracks the excessive-block-size
+// value passed to wire.SetLimits, which for every node running this
+// package is 4,000,000,000 (Server.Init, unconditional) — NOT go-wire's
+// own pre-SetLimits default of 32,000,000 (giving a 64 MiB maxMessagePayload
+// pre-check and a ~30.5 MiB per-tx mpl at that default; neither is the
+// figure that applies here). So the true worst case for THIS node is
+// ~3.73 GiB (4,000,000,000 bytes) per queued entry, and
+// ~373 GiB (100 * 3.73 GiB) per peer at this bound — a ceiling that
+// predates this task (it governs every non-block message type, not
+// something Task 14 introduced) but whose blast radius this queue widens:
+// before, one such tx was decoded, validated-or-rejected, and released by a
+// single synchronous call; now up to 100 can be retained per peer at once.
+// In practice bandwidth and time to deliver that many maximal-size messages
+// bound this far below the theoretical figure, and the transport's own
+// Conn.Inbound() channel (128 deep, same byte-unboundedness) sits upstream
+// of this one with an identical property already — but the theoretical
+// number is the one a later reader should be able to trust, so it is
+// stated plainly here rather than rounded down to "negligible."
+//
+// Aggregate cost across N connected peers is N*txIngestQueueDepth entries
+// (not bytes, per above) — at a few hundred peers, still a smaller entry
+// count than legacy's own single 10,000-deep queue, and unlike that queue
+// this one only ever holds tx messages, not headers/blocks/invs as well.
+const txIngestQueueDepth = 100
 
 // ingestReport is one finished ingest, delivered to the Run goroutine so the
 // scheduler update and the idle-timer reset happen on the loop that owns them.
@@ -267,6 +391,7 @@ func NewPeer(cfg PeerConfig) *Peer {
 		// Capacity one: it is an edge signal, not a queue. The queue is
 		// p.getData, and the serve loop drains it until it is empty.
 		getDataWake: make(chan struct{}, 1),
+		txMsgCh:     make(chan *wire.MsgTx, txIngestQueueDepth),
 	}
 }
 
@@ -319,6 +444,14 @@ func (p *Peer) Run(ctx context.Context) error {
 	// ctx cancellation or on p.gone, both of which Run closes on its way out.
 	if p.cfg.Sync != nil && p.cfg.Fetcher != nil {
 		go p.serveLoop(ctx)
+	}
+
+	// The tx ingest worker runs off this loop for the same reason serveLoop
+	// does: validating a transaction is slow, and Run still has to service
+	// pings, the idle timer and shutdown while it happens. It stops on ctx
+	// cancellation or p.gone, both of which Run closes on its way out.
+	if p.cfg.TxIngestor != nil {
+		go p.txIngestLoop(ctx)
 	}
 
 	for _, msg := range p.hs.Initial() {
@@ -447,7 +580,15 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 	// The sync machines are dispatched with the peer lock released: they take
 	// PeerManager's sync-state mutex, and the package lock order is peer lock
 	// then manager lock.
-	return p.dispatchSync(msg, est, firstEstablished, info.Services)
+	if err := p.dispatchSync(msg, est, firstEstablished, info.Services); err != nil {
+		return err
+	}
+
+	// Tx ingestion is independent of the sync machines (see dispatchTx's own
+	// doc comment) and never returns an error that disconnects the peer.
+	p.dispatchTx(msg, est)
+
+	return nil
 }
 
 // dispatchSync feeds one post-handshake message to the manager-owned sync
@@ -509,6 +650,53 @@ func (p *Peer) dispatchSync(msg wire.Message, established, firstEstablished bool
 	}
 
 	return nil
+}
+
+// dispatchTx routes a post-handshake *wire.MsgTx to the tx ingest worker.
+// Kept separate from dispatchSync deliberately: tx ingestion is not part of
+// the block-sync machine graph (HeaderSync/BlockDownloader) dispatchSync
+// dispatches to, and unlike that method this must still run when cfg.Sync is
+// nil. The correct reason is PeerManager.RelayTxs itself, not the block
+// ingestor's construction path (an earlier version of this comment cited
+// that, incorrectly — review round 1, Minor 3): RelayTxs iterates m.peers
+// directly and has no dependency on m.headerSync/SyncEnabled(), so a peer
+// whose txMsgCh this feeds must reach the ingestor regardless of whether
+// block sync itself is configured. handleMessage calls this after
+// dispatchSync, under the same "established" gate net_processing.cpp
+// ProcessMessage applies to every post-handshake message.
+//
+// legacy's OnTx (services/legacy/peer_server.go:892, check at :898-900)
+// refuses every inbound tx up front when cfg.BlocksOnly is set. That is a
+// legacy command-line flag with no settings key in this port, and F5
+// forbids adding one — deliberately not carried here, disclosed rather
+// than silently dropped (review round 1, Minor 10).
+func (p *Peer) dispatchTx(msg wire.Message, established bool) {
+	if !established || p.cfg.TxIngestor == nil {
+		return
+	}
+
+	m, ok := msg.(*wire.MsgTx)
+	if !ok {
+		return
+	}
+
+	// Computed once, unconditionally, and reused below by both MarkTxKnown
+	// and queueTx's own drop log (see queueTx's doc comment on why that
+	// reuse matters): there is no cheaper way to get either of their inputs.
+	hash := m.TxHash()
+
+	// Marked BEFORE queueing, matching legacy's own ordering exactly
+	// (services/legacy/peer_server.go:906-908, AddKnownInventory ahead of
+	// QueueTx) — see MarkTxKnown's own doc comment (PeerConfig) for why.
+	// This runs synchronously, on the Run goroutine, ahead of queueTx's
+	// non-blocking handoff to the async worker — so by the time
+	// TxIngestor.Ingest is ever called for this tx, the mark has already
+	// happened (review round 1, Important 2).
+	if p.cfg.MarkTxKnown != nil {
+		p.cfg.MarkTxKnown(p.cfg.SyncPeer, hash)
+	}
+
+	p.queueTx(m, hash)
 }
 
 // send puts machine output on the droppable lane. A full send queue is not
@@ -622,6 +810,116 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) e
 	}()
 
 	return nil
+}
+
+// queueTx hands one inbound tx to txIngestLoop instead of validating it on
+// the Run goroutine: bridge validation is slow, and Run has to keep
+// servicing pings, the idle timer and shutdown while it happens — the same
+// reasoning startIngest documents for blocks. Unlike a block, a tx arrives on
+// the ordinary message channel (Conn.Inbound()), interleaved with every
+// other post-handshake message, so nothing upstream serializes it the way
+// the one-block-at-a-time transport does for InboundBlocks(); txMsgCh's
+// bound (txIngestQueueDepth) is this method's own backpressure instead.
+//
+// A full queue means this peer is delivering txs faster than they can be
+// validated. The newest one is dropped rather than blocking — a deliberate
+// DEPARTURE from legacy's own policy, disclosed here per spec §4.3 (review
+// round 1, Important 3) rather than silently ported as a smaller version of
+// it. Legacy's OnTx does the opposite on purpose, and says so:
+// "intentionally block further receives until the transaction is fully
+// processed and known good or bad. This helps prevent a malicious peer from
+// queuing up a bunch of bad transactions before disconnecting (or being
+// disconnected) and wasting memory" (OnTx, services/legacy/peer_server.go:
+// 910-914, the QueueTx call itself at :915 — verified directly against the
+// file, not against a prior citation of this same quote, which was wrong
+// twice over: this port's own review round 1 fix cited :900-905, and it
+// propagated from a citation in the controller's own round-1 text; the
+// blocking send QueueTx makes is manager.go:2668, sm.msgChan<- into the
+// single global 10,000-deep queue). Legacy can afford to block there
+// because OnTx runs on that peer's own dedicated callback goroutine,
+// separate from the one that services pings — blocking it stalls only that
+// peer's further reads. This package has no such separation: queueTx runs
+// on dispatchTx <- handleMessage <- Run's own select loop, the SAME
+// goroutine that also owns the idle timer, pings and shutdown (exactly why
+// block ingestion was moved off it — startIngest's own doc comment). A
+// blocking send here would stall Run itself, not just this peer's tx
+// processing, reintroducing the defect Task 10 already fixed for blocks.
+// So: dropped, not blocked. The consequence, honestly stated: a dropped
+// unsolicited tx has no ack and no retry, so it is genuinely LOST for this
+// delivery attempt, not merely delayed the way legacy's blocking peer would
+// be — and it does not self-heal until Task 16 wires the inv->getdata round
+// trip, at which point another peer's inv of the same hash can still recover
+// it. Unsolicited transactions are never punished either way (F3), so a
+// drop here stays a capacity decision, not a fault judgement.
+//
+// Logged at Warn, not Debug (review round 1, Important 3/Minor 5): a silent
+// Debug-level drop of peer data is invisible in a normal production
+// deployment, and this file's own convention already logs every other drop
+// at Warn (see Peer.send). hash is dispatchTx's caller-computed
+// msg.TxHash(), passed in rather than recomputed here — a stale version of
+// this comment claimed the hash was "deliberately NOT computed" to avoid a
+// double-SHA256 on the drop path, which stopped being true the moment
+// dispatchTx started computing it unconditionally for MarkTxKnown (review
+// round 1, Important 2): the cost moved, it was never removed, and legacy
+// pays a double cost itself: OnTx's own tracing call hashes
+// (peer_server.go:895, msg.TxHash(), a Go function argument evaluated
+// whether or not debug logging is enabled) and then hashes again three
+// lines later (:907, tx.Hash() — a fresh bsvutil.Tx, so nothing is cached
+// from the first hash to reuse). Reusing dispatchTx's already-paid-for
+// value here costs nothing further and makes the drop log useful (which
+// tx, not just that one dropped). txDropped
+// (PeerSnapshot.TxDropped) is the counter for the aggregate signal; see its
+// own doc comment for what it does and does not yet reach.
+func (p *Peer) queueTx(msg *wire.MsgTx, hash chainhash.Hash) {
+	select {
+	case p.txMsgCh <- msg:
+	default:
+		p.txDropped.Add(1)
+		p.cfg.Logger.Warnf("[svp2p] tx ingest queue full for %s, dropping %s (%d dropped so far)",
+			p.cfg.Conn.RemoteAddr(), hash, p.txDropped.Load())
+	}
+}
+
+// txIngestLoop is the one goroutine that calls TxIngestor.Ingest for this
+// peer. Serializing here — one worker per peer, rather than one goroutine
+// per inbound tx — bounds how many concurrent validations a single peer can
+// force, without needing a new setting (F5): the bound is txMsgCh's fixed
+// capacity. It stops on ctx cancellation or p.gone, the same two shutdown
+// signals serveLoop uses.
+func (p *Peer) txIngestLoop(ctx context.Context) {
+	for {
+		select {
+		case msg := <-p.txMsgCh:
+			p.ingestTx(ctx, msg)
+		case <-p.gone:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// ingestTx runs one queued tx through the ingestor and sends its reject
+// message, if any. Conn.Send is safe to call from any goroutine — it only
+// enqueues onto a channel guarded by its own byte budget — so this sends
+// directly rather than funneling the outcome back through the Run loop the
+// way a finished block ingest does (ingestCh). That indirection exists for
+// blocks because BlockDone can return a disconnect error and only Run may
+// disconnect a peer; no TxIngestOutcome ever disconnects (see its own doc
+// comment), so there is nothing here that has to run on Run itself.
+func (p *Peer) ingestTx(ctx context.Context, msg *wire.MsgTx) {
+	peerAddr := p.cfg.Conn.RemoteAddr().String()
+	outcome := p.cfg.TxIngestor.Ingest(ctx, msg, peerAddr)
+
+	if outcome.Err != nil {
+		p.cfg.Logger.Debugf("[svp2p] tx ingest error for %s from %s: %v", msg.TxHash(), peerAddr, outcome.Err)
+	}
+
+	if outcome.Reject != nil {
+		if err := p.cfg.Conn.Send(outcome.Reject); err != nil {
+			p.cfg.Logger.Warnf("[svp2p] dropped tx reject to %s: %v", peerAddr, err)
+		}
+	}
 }
 
 func (p *Peer) ingestFinished() {
@@ -740,6 +1038,7 @@ func (p *Peer) Info() PeerSnapshot {
 		ConnectedAt:      p.connectedAt,
 		LastRecv:         p.lastRecv,
 		MisbehaviorScore: p.hs.MisbehaviorScore(),
+		TxDropped:        p.txDropped.Load(),
 	}
 }
 

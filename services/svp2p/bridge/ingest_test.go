@@ -12,6 +12,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -126,6 +127,7 @@ func newIngestHarness(ctx context.Context, t *testing.T, dbName string, unified 
 		subtreeStore:     subtreeStore,
 		blockValidation:  captured,
 		headerEvents:     make(chan HeaderEvent, 1),
+		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns),
 	}
 
 	return &ingestHarness{sm: sm, utxoStore: store, subtreeStore: subtreeStore, captured: captured}
@@ -346,6 +348,33 @@ func buildCoinbaseOnlyBlock(t *testing.T) *bsvutil.Block {
 // single-transaction block: the streaming source must yield the coinbase it
 // decoded up front and nothing else, and the pipeline's early return must
 // leave both entries agreeing on an empty subtree list.
+// TestIngestBlock_ClearsRejectedTxnsOnAcceptedBlock proves the Task 14
+// clearing site: a successfully ingested block wipes the whole rejectedTxns
+// set (netsync/manager.go:1855, the accepted-block path), not just the
+// hashes the block itself carried. The hash seeded here belongs to neither
+// transaction in the block.
+func TestIngestBlock_ClearsRejectedTxnsOnAcceptedBlock(t *testing.T) {
+	ctx := context.Background()
+
+	block := buildCoinbaseOnlyBlock(t)
+	txs := block.Transactions()
+	require.Len(t, txs, 1)
+
+	h := newIngestHarness(ctx, t, "ingest_clears_rejected_txns", false, 0)
+
+	unrelated := chainhash.HashH([]byte("unrelated-rejected-tx"))
+	h.sm.rejectedTxns.Set(unrelated, struct{}{})
+
+	_, stillRejected := h.sm.rejectedTxns.Get(unrelated)
+	require.True(t, stillRejected, "test setup: the seeded hash must be present before ingest")
+
+	header := block.MsgBlock().Header
+	require.NoError(t, h.sm.IngestBlock(ctx, &header, 1, bytes.NewReader(serializeTxStream(t, txs)), "peer-a"))
+
+	_, stillRejected = h.sm.rejectedTxns.Get(unrelated)
+	require.False(t, stillRejected, "an accepted block must fully wipe rejectedTxns, not just its own transactions")
+}
+
 func TestIngestBlock_ParityWithHandleBlockDirect_CoinbaseOnly(t *testing.T) {
 	ctx := context.Background()
 

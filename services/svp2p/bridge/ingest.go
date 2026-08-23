@@ -488,5 +488,17 @@ func (sm *svp2pBridge) IngestBlock(ctx context.Context, header *wire.BlockHeader
 		return err
 	}
 
+	// Do not request rejected transactions again until a new block has been
+	// processed: a full wipe, not a per-tx removal, matching legacy's own
+	// clearing site exactly (netsync/manager.go:1855, sm.rejectedTxns.Clear(),
+	// immediately after its "accepted block %v at height %d" log at :1852).
+	// See ingest_tx.go's IngestTx for the set this clears. The nil check is
+	// for callers that construct svp2pBridge directly rather than through
+	// New() (this package's own test harnesses do); every production path
+	// goes through New(), which always initializes the set.
+	if sm.rejectedTxns != nil {
+		sm.rejectedTxns.Clear()
+	}
+
 	return nil
 }

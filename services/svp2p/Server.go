@@ -214,6 +214,24 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return err
 	}
 
+	// txAnnouncer is built before startSync, not just before the Kafka
+	// consumer below: startSync wires the tx ingestor (Task 14) into the
+	// manager, and that ingestor's announce seam is txAnnouncer.put. It only
+	// needs s.manager.RelayTxs, which Init already constructed, so building
+	// it here costs nothing extra and guarantees the seam always has
+	// somewhere to land — the same reasoning this file already documents for
+	// the Kafka consumer's callback below.
+	//
+	// The canRelay closure is spec §7's FSM RUNNING gate (canRelayTx,
+	// txrelay.go), applied at put — the choke point BOTH tx-announce
+	// producers share, this one and the Kafka-sourced one below — not just
+	// at that Kafka listener's own control channel, which covers only
+	// itself. See txAnnouncer.canRelay's doc comment (review round 1,
+	// Important 1) for why both gates stay.
+	s.txAnnouncer = newTxAnnouncer(s.logger, s.manager.RelayTxs, func() bool {
+		return canRelayTx(ctx, s.blockchainClient, s.logger)
+	})
+
 	if err := s.startSync(ctx); err != nil {
 		if errors.IsContextError(err) {
 			s.logger.Infof("[svp2p] shutting down during header index hydration")
@@ -260,11 +278,9 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// blocks-final and after the same manager readiness point, for the same
 	// "nobody to tell yet" reasoning — except this one is CONTROLLED (E1):
 	// bridge.StartTxMetaConsumer only actually consumes while the FSM is
-	// RUNNING, polling that state itself. s.txAnnouncer is built first so
-	// the consumer's callback (its Put) always has somewhere to land, even
-	// in the narrow window before StartTxMetaConsumer's own goroutines have
-	// spun up.
-	s.txAnnouncer = newTxAnnouncer(s.logger, s.manager.RelayTxs)
+	// RUNNING, polling that state itself. s.txAnnouncer was already built
+	// above, before startSync, so both this consumer's callback AND the
+	// peer-sourced tx ingestor (Task 14) share the one announcer instance.
 	bridge.StartTxMetaConsumer(ctx, s.logger, s.settings, s.blockchainClient, s.txAnnouncer.put)
 
 	apiKey := s.settings.GRPCAdminAPIKey
@@ -385,24 +401,30 @@ func (s *Server) startSync(ctx context.Context) error {
 		return err
 	}
 
-	// Both adapters come from the same bridge instance, so the getdata answerer
-	// reads through the same clients the ingest path writes through. Assigned
-	// from a nil check rather than passed straight through, because a typed nil
-	// in an interface is not nil, and ConfigureSync switches on Ingestor == nil.
+	// All three adapters come from the same bridge instance, so the getdata
+	// answerer and the tx ingestor read/write through the same clients the
+	// block-ingest path does — in particular, so IngestTx's rejectedTxns and
+	// IngestBlock's clear of it (ingest_tx.go, ingest.go) are the same set.
+	// Assigned from a nil check rather than passed straight through, because
+	// a typed nil in an interface is not nil, and ConfigureSync switches on
+	// Ingestor == nil.
 	var (
-		ingestor protocol.BlockIngestor
-		fetcher  protocol.BlockTxFetcher
+		ingestor    protocol.BlockIngestor
+		fetcher     protocol.BlockTxFetcher
+		txIngestorI protocol.TxIngestor
 	)
 
 	if ing != nil {
 		ingestor = ing
 		fetcher = ing.bridge
+		txIngestorI = &txIngestor{bridge: ing.bridge, announce: s.txAnnouncer.put}
 	}
 
 	if err := s.manager.ConfigureSync(protocol.SyncConfig{
 		Index:                            s.HeaderIndex(),
 		Ingestor:                         ingestor,
 		Fetcher:                          fetcher,
+		TxIngestor:                       txIngestorI,
 		AllowSyncCandidateFromLocalPeers: s.settings.Legacy.AllowSyncCandidateFromLocalPeers,
 		TickInterval:                     s.syncTick,
 		MaxLastBlockTime:                 s.maxLastBlockTime,

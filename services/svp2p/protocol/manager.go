@@ -67,6 +67,14 @@ type SyncConfig struct {
 	// answers no getdata.
 	Fetcher BlockTxFetcher
 
+	// TxIngestor is the Teranode-side transaction ingestion path, or nil
+	// when the bridge dependencies are not injected yet. Unlike Ingestor it
+	// gates nothing else here either: tx ingestion has no dependency on the
+	// header-sync/block-download machines this method builds, so it is
+	// stored unconditionally below rather than inside the
+	// "cfg.Ingestor == nil" early return.
+	TxIngestor TxIngestor
+
 	// DisableCheckpoints mirrors legacy netsync Config.DisableCheckpoints.
 	DisableCheckpoints bool
 
@@ -137,6 +145,7 @@ type PeerManager struct {
 	serving         *Serving
 	ingestor        BlockIngestor
 	fetcher         BlockTxFetcher
+	txIngestor      TxIngestor
 	// activeTip is our own best chain tip (the chainActive counterpart),
 	// fed from the blockchain service and always a header present in the
 	// index — the download scheduler cannot place a tip it cannot look up.
@@ -178,6 +187,11 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 	defer m.syncMu.Unlock()
 
 	m.headerIndex = cfg.Index
+
+	// Stored unconditionally, ahead of the cfg.Ingestor nil check below: tx
+	// ingestion has no dependency on the header-sync/block-download
+	// machines that check gates.
+	m.txIngestor = cfg.TxIngestor
 
 	if cfg.TickInterval > 0 {
 		m.syncTick = cfg.TickInterval
@@ -559,6 +573,14 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 		m.syncMu.Unlock()
 	}
 
+	// Read independently of SyncEnabled(): tx ingestion has no dependency on
+	// the header-sync/block-download machines that gates, so a TxIngestor
+	// set via ConfigureSync must reach every peer regardless of whether
+	// block sync itself is enabled.
+	m.syncMu.Lock()
+	txIngestor := m.txIngestor
+	m.syncMu.Unlock()
+
 	peer := NewPeer(PeerConfig{
 		Handshake: HandshakeConfig{
 			Inbound:   inbound,
@@ -582,6 +604,11 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 		SyncPeer:     syncPeer,
 		Ingestor:     ingestor,
 		Fetcher:      fetcher,
+		TxIngestor:   txIngestor,
+		// A bound method value, not manager state snapshotted under a lock:
+		// markTxKnown takes syncMu itself on each call, so there is nothing
+		// to read here ahead of time the way ingestor/fetcher/txIngestor are.
+		MarkTxKnown: m.markTxKnown,
 	})
 
 	m.mu.Lock()
@@ -790,6 +817,32 @@ func (m *PeerManager) Inv(syncPeer *SyncPeer, msg *wire.MsgInv) ([]wire.Message,
 	markGetHeadersOutstanding(syncPeer, msgs)
 
 	return msgs, err
+}
+
+// markTxKnown records hash as known to syncPeer — the tx-side counterpart
+// of Inv's unconditional knownBlocks.mark above (manager.go:800-806,
+// itself citing legacy's processInvMsg AddKnownInventory): whichever peer
+// delivers a tx to us must never be re-offered it by RelayTxs
+// (relay.go selectTxRelayTargets reads knownTxs). Legacy's own equivalent,
+// OnTx's AddKnownInventory call, runs BEFORE QueueTx
+// (services/legacy/peer_server.go:906-908) — this is called from
+// Peer.dispatchTx before queueTx for the same reason (review round 1,
+// Important 2).
+//
+// Unlike Inv's marking, this needs no headerSync/blockDownloader state —
+// RelayTxs itself has none either (it iterates m.peers directly) — so it
+// takes syncMu on its own rather than being folded into the syncDispatcher
+// interface, which exists only where cfg.Sync is configured. This must
+// work whether or not it is: a tx-ingestion-only deployment (TxIngestor
+// set, Ingestor/Sync not) still runs RelayTxs for every connected peer.
+func (m *PeerManager) markTxKnown(syncPeer *SyncPeer, hash chainhash.Hash) {
+	if syncPeer == nil || syncPeer.State == nil {
+		return
+	}
+
+	m.syncMu.Lock()
+	syncPeer.State.knownTxs.mark(hash)
+	m.syncMu.Unlock()
 }
 
 // GetHeaders dispatches the NetMsgType::GETHEADERS event. The refusal is
