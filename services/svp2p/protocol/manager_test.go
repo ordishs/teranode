@@ -1350,6 +1350,76 @@ func TestSyncPass_ADisconnectUnwindsTheSlotTheSweepJustGranted(t *testing.T) {
 	})
 }
 
+// TestSyncPass_RotatedRoundPeerLateReplyIsNotScoredAsUnsolicited pins Task 11's
+// self-flagged residual (Important 2 in the review): electLocked and the sweep
+// both hand a peer a getheaders through PeerEstablished, and until this fix
+// neither call was covered by markGetHeadersOutstanding. The rotated peer's
+// slot is refilled on the SAME pass that released it — the sweep runs
+// PeerEstablished, then CheckStall, for one handle at a time
+// (net_processing.cpp's own SendBlockSync-before-DetectStalling order), so a
+// LATER handle in one pass can re-seed headersFirstMode on the very tick that
+// stalled the peer ahead of it lost it. A late, honest reply from the rotated
+// peer must not be read as unsolicited just because nobody marked its original
+// getheaders.
+func TestSyncPass_RotatedRoundPeerLateReplyIsNotScoredAsUnsolicited(t *testing.T) {
+	// A checkpoint far above our tip keeps headersFirstMode on for the whole
+	// test, which is what makes the round-ignore branch reachable at all.
+	cpHash := chainhash.Hash{0xC0}
+
+	f := newRotationFixture(t, 40, chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+	rotated, elected := f.handles[0], f.handles[1]
+
+	// Tick 1: the sweep is the ONLY thing granting the slot here — no
+	// Established, no manual PeerEstablished call — which is what makes this
+	// test exercise the unmarked call site rather than the one manager.Headers
+	// already covers.
+	out, disconnect := f.pass(testNow)
+
+	require.Empty(t, disconnect)
+	require.Len(t, getHeadersTo(out, rotated.peer), 1,
+		"the sweep must start header sync with the first eligible peer")
+	require.Empty(t, getHeadersTo(out, elected.peer),
+		"a headers-first round is single-slot on this tick")
+
+	f.setup(func() {
+		require.True(t, rotated.sync.State.fSyncStarted)
+		require.True(t, f.m.headerSync.IsHeadersFirstMode())
+		// CheckStall seeds nLastProgressTime on its first look at this peer.
+		require.Equal(t, testNow, rotated.sync.State.nLastProgressTime)
+	})
+
+	// Tick 2, past the rotation window: CheckStall rotates `rotated` — this
+	// runs bd.hs.SyncPeerTimedOut synchronously, inside this same syncMu-held
+	// pass, clearing fSyncStarted and headersFirstMode before the loop reaches
+	// `elected`. `elected` is handles[1], so the sweep reaches it on the SAME
+	// pass and re-seeds headersFirstMode = true for its own round.
+	out, disconnect = f.pass(testNow + micros(2*MaxLastBlockTime))
+
+	require.Empty(t, disconnect, "a rotation must not disconnect anyone")
+	require.Empty(t, getHeadersTo(out, rotated.peer),
+		"the rotated peer must not be asked for anything on the pass that rotated it")
+	require.Len(t, getHeadersTo(out, elected.peer), 1,
+		"the same pass re-grants the round to the next eligible peer")
+
+	f.setup(func() {
+		require.False(t, rotated.sync.State.fSyncStarted, "the rotation released the slot")
+		require.True(t, elected.sync.State.fSyncStarted, "the same tick re-granted it")
+		require.True(t, f.m.headerSync.IsHeadersFirstMode(),
+			"headersFirstMode is back on, seeded by the peer that just took the slot")
+	})
+
+	// The rotated peer, having been silent past the window, now answers the
+	// ORIGINAL getheaders tick 1 sent it — honestly, and in bulk (our headers
+	// index is still at genesis, so a real reply here is large).
+	batch := minedRun(f.genesis, MaxBlocksToAnnounce, 9100)
+
+	_, score, err := f.m.Headers(rotated.sync, headersMsg(batch))
+	require.NoError(t, err)
+	require.Zero(t, score,
+		"a late but honest reply to our own getheaders must not be scored as unsolicited")
+}
+
 // TestSyncPass_SkipsAPeerThatHasNotFinishedItsHandshake pins the guard
 // net_processing.cpp SendMessages carries before it does anything at all for a
 // peer (:5835-5837, "Don't send anything until the version handshake is
@@ -1820,6 +1890,263 @@ func TestManagerPromotesBlockAvailabilityOnIndexGrowth(t *testing.T) {
 		require.Nil(t, syncPeer.State.pindexBestKnownBlock,
 			"the sweep must not invent availability the peer never announced")
 	})
+}
+
+// TestManagerScoresUnsolicitedBulkHeaders pins the manager-level half of
+// Task 11: PeerManager, not HeaderSync, is what knows a getheaders is
+// outstanding for a peer, because it is the only thing that sees every
+// dispatch call's output messages (Established, Headers, Inv — peer.go
+// dispatchSync's contract that the sync machines perform no I/O). This test
+// drives the real dispatch methods, not HeaderSync.OnHeaders directly, so it
+// proves the wiring rather than restating the policy headersync_test.go
+// already pins.
+func TestManagerScoresUnsolicitedBulkHeaders(t *testing.T) {
+	t.Run("a bulk batch answering our own inv-driven getheaders scores nothing", func(t *testing.T) {
+		genesis := syncGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		cpHash := chainhash.Hash{0xC0}
+		m := syncTestManager(t, idx, &recordingIngestor{},
+			chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+		holderPeer, holderFar := newTestPeer(t, time.Minute, time.Minute)
+		bystanderPeer, bystanderFar := newTestPeer(t, time.Minute, time.Minute)
+
+		t.Cleanup(func() {
+			_ = holderFar.nc.Close()
+			_ = bystanderFar.nc.Close()
+		})
+
+		holder := fullNodePeer("31.1.1.1:8333")
+		bystander := fullNodePeer("32.2.2.2:8333")
+
+		registerPeer(m, holderPeer, holder)
+		registerPeer(m, bystanderPeer, bystander)
+
+		require.Len(t, m.Established(holder, wire.SFNodeNetwork), 1)
+
+		m.syncMu.Lock()
+		require.True(t, m.headerSync.IsHeadersFirstMode())
+		require.False(t, bystander.State.fSyncStarted)
+		m.syncMu.Unlock()
+
+		batch := minedRun(genesis, MaxBlocksToAnnounce, 7700)
+		last := batch[len(batch)-1].BlockHash()
+
+		// The bystander announces a chain we do not hold. OnInv solicits a
+		// getheaders from it (BlockDownloader.OnInv / getHeadersFor) —
+		// exactly the point where "a getheaders is outstanding" becomes true
+		// for this peer.
+		invMsgs, err := m.Inv(bystander, invMsg(t, wire.InvTypeBlock, last))
+		require.NoError(t, err)
+		requireGetHeaders(t, invMsgs)
+
+		// It answers with a bulk batch that satisfies that exact request.
+		msgs, score, err := m.Headers(bystander, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, score, "a bulk batch answering our own getheaders must not score")
+		require.Nil(t, msgs)
+
+		// C11: an absence assertion alone cannot tell "the rule holds" from
+		// "scoring is broken and never fires." A second, unrelated bulk batch
+		// from the same peer with nothing further requested MUST score, in
+		// this same test, or a mutation that always returns zero would still
+		// pass the assertion above.
+		//
+		// PARITY-HARNESS-DEPENDENT: scoreUnsolicitedBulkHeaders is a policy
+		// choice with no SVNode counterpart (headersync.go's doc comment on
+		// the constant). The parity harness may move this number; grep
+		// PARITY-HARNESS-DEPENDENT for every place this dependency is
+		// recorded.
+		_, score, err = m.Headers(bystander, headersMsg(batch))
+		require.NoError(t, err)
+		require.Equal(t, scoreUnsolicitedBulkHeaders, score,
+			"a second bulk batch with no fresh solicitation must score")
+	})
+
+	t.Run("the same bulk batch unsolicited scores, and repeats to the ban threshold", func(t *testing.T) {
+		genesis := syncGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		cpHash := chainhash.Hash{0xC0}
+		m := syncTestManager(t, idx, &recordingIngestor{},
+			chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+		holderPeer, holderFar := newTestPeer(t, time.Minute, time.Minute)
+		bystanderPeer, bystanderFar := newTestPeer(t, time.Minute, time.Minute)
+
+		t.Cleanup(func() {
+			_ = holderFar.nc.Close()
+			_ = bystanderFar.nc.Close()
+		})
+
+		holder := fullNodePeer("41.1.1.1:8333")
+		bystander := fullNodePeer("42.2.2.2:8333")
+
+		registerPeer(m, holderPeer, holder)
+		registerPeer(m, bystanderPeer, bystander)
+
+		require.Len(t, m.Established(holder, wire.SFNodeNetwork), 1)
+
+		batch := minedRun(genesis, MaxBlocksToAnnounce, 7800)
+
+		total := 0
+		calls := 0
+
+		for total < banScoreThreshold {
+			_, score, err := m.Headers(bystander, headersMsg(batch))
+			require.NoError(t, err)
+			require.Equal(t, scoreUnsolicitedBulkHeaders, score,
+				"every unsolicited occurrence must score the same policy delta")
+
+			total += score
+			calls++
+
+			require.Less(t, calls, 1000, "the loop must reach the ban threshold, not spin forever")
+		}
+
+		require.GreaterOrEqual(t, total, banScoreThreshold)
+	})
+
+	// Review Critical 1: markGetHeadersOutstanding recorded a bool, but one
+	// inv can carry several unknown block hashes and BlockDownloader.OnInv
+	// asks a getheaders for EACH of them (blockdownload.go getHeadersFor,
+	// one per distinct hash). A bool remembers only "one solicitation was
+	// made", so an honest peer answering the SECOND request was scored as
+	// unsolicited. No race, no stall, no timing window: one inv is enough.
+	t.Run("two unknown hashes in one inv each earn an honest reply, and neither scores", func(t *testing.T) {
+		genesis := syncGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		cpHash := chainhash.Hash{0xC0}
+		m := syncTestManager(t, idx, &recordingIngestor{},
+			chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+		holderPeer, holderFar := newTestPeer(t, time.Minute, time.Minute)
+		bystanderPeer, bystanderFar := newTestPeer(t, time.Minute, time.Minute)
+
+		t.Cleanup(func() {
+			_ = holderFar.nc.Close()
+			_ = bystanderFar.nc.Close()
+		})
+
+		holder := fullNodePeer("51.1.1.1:8333")
+		bystander := fullNodePeer("52.2.2.2:8333")
+
+		registerPeer(m, holderPeer, holder)
+		registerPeer(m, bystanderPeer, bystander)
+
+		require.Len(t, m.Established(holder, wire.SFNodeNetwork), 1)
+
+		// Two distinct chains, each named by an unknown hash in the SAME inv
+		// message.
+		batchA := minedRun(genesis, MaxBlocksToAnnounce, 7900)
+		batchB := minedRun(genesis, MaxBlocksToAnnounce, 8000)
+
+		invMsgs, err := m.Inv(bystander, invMsg(t, wire.InvTypeBlock,
+			batchA[len(batchA)-1].BlockHash(), batchB[len(batchB)-1].BlockHash()))
+		require.NoError(t, err)
+		require.Len(t, invMsgs, 2, "one getheaders per distinct unknown hash in the inv")
+
+		// Both replies answer a getheaders we actually sent. Neither may score.
+		_, score, err := m.Headers(bystander, headersMsg(batchA))
+		require.NoError(t, err)
+		require.Zero(t, score, "the first honest reply must not score")
+
+		_, score, err = m.Headers(bystander, headersMsg(batchB))
+		require.NoError(t, err)
+		require.Zero(t, score, "the second honest reply must not score either — "+
+			"a single bool cannot remember two outstanding solicitations")
+	})
+}
+
+// TestManagerBansAPeerForRepeatedUnsolicitedBulkHeaders is the review's Minor
+// 5: every "reaches the ban threshold" assertion elsewhere in this file is
+// test-local arithmetic (summing returned deltas against banScoreThreshold),
+// and none of them drives Peer.scoreMisbehavior/checkBanThreshold (peer.go) —
+// the actual consequence the policy exists to have. This test runs the real
+// wire: a live Peer.Run loop, real TCP messages, and the manager's own
+// connection registry, so the disconnect it observes is the policy's real
+// effect, not an arithmetic stand-in for it.
+func TestManagerBansAPeerForRepeatedUnsolicitedBulkHeaders(t *testing.T) {
+	genesis := syncGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	cpHash := chainhash.Hash{0xC0}
+	m := syncTestManager(t, idx, &recordingIngestor{},
+		chaincfg.Checkpoint{Height: 100000, Hash: &cpHash})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+	defer func() { require.NoError(t, m.Stop()) }()
+
+	addr := m.ListenAddrs()[0]
+
+	holder := dialScripted(t, addr)
+	holderVersion := remoteVersion(6001)
+	holderVersion.Services = wire.SFNodeNetwork
+	holder.completeOutboundHandshakeAs(t, holderVersion)
+
+	defer func() { _ = holder.nc.Close() }()
+
+	// The holder takes the single sync slot — drain its initial getheaders so
+	// nothing here depends on the droppable send lane.
+	_, ok := holder.readUntil(t, wire.CmdGetHeaders).(*wire.MsgGetHeaders)
+	require.True(t, ok)
+
+	bystander := dialScripted(t, addr)
+	bystanderVersion := remoteVersion(6002)
+	bystanderVersion.Services = wire.SFNodeNetwork
+	bystander.completeOutboundHandshakeAs(t, bystanderVersion)
+
+	defer func() { _ = bystander.nc.Close() }()
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 2 }, 5*time.Second, 20*time.Millisecond,
+		"both peers must be connected before the bystander is scored")
+
+	batch := minedRun(genesis, MaxBlocksToAnnounce, 9500)
+
+	headers := wire.NewMsgHeaders()
+	for _, h := range batch {
+		require.NoError(t, headers.AddBlockHeader(h))
+	}
+
+	// Ceiling division, not floor: PARITY-HARNESS-DEPENDENT means the harness
+	// may move scoreUnsolicitedBulkHeaders, and floor division only works by
+	// coincidence when it divides banScoreThreshold exactly (100/20). Move it
+	// to 30 and floor division asks for 3 occurrences (90, never reaching
+	// 100) against a correct implementation. Ceiling division asks for
+	// however many occurrences it actually takes to reach the threshold,
+	// whatever the harness sets the score to.
+	occurrences := (banScoreThreshold + scoreUnsolicitedBulkHeaders - 1) / scoreUnsolicitedBulkHeaders
+
+	// One occurrence short of the threshold: the bystander must still be
+	// connected. This is the C11 shape — a window with nothing happening
+	// cannot tell "the rule holds below threshold" from "the ban never
+	// fires at all" — so the positive case right after (one more write
+	// disconnects) is what actually proves the mechanism.
+	for i := 0; i < occurrences-1; i++ {
+		bystander.write(t, headers)
+	}
+
+	require.Never(t, func() bool { return m.ConnectedCount() == 1 }, 300*time.Millisecond, 20*time.Millisecond,
+		"one occurrence short of the ban threshold must not disconnect the bystander")
+
+	bystander.write(t, headers)
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 1 }, 5*time.Second, 50*time.Millisecond,
+		"the bystander must be disconnected once checkBanThreshold sees its accumulated score")
 }
 
 // TestSyncPass_TimesOutASilentRotatedPeerAndRehomesItsBlocks is the cheap

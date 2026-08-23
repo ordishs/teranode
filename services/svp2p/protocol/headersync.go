@@ -65,6 +65,32 @@ const (
 	// received"). One hundred is the ban threshold, so a single such header
 	// ends the peer.
 	scoreBadDiffBits = 100
+
+	// scoreUnsolicitedBulkHeaders is Task 11's policy at the round-ignore
+	// site below (see the comment on the `hs.headersFirstMode &&
+	// !peer.State.fSyncStarted` branch in OnHeaders): a BULK headers batch
+	// (len(headers) >= MaxBlocksToAnnounce) from a peer that neither holds
+	// the sync slot nor answers a getheaders we sent it.
+	//
+	// THIS HAS NO SVNODE COUNTERPART. net_processing.cpp's HEADERS handler
+	// runs no solicitation check at all — accepting unsolicited headers is
+	// what makes block announcement work — so there is no C++ line to port.
+	// The nearest relative is legacy netsync's mode-based disconnect,
+	// services/legacy/netsync/manager.go handleHeadersMsg, which drops ANY
+	// peer that sends headers while !headersFirstMode, unconditionally and
+	// regardless of batch size. This constant is deliberately narrower:
+	// scoped to bulk batches only (an announcement-size batch stays free,
+	// exactly because SVNode's own accept-unsolicited-announcements behavior
+	// must not break), and scored rather than disconnected outright.
+	//
+	// PARITY-HARNESS-DEPENDENT: the number itself is a POLICY CHOICE, not a
+	// ported constant, and the parity harness (a separate plan, not yet
+	// built — see OPEN QUESTION 1 in the Phase 3 plan) is the only thing that
+	// can adjudicate whether it diverges from SVNode observably. The harness
+	// may move this number; it must not move whether an unsolicited bulk
+	// batch scores at all. Every place this dependency is recorded carries
+	// the literal string PARITY-HARNESS-DEPENDENT, so grep for it.
+	scoreUnsolicitedBulkHeaders = 20
 )
 
 // ErrCheckpointMismatch reports a header at a checkpoint height whose hash is
@@ -171,6 +197,62 @@ type SyncPeer struct {
 	// The zero chainhash.Hash means no continuation is pending, matching the
 	// C++ SetNull() sentinel.
 	hashContinue chainhash.Hash
+
+	// getHeadersOutstanding counts how many getheaders PeerManager has
+	// decided to send this peer whose reply has not arrived yet — "decided
+	// to send", not "sent": a getheaders the send budget refuses still
+	// increments this count (see markGetHeadersOutstanding, manager.go),
+	// because the decision is made and recorded before send is attempted, and
+	// a peer.go dispatchSync/p.send failure only logs and drops (peer.go).
+	// That direction is safe for what this field guards: it can only ever
+	// leave the count too HIGH relative to what actually reached the wire,
+	// and a too-high count only ever SUPPRESSES a score — it can never
+	// manufacture one. Task 11's per-peer solicitation tracking: HAS NO
+	// SVNODE COUNTERPART, since net_processing.cpp never needs to ask
+	// whether a headers batch was solicited (see scoreUnsolicitedBulkHeaders
+	// above).
+	//
+	// IT IS A COUNT, NOT A BOOL, because a single event can leave MORE THAN
+	// ONE getheaders outstanding for this peer at once:
+	// BlockDownloader.OnInv (blockdownload.go) sends one getheaders per
+	// DISTINCT unknown block hash in a single inv message, and a peer that
+	// pipelines a second inv before answering the first getheaders adds a
+	// second one on top. A bool can only remember "at least one was sent",
+	// so it reads the SECOND of two honest replies as unsolicited. Each
+	// increment below stands for exactly one getheaders this machine has not
+	// yet been answered for; each decrement below stands for one headers
+	// message that answered one of them, whichever it was — there is no
+	// hashStop correlation, so this cannot tell one outstanding request from
+	// another, only how many are open.
+	//
+	// Written by PeerManager (manager.go Established/electLocked/the sync-pass
+	// sweep/Headers/Inv — every place a sync machine's output reaches the
+	// wire, see peer.go dispatchSync and the two syncPass call sites) once per
+	// *wire.MsgGetHeaders any of those calls returns for this peer. Read and
+	// decremented by OnHeaders below, once per call, before any other check:
+	// that is "the next headers batch" the field answers for — it answers
+	// for ANY one of the outstanding requests, not a specific one, since
+	// nothing here correlates a reply to the getheaders that solicited it.
+	// This is what lets an unsolicited bulk batch be told apart from one that
+	// answers a getheaders we actually sent (a round-owner's continuation, an
+	// inv-driven fetch, an election/sweep grant, or the announcement-gap
+	// getheaders below).
+	//
+	// Not bounded: net_processing.cpp itself sends one getheaders per
+	// unknown-block inv entry with no cap on how many may be outstanding for
+	// one peer at once, and MAX_HEADERS_RESULTS already bounds what one reply
+	// can cost us to process regardless of how many are open.
+	//
+	// Locking: guarded by PeerManager.syncMu, the same lock that already
+	// covers the whole sync-state graph (see peerSyncState's doc comment).
+	// Every write and the one read+decrement happen inside a method that
+	// already holds syncMu for its whole call — manager.go's dispatch and
+	// election/sweep call sites, and HeaderSync.OnHeaders is only ever
+	// reached through the syncMu-held Headers wrapper. This field is
+	// manager-lock-only: peer.go's own `mu` (guarding the handshake and
+	// connection state) never touches it, so the peer-lock-then-manager-lock
+	// order documented in peer.go handleMessage is not in play here.
+	getHeadersOutstanding int
 }
 
 func NewSyncPeer(addr string, services wire.ServiceFlag, state *peerSyncState) *SyncPeer {
@@ -503,6 +585,19 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 		return nil, 0, nil
 	}
 
+	// Task 11: this batch answers "the next headers batch" the
+	// getHeadersOutstanding doc comment promises — one of however many
+	// getheaders are currently open for this peer, not a specific one, since
+	// nothing here correlates a reply to the request that solicited it. It is
+	// read and decremented here, once, before anything else runs — including
+	// the too-many-headers and empty-batch returns below, neither of which is
+	// a batch the round-ignore branch would ever see anyway. solicited feeds
+	// the scoring decision at that branch further down.
+	solicited := peer.getHeadersOutstanding > 0
+	if solicited {
+		peer.getHeadersOutstanding--
+	}
+
 	headers := msg.Headers
 
 	// net_processing.cpp HEADERS: "headers message size = %u" →
@@ -531,17 +626,36 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 	// block availability, so it stays usable for download afterwards. Outside
 	// the round every peer's headers are indexed, as net_processing.cpp does.
 	//
-	// The ignored batch is deliberately unscored: junk headers cost a peer
-	// nothing but our wire decode here, and any disconnect policy for
-	// unrequested headers belongs to the manager, which knows what it asked
-	// each peer for.
+	// An announcement-size ignored batch is unscored: junk headers cost a peer
+	// nothing but our wire decode here, and SVNode's own HEADERS handler has
+	// no solicitation check at all — accepting unsolicited announcements is
+	// what makes block announcement work, so scoring them here would be
+	// stricter than SVNode for the traffic pattern SVNode relies on.
 	//
-	// Task 11 deliberately did NOT add that policy, and this is where it would
-	// go. The peer loop gained the equivalent gate for unrequested BLOCKS,
-	// because those consume the shared admission budget and starve the sync
-	// peer; unrequested headers cost only a decode and are already bounded by
-	// MAX_HEADERS_RESULTS, so a disconnect policy for them is Phase 3 work,
-	// alongside the header-index hardening this file's PoW note describes.
+	// Task 11's policy: a BULK batch (len(headers) >= MaxBlocksToAnnounce) is
+	// different. It cannot be an honest announcement — MAX_BLOCKS_TO_ANNOUNCE
+	// is exactly the boundary net_processing.cpp itself uses to tell an
+	// announcement from a bulk reply — so an unsolicited one is free to send
+	// (a 37 byte inv earns a getheaders, and nothing here correlates a reply
+	// to the request's HashStop, so one inv buys one free bulk decode of up
+	// to MAX_HEADERS_RESULTS headers regardless of this policy). What this
+	// scores is the batch that answers NEITHER an inv NOR any other
+	// getheaders we sent — the peer that skips even that one-inv cost and
+	// pushes bulk headers at us unprompted. scoreUnsolicitedBulkHeaders (see
+	// its doc comment) scores that per occurrence, UNLESS the batch answers
+	// a getheaders PeerManager actually sent this peer (solicited, above) —
+	// which covers a bulk reply to BlockDownloader.OnInv's getHeadersFor, or
+	// a peer that held the sync slot until moments ago and is still draining
+	// its last continuation. The mechanism raises the cost of pure spam above
+	// zero; it does not close the inv-first path, and closing that is beyond
+	// this brief. THIS POLICY HAS NO SVNODE COUNTERPART; see the constant's
+	// doc comment for the nearest relative, legacy netsync's mode-based
+	// disconnect.
+	//
+	// The peer loop's equivalent gate for unrequested BLOCKS predates this:
+	// those consume the shared admission budget and starve the sync peer,
+	// where an unrequested headers batch costs only a decode and was already
+	// bounded by MAX_HEADERS_RESULTS regardless of this policy.
 	//
 	// The cost of parking the announcement here — a peer stays unschedulable
 	// until something resolves the hash — is what Phase 3 Task 4 answered, on
@@ -563,7 +677,12 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 	if hs.headersFirstMode && !peer.State.fSyncStarted {
 		peer.State.updateBlockAvailability(hs.cfg.Index, headers[len(headers)-1].BlockHash())
 
-		return nil, 0, nil
+		score := 0
+		if !solicited && len(headers) >= MaxBlocksToAnnounce {
+			score = scoreUnsolicitedBulkHeaders
+		}
+
+		return nil, score, nil
 	}
 
 	// net_processing.cpp HEADERS: when the first header's parent is unknown and

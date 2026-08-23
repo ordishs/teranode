@@ -801,6 +801,128 @@ func TestHeaderSync_OnHeadersBatching(t *testing.T) {
 	})
 }
 
+// TestHeaderSync_UnsolicitedBulkHeaders pins Task 11's policy at the
+// round-ignore site (headersync.go OnHeaders, "the ignored batch is
+// deliberately unscored" comment): a BULK batch from a peer that does not
+// hold the sync slot scores misbehavior UNLESS it answers a getheaders we
+// sent that peer. An announcement-size batch (< MaxBlocksToAnnounce) never
+// scores, solicited or not — SVNode's HEADERS handler has no solicitation
+// check, and breaking that would break block announcement.
+//
+// PeerManager, not this machine, tracks solicitation (see manager.go
+// Established/Headers/Inv): these tests drive OnHeaders directly and set
+// peer.getHeadersOutstanding by hand to stand in for that tracking, exactly
+// as the manager-level test in manager_test.go does through the real dispatch
+// path.
+func TestHeaderSync_UnsolicitedBulkHeaders(t *testing.T) {
+	// bystanderRound starts a headers-first round with holder and returns a
+	// second peer that never holds the slot, matching the existing
+	// "during a round a peer without the sync slot cannot index headers" setup.
+	bystanderRound := func(t *testing.T) (*HeaderSync, *SyncPeer) {
+		t.Helper()
+
+		f := newSyncFixture(t, 1)
+		wrong := chainhash.Hash{0xDE, 0xAD}
+
+		hs, holder := startedSync(t, f, []chaincfg.Checkpoint{{Height: 100000, Hash: &wrong}})
+		require.True(t, hs.IsHeadersFirstMode())
+
+		bystander := fullNodePeer("5.6.7.8:8333")
+		require.Nil(t, hs.PeerEstablished(bystander))
+		require.False(t, bystander.State.fSyncStarted)
+
+		// This is what makes bystander a bystander: holder, not it, owns the
+		// round's single sync slot.
+		require.True(t, holder.State.fSyncStarted)
+
+		return hs, bystander
+	}
+
+	t.Run("an unsolicited bulk batch scores misbehavior", func(t *testing.T) {
+		hs, bystander := bystanderRound(t)
+
+		batch := minedRun(&wire.BlockHeader{}, MaxBlocksToAnnounce, 5000)
+
+		_, misbehavior, err := hs.OnHeaders(bystander, headersMsg(batch))
+		require.NoError(t, err)
+
+		// PARITY-HARNESS-DEPENDENT: scoreUnsolicitedBulkHeaders is a Teranode
+		// hardening policy choice with no SVNode counterpart (see the
+		// OnHeaders comment at the round-ignore site). The parity harness
+		// (Phase 3 Task 26, OPEN QUESTION 1) may move this number; it must not
+		// move whether an unsolicited bulk batch scores at all. Grep
+		// PARITY-HARNESS-DEPENDENT to find every place this dependency is
+		// recorded.
+		require.Equal(t, scoreUnsolicitedBulkHeaders, misbehavior)
+	})
+
+	t.Run("a solicited bulk batch scores nothing, and consumes the solicitation", func(t *testing.T) {
+		hs, bystander := bystanderRound(t)
+
+		// Stands in for PeerManager having just sent this peer one getheaders
+		// (Established, Headers, Inv, or an election/sweep grant — see
+		// manager.go).
+		bystander.getHeadersOutstanding = 1
+
+		batch := minedRun(&wire.BlockHeader{}, MaxBlocksToAnnounce, 5100)
+
+		_, misbehavior, err := hs.OnHeaders(bystander, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+
+		// The solicitation is consumed by the batch it was waiting for: a
+		// second, unrelated bulk batch from the same peer with nothing
+		// further requested must score.
+		require.Zero(t, bystander.getHeadersOutstanding)
+
+		_, misbehavior, err = hs.OnHeaders(bystander, headersMsg(batch))
+		require.NoError(t, err)
+		require.Equal(t, scoreUnsolicitedBulkHeaders, misbehavior)
+	})
+
+	t.Run("an unsolicited announcement-size batch stays free", func(t *testing.T) {
+		hs, bystander := bystanderRound(t)
+
+		// One short of the bulk boundary (headersync_test.go's "one too many
+		// for the announcement path" comment pins MaxBlocksToAnnounce itself
+		// as bulk, so the free side stops at MaxBlocksToAnnounce-1).
+		batch := minedRun(&wire.BlockHeader{}, MaxBlocksToAnnounce-1, 5200)
+
+		_, misbehavior, err := hs.OnHeaders(bystander, headersMsg(batch))
+		require.NoError(t, err)
+		require.Zero(t, misbehavior)
+	})
+
+	t.Run("repeated unsolicited bulk batches reach the ban threshold", func(t *testing.T) {
+		hs, bystander := bystanderRound(t)
+
+		batch := minedRun(&wire.BlockHeader{}, MaxBlocksToAnnounce, 5300)
+
+		total := 0
+		calls := 0
+
+		for total < banScoreThreshold {
+			_, misbehavior, err := hs.OnHeaders(bystander, headersMsg(batch))
+			require.NoError(t, err)
+
+			// C11: assert the delta itself, not merely that the cumulative
+			// total moved — a mutation that stopped scoring after the first
+			// call must fail this loop rather than pass it by coincidence.
+			require.Equal(t, scoreUnsolicitedBulkHeaders, misbehavior,
+				"every occurrence must score the same policy delta")
+
+			total += misbehavior
+			calls++
+
+			require.Less(t, calls, 1000, "the loop must reach the ban threshold, not spin forever")
+		}
+
+		require.GreaterOrEqual(t, total, banScoreThreshold)
+		require.Less(t, total-scoreUnsolicitedBulkHeaders, banScoreThreshold,
+			"the call before this one must not already have reached the threshold")
+	})
+}
+
 // TestHeaderSync_SyncSlotRelease pins FinalizeNode plus resetHeaderState: the
 // sync slot and the header state must both come back when the sync peer goes
 // away or stops answering.

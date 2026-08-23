@@ -696,7 +696,40 @@ func (m *PeerManager) Established(syncPeer *SyncPeer, services wire.ServiceFlag)
 	// are only known once its version message has arrived.
 	syncPeer.Services = services
 
-	return m.headerSync.PeerEstablished(syncPeer)
+	msgs := m.headerSync.PeerEstablished(syncPeer)
+	markGetHeadersOutstanding(syncPeer, msgs)
+
+	return msgs
+}
+
+// markGetHeadersOutstanding records, on syncPeer, that a getheaders just left
+// for it — Task 11's per-peer solicitation tracking (see the doc comment on
+// SyncPeer.getHeadersOutstanding). Established, electLocked, the sync-pass
+// sweep, Headers and Inv are the only five places a sync machine's output
+// reaches the wire (peer.go dispatchSync's contract that the machines
+// themselves perform no I/O, plus the two election/sweep sites that hand a
+// grant's getheaders straight to their own outgoing/out slice), which is what
+// makes checking their return value here sufficient to cover every
+// getheaders-emitting site inside HeaderSync and BlockDownloader without
+// either machine having to know about solicitation tracking itself.
+//
+// It counts every *wire.MsgGetHeaders in msgs rather than stopping at the
+// first: BlockDownloader.OnInv (blockdownload.go) can return more than one in
+// a single call, one per distinct unknown block hash in the inv, and that
+// count is exactly how many replies must be read as solicited.
+//
+// Requires syncMu, like every other write to sync state; every caller already
+// holds it for their whole call.
+func markGetHeadersOutstanding(syncPeer *SyncPeer, msgs []wire.Message) {
+	if syncPeer == nil {
+		return
+	}
+
+	for _, out := range msgs {
+		if _, ok := out.(*wire.MsgGetHeaders); ok {
+			syncPeer.getHeadersOutstanding++
+		}
+	}
 }
 
 // Headers dispatches the NetMsgType::HEADERS event.
@@ -713,6 +746,7 @@ func (m *PeerManager) Headers(syncPeer *SyncPeer, msg *wire.MsgHeaders) ([]wire.
 	}
 
 	msgs, score, err := m.headerSync.OnHeaders(syncPeer, msg)
+	markGetHeadersOutstanding(syncPeer, msgs)
 
 	// This batch may have grown the index, which is what can resolve another
 	// peer's parked announcement. It runs on the error path too: OnHeaders
@@ -733,7 +767,10 @@ func (m *PeerManager) Inv(syncPeer *SyncPeer, msg *wire.MsgInv) ([]wire.Message,
 		return nil, nil
 	}
 
-	return m.blockDownloader.OnInv(syncPeer, msg)
+	msgs, err := m.blockDownloader.OnInv(syncPeer, msg)
+	markGetHeadersOutstanding(syncPeer, msgs)
+
+	return msgs, err
 }
 
 // GetHeaders dispatches the NetMsgType::GETHEADERS event. The refusal is
@@ -971,6 +1008,8 @@ func (m *PeerManager) electLocked(handles []peerHandle, exclude *SyncPeer) []out
 			}
 
 			if msgs := m.headerSync.PeerEstablished(h.sync); len(msgs) > 0 {
+				markGetHeadersOutstanding(h.sync, msgs)
+
 				return []outgoing{{peer: h.peer, msgs: msgs}}
 			}
 		}
@@ -1107,6 +1146,7 @@ func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, n
 		// getheaders it produces joins out and is sent by syncTickOnce after the
 		// unlock, the collect-then-act shape this file keeps throughout.
 		msgs := m.headerSync.PeerEstablished(h.sync)
+		markGetHeadersOutstanding(h.sync, msgs)
 
 		switch m.blockDownloader.CheckStall(h.sync, ingests[i], now) {
 		case StallActionDisconnect:
