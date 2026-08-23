@@ -1133,6 +1133,161 @@ func (m *PeerManager) RelayBlock(hash chainhash.Hash, header *wire.BlockHeader) 
 	}
 }
 
+// RelayTxs is the tx announcement relay's entry point: Task 13's batcher
+// (services/svp2p/txrelay.go) flushes here once per batch window, and every
+// entry gets the per-peer relayDisabled/feefilter/dedup gate
+// (relay.go selectTxRelayTargets) before anything is sent.
+//
+// Unlike RelayBlock, which relays ONE hash per call, this relays a BATCH —
+// net_processing.cpp SendTxnInventory's own shape (:5464, "batched tx invs
+// per peer"): every tx in txs that a given peer should receive is
+// accumulated into that peer's own single wire.MsgInv, so a peer with many
+// newly-relayed txs in one flush window gets one INV message carrying all
+// of them (bounded at wire.MaxInvPerMsg — see the AddInvVect error handling
+// below), not one INV per tx.
+//
+// Same shape as RelayBlock (spec §4.3, and Task 12's own review finding on
+// RelayBlock: collect under syncMu, send after unlocking) for the same
+// reason: Conn.Send can block on a backed-up writer, and no lock in this
+// package may be held across a blocking call.
+func (m *PeerManager) RelayTxs(txs []TxHashAndFee) {
+	if len(txs) == 0 {
+		return
+	}
+
+	// Snapshotted OUTSIDE every lock this package holds, exactly like
+	// RelayBlock's own targets pass: Peer.RelayTxDisabled and Peer.FeeFilter
+	// both take the peer lock, and the package's lock order forbids taking a
+	// peer lock while a manager lock is held (see the note on syncMu).
+	handles := m.peerHandles()
+
+	type target struct {
+		peer          *Peer
+		sync          *SyncPeer
+		relayDisabled bool
+		feeFilter     int64
+	}
+
+	targets := make([]target, 0, len(handles))
+	// byPeer mirrors targets, keyed for O(1) lookup: selectTxRelayTargets
+	// returns the chosen *Peer values directly, and this is what turns
+	// "which target did this decision come from" into a map lookup instead
+	// of an O(len(targets)) scan repeated for every decision of every tx in
+	// the batch — a batch can hold up to wire.MaxInvPerMsg (50,000) txs, so
+	// an O(targets) scan per decision would make this whole loop
+	// O(txs*targets^2) rather than O(txs*targets).
+	byPeer := make(map[*Peer]target, len(handles))
+
+	for _, h := range handles {
+		if !h.established || h.sync == nil || h.sync.State == nil {
+			continue
+		}
+
+		tgt := target{
+			peer:          h.peer,
+			sync:          h.sync,
+			relayDisabled: h.peer.RelayTxDisabled(),
+			feeFilter:     h.peer.FeeFilter(),
+		}
+
+		targets = append(targets, tgt)
+		byPeer[h.peer] = tgt
+	}
+
+	invs := make(map[*Peer]*wire.MsgInv, len(targets))
+
+	// candidates is hoisted out of the tx loop and reused for every tx in
+	// the batch, rather than a fresh slice per tx (review round 1, Important
+	// 1): only the `known` field actually varies per tx, so every other
+	// field is set once here and left alone. A flush can carry up to
+	// wire.MaxInvPerMsg (50,000) txs; a fresh len(targets)-sized allocation
+	// per tx was needless churn on a path that runs once per second.
+	candidates := make([]txRelayCandidate, len(targets))
+	for i, tgt := range targets {
+		candidates[i] = txRelayCandidate{
+			peer:          tgt.peer,
+			relayDisabled: tgt.relayDisabled,
+			feeFilter:     tgt.feeFilter,
+		}
+	}
+
+	for _, tx := range txs {
+		// syncMu is taken and released PER TX, not once for the whole batch
+		// (review round 1, Important 1): the lock also serialises header
+		// sync, block download scheduling, and RelayBlock, and a 50,000-tx
+		// flush holding it continuously would park all of that for the
+		// length of one flush. Releasing between txs lets any of those
+		// interleave. Nothing here blocks (map/slice operations and one
+		// AddInvVect call, all pure CPU), so per-tx lock/unlock overhead is
+		// the only added cost, and it is negligible next to what it buys.
+		m.syncMu.Lock()
+
+		for i := range candidates {
+			candidates[i].known = targets[i].sync.State.knownTxs.has(tx.TxHash)
+		}
+
+		decisions := selectTxRelayTargets(candidates, tx)
+
+		for _, p := range decisions {
+			tgt, ok := byPeer[p]
+			if !ok {
+				// Cannot happen: decisions is built from candidates, which
+				// is built from targets, so every decision peer has a
+				// byPeer entry. Guarded rather than indexed unconditionally
+				// in case that invariant ever breaks.
+				continue
+			}
+
+			msg, ok := invs[tgt.peer]
+			if !ok {
+				msg = wire.NewMsgInv()
+				invs[tgt.peer] = msg
+			}
+
+			if err := msg.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &tx.TxHash)); err != nil {
+				// Only reachable once a single peer's accumulated batch
+				// already hit wire.MaxInvPerMsg (50,000) in one flush
+				// window — the batcher's own size cap (maxRequestedTxns,
+				// txrelay.go) already bounds txs itself to that same
+				// number, so this cannot happen today; kept rather than
+				// silently dropped in case that relationship changes. Not
+				// marked known below: net_processing.cpp's own equivalent
+				// flushes and continues rather than dropping
+				// (SendTxnInventory, :5476-5480), so a tx that fails to
+				// queue here must stay eligible for a later relay attempt,
+				// not be permanently suppressed for this peer (review
+				// round 1, Minor 4).
+				m.logger.Warnf("[svp2p] relay: dropping tx %s for a peer already at the max inv batch size: %v", tx.TxHash, err)
+				continue
+			}
+
+			// Marked only after AddInvVect actually succeeded, and still
+			// under the same syncMu acquisition that read `known` for this
+			// tx — the same reasoning as RelayBlock's own knownBlocks.mark
+			// call: a peer that gets this tx here must never get it again
+			// from a later RelayTxs call for the same hash (a Kafka replay,
+			// or the same hash surviving past the batcher's own 1-minute
+			// dedup window — see peerSyncState.knownTxs's doc comment).
+			tgt.sync.State.knownTxs.mark(tx.TxHash)
+		}
+
+		m.syncMu.Unlock()
+	}
+
+	// Sent with no lock held, matching RelayBlock's own send pass.
+	out := make([]outgoing, 0, len(invs))
+
+	for peer, msg := range invs {
+		if len(msg.InvList) == 0 {
+			continue
+		}
+
+		out = append(out, outgoing{peer: peer, msgs: []wire.Message{msg}})
+	}
+
+	sendAll(out)
+}
+
 // electSyncPeer offers the free sync slot to the first eligible candidate,
 // skipping exclude (the peer that just lost it). HeaderSync.PeerEstablished
 // is the election: it returns the initial getheaders only for a peer that may

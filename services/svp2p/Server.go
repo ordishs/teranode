@@ -101,6 +101,18 @@ type Server struct {
 	// Kafka client's Close is unaffected by that fake's limitation.
 	blocksFinalConsumer kafka.KafkaConsumerGroupI
 
+	// txAnnouncer is the tx announcement relay's batching leg (txrelay.go):
+	// bridge.StartTxMetaConsumer's decoded, non-coinbase, not-in-block ADD
+	// entries land here via txAnnouncer.put, and its own flush calls
+	// s.manager.RelayTxs. Unlike blocksFinalConsumer, this is constructed
+	// unconditionally in Start regardless of whether
+	// settings.Kafka.TxMetaConfig is set: it is cheap (no I/O of its own
+	// until something Puts into it), and constructing it unconditionally
+	// means Stop always has exactly one thing to close rather than a
+	// conditional mirroring bridge.StartTxMetaConsumer's own nil check. nil
+	// only before Start runs (Init/New alone).
+	txAnnouncer *txAnnouncer
+
 	headerIndexMu sync.RWMutex
 	headerIndex   *protocol.HeaderIndex
 
@@ -244,6 +256,17 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	s.blocksFinalConsumer = consumer
 
+	// The tx announcement relay's Kafka leg. Started the same way as
+	// blocks-final and after the same manager readiness point, for the same
+	// "nobody to tell yet" reasoning — except this one is CONTROLLED (E1):
+	// bridge.StartTxMetaConsumer only actually consumes while the FSM is
+	// RUNNING, polling that state itself. s.txAnnouncer is built first so
+	// the consumer's callback (its Put) always has somewhere to land, even
+	// in the narrow window before StartTxMetaConsumer's own goroutines have
+	// spun up.
+	s.txAnnouncer = newTxAnnouncer(s.logger, s.manager.RelayTxs)
+	bridge.StartTxMetaConsumer(ctx, s.logger, s.settings, s.blockchainClient, s.txAnnouncer.put)
+
 	apiKey := s.settings.GRPCAdminAPIKey
 	if apiKey == "" {
 		key := make([]byte, 32)
@@ -295,6 +318,22 @@ func (s *Server) Stop(_ context.Context) error {
 		}
 
 		s.blocksFinalConsumer = nil
+	}
+
+	// The tx announcer is closed here too, ahead of the manager, for the
+	// same reason as blocksFinalConsumer above: RelayTxs (its flush target)
+	// must not be called against a peer registry that is already being torn
+	// down. Unlike blocksFinalConsumer this has no separate consumer handle
+	// to Close — bridge.StartTxMetaConsumer's controlled listener is
+	// entirely ctx-owned (E1's own doc comment) and already stops consuming
+	// once the Start ctx is cancelled, which happens before Stop runs. What
+	// txAnnouncer.close does is mark future/in-flight Puts into the batcher
+	// no-ops and drain whatever is already queued, under a bounded timeout
+	// (util.DrainBatcher) — the same close-before-teardown shape legacy's
+	// own closeTxAnnounceBatcher uses in Stop (netsync/manager.go:3078).
+	if s.txAnnouncer != nil {
+		s.txAnnouncer.close(s.logger)
+		s.txAnnouncer = nil
 	}
 
 	// Peers are joined next: PeerManager.Stop waits for every peer goroutine,

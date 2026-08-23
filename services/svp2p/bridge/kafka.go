@@ -2,11 +2,18 @@ package bridge
 
 import (
 	"context"
+	"encoding/binary"
+	"net/url"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/txmetacache"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
@@ -131,4 +138,348 @@ func handleBlocksFinalMessage(logger ulogger.Logger, msg *kafka.KafkaMessage, on
 	onFinal(*hash, header.ToWireBlockHeader())
 
 	return nil
+}
+
+// decodeTxMetaBatch's own truncation errors, one per failure site in legacy's
+// processTXmetaBatchMessage: too short to even hold the leading entry count,
+// too short for the next entry's fixed-size header, or too short for the
+// content length that entry's header declared.
+var (
+	errShortTxMetaBatch       = errors.NewProcessingError("svp2p: txmeta batch message shorter than the entry count header")
+	errTruncatedTxMetaEntry   = errors.NewProcessingError("svp2p: txmeta batch message truncated mid-entry")
+	errTruncatedTxMetaContent = errors.NewProcessingError("svp2p: txmeta batch message truncated mid-content")
+)
+
+// TxMetaHandler is called once per non-coinbase, not-yet-relayed transaction
+// decoded off the txmeta topic's ADD entries — hash, fee (satoshis), and
+// serialized size (bytes), exactly the three fields legacy's own
+// TxHashAndFee carries (netsync/manager.go:361-365) — for the caller to
+// batch and relay to peers. Declared with primitive parameters rather than
+// a protocol type for the same reason as BlockFinalHandler: spec §4.4
+// forbids this package from importing protocol.
+type TxMetaHandler func(hash chainhash.Hash, fee uint64, size uint64)
+
+// txRunningPollInterval mirrors legacy netsync's own control-goroutine tick
+// (netsync/manager.go:3301, startKafkaListeners: `case <-time.After(1 *
+// time.Second)`): how often the tx listener's RUNNING gate is re-evaluated
+// against the FSM.
+const txRunningPollInterval = 1 * time.Second
+
+// StartTxMetaConsumer wires the txmeta Kafka topic
+// (settings.Kafka.TxMetaConfig) to onTx, decoding each message the way
+// legacy netsync's kafkaTXmetaListener / processTXmetaBatchMessage does
+// (netsync/manager.go:3479-3629): a binary batch of ADD/DELETE entries in
+// either the v1 or the v2 (partition-aware) wire format, skipping coinbase
+// and already-in-a-block entries before ever calling onTx.
+//
+// Unlike StartBlocksFinalConsumer this IS a controlled listener
+// (kafka.StartKafkaControlledListener), because — unlike blocks-related
+// listeners, whose control channel legacy feeds `true` unconditionally,
+// dead machinery today (see StartBlocksFinalConsumer's doc comment) — the
+// tx control channel is genuinely load-bearing: legacy's own poller
+// (netsync/manager.go:3316-3321) gates it on
+// `IsFSMCurrentState(FSMStateRUNNING)`, the "relay txs only in RUNNING"
+// rule (spec §7). That poll is carried here as its own goroutine, tied to
+// ctx, polling every txRunningPollInterval and sending into a buffered(1)
+// control channel with a NON-BLOCKING send — matching legacy's own
+// AGGREGATOR channel shape (manager.go:3295, buffered(1), "Non-blocking
+// send to avoid deadlock if no one is reading"), NOT its per-listener
+// channel: legacy's own per-listener control channel is unbuffered with a
+// BLOCKING forward (manager.go:3364 `make(chan bool)`, :3413-3421), so
+// legacy never drops a listener-directed control value — review round 1,
+// Minor 1. Because this port collapses the two-stage fan-out into one hop
+// (see the DEVIATION note below), the non-blocking send now sits directly
+// on the listener-facing channel, so a control update CAN be dropped here
+// where legacy's never is. The effect is bounded and self-correcting: at
+// most one txRunningPollInterval tick of staleness, since the poller
+// re-sends every tick regardless of whether the previous one was read.
+//
+// DEVIATION from legacy's own wiring, disclosed rather than silent (E1):
+// legacy's poller writes into a package-level aggregator channel
+// (txControlChan) that a SEPARATE forwarder goroutine then fans out, by a
+// blocking send, to every tx-related listener's own control channel
+// (manager.go:3299-3300, :3413-3421) — because legacy can have more than
+// one tx listener sharing that gate. This port has exactly one
+// (txmeta), so the intermediate fan-out stage is pure indirection with
+// nothing to fan out to; the poller here sends directly into the one
+// control channel kafka.StartKafkaControlledListener reads. The poll
+// cadence, the FSM check, the buffered(1)-with-non-blocking-send shape, and
+// the gate's effect on the listener are otherwise unchanged.
+//
+// replay=0 (E2): the URL's query is rewritten before the listener starts,
+// mirroring legacy exactly (netsync/manager.go:3374-3380, "disable replay
+// for txmeta in the legacy service, we do not have to replay anything,
+// ever"). Deliberately NOT done for blocks-final (see Task 12's review):
+// the two consumers differ on purpose. blockchainClient's default
+// (util.GetQueryParamInt(url, "replay", 1)) is "replay everything" if this
+// rewrite is ever skipped, so leaving it off here would be a silent
+// behaviour change, not a neutral one.
+//
+// A nil TxMetaConfig means the topic is not configured, matching legacy's
+// own `if txmetaKafkaURL != nil` gate (netsync/manager.go:3363): the tx
+// announcement relay is simply off, and nothing is relayed by this path.
+//
+// The consumer's lifecycle is entirely ctx-owned, like legacy's own
+// kafka.StartKafkaControlledListener call (manager.go:3382): both the
+// poller and the controlled listener return on ctx.Done(), with no
+// separate Close() to call from Stop — StartKafkaControlledListener itself
+// has no return value to close (it manages its own internal
+// consumer/cancel pair). Server.Stop relies on the Start ctx already having
+// been cancelled by the daemon before Stop runs, exactly as it already
+// documents for the header index subscription goroutine.
+func StartTxMetaConsumer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, onTx TxMetaHandler) {
+	configURL := tSettings.Kafka.TxMetaConfig
+	if configURL == nil {
+		logger.Infof("[svp2p] tx announcement relay disabled: kafka_txmetaConfig is not set")
+		return
+	}
+
+	values := configURL.Query()
+	values.Set("replay", "0")
+	configURL.RawQuery = values.Encode()
+
+	groupID := "txmeta.legacy." + tSettings.ClientName
+
+	// Buffered(1), matching legacy's own aggregator channel shape
+	// (manager.go:3295, "buffered to prevent blocking"); see the DEVIATION
+	// note above for why the poller writes directly into this one instead
+	// of through legacy's fan-out stage.
+	controlCh := make(chan bool, 1)
+
+	go pollTxRunningGate(ctx, blockchainClient, controlCh)
+
+	go kafka.StartKafkaControlledListener(ctx, logger, groupID, controlCh, configURL,
+		func(lctx context.Context, kafkaURL *url.URL, lGroupID string) {
+			kafka.StartKafkaListener(lctx, logger, kafkaURL, lGroupID, true, func(msg *kafka.KafkaMessage) error {
+				return handleTxMetaMessage(logger, msg, onTx)
+			}, &tSettings.Kafka)
+		})
+}
+
+// pollTxRunningGate is legacy's control-channel poller
+// (netsync/manager.go:3294-3329), reduced to the tx half: every
+// txRunningPollInterval, ask the FSM whether it is RUNNING, and push the
+// answer into controlCh without blocking if nobody is currently reading it.
+// Returns when ctx is done, the same shutdown signal the controlled
+// listener itself watches.
+//
+// Uses ctx (this function's own parameter, StartTxMetaConsumer's caller's
+// ctx), not legacy's sm.ctx — E1 flagged this as a decision to make
+// deliberately rather than copy: legacy's poller reads sm.blockchainClient's
+// FSM state on sm.ctx while startKafkaListeners itself was handed a
+// DIFFERENT ctx parameter, an inconsistency this port has no reason to
+// carry forward, since pollTxRunningGate has only the one ctx its caller
+// gave it and no separate longer-lived one to reach for (review round 1,
+// Minor 2).
+func pollTxRunningGate(ctx context.Context, blockchainClient blockchain.ClientI, controlCh chan bool) {
+	ticker := time.NewTicker(txRunningPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			running, err := blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
+			if err != nil {
+				// canRelayTx's own fail-closed rule (services/legacy/peer_server.go
+				// canRelayTx, "Fails closed: any error reading the state
+				// suppresses relay"): an error reading FSM state is treated as
+				// "not running", never as "keep the previous answer".
+				running = false
+			}
+
+			select {
+			case controlCh <- running:
+			default:
+			}
+		}
+	}
+}
+
+// handleTxMetaMessage decodes one txmeta batch message and calls onTx for
+// every entry that should be relayed. Every parse failure at the top level
+// (truncated buffer) logs and returns nil rather than an error, the same
+// never-going-to-become-parseable discipline as handleBlocksFinalMessage
+// and legacy's own processTXmetaBatchMessage (netsync/manager.go:3519-3520,
+// "truncated message", ":3562, "truncated content").
+func handleTxMetaMessage(logger ulogger.Logger, msg *kafka.KafkaMessage, onTx TxMetaHandler) error {
+	entries, err := decodeTxMetaBatch(msg.Value)
+	if err != nil {
+		logger.Errorf("[svp2p] failed to decode txmeta batch message, skipping: %v", err)
+		return nil
+	}
+
+	for _, e := range entries {
+		if e.action != txmetacache.WireActionADD {
+			continue
+		}
+
+		var txMeta meta.Data
+		if err := meta.NewMetaDataFromBytes(e.content, &txMeta); err != nil {
+			logger.Errorf("[svp2p][%s] failed to decode tx meta data from txmeta message, skipping entry: %v", e.hash, err)
+			continue
+		}
+
+		// Coinbase transactions are never announced: relaying one to a peer
+		// as a fresh mempool tx earns an instant ban (net_processing.cpp's
+		// own coinbase-is-not-a-standalone-tx rule), mirrored from legacy's
+		// own skip (netsync/manager.go:3592-3594, "Never announce coinbase").
+		if txMeta.IsCoinbase {
+			continue
+		}
+
+		// Never announce transactions that arrived as part of a block: the
+		// txmeta topic also carries those (block validation, subtree
+		// validation, legacy sync pre-warm) to populate the subtree-
+		// validation cache, and relaying them as fresh mempool txs floods
+		// peers with getdata for transactions that are long mined — and
+		// often already pruned. Mirrors legacy's own InBlock skip
+		// (netsync/manager.go:3596-3601) and PR 1073's "never announce
+		// block-originated txs".
+		if txMeta.InBlock {
+			continue
+		}
+
+		onTx(e.hash, txMeta.Fee, txMeta.SizeInBytes)
+	}
+
+	return nil
+}
+
+// txMetaEntry is one decoded entry off the txmeta wire batch, before its
+// content (if any) has been deserialized into a meta.Data. Kept as its own
+// type so decodeTxMetaBatch — the pure, directly-unit-testable half of this
+// file's decode logic — has no knowledge of meta.Data or the ADD/DELETE
+// dispatch; handleTxMetaMessage does that.
+type txMetaEntry struct {
+	hash    chainhash.Hash
+	action  byte
+	content []byte
+}
+
+// decodeTxMetaBatch parses a txmeta binary batch message in either the v1
+// or v2 wire format, mirroring legacy's processTXmetaBatchMessage
+// (netsync/manager.go:3479-3629) byte for byte. Two wire formats are
+// accepted, distinguished by a multi-byte signature at the start of the
+// message (mirrors services/subtreevalidation/txmetaHandler.go, cited by
+// legacy's own doc comment at the same site):
+//
+//	v1 (legacy)
+//	  [4 bytes] entry count (uint32 LE)
+//	  per entry: [32 hash][1 action][4 contentLen][N content]
+//
+//	v2 (partition-aware)
+//	  [1 byte magic=0xFF][1 byte version=0x02][2 reserved=0][4 entry count LE]
+//	  per entry: [8 xxhash][32 hash][1 action][4 contentLen][N content]
+//
+// v2 detection requires the full 4-byte header signature AND a plausible
+// entry count for the buffer length, otherwise the message is parsed as
+// v1 — this avoids misclassifying a v1 message whose entry count happens to
+// begin with byte 0xFF (counts 255, 511, 767, ...). The xxhash prefix in v2
+// is read and discarded, exactly as legacy does — this port only needs the
+// 32-byte tx hash to announce.
+//
+// A truncated buffer (not enough bytes left for the next entry's header, or
+// for its declared content) returns an error rather than a partial result,
+// and the caller logs and drops the WHOLE message — matching legacy's own
+// "not going to retry" discipline (netsync/manager.go:3562, ":3585, both
+// `return nil` rather than an error the consumer would retry), but NOT its
+// partial-announce behaviour: legacy announces entries as it walks them
+// (`sm.announceTx` inside the loop), so a truncation at entry n still keeps
+// whatever it already announced for entries before n
+// (netsync/manager.go:3565, :3588). This port collects every entry before
+// returning any of them, so a truncated message here yields NONE of its
+// entries, even well-formed leading ones — strictly the safer direction
+// (fewer announcements, never more), but a real divergence from legacy's
+// own behaviour at this site, not a match to it (review round 1, Minor 3).
+//
+// A second, smaller divergence at the same site: legacy does not
+// bounds-check a DELETE entry's contentLen before advancing past it
+// (netsync/manager.go:3618, a bare `offset += int(contentLen)`), so a final
+// DELETE entry with an over-long contentLen succeeds in legacy and errors
+// here. Also safer, also unmentioned there until now.
+func decodeTxMetaBatch(data []byte) ([]txMetaEntry, error) {
+	if len(data) < 4 {
+		return nil, errShortTxMetaBatch
+	}
+
+	var (
+		offset     int
+		entryCount uint32
+		isV2       bool
+	)
+
+	if len(data) >= txmetacache.WireV2HeaderLen &&
+		data[0] == txmetacache.WireV2Magic &&
+		data[1] == txmetacache.WireV2Version &&
+		data[2] == 0 && data[3] == 0 {
+		candidateCount := binary.LittleEndian.Uint32(data[4:])
+		remaining := uint64(len(data) - txmetacache.WireV2HeaderLen)
+
+		if uint64(candidateCount)*uint64(txmetacache.WireV2MinEntrySize) <= remaining {
+			entryCount = candidateCount
+			offset = txmetacache.WireV2HeaderLen
+			isV2 = true
+		}
+	}
+
+	if !isV2 {
+		entryCount = binary.LittleEndian.Uint32(data[:4])
+		offset = 4
+	}
+
+	entryHeaderSize := txmetacache.WireV1MinEntrySize
+	if isV2 {
+		entryHeaderSize = txmetacache.WireV2MinEntrySize
+	}
+
+	// Capacity hint bounded by what the buffer could actually hold, not by
+	// entryCount directly: legacy's own loop (netsync/manager.go:3562-3568)
+	// never allocates a slice sized by entryCount up front, so a short
+	// message with an enormous claimed count just fails the truncation
+	// check on the FIRST iteration below. Sizing this slice's capacity by
+	// entryCount alone, unbounded, would let a single small message with
+	// entryCount near uint32's max try to reserve gigabytes before that
+	// check ever runs — an allocation DoS the v2 path's own
+	// candidateCount*WireV2MinEntrySize<=remaining check already guards
+	// against, but nothing bounded the v1 path here until this line.
+	capacityHint := entryCount
+	if maxPossible := uint32(len(data) / entryHeaderSize); maxPossible < capacityHint { //nolint:gosec // len(data) is bounded by the Kafka message size
+		capacityHint = maxPossible
+	}
+
+	entries := make([]txMetaEntry, 0, capacityHint)
+
+	for i := uint32(0); i < entryCount; i++ {
+		if offset+entryHeaderSize > len(data) {
+			return nil, errTruncatedTxMetaEntry
+		}
+
+		if isV2 {
+			// The xxhash prefix; netsync doesn't use it either.
+			offset += 8
+		}
+
+		var hash chainhash.Hash
+		copy(hash[:], data[offset:offset+32])
+		offset += 32
+
+		action := data[offset]
+		offset++
+
+		contentLen := binary.LittleEndian.Uint32(data[offset:])
+		offset += 4
+
+		if offset+int(contentLen) > len(data) {
+			return nil, errTruncatedTxMetaContent
+		}
+
+		content := data[offset : offset+int(contentLen)]
+		offset += int(contentLen)
+
+		entries = append(entries, txMetaEntry{hash: hash, action: action, content: content})
+	}
+
+	return entries, nil
 }

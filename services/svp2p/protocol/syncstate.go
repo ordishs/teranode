@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 )
 
 // peerSyncState is the net_processing.cpp CNodeState port: per-peer sync
@@ -172,13 +173,40 @@ type peerSyncState struct {
 	// one call, which is a real limitation of a count-based bound, not a
 	// time-based one.
 	knownBlocks *knownBlockSet
+
+	// knownTxs is this peer's known-tx set — the SAME bookkeeping role
+	// knownBlocks plays for blocks, but for transactions relayed by the tx
+	// announcement relay (relay.go selectTxRelayTargets, manager.go
+	// RelayTxs), and deliberately its OWN set rather than knownBlocks
+	// itself: knownBlocks is documented as blocks-only by design (Task 12),
+	// sized at knownBlockCap (288) against a once-every-ten-minutes rate
+	// that a tx-scale cap would blow through in seconds. See knownTxCap's
+	// own doc comment for the E3 sizing argument.
+	//
+	// Unlike knownBlocks — which is also fed by inbound peer signals (Inv,
+	// BlockDone: whichever peer told us about a hash first gets it marked
+	// before any relay for that hash runs) — this set has only ONE writer
+	// today: RelayTxs marks a hash for every peer it actually sends an inv
+	// to. There is no peer-originated tx-inv path yet in this port (Task
+	// 16's LegacyInvConfig round trip, out of this task's scope per the
+	// plan's scope fence) to feed the "peer already told us they have it"
+	// half the way updateBlockAvailability does for blocks. So this set
+	// answers only "did WE already relay this tx to this peer", not "does
+	// this peer already have it" — still exactly what stops the txmeta
+	// path (which has no peer-of-origin to exclude in the first place, only
+	// a Kafka source) from re-announcing the same hash to the same peer
+	// across two separate batcher flushes more than a dedup-window apart.
+	knownTxs *knownBlockSet
 }
 
 // newPeerSyncState returns a zero-value peerSyncState: no best known block,
 // no pending unknown announcement, sync not started, nothing in flight or
 // stalling. This mirrors a freshly default-constructed CNodeState entry.
 func newPeerSyncState() *peerSyncState {
-	return &peerSyncState{knownBlocks: newKnownBlockSet()}
+	return &peerSyncState{
+		knownBlocks: newKnownBlockSet(knownBlockCap),
+		knownTxs:    newKnownBlockSet(knownTxCap),
+	}
 }
 
 // knownBlockCap bounds knownBlockSet. Legacy's own cap (peer.go
@@ -214,24 +242,54 @@ func newPeerSyncState() *peerSyncState {
 // as a bare-hash estimate would suggest.
 const knownBlockCap = 288
 
-// knownBlockSet is a bounded, insertion-ordered set of block hashes: the
-// backing store for peerSyncState.knownBlocks (see its doc comment for what
-// it means and who writes it). Bounded FIFO eviction rather than legacy's
-// most-recently-used replacement (peer.go mruInventoryMap) — the two are
-// equivalent for this set's actual access pattern, since every hash here is
-// inserted exactly once, checked for existence any number of times, and
-// never re-inserted after it is marked; there is no "most recently used"
-// distinct from "most recently inserted" to preserve.
+// knownTxCap bounds peerSyncState.knownTxs. Legacy's own maxKnownInventory
+// (peer.go:53-55, wire.MaxInvPerMsg = 50,000) was sized for exactly this
+// traffic — outbound send-side dedup across BOTH blocks and transactions,
+// dominated in practice by transactions, since blocks arrive roughly once
+// every ten minutes and transactions arrive continuously. Task 12 rejected
+// reusing that number for knownBlockCap because blocks-only traffic is far
+// slower than the number implies (knownBlockCap's own doc comment: 288
+// already covers 48 hours of blocks). That argument does not carry over
+// here — tx traffic is exactly the traffic legacy calibrated 50,000
+// against, and this set is no longer sharing its budget with anything
+// else, so reusing legacy's own number is the FAITHFUL restoration of what
+// it was sized for, not a naive copy (spec §4.3 fidelity).
+//
+// The honest cost, disclosed rather than assumed away: at ~75-80 bytes per
+// entry (knownBlockCap's own per-entry accounting applies unchanged here —
+// every hash stored twice, once as a map key and once in the FIFO order
+// slice), 50,000 entries costs roughly 4 MB per peer, versus knownBlocks'
+// ~25 KB. At 1,000 connected peers that is single-digit GB aggregate, where
+// knownBlocks' equivalent is ~23 MB — a real, order-of-magnitude increase
+// in per-peer memory that a horizontally-scaled node with many peer
+// connections should account for. Flagged as a concern in this task's
+// report rather than silently sized down, because sizing it down would be
+// exactly the kind of unfaithful port spec §4.3 warns against without a
+// stated reason grounded in this port's own traffic, not legacy's.
+const knownTxCap = wire.MaxInvPerMsg
+
+// knownBlockSet is a bounded, insertion-ordered set of hashes: the backing
+// store for peerSyncState.knownBlocks AND peerSyncState.knownTxs (see each
+// field's own doc comment for what it means and who writes it) — one type,
+// two independently-capped instances, since knownBlocks is blocks-only by
+// design (Task 12) and knownTxs needs a very different cap (see
+// knownTxCap). Bounded FIFO eviction rather than legacy's most-recently-used
+// replacement (peer.go mruInventoryMap) — the two are equivalent for this
+// set's actual access pattern, since every hash here is inserted exactly
+// once, checked for existence any number of times, and never re-inserted
+// after it is marked; there is no "most recently used" distinct from "most
+// recently inserted" to preserve.
 //
 // Not safe for concurrent use on its own: every peerSyncState field is
 // guarded by PeerManager.syncMu, and this is no exception.
 type knownBlockSet struct {
-	set   map[chainhash.Hash]struct{}
-	order []chainhash.Hash
+	set      map[chainhash.Hash]struct{}
+	order    []chainhash.Hash
+	capacity int
 }
 
-func newKnownBlockSet() *knownBlockSet {
-	return &knownBlockSet{set: make(map[chainhash.Hash]struct{})}
+func newKnownBlockSet(capacity int) *knownBlockSet {
+	return &knownBlockSet{set: make(map[chainhash.Hash]struct{}), capacity: capacity}
 }
 
 // has reports whether hash is already known. A nil receiver (a peerSyncState
@@ -249,8 +307,8 @@ func (k *knownBlockSet) has(hash chainhash.Hash) bool {
 }
 
 // mark records hash as known, evicting the oldest entry first if the set is
-// already at knownBlockCap. A hash already in the set is left exactly where
-// it is: this is a "known or not" set, not an LRU, so re-marking does not
+// already at its cap. A hash already in the set is left exactly where it
+// is: this is a "known or not" set, not an LRU, so re-marking does not
 // refresh an eviction order that does not exist (see the type's doc
 // comment).
 func (k *knownBlockSet) mark(hash chainhash.Hash) {
@@ -262,7 +320,7 @@ func (k *knownBlockSet) mark(hash chainhash.Hash) {
 		return
 	}
 
-	if len(k.order) >= knownBlockCap {
+	if len(k.order) >= k.capacity {
 		oldest := k.order[0]
 		k.order = k.order[1:]
 		delete(k.set, oldest)

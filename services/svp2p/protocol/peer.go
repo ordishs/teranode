@@ -758,6 +758,39 @@ func (p *Peer) WantsHeaders() bool {
 	return p.hs.PeerInfo().WantsHeaders
 }
 
+// RelayTxDisabled reports whether this peer negotiated fRelayTxes=false
+// (PeerInfo.DisableRelayTx, wire.MsgVersion.DisableRelayTx), the tx
+// announcement relay's (relay.go selectTxRelayTargets) per-peer opt-out —
+// legacy's own relayTxDisabled gate at the equivalent site
+// (services/legacy/peer_server.go handleRelayInvMsg, "Don't relay the
+// transaction to the peer when it has transaction relaying disabled").
+//
+// Takes the peer lock like WantsHeaders, for the same reason: the package's
+// lock order forbids calling this while a manager lock is held, so
+// PeerManager.RelayTxs reads it before taking syncMu, not after.
+func (p *Peer) RelayTxDisabled() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.hs.PeerInfo().DisableRelayTx
+}
+
+// FeeFilter reports this peer's last announced minimum relay fee rate, in
+// satoshis/kB (PeerInfo.FeeFilter, net_processing.cpp FEEFILTER, set by
+// handshake.go's *wire.MsgFeeFilter case). Zero means the peer has never
+// sent one, which selectTxRelayTargets treats as "no filter" — the same
+// `feeFilter > 0` gate legacy's own handleRelayTxMsg uses
+// (services/legacy/peer_server.go:2566).
+//
+// Takes the peer lock like WantsHeaders and RelayTxDisabled, for the same
+// lock-order reason.
+func (p *Peer) FeeFilter() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.hs.PeerInfo().FeeFilter
+}
+
 func (p *Peer) disconnect(err error) error {
 	p.discOnce.Do(func() { p.discErr = err })
 

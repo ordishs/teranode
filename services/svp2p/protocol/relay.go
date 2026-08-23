@@ -1,7 +1,10 @@
 package protocol
 
 import (
+	"math"
+
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-wire"
 )
 
@@ -184,4 +187,112 @@ func ancestorMatches(idx *HeaderIndex, best *HeaderNode, node HeaderNode) bool {
 	}
 
 	return ancestor.Hash == node.Hash
+}
+
+// TxHashAndFee is one transaction the tx announcement relay
+// (manager.go RelayTxs, this file's selectTxRelayTargets) has been asked to
+// announce — legacy netsync's own TxHashAndFee ported field for field
+// (services/legacy/netsync/manager.go:361-365): TxHash to identify it, Fee
+// (satoshis) and Size (serialized bytes) to test against a peer's feefilter.
+type TxHashAndFee struct {
+	TxHash chainhash.Hash
+	Fee    uint64
+	Size   uint64
+}
+
+// txRelayCandidate is one connected, established peer's tx-relay-relevant
+// state, snapshotted by PeerManager.RelayTxs before selectTxRelayTargets
+// runs — the tx-relay counterpart of relayCandidate; see that type's doc
+// comment for why the snapshot/decide split exists (no I/O, no lock, inside
+// the selection function itself).
+type txRelayCandidate struct {
+	peer *Peer
+
+	// relayDisabled is Peer.RelayTxDisabled (PeerInfo.DisableRelayTx): a
+	// peer that negotiated fRelayTxes=false gets no tx announcements at
+	// all, mirroring legacy's own relayTxDisabled gate
+	// (services/legacy/peer_server.go handleRelayInvMsg).
+	relayDisabled bool
+
+	// feeFilter is Peer.FeeFilter (PeerInfo.FeeFilter): the peer's last
+	// announced minimum relay fee rate in satoshis/kB, or 0 for "no
+	// filter". See selectTxRelayTargets for the feePerKB comparison this
+	// gates, mirroring legacy's own handleRelayTxMsg
+	// (services/legacy/peer_server.go:2565-2591).
+	feeFilter int64
+
+	// known reports that this exact tx has already been relayed to this
+	// peer (peerSyncState.knownTxs — see that field's own doc comment for
+	// why this is a "did WE already send it" set, not a "does the peer
+	// already have it" one, unlike knownBlocks).
+	known bool
+}
+
+// selectTxRelayTargets is net_processing.cpp SendTxnInventory (:5464,
+// bitcoin-sv@879fc8b42) reduced to a single transaction, mirroring
+// selectRelayTargets' own single-hash reduction of SendBlockHeaders for the
+// same reason: this port relays one flushed batcher entry at a time, not a
+// per-peer accumulated list — and it is legacy's own decision order at
+// handleRelayTxMsg (services/legacy/peer_server.go:2565-2591), called from
+// handleRelayInvMsg's InvTypeTx branch (:2534-2549):
+//
+//  1. a peer with fRelayTxes=false (relayDisabled) gets nothing, ever —
+//     checked before the feefilter, matching legacy's own ordering
+//     (handleRelayInvMsg tests relayTxDisabled first);
+//  2. a peer this tx has already been relayed to (known) gets nothing
+//     again — this port's dedup, doing the job legacy's QueueInventory /
+//     knownInventory.Exists does at the send site (peer_server.go:2487-2490);
+//  3. a positive feeFilter suppresses the tx when its fee-per-kB falls
+//     below the filter, computed exactly as legacy does: fee*1000/size
+//     rounding down (integer division), with a MaxInt64 sentinel when size
+//     is 0 or the uint64->int64 conversion overflows, so a filter can never
+//     suppress a tx it cannot rate — mirrors handleRelayTxMsg's own
+//     feePerKB default and its safeconversion error handling exactly.
+//
+// It performs no I/O and takes no lock: the caller (PeerManager.RelayTxs)
+// snapshots every candidate field under the locks that own it before
+// calling this, and sends the result with no lock held, matching
+// selectRelayTargets/RelayBlock's own split (spec §4.3).
+func selectTxRelayTargets(candidates []txRelayCandidate, tx TxHashAndFee) []*Peer {
+	var out []*Peer
+
+	for _, c := range candidates {
+		if c.relayDisabled || c.known {
+			continue
+		}
+
+		if c.feeFilter > 0 && feePerKB(tx) < c.feeFilter {
+			continue
+		}
+
+		out = append(out, c.peer)
+	}
+
+	return out
+}
+
+// feePerKB computes tx's fee rate in satoshis per 1000 bytes, rounding down
+// via integer division — legacy's own computation at handleRelayTxMsg
+// (services/legacy/peer_server.go:2565-2591). Returns math.MaxInt64 (legacy's
+// own sentinel, "so it can never be suppressed by the filter check") when
+// Size is 0 (division by zero) or either field overflows int64 on
+// conversion — legacy uses safeconversion.Uint64ToInt64 and falls back to
+// the same sentinel on its error return; a tx this port cannot rate is
+// never suppressed, matching that fail-open choice exactly.
+func feePerKB(tx TxHashAndFee) int64 {
+	if tx.Size == 0 {
+		return math.MaxInt64
+	}
+
+	fee, err := safeconversion.Uint64ToInt64(tx.Fee)
+	if err != nil {
+		return math.MaxInt64
+	}
+
+	size, err := safeconversion.Uint64ToInt64(tx.Size)
+	if err != nil {
+		return math.MaxInt64
+	}
+
+	return fee * 1000 / size
 }

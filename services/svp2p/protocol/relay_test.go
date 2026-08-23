@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -609,4 +610,96 @@ func TestRelayBlockKeepsSendingHeadersAcrossConsecutiveBlocks(t *testing.T) {
 	require.Len(t, secondHeaders.Headers, 1)
 	require.Equal(t, hashN1, secondHeaders.Headers[0].BlockHash(),
 		"the second consecutive block must also be announced by headers, not fall back to inv")
+}
+
+// ---------------------------------------------------------------------------
+// selectTxRelayTargets: pure, table-driven (Task 13).
+// ---------------------------------------------------------------------------
+
+func TestSelectTxRelayTargets(t *testing.T) {
+	tx := TxHashAndFee{TxHash: chainhash.Hash{0x01}, Fee: 1000, Size: 1000} // 1000 sat/kB
+
+	t.Run("a plain peer with no filter gets the tx", func(t *testing.T) {
+		peer := &Peer{}
+
+		out := selectTxRelayTargets([]txRelayCandidate{{peer: peer}}, tx)
+
+		require.Len(t, out, 1)
+		require.Same(t, peer, out[0])
+	})
+
+	t.Run("a peer with fRelayTxes=false gets nothing, filter or no filter", func(t *testing.T) {
+		peer := &Peer{}
+
+		out := selectTxRelayTargets([]txRelayCandidate{{peer: peer, relayDisabled: true}}, tx)
+
+		require.Empty(t, out)
+	})
+
+	t.Run("a peer that already has this exact tx gets nothing again", func(t *testing.T) {
+		peer := &Peer{}
+
+		out := selectTxRelayTargets([]txRelayCandidate{{peer: peer, known: true}}, tx)
+
+		require.Empty(t, out)
+	})
+
+	// E5: pair every suppression with a positive arrival on another peer in
+	// the same call, so a nil/empty result can only mean "correctly
+	// suppressed", never "the selection function itself is broken".
+	t.Run("feefilter suppresses a peer below the rate but not one at or above it", func(t *testing.T) {
+		belowFilter := &Peer{connectedAt: time.Unix(1, 0)} // filter 1001 > 1000 sat/kB fee rate
+		atFilter := &Peer{connectedAt: time.Unix(2, 0)}    // filter 1000 == fee rate: not suppressed (legacy: feePerKB < feeFilter, not <=)
+		noFilter := &Peer{connectedAt: time.Unix(3, 0)}
+
+		out := selectTxRelayTargets([]txRelayCandidate{
+			{peer: belowFilter, feeFilter: 1001},
+			{peer: atFilter, feeFilter: 1000},
+			{peer: noFilter, feeFilter: 0},
+		}, tx)
+
+		require.Len(t, out, 2, "exactly the two peers whose filter does not exceed the fee rate")
+		require.NotContains(t, out, belowFilter)
+		require.Contains(t, out, atFilter)
+		require.Contains(t, out, noFilter)
+	})
+
+	t.Run("a zero-size tx cannot be suppressed by any filter (MaxInt64 sentinel)", func(t *testing.T) {
+		zeroSize := TxHashAndFee{TxHash: chainhash.Hash{0x02}, Fee: 0, Size: 0}
+		peer := &Peer{}
+
+		out := selectTxRelayTargets([]txRelayCandidate{{peer: peer, feeFilter: math.MaxInt64}}, zeroSize)
+
+		require.Len(t, out, 1, "a tx this port cannot rate must never be suppressed (legacy's own fail-open default)")
+	})
+
+	t.Run("a mixed batch routes each candidate independently", func(t *testing.T) {
+		disabledPeer := &Peer{connectedAt: time.Unix(1, 0)}
+		knownPeer := &Peer{connectedAt: time.Unix(2, 0)}
+		filteredPeer := &Peer{connectedAt: time.Unix(3, 0)}
+		okPeer := &Peer{connectedAt: time.Unix(4, 0)}
+
+		out := selectTxRelayTargets([]txRelayCandidate{
+			{peer: disabledPeer, relayDisabled: true},
+			{peer: knownPeer, known: true},
+			{peer: filteredPeer, feeFilter: 1001},
+			{peer: okPeer},
+		}, tx)
+
+		require.Len(t, out, 1)
+		require.Same(t, okPeer, out[0])
+	})
+}
+
+func TestFeePerKB(t *testing.T) {
+	t.Run("rounds down like legacy's integer division", func(t *testing.T) {
+		// 999 sat over 1000 bytes = 0.999 sat/byte = 999 sat/kB exactly;
+		// 1 sat over 3 bytes = 333.33... sat/kB, truncated to 333.
+		require.Equal(t, int64(999), feePerKB(TxHashAndFee{Fee: 999, Size: 1000}))
+		require.Equal(t, int64(333), feePerKB(TxHashAndFee{Fee: 1, Size: 3}))
+	})
+
+	t.Run("zero size is the MaxInt64 sentinel, not a division by zero", func(t *testing.T) {
+		require.Equal(t, int64(math.MaxInt64), feePerKB(TxHashAndFee{Fee: 500, Size: 0}))
+	})
 }

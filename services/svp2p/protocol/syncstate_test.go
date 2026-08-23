@@ -309,3 +309,101 @@ func TestProcessBlockAvailability_NoOpWhenNoPending(t *testing.T) {
 	require.Equal(t, chainhash.Hash{}, state.hashLastUnknownBlock)
 	require.Equal(t, int32(0), state.pindexBestKnownBlock.Height)
 }
+
+// ---------------------------------------------------------------------------
+// knownBlockSet: pure, table-driven (review round 1, Minor 8 — the type
+// backs both peerSyncState.knownBlocks and peerSyncState.knownTxs, each with
+// its own capacity since the capacity-as-parameter refactor, and had no
+// direct test at either cap before this).
+// ---------------------------------------------------------------------------
+
+func TestKnownBlockSet_HasReflectsMarkedMembership(t *testing.T) {
+	s := newKnownBlockSet(3)
+
+	hashA := chainhash.Hash{0x01}
+	hashB := chainhash.Hash{0x02}
+
+	require.False(t, s.has(hashA), "an unmarked hash must not be known")
+
+	s.mark(hashA)
+
+	require.True(t, s.has(hashA), "a marked hash must be known")
+	require.False(t, s.has(hashB), "marking one hash must not affect another")
+}
+
+func TestKnownBlockSet_MarkIsIdempotent(t *testing.T) {
+	s := newKnownBlockSet(3)
+	hash := chainhash.Hash{0x01}
+
+	s.mark(hash)
+	s.mark(hash)
+	s.mark(hash)
+
+	require.True(t, s.has(hash))
+	require.Len(t, s.order, 1, "re-marking an already-known hash must not add a second entry")
+}
+
+// TestKnownBlockSet_EvictsOldestAtCapacity pins the FIFO eviction rule
+// (mark's own doc comment): once the set holds `capacity` entries, marking
+// one more evicts the OLDEST entry, not an arbitrary one, and the evicted
+// entry is genuinely forgotten (has reports false for it again).
+func TestKnownBlockSet_EvictsOldestAtCapacity(t *testing.T) {
+	const capacity = 3
+
+	s := newKnownBlockSet(capacity)
+
+	hashes := make([]chainhash.Hash, capacity+1)
+	for i := range hashes {
+		hashes[i] = chainhash.Hash{byte(i + 1)}
+	}
+
+	for _, h := range hashes[:capacity] {
+		s.mark(h)
+	}
+
+	for _, h := range hashes[:capacity] {
+		require.True(t, s.has(h), "every hash marked up to capacity must still be known")
+	}
+
+	// One more mark, past capacity: the OLDEST (hashes[0]) must be evicted,
+	// and every other entry marked so far must survive.
+	s.mark(hashes[capacity])
+
+	require.False(t, s.has(hashes[0]), "the oldest entry must be evicted once capacity is exceeded")
+
+	for _, h := range hashes[1:] {
+		require.True(t, s.has(h), "every entry marked after the evicted one must still be known")
+	}
+}
+
+// TestKnownBlockSet_IndependentCapacities proves the capacity-as-parameter
+// refactor actually isolates two instances of the same type from each
+// other's cap — the exact property peerSyncState.knownBlocks and
+// peerSyncState.knownTxs depend on (syncstate.go's own knownBlockCap=288 vs
+// knownTxCap=wire.MaxInvPerMsg).
+func TestKnownBlockSet_IndependentCapacities(t *testing.T) {
+	small := newKnownBlockSet(1)
+	large := newKnownBlockSet(1000)
+
+	hashA := chainhash.Hash{0x01}
+	hashB := chainhash.Hash{0x02}
+
+	small.mark(hashA)
+	small.mark(hashB) // evicts hashA at capacity 1
+
+	require.False(t, small.has(hashA))
+	require.True(t, small.has(hashB))
+
+	large.mark(hashA)
+	large.mark(hashB)
+
+	require.True(t, large.has(hashA), "a set with a larger capacity must not evict on the same schedule as a smaller one")
+	require.True(t, large.has(hashB))
+}
+
+func TestKnownBlockSet_NilReceiverIsSafe(t *testing.T) {
+	var s *knownBlockSet
+
+	require.False(t, s.has(chainhash.Hash{0x01}))
+	require.NotPanics(t, func() { s.mark(chainhash.Hash{0x01}) })
+}
