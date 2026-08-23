@@ -61,6 +61,12 @@ type SyncConfig struct {
 	// bridge dependencies are not injected yet.
 	Ingestor BlockIngestor
 
+	// Fetcher is the Teranode-side read path a getdata is answered from, or
+	// nil when the bridge dependencies are not injected yet. Unlike Ingestor
+	// it gates nothing else: a manager with no fetcher still syncs, it just
+	// answers no getdata.
+	Fetcher BlockTxFetcher
+
 	// DisableCheckpoints mirrors legacy netsync Config.DisableCheckpoints.
 	DisableCheckpoints bool
 
@@ -130,6 +136,7 @@ type PeerManager struct {
 	blockDownloader *BlockDownloader
 	serving         *Serving
 	ingestor        BlockIngestor
+	fetcher         BlockTxFetcher
 	// activeTip is our own best chain tip (the chainActive counterpart),
 	// fed from the blockchain service and always a header present in the
 	// index — the download scheduler cannot place a tip it cannot look up.
@@ -236,6 +243,7 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 	m.blockDownloader = blockDownloader
 	m.serving = serving
 	m.ingestor = cfg.Ingestor
+	m.fetcher = cfg.Fetcher
 
 	// Until the blockchain service reports a tip, our own chain is whatever
 	// hydration put in the index.
@@ -539,6 +547,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 	var (
 		dispatch syncDispatcher
 		ingestor BlockIngestor
+		fetcher  BlockTxFetcher
 	)
 
 	if m.SyncEnabled() {
@@ -546,6 +555,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 
 		m.syncMu.Lock()
 		ingestor = m.ingestor
+		fetcher = m.fetcher
 		m.syncMu.Unlock()
 	}
 
@@ -571,6 +581,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 		Sync:         dispatch,
 		SyncPeer:     syncPeer,
 		Ingestor:     ingestor,
+		Fetcher:      fetcher,
 	})
 
 	m.mu.Lock()
@@ -759,6 +770,32 @@ func (m *PeerManager) GetBlocks(syncPeer *SyncPeer, msg *wire.MsgGetBlocks) []wi
 	}
 
 	return m.serving.OnGetBlocks(syncPeer, m.activeTip, msg)
+}
+
+// GetData dispatches the NetMsgType::GETDATA event. It only classifies the
+// request; the fetches and the sends run on the peer's serve goroutine, with
+// no lock held (getdata.go serveGetData).
+func (m *PeerManager) GetData(syncPeer *SyncPeer, msg *wire.MsgGetData) []getDataItem {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	if m.serving == nil || syncPeer == nil {
+		return nil
+	}
+
+	return m.serving.OnGetData(msg)
+}
+
+// ContinueInv dispatches the getdata continuation, after a block has gone out.
+func (m *PeerManager) ContinueInv(syncPeer *SyncPeer, hash chainhash.Hash) []wire.Message {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	if m.serving == nil || syncPeer == nil {
+		return nil
+	}
+
+	return m.serving.ContinueInv(syncPeer, m.activeTip, hash)
 }
 
 // BlockExpected reports whether hash is in flight from this peer, which is

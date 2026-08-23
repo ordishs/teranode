@@ -141,6 +141,15 @@ type syncDispatcher interface {
 	GetHeaders(sp *SyncPeer, msg *wire.MsgGetHeaders) []wire.Message
 	GetBlocks(sp *SyncPeer, msg *wire.MsgGetBlocks) []wire.Message
 
+	// GetData classifies one getdata request. Like the two above it cannot end
+	// the connection: a getdata only REQUESTS data, so an entry we cannot
+	// answer is a gap on our side (serving.go OnGetData).
+	GetData(sp *SyncPeer, msg *wire.MsgGetData) []getDataItem
+
+	// ContinueInv is the getdata continuation: after a served block, an inv of
+	// our tip when that block was the one that closed a full getblocks reply.
+	ContinueInv(sp *SyncPeer, hash chainhash.Hash) []wire.Message
+
 	// BlockExpected reports whether hash is in flight from this peer, which is
 	// what makes an inbound block solicited.
 	BlockExpected(sp *SyncPeer, hash chainhash.Hash) bool
@@ -169,6 +178,11 @@ type PeerConfig struct {
 	// Ingestor is the Teranode-side block ingestion path, or nil when it is
 	// not wired.
 	Ingestor BlockIngestor
+
+	// Fetcher is the Teranode-side read path a getdata is answered from, or
+	// nil when it is not wired. Without it a getdata is ignored: see
+	// queueGetData.
+	Fetcher BlockTxFetcher
 }
 
 type PeerSnapshot struct {
@@ -208,6 +222,15 @@ type Peer struct {
 	// ingestCh carries each finished ingest back to the Run goroutine.
 	ingestCh chan ingestReport
 
+	// getData is this peer's pending inventory requests, the port of
+	// CNode::vRecvGetData: a deque the Run goroutine appends classified entries
+	// to and the serve goroutine drains one pass at a time, so a request the
+	// pass could not finish is retained rather than dropped (getdata.go).
+	// getDataWake signals the serve goroutine that entries are waiting.
+	getDataMu   sync.Mutex
+	getData     []getDataItem
+	getDataWake chan struct{}
+
 	// ingest, ingestStarted, ingestTxBytes and ingestActive are written by the
 	// Run goroutine and read by it plus the manager's stall ticker through
 	// IngestSnapshot, so they are guarded by mu like the rest of the peer's
@@ -241,6 +264,9 @@ func NewPeer(cfg PeerConfig) *Peer {
 		connectedAt: time.Now(),
 		gone:        make(chan struct{}),
 		ingestCh:    make(chan ingestReport, ingestReportQueue),
+		// Capacity one: it is an edge signal, not a queue. The queue is
+		// p.getData, and the serve loop drains it until it is empty.
+		getDataWake: make(chan struct{}, 1),
 	}
 }
 
@@ -287,6 +313,13 @@ func (p *Peer) Run(ctx context.Context) error {
 	defer p.goneOnce.Do(func() { close(p.gone) })
 
 	p.cfg.Conn.Start(ctx)
+
+	// The getdata answerer runs off this loop: one block send takes minutes,
+	// and Run has to keep the idle timer honest while it happens. It stops on
+	// ctx cancellation or on p.gone, both of which Run closes on its way out.
+	if p.cfg.Sync != nil && p.cfg.Fetcher != nil {
+		go p.serveLoop(ctx)
+	}
 
 	for _, msg := range p.hs.Initial() {
 		if err := p.cfg.Conn.SendPriority(msg); err != nil {
@@ -468,6 +501,11 @@ func (p *Peer) dispatchSync(msg wire.Message, established, firstEstablished bool
 
 	case *wire.MsgGetBlocks:
 		p.send(p.cfg.Sync.GetBlocks(p.cfg.SyncPeer, m))
+
+	case *wire.MsgGetData:
+		// Handed to the serve goroutine rather than answered here: see
+		// queueGetData.
+		p.queueGetData(m)
 	}
 
 	return nil

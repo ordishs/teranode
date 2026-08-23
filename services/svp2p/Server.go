@@ -295,14 +295,29 @@ func (s *Server) startSync(ctx context.Context) error {
 		return err
 	}
 
-	ingestor, err := s.newBlockIngestor()
+	ing, err := s.newBlockIngestor()
 	if err != nil {
 		return err
+	}
+
+	// Both adapters come from the same bridge instance, so the getdata answerer
+	// reads through the same clients the ingest path writes through. Assigned
+	// from a nil check rather than passed straight through, because a typed nil
+	// in an interface is not nil, and ConfigureSync switches on Ingestor == nil.
+	var (
+		ingestor protocol.BlockIngestor
+		fetcher  protocol.BlockTxFetcher
+	)
+
+	if ing != nil {
+		ingestor = ing
+		fetcher = ing.bridge
 	}
 
 	if err := s.manager.ConfigureSync(protocol.SyncConfig{
 		Index:                            s.HeaderIndex(),
 		Ingestor:                         ingestor,
+		Fetcher:                          fetcher,
 		AllowSyncCandidateFromLocalPeers: s.settings.Legacy.AllowSyncCandidateFromLocalPeers,
 		TickInterval:                     s.syncTick,
 		MaxLastBlockTime:                 s.maxLastBlockTime,
@@ -326,7 +341,7 @@ func (s *Server) startSync(ctx context.Context) error {
 // service keeps serving the peer API and following the chain, and asks no peer
 // for a block it has nothing to ingest with. The daemon always injects the
 // dependencies; only a depless caller (New instead of NewWithDeps) hits this.
-func (s *Server) newBlockIngestor() (protocol.BlockIngestor, error) {
+func (s *Server) newBlockIngestor() (*blockIngestor, error) {
 	if !s.deps.complete() {
 		s.logger.Warnf("[svp2p] block sync disabled: the block ingestion dependencies are not injected")
 		return nil, nil

@@ -27,6 +27,15 @@ type blockIngestor struct {
 
 var _ protocol.BlockIngestor = (*blockIngestor)(nil)
 
+// The read side needs no adapter type of its own: bridge.Bridge already
+// declares FetchBlock and FetchTx with exactly the signatures protocol asks
+// for, so the bridge satisfies the narrow interface directly. This assertion
+// is the seam spec §4.4 requires — the one place the two halves are named
+// together — and it fails to compile the day either side drifts. The
+// composition itself is one assignment in Server.startSync, beside the
+// ingestor.
+var _ protocol.BlockTxFetcher = (bridge.Bridge)(nil)
+
 // WatchProgress is bridge.NewProgressReader: the wrapper the peer loop's idle
 // timer polls while a long ingest runs.
 func (b *blockIngestor) WatchProgress(r io.ReadCloser) protocol.IngestProgress {

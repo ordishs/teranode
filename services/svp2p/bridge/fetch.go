@@ -59,7 +59,22 @@ const minLegacyBlockWireBytes = 80 + 1 + 60
 // A block the blockchain service does not know about fails here, before any
 // HTTP request is made, with whatever GetBlockHeader returns (a
 // BlockNotFoundError, matched by errors.ErrBlockNotFound, from the SQL
-// blockchain store).
+// blockchain store). A block it knows about but the asset service answers 404
+// for is folded into that SAME error, deliberately: the two causes are
+// different — the blockchain miss means "we do not know this block at all",
+// the asset 404 means "we know it but do not retain its body" — and the answer
+// to the peer is identical, so one code covers both and the caller needs no
+// second branch. Every other asset-service status keeps its own type, because
+// the caller distinguishes absence from failure on ErrBlockNotFound alone (see
+// the classification note at the HTTP call below).
+//
+// The returned stream is single-use, but this method is NOT: Task 10 calls it
+// TWICE for every block it serves — once to hash the payload for the wire
+// message checksum, once to stream it to the socket — because SVNode
+// ban-scores a wrong checksum (net_processing.cpp:5005-5015) and the payload
+// must never be materialized to compute one. Anything added here must stay
+// safe and cheap to repeat, and must keep reporting the same declared length
+// for the same block.
 func (b *svp2pBridge) FetchBlock(ctx context.Context, hash *chainhash.Hash) (io.ReadCloser, uint64, error) {
 	_, meta, err := b.blockchainClient.GetBlockHeader(ctx, hash)
 	if err != nil {
@@ -79,6 +94,17 @@ func (b *svp2pBridge) FetchBlock(ctx context.Context, hash *chainhash.Hash) (io.
 
 	body, err := util.DoHTTPRequestBodyReader(ctx, url)
 	if err != nil {
+		// The asset service answering 404 for a block the blockchain service
+		// knows about means the body is not retained here. util's HTTP helper
+		// already classifies by status (util/http.go:466-473 buildHTTPError:
+		// 404 -> ErrNotFound, 503 -> ErrServiceUnavailable, everything else ->
+		// ServiceError), so only the code needs narrowing: the caller answers
+		// a peer notfound on ErrBlockNotFound alone, and folding a 500 into
+		// that would tell the peer to stop asking for a block we do hold.
+		if errors.Is(err, errors.ErrNotFound) {
+			return nil, 0, errors.NewBlockNotFoundError("block %s is not served by the asset service", hash.String(), err)
+		}
+
 		return nil, 0, err
 	}
 

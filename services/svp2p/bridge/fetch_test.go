@@ -620,3 +620,107 @@ func TestFetchTx_ProjectionIsTxOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, tx.Bytes(), got)
 }
+
+// TestFetchBlock_AssetServiceStatusIsClassified is the split Task 10 needs: a
+// block the asset service does not have is a 404, and it must arrive as
+// errors.ErrBlockNotFound so the getdata answerer can say notfound; every
+// other status is a real failure and must NOT look like absence, because
+// answering notfound for it tells the peer to stop asking for a block we hold.
+func TestFetchBlock_AssetServiceStatusIsClassified(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		wantAbsent bool
+	}{
+		{name: "404 is absence", status: http.StatusNotFound, wantAbsent: true},
+		{name: "500 is a failure", status: http.StatusInternalServerError, wantAbsent: false},
+		{name: "503 is a failure", status: http.StatusServiceUnavailable, wantAbsent: false},
+		{name: "400 is a failure", status: http.StatusBadRequest, wantAbsent: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			hash := chainhash.Hash{0x3f}
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "no", tt.status)
+			}))
+			defer srv.Close()
+
+			util.SetSSRFProtection(false)
+			t.Cleanup(func() { util.SetSSRFProtection(true) })
+
+			b, mockBC, _ := newFetchBridge(ctx, t, srv.URL)
+			mockBC.On("GetBlockHeader", mock.Anything, &hash).
+				Return((*model.BlockHeader)(nil), &model.BlockHeaderMeta{SizeInBytes: minLegacyBlockWireBytes + 100}, nil).Once()
+
+			_, _, err := b.FetchBlock(ctx, &hash)
+			require.Error(t, err)
+			require.Equal(t, tt.wantAbsent, errors.Is(err, errors.ErrBlockNotFound),
+				"status %d classified wrongly: %v", tt.status, err)
+		})
+	}
+}
+
+// TestFetchBlock_TwoPassesDeliverIdenticalBytes is the contract Task 10's
+// streaming send rests on. That send hashes the payload in one pass and writes
+// a second one to the socket, and the message header carries the checksum from
+// the first pass ahead of the bytes of the second. So a served block whose two
+// passes disagreed by a single byte would go out with a checksum SVNode
+// ban-scores (net_processing.cpp:5005-5015).
+//
+// This drives the real FetchBlock twice against the real HTTP path and
+// requires both passes to yield the same declared length, the same bytes, and
+// therefore the same double-SHA256 — the exact quantity that lands in the
+// header. It also records the cost of the ruling: two asset-service reads for
+// one served block.
+func TestFetchBlock_TwoPassesDeliverIdenticalBytes(t *testing.T) {
+	ctx := context.Background()
+
+	hash := chainhash.Hash{0x02}
+	body := paddedWireBody("two-pass-block-bytes")
+
+	var hits int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	util.SetSSRFProtection(false)
+	t.Cleanup(func() { util.SetSSRFProtection(true) })
+
+	b, mockBC, _ := newFetchBridge(ctx, t, srv.URL)
+	mockBC.On("GetBlockHeader", mock.Anything, &hash).
+		Return((*model.BlockHeader)(nil), &model.BlockHeaderMeta{SizeInBytes: uint64(len(body))}, nil).Twice()
+
+	pass := func() (uint64, []byte) {
+		reader, length, err := b.FetchBlock(ctx, &hash)
+		require.NoError(t, err)
+
+		defer reader.Close()
+
+		raw, err := io.ReadAll(reader)
+		require.NoError(t, err)
+
+		return length, raw
+	}
+
+	firstLen, firstBytes := pass()
+	secondLen, secondBytes := pass()
+
+	require.Equal(t, firstLen, secondLen, "the declared length must not change between passes")
+	require.Equal(t, firstBytes, secondBytes, "the two passes must deliver identical bytes")
+
+	// Both halves of the header the send writes: the length field, and the
+	// checksum the peer verifies against the bytes it received.
+	require.EqualValues(t, len(firstBytes), firstLen, "the streamed byte count must equal the declared length")
+	require.Equal(t, chainhash.DoubleHashB(firstBytes)[0:4], chainhash.DoubleHashB(secondBytes)[0:4])
+
+	require.Equal(t, 2, hits, "the two-pass checksum costs exactly two asset-service reads per served block")
+}
