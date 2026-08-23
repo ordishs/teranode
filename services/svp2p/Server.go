@@ -33,6 +33,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/health"
+	"github.com/bsv-blockchain/teranode/util/kafka"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -84,6 +85,21 @@ type Server struct {
 	banList         *protocol.BanList
 	manager         *protocol.PeerManager
 	admission       *bridge.Admission
+
+	// blocksFinalConsumer is the block announcement relay's Kafka leg
+	// (bridge/kafka.go). nil when settings.Kafka.BlocksFinalConfig is unset,
+	// which is not an error: block announcements just do not go out this way.
+	// Its lifecycle is Start/Stop's, like admission and manager: started in
+	// Start bound to the Start ctx, closed explicitly in Stop rather than
+	// left to ctx cancellation alone. That ordering exists so no new
+	// RelayBlock call starts against a peer registry the manager is already
+	// tearing down (see Stop's own comment) — NOT as a claim that Close
+	// proves the underlying consumer goroutine has exited. Against
+	// util/kafka/in_memory_kafka's own fake it provably has not (fix round 1,
+	// review finding I3): Close's wg.Wait() is a no-op nothing ever Add()s
+	// to, and nothing inside its idle message loop ever checks ctx. A real
+	// Kafka client's Close is unaffected by that fake's limitation.
+	blocksFinalConsumer kafka.KafkaConsumerGroupI
 
 	headerIndexMu sync.RWMutex
 	headerIndex   *protocol.HeaderIndex
@@ -216,6 +232,18 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	s.logger.Infof("[svp2p] peer manager started, listening on %v", s.manager.ListenAddrs())
 
+	// The block announcement relay's Kafka leg. Started after the manager so
+	// RelayBlock always has a live peer registry to read; a message that
+	// arrives in the gap before the manager is up simply finds no peers
+	// connected yet, which is the same "nobody to tell" case as a call with
+	// zero peers at any other time.
+	consumer, err := bridge.StartBlocksFinalConsumer(ctx, s.logger, s.settings, s.manager.RelayBlock)
+	if err != nil {
+		return errors.New(errors.ERR_SERVICE_NOT_STARTED, "svp2p: failed to start blocks-final Kafka consumer", err)
+	}
+
+	s.blocksFinalConsumer = consumer
+
 	apiKey := s.settings.GRPCAdminAPIKey
 	if apiKey == "" {
 		key := make([]byte, 32)
@@ -251,7 +279,25 @@ func (s *Server) Stop(_ context.Context) error {
 	// is ctx-owned: it exits on the Start ctx's cancellation, which the
 	// daemon triggers before calling Stop. Nothing to join here.
 	//
-	// Peers are joined FIRST: PeerManager.Stop waits for every peer goroutine,
+	// The blocks-final consumer is closed FIRST, ahead of the manager: this
+	// is the intended ordering so no new RelayBlock call starts while the
+	// peer registry is being torn down under it. Against a real Kafka client
+	// Close stops the fetch loop before returning, so the ordering is
+	// actually enforced there. It is NOT enforced against
+	// util/kafka/in_memory_kafka's own consumer-group fake, whose Close does
+	// not wait for its message loop to exit (see blocksFinalConsumer's field
+	// comment) — fix round 1, review finding I3 — so a test built on that
+	// fake can show Close/Stop returning promptly, but cannot itself prove
+	// this ordering held.
+	if s.blocksFinalConsumer != nil {
+		if err := s.blocksFinalConsumer.Close(); err != nil {
+			return errors.New(errors.ERR_SERVICE_ERROR, "svp2p: failed to close blocks-final Kafka consumer", err)
+		}
+
+		s.blocksFinalConsumer = nil
+	}
+
+	// Peers are joined next: PeerManager.Stop waits for every peer goroutine,
 	// and a peer may still be running an ingest that goes through Admission.
 	// Releasing Admission's eviction goroutine before those callers are gone
 	// would stop the failure map underneath a live ingest.

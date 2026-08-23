@@ -59,6 +59,19 @@ type Bridge interface {
 	// HeaderEvents delivers tip-change notifications sourced from the
 	// blockchain service's subscription (spec §4.4). The channel is never
 	// closed by Bridge.
+	//
+	// OPEN QUESTION (Task 12, Phase 3): this method has no producer and no
+	// consumer anywhere in this codebase, and no task in the 27-task Phase 3
+	// plan gives it one. The block announcement relay (protocol/relay.go)
+	// takes its trigger from the blocks-final Kafka topic instead — the
+	// point at which finality is actually decided, and what legacy netsync
+	// does (kafkaBlocksFinalListener, services/legacy/netsync/manager.go:3443).
+	// So either spec §4.4's sketch of this method is aspirational, or
+	// something is meant to feed it that Phase 3 never identified. Kept per
+	// spec §4.4, which lists it on the Bridge interface sketch and is the
+	// binding authority over the plan; deleting it is not this task's call
+	// to make. See the method's own doc comment below for what stays
+	// unchanged: the channel is real, just never written to.
 	HeaderEvents() <-chan HeaderEvent
 
 	// FetchBlock streams a block's legacy-wire bytes (header + varint(txCount)
@@ -174,8 +187,13 @@ func New(
 // Phase 2 uses it: block sync pulls headers from peers, so nothing in this
 // phase needs telling that our own tip moved, and nothing publishes into the
 // channel. The channel is real rather than nil — a consumer can range over it
-// today without an adapter — but it stays silent until the Phase 3 relay work
-// wires the blockchain-service subscription (spec §4.4) that feeds it.
+// without an adapter if one is ever wired up — but Phase 3 deliberately did
+// NOT wire the blockchain-service subscription (spec §4.4) that would feed
+// it: the block announcement relay (Task 12) takes its trigger from the
+// blocks-final Kafka topic instead, because that is where finality is
+// decided and it is what legacy does. So this channel stays silent, with no
+// producer and no consumer anywhere in this codebase — see the interface
+// doc comment's OPEN QUESTION above.
 func (b *svp2pBridge) HeaderEvents() <-chan HeaderEvent {
 	return b.headerEvents
 }

@@ -44,11 +44,14 @@ const MaxGetBlocksResults = wire.MaxBlocksPerMsg
 //   - The pruning branch (net_processing.cpp:2593-2604). Teranode does not
 //     prune blocks the way fPruneMode does, and it has no counterpart of
 //     nPrunedBlocksLikelyToHave.
-//   - state->pindexBestHeaderSent (net_processing.cpp:3040-3045), which
-//     SendMessages reads when it decides whether to announce a new block by
-//     headers. That consumer arrives with the relay path (Task 12), and
-//     peerSyncState deliberately carries no field without a consumer, so the
-//     field is added there, not here.
+//   - state->pindexBestHeaderSent (net_processing.cpp:3044) is now WRITTEN
+//     here — see the assignment at the end of OnGetHeaders below, and
+//     peerSyncState's doc comment for the field. Its reader is the block
+//     announcement relay (relay.go headerAlreadySent, Task 12), which is why
+//     the field lives on peerSyncState and not on this machine: Serving
+//     carries no lock and no per-peer state of its own beyond what the
+//     caller hands it each call, and the relay runs on a different call path
+//     entirely (a Kafka message, not a peer message).
 type Serving struct {
 	idx *HeaderIndex
 	hs  *HeaderSync
@@ -120,6 +123,14 @@ func (s *Serving) OnGetHeaders(peer *SyncPeer, activeTip HeaderNode, msg *wire.M
 	// empty batch as "nothing interesting, stop asking" and neither scores nor
 	// disconnects for it.
 	if start.empty {
+		// C++: pindex is nullptr here (chainActive.Next of the peer's own tip
+		// is nullptr), and ProcessGetHeadersMessage's reset is unconditional on
+		// pindex being null: "pindex ? pindex : chainActive.Tip()". An empty
+		// reply still counts as telling this peer about our tip.
+		if peer.State != nil {
+			peer.State.pindexBestHeaderSent = &activeTip
+		}
+
 		return []wire.Message{out}, false
 	}
 
@@ -148,6 +159,27 @@ func (s *Serving) OnGetHeaders(peer *SyncPeer, activeTip HeaderNode, msg *wire.M
 		if stopping && header.BlockHash() == msg.HashStop {
 			break
 		}
+	}
+
+	// sent is the C++ "pindex" pindexBestHeaderSent is reset to: the last
+	// header actually queued above, or our own tip if the loop pushed
+	// nothing (the AddBlockHeader break on its very first iteration; see the
+	// comment there for why that cannot happen in practice). Looked up ONCE
+	// here rather than once per iteration inside the loop above (fix round
+	// 1, review Minor 5): only the final value is ever read, and the loop
+	// runs under syncMu, so up to MaxHeadersResults (2000) redundant
+	// HeaderIndex.Lookup calls — each its own mutex acquisition — were paid
+	// on this serving hot path for nothing.
+	sent := activeTip
+
+	if len(out.Headers) > 0 {
+		if node, ok := s.idx.Lookup(out.Headers[len(out.Headers)-1].BlockHash()); ok {
+			sent = node
+		}
+	}
+
+	if peer.State != nil {
+		peer.State.pindexBestHeaderSent = &sent
 	}
 
 	return []wire.Message{out}, false

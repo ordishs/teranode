@@ -743,6 +743,21 @@ func (p *Peer) Info() PeerSnapshot {
 	}
 }
 
+// WantsHeaders reports whether this peer negotiated sendheaders
+// (PeerInfo.WantsHeaders, the fPreferHeaders equivalent), which is what the
+// block announcement relay (relay.go selectRelayTargets) reads to choose a
+// headers message over a plain inv for this peer.
+//
+// Takes the peer lock like every other read of handshake state (Info); the
+// package's lock order forbids calling this while a manager lock is held —
+// PeerManager.RelayBlock reads it before taking syncMu, not after.
+func (p *Peer) WantsHeaders() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.hs.PeerInfo().WantsHeaders
+}
+
 func (p *Peer) disconnect(err error) error {
 	p.discOnce.Do(func() { p.discErr = err })
 

@@ -117,13 +117,159 @@ type peerSyncState struct {
 	// yet; the first stall check seeds it. Populated and consumed by block
 	// download scheduling (Task 6); not touched here.
 	nLastProgressTime int64
+
+	// pindexBestHeaderSent mirrors CNodeState::pindexBestHeaderSent
+	// (node_state.h): the last header we told this peer about, via a
+	// getheaders reply OR a relay headers announcement. Serving.OnGetHeaders's
+	// doc comment named this field as its own missing counterpart, deferred
+	// to "the relay path (Task 12)" — this is that task. nil mirrors the C++
+	// nullptr: neither has happened yet for this peer.
+	//
+	// Written in two places, matching the two places net_processing.cpp
+	// writes it:
+	//
+	//   - Serving.OnGetHeaders, ProcessGetHeadersMessage's unconditional reset
+	//     (net_processing.cpp:3044, bitcoin-sv@879fc8b42): "It is important
+	//     that we simply reset the BestHeaderSent value here, and not
+	//     max(BestHeaderSent, newHeaderSent)" — every getheaders reply
+	//     overwrites it, never merges with what was there.
+	//   - PeerManager.RelayBlock, SendBlockHeaders's own write right after it
+	//     pushes the plain HEADERS message (net_processing.cpp:5372-5373 —
+	//     verified by grepping every pindexBestHeaderSent site in the file
+	//     rather than trusting a remembered line number; :5357 is the
+	//     sibling compact-block branch this port does not take, Phase 4).
+	//     A relay announcement is exactly as much "telling the peer about a
+	//     header" as a getheaders reply is. This write is its OWN defect,
+	//     not part of I1/I2's root cause: I1 was the dropped
+	//     pindexBestKnownBlock branch and I2 was the absent parent test,
+	//     both read-side; this write is what I2's parent test needs in
+	//     order to see a PRIOR relay's headers send when it decides the
+	//     NEXT block's hasParent (fix round 2, review Minor 2 correction).
+	//
+	// Read by the block announcement relay (relay.go peerHasHeader), which is
+	// half of net_processing.cpp PeerHasHeader — see that function's doc
+	// comment for the other half, pindexBestKnownBlock. This is its only
+	// consumer; peerSyncState carries no field without one (see the file doc
+	// comment above).
+	pindexBestHeaderSent *HeaderNode
+
+	// knownBlocks is this peer's known-block set: legacy peer.go's
+	// knownInventory (mruInventoryMap, AddKnownInventory/QueueInventory.Exists)
+	// reduced to blocks only, since this port relays no other inventory type
+	// yet. It covers exactly what neither pindexBestKnownBlock nor
+	// pindexBestHeaderSent can see: a block WE already relayed to this peer
+	// by plain INV, which touches neither field (see relay.go relayCandidate's
+	// doc comment on hasBlock). Combined with those two fields by the relay
+	// (relay.go, manager.go RelayBlock), it is what makes "never announce to
+	// the originating peer" and "never announce the same block twice" the
+	// same rule: whichever peer told us about a hash first (an inv, or the
+	// block body itself) has that hash marked here before the relay for it
+	// ever runs (manager.go Inv, BlockDone), and the relay marks it for
+	// whoever it sends the announcement to.
+	//
+	// Sized for the STEADY-STATE case only — see knownBlockCap's own doc
+	// comment for why a single large inv batch can consume the whole cap in
+	// one call, which is a real limitation of a count-based bound, not a
+	// time-based one.
+	knownBlocks *knownBlockSet
 }
 
 // newPeerSyncState returns a zero-value peerSyncState: no best known block,
 // no pending unknown announcement, sync not started, nothing in flight or
 // stalling. This mirrors a freshly default-constructed CNodeState entry.
 func newPeerSyncState() *peerSyncState {
-	return &peerSyncState{}
+	return &peerSyncState{knownBlocks: newKnownBlockSet()}
+}
+
+// knownBlockCap bounds knownBlockSet. Legacy's own cap (peer.go
+// maxKnownInventory = wire.MaxInvPerMsg, 50000) sizes a set shared between
+// every relayed transaction and every relayed block; this port's set holds
+// blocks only, at roughly one every ten minutes on mainnet (the target
+// spacing chaincfg.MainNetParams.TargetTimePerBlock encodes), so that cap
+// would cover the better part of a year. 288 is sized against that
+// STEADY-STATE rate: 48 hours of blocks at the target spacing, with what
+// looks like headroom for a catch-up burst.
+//
+// It is NOT a time-based bound, and the "48 hours" framing above is an
+// average, not a floor: the cap is consumed per mark() call, and Inv (in
+// manager.go) marks every InvTypeBlock entry in a single inbound MsgInv —
+// up to wire.MaxInvPerMsg (50,000) entries in ONE message. A single large
+// inv batch, exactly the "multi-block catch-up burst after a reconnect"
+// case this comment used to cite as the reason for the headroom, can evict
+// most or all of the set in one call, so the real worst-case protection
+// window is "until the next big inv batch", which can be much shorter than
+// 48 hours. The consequence stays bounded to a wasted small message either
+// way — see relay.go's doc comments on hasBlock for why eviction is
+// wasteful rather than harmful — so the number is kept, with this correction
+// to what it actually guarantees.
+//
+// Each entry costs roughly 75-80 bytes, not the 32 bytes of a bare
+// chainhash.Hash (fix round 2, review Minor 4 correction: knownBlockSet
+// stores every hash TWICE — once as a map key, with the map's own
+// bucket/entry overhead, and once again in the order slice that makes
+// eviction FIFO): call it 25 KB per peer at the cap, and roughly 23 MB in
+// aggregate across 1000 connected peers. Still small against this
+// service's other per-peer state (negligible next to Task 10's
+// maxPendingGetData, whose cost analysis this mirrors), just not as small
+// as a bare-hash estimate would suggest.
+const knownBlockCap = 288
+
+// knownBlockSet is a bounded, insertion-ordered set of block hashes: the
+// backing store for peerSyncState.knownBlocks (see its doc comment for what
+// it means and who writes it). Bounded FIFO eviction rather than legacy's
+// most-recently-used replacement (peer.go mruInventoryMap) — the two are
+// equivalent for this set's actual access pattern, since every hash here is
+// inserted exactly once, checked for existence any number of times, and
+// never re-inserted after it is marked; there is no "most recently used"
+// distinct from "most recently inserted" to preserve.
+//
+// Not safe for concurrent use on its own: every peerSyncState field is
+// guarded by PeerManager.syncMu, and this is no exception.
+type knownBlockSet struct {
+	set   map[chainhash.Hash]struct{}
+	order []chainhash.Hash
+}
+
+func newKnownBlockSet() *knownBlockSet {
+	return &knownBlockSet{set: make(map[chainhash.Hash]struct{})}
+}
+
+// has reports whether hash is already known. A nil receiver (a peerSyncState
+// built by a zero-value literal instead of newPeerSyncState, as some test
+// doubles do) answers false rather than panicking: "not yet known" is the
+// correct answer for a set that was never given anything to know.
+func (k *knownBlockSet) has(hash chainhash.Hash) bool {
+	if k == nil {
+		return false
+	}
+
+	_, ok := k.set[hash]
+
+	return ok
+}
+
+// mark records hash as known, evicting the oldest entry first if the set is
+// already at knownBlockCap. A hash already in the set is left exactly where
+// it is: this is a "known or not" set, not an LRU, so re-marking does not
+// refresh an eviction order that does not exist (see the type's doc
+// comment).
+func (k *knownBlockSet) mark(hash chainhash.Hash) {
+	if k == nil {
+		return
+	}
+
+	if _, ok := k.set[hash]; ok {
+		return
+	}
+
+	if len(k.order) >= knownBlockCap {
+		oldest := k.order[0]
+		k.order = k.order[1:]
+		delete(k.set, oldest)
+	}
+
+	k.set[hash] = struct{}{}
+	k.order = append(k.order, hash)
 }
 
 // updateBlockAvailability mirrors net_processing.cpp UpdateBlockAvailability.
