@@ -1326,6 +1326,29 @@ func (a *AddrMan) Attempt(addr Address, fCountFailure bool, nTime int64) {
 	}
 }
 
+// NLastTry reads CAddrInfo::nLastTry (addrman.h:33) for one address, returning
+// zero when the address is unknown.
+//
+// C++ needs no such accessor: CAddrMan::Select returns a CAddrInfo, so
+// ThreadOpenConnections reads nLastTry straight off the address it just picked
+// (net.cpp:1955). This port's Select returns the wire Address alone, so the one
+// CAddrInfo field that walk needs is read back by address instead.
+func (a *AddrMan) NLastTry(addr Address) int64 {
+	a.cs.Lock()
+	defer a.cs.Unlock()
+
+	info := a.find(newNetAddr(addr.ip))
+	if info == nil {
+		return 0
+	}
+
+	if info.port != addr.port {
+		return 0
+	}
+
+	return info.nLastTry
+}
+
 // Connected is `void Connected(const CService&, int64_t)` (addrman.h:607).
 func (a *AddrMan) Connected(addr Address, nTime int64) {
 	a.cs.Lock()

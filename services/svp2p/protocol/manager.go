@@ -31,6 +31,11 @@ const (
 	dialRetryBase = 5 * time.Second
 	dialRetryMax  = 5 * time.Minute
 
+	// dialTimeout is the connect timeout every outbound dial goes through,
+	// unchanged from the value dialLoop carried inline before the addrman-fed
+	// dialer shared the seam with it.
+	dialTimeout = 30 * time.Second
+
 	// maxSentNonces bounds the self-connection nonce registry, mirroring
 	// bsvd's sentNonces mruNonceMap size (50).
 	maxSentNonces = 50
@@ -177,18 +182,43 @@ type PeerManager struct {
 	// written again, so it needs no lock.
 	addrRelaySeed [32]byte
 
+	// outboundDials is the set of addresses the addrman-driven dialer holds a
+	// dial for, keyed by ip:port and guarded by mu. It is the stand-in for
+	// SVNode's semOutbound grant, which ThreadOpenConnections takes before
+	// ConnectNode and moves into the CNode it created (net.cpp:1852,
+	// :2178-2180) — see outbound.go's outboundSlots.connected.
+	outboundDials map[string]struct{}
+
+	// outboundTick is the addrman-driven dialer's pass period, SVNode's own
+	// 500ms (net.cpp:1846). A field for the same reason syncTick is one: the
+	// tests drive the loop faster than a real node does.
+	outboundTick time.Duration
+
+	// dialTCP opens one outbound TCP connection. It is the single dial seam
+	// both dialLoop (legacy_connect_peers) and the addrman-driven dialer go
+	// through, so the network — the one dependency neither can provide for
+	// itself — can be stood in for without either loop's own logic being
+	// bypassed.
+	dialTCP func(addr string) (net.Conn, error)
+
 	quit chan struct{}
 	wg   sync.WaitGroup
 }
 
 func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList *BanList) *PeerManager {
 	m := &PeerManager{
-		logger:    logger,
-		tSettings: tSettings,
-		banList:   banList,
-		peers:     make(map[*Peer]*SyncPeer),
-		quit:      make(chan struct{}),
-		syncTick:  defaultSyncTick,
+		logger:        logger,
+		tSettings:     tSettings,
+		banList:       banList,
+		peers:         make(map[*Peer]*SyncPeer),
+		outboundDials: make(map[string]struct{}),
+		quit:          make(chan struct{}),
+		syncTick:      defaultSyncTick,
+		outboundTick:  defaultOpenConnectionsTick,
+	}
+
+	m.dialTCP = func(addr string) (net.Conn, error) {
+		return net.DialTimeout("tcp", addr, dialTimeout)
 	}
 
 	// net.cpp CConnman::Start seeds nSeed0/nSeed1 from GetRand; a failed read
@@ -514,6 +544,25 @@ func (m *PeerManager) Start(ctx context.Context, listenAddresses []string) error
 		}(addr)
 	}
 
+	// net.cpp ThreadOpenConnections' `-connect` branch (net.cpp:1817-1836)
+	// returns without ever reaching the addrman-fed loop below it, which is
+	// what makes legacy_connect_peers dominant when it is set. A zero target
+	// and a missing address table are the other two states that leave the loop
+	// off; SetAddrMan must be called before Start, so reading it once here is
+	// enough.
+	if addrMan := m.addrManager(); addrMan != nil &&
+		len(m.tSettings.Legacy.ConnectPeers) == 0 &&
+		m.tSettings.Legacy.TargetOutboundPeers > 0 {
+		target := m.tSettings.Legacy.TargetOutboundPeers
+
+		m.wg.Add(1)
+
+		go func() {
+			defer m.wg.Done()
+			m.openConnectionsLoop(ctx, addrMan, target)
+		}()
+	}
+
 	if m.SyncEnabled() {
 		m.wg.Add(1)
 
@@ -569,7 +618,7 @@ func (m *PeerManager) dialLoop(ctx context.Context, addr string) {
 			return
 		}
 
-		nc, err := net.DialTimeout("tcp", addr, 30*time.Second)
+		nc, err := m.dialTCP(addr)
 		if err == nil {
 			runErr := m.runPeer(ctx, nc, false)
 
@@ -812,10 +861,16 @@ func (m *PeerManager) Established(syncPeer *SyncPeer, services wire.ServiceFlag)
 }
 
 // GetAddrRequest is the outbound half of ProcessVersionMessage's
-// `if(!pfrom->fInbound)` block: "Get recent addresses"
-// (net_processing.cpp:1867-1871). The OUTBOUND side asks its peer for
-// addresses and arms fGetAddr; an inbound connection is never asked, the same
+// `if(!pfrom->fInbound)` block: "Get recent addresses" plus the
+// MarkAddressGood that closes it (net_processing.cpp:1867-1872). The OUTBOUND
+// side asks its peer for addresses, arms fGetAddr, and marks the peer's own
+// address Good in the table; an inbound connection gets none of it, the same
 // asymmetry ProcessGetAddrMessage enforces in the other direction.
+//
+// The Good call is here, and not at the dial site, because this IS that C++
+// block: SVNode marks the address good only once the peer has proved it speaks
+// the protocol, which is what reaching this method means. Its position after
+// the getaddr keeps SVNode's decision order.
 //
 // Two differences from C++, both forced and both harmless. It is sent at
 // verack rather than at version, because this port has no version-time send
@@ -835,7 +890,7 @@ func (m *PeerManager) Established(syncPeer *SyncPeer, services wire.ServiceFlag)
 // which is legacy's own shape). Unsolicited self-advertisement to every
 // outbound peer is a separate behavior and is deliberately left out rather
 // than half-built.
-func (m *PeerManager) GetAddrRequest(syncPeer *SyncPeer, inbound bool) []wire.Message {
+func (m *PeerManager) GetAddrRequest(syncPeer *SyncPeer, inbound bool, remoteAddr *wire.NetAddress) []wire.Message {
 	if inbound || syncPeer == nil {
 		return nil
 	}
@@ -843,6 +898,12 @@ func (m *PeerManager) GetAddrRequest(syncPeer *SyncPeer, inbound bool) []wire.Me
 	m.syncMu.Lock()
 	syncPeer.fGetAddr = true
 	m.syncMu.Unlock()
+
+	// AddrMan.Good takes AddrMan's own lock, so it runs with syncMu released:
+	// every AddrMan method is a blocking call (see the addrMan field's note).
+	if addrMan := m.addrManager(); addrMan != nil && remoteAddr != nil {
+		addrMan.Good(addrFromNetAddr(remoteAddr), time.Now().Unix())
+	}
 
 	return []wire.Message{wire.NewMsgGetAddr()}
 }

@@ -706,6 +706,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// and net.h:163.
 			BlockDownloadSlowFetchTimeout: getDuration("legacy_blockDownloadSlowFetchTimeout", 30*time.Second, alternativeContext...),
 			BlockDownloadMaxParallelFetch: getInt("legacy_blockDownloadMaxParallelFetch", 3, alternativeContext...),
+			// The outbound connection target, default as SVNode's net.h:96
+			// DEFAULT_MAX_OUTBOUND_CONNECTIONS. Zero turns the svp2p
+			// addrman-driven dialer off; legacy_connect_peers overrides it.
+			TargetOutboundPeers: getInt("legacy_targetOutboundPeers", 8, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

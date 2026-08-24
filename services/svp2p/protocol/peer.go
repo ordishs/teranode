@@ -241,9 +241,12 @@ type syncDispatcher interface {
 // (manager.go runPeer). Either can be on with the other off.
 type addrDispatcher interface {
 	// GetAddrRequest is the handshake-complete event: an outbound connection
-	// asks its peer for addresses (net_processing.cpp:1867-1871). It returns
-	// nothing for an inbound connection, which SVNode never asks.
-	GetAddrRequest(sp *SyncPeer, inbound bool) []wire.Message
+	// asks its peer for addresses and its address is marked good
+	// (net_processing.cpp:1867-1872). It returns nothing for an inbound
+	// connection, which SVNode never asks. remoteAddr is the connection's own
+	// peer address, which is what MarkAddressGood is given (`CAddress peerAddr`,
+	// net_processing.cpp:1843).
+	GetAddrRequest(sp *SyncPeer, inbound bool, remoteAddr *wire.NetAddress) []wire.Message
 
 	// GetAddr answers one getaddr. It cannot end the connection: SVNode
 	// ignores a getaddr it will not answer and scores nothing
@@ -741,12 +744,13 @@ func (p *Peer) dispatchAddr(msg wire.Message, established, firstEstablished bool
 		return nil
 	}
 
-	// net_processing.cpp:1867-1871, the outbound half of
+	// net_processing.cpp:1867-1872, the outbound half of
 	// ProcessVersionMessage's `if(!pfrom->fInbound)` block: "Get recent
-	// addresses". Sent at verack rather than at version because this port has
-	// no version-time send hook — the handshake machine owns that exchange.
+	// addresses", and the MarkAddressGood that closes it. Sent at verack
+	// rather than at version because this port has no version-time send hook —
+	// the handshake machine owns that exchange.
 	if firstEstablished {
-		p.send(p.cfg.Addrs.GetAddrRequest(p.cfg.SyncPeer, p.cfg.Handshake.Inbound))
+		p.send(p.cfg.Addrs.GetAddrRequest(p.cfg.SyncPeer, p.cfg.Handshake.Inbound, p.cfg.Handshake.RemoteAddr))
 	}
 
 	// The same pre-handshake gate dispatchSync and dispatchTx apply
