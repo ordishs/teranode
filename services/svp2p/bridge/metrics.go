@@ -7,12 +7,39 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Metrics relocated from the legacy netsync package's metrics.go, trimmed to the
-// subset handle_block.go and subtree_partition.go actually observe (the
-// tx-message and orphan-pool metrics have no relocated consumer in Phase 2 —
-// see Decision 1 in the svp2p Phase 2 plan) and renamed/re-subsystemed so a
-// coexisting legacy netsync process cannot collide with this package's
-// registrations under the same metric name.
+// Metrics relocated from the legacy netsync package's metrics.go, trimmed to
+// the subset handle_block.go and subtree_partition.go actually observe, and
+// renamed/re-subsystemed so a coexisting legacy netsync process cannot collide
+// with this package's registrations under the same metric name.
+//
+// The arithmetic, corrected here per the phase-2 ledger's Task 8 nit ("report
+// metric arithmetic 18/4 should read 19/5") and re-counted against
+// services/legacy/netsync/metrics.go rather than carried over: legacy
+// registers 19, this package kept 14 and dropped 5. The five are the
+// tx-message and orphan-pool ones — HandleTxMsg, HandleTxMsgValidate,
+// ProcessOrphanTransactions, Orphans and OrphanTime. It registers 15, the 14
+// plus its own OrphanEvictionQueueDrops below.
+//
+// RESIDUAL, recorded by Task 25 rather than acted on: those five were dropped
+// because Phase 2 had no relocated consumer for them (Decision 1, svp2p Phase
+// 2 plan). Phase 3 built the consumers — IngestTx (Task 14, ingest_tx.go) and
+// the orphan transaction pool (Task 15, orphans.go) — so the reason no longer
+// holds and the ingest and orphan paths run uninstrumented apart from
+// OrphanEvictionQueueDrops. Re-adding them is new instrumentation with its own
+// naming and label decisions, not a minors-sweep row, so it is booked as a
+// follow-up instead of smuggled in here.
+//
+// DECISION, Task 25, on the ledger line "Metrics series split if both ingest
+// entries reachable" (Task 10 note): NO series split. IngestBlock deliberately
+// shares handle_block_direct with HandleBlockDirect (ingest.go:375-378), which
+// is sound only while one of the two entries is unreachable in a running node.
+// Re-checked at the end of Phase 3, and it still is: HandleBlockDirect is not
+// on the Bridge interface (bridge.go) at all, and the only callers anywhere in
+// the tree are this package's own tests. Nothing this phase added reaches it —
+// the transport hands bridge a reader, so protocol calls IngestBlock. The
+// series therefore stays unambiguous and the shared histogram stays. WHOEVER
+// GIVES HandleBlockDirect A PRODUCTION CALLER must split the series in the
+// same change, or the two entries will silently share one histogram.
 var (
 	prometheusSvp2pBridgeBlockHeight                    prometheus.Gauge
 	prometheusSvp2pBridgeHandleBlockDirect              prometheus.Histogram

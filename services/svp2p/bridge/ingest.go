@@ -375,6 +375,9 @@ func (sm *svp2pBridge) IngestBlock(ctx context.Context, header *wire.BlockHeader
 		// Shares the buffered entry's histogram: only one of the two entries
 		// is reachable in a running node — protocol calls IngestBlock and
 		// nothing calls HandleBlockDirect — so the series stays unambiguous.
+		// Re-checked at the end of Phase 3 and kept; the decision, what it
+		// depends on and what breaks it are recorded on metrics.go's own
+		// header comment.
 		tracing.WithHistogram(prometheusSvp2pBridgeHandleBlockDirect),
 	)
 

@@ -2220,3 +2220,292 @@ func TestCheckStall_HonoursTheConfiguredRateFloor(t *testing.T) {
 		})
 	}
 }
+
+// mixedInvMsg builds an inv message from entries the caller types
+// individually, including nil entries, which is what the OnInv error-contract
+// and skip-contract tests need and invMsg above cannot express.
+func mixedInvMsg(t *testing.T, entries ...*wire.InvVect) *wire.MsgInv {
+	t.Helper()
+
+	msg := wire.NewMsgInv()
+
+	for _, entry := range entries {
+		if entry == nil {
+			// Appended directly: AddInvVect would dereference it.
+			msg.InvList = append(msg.InvList, nil)
+			continue
+		}
+
+		require.NoError(t, msg.AddInvVect(entry))
+	}
+
+	return msg
+}
+
+func blockInv(hash chainhash.Hash) *wire.InvVect {
+	return wire.NewInvVect(wire.InvTypeBlock, &hash)
+}
+
+func txInv(hash chainhash.Hash) *wire.InvVect {
+	return wire.NewInvVect(wire.InvTypeTx, &hash)
+}
+
+// TestOnInv_DistinctUnknownBlocksEachDrawTheirOwnGetheaders records the Task 25
+// decision on the phase-2 ledger line "M5 N-getheaders on distinct unknown
+// invs", and pins the behavior that decision keeps.
+//
+// net_processing.cpp ProcessInvMessage answers each entry of the inv inside the
+// per-entry loop (:2461-2462) and pushes one getheaders per new block hash
+// (:2489-2493), whose hashStop is that entry's own hash (`inv.hash`, :2492).
+// N distinct unknown hashes in one message therefore draw N getheaders from
+// SVNode, and this port keeps that.
+//
+// The one-per-message rule OnInv already documents is NOT widened to distinct
+// hashes, and the reason is in the message it would have to build: hashStop
+// truncates the peer's reply, so one getheaders can only ever bound one of the
+// announced branches. Collapsing three distinct announcements onto the first
+// hash's hashStop would leave the other two unrequested, and nothing re-asks
+// for them — OnHeaders only chains another getheaders off a full 2000-header
+// batch. The duplicate-hash case is different in kind, and that is why it is
+// the only one collapsed: the copies are byte-identical, so dropping them
+// loses nothing.
+//
+// What this does leave standing is an amplification asymmetry (recorded as a
+// residual, not fixed here): a peer spends 36 bytes per fabricated hash and
+// draws a full locator back per hash. SVNode has the identical exposure at the
+// identical site, so closing it here would be a divergence, not a port.
+func TestOnInv_DistinctUnknownBlocksEachDrawTheirOwnGetheaders(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := fullNodePeer("1.2.3.4:8333")
+
+	unknown := []chainhash.Hash{{0xA1}, {0xA2}, {0xA3}}
+
+	msgs, txHashes, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeBlock, unknown...))
+	require.NoError(t, err)
+	require.Empty(t, txHashes)
+	require.Len(t, msgs, len(unknown), "one getheaders per distinct unknown hash, as net_processing.cpp:2489-2493 sends")
+
+	locator := f.idx.Locator()
+
+	for i, hash := range unknown {
+		gh, ok := msgs[i].(*wire.MsgGetHeaders)
+		require.True(t, ok, "message %d is %T", i, msgs[i])
+
+		require.Equal(t, hash, gh.HashStop,
+			"getheaders %d stops at the hash that entry announced, not at another entry's", i)
+
+		require.Len(t, gh.BlockLocatorHashes, len(locator))
+
+		for j := range locator {
+			require.Equal(t, locator[j], *gh.BlockLocatorHashes[j],
+				"every getheaders in the batch carries the same locator")
+		}
+	}
+}
+
+// TestOnInv_AnErrorDiscardsEverythingAlreadyQueued closes the phase-2 ledger's
+// Task 6 minor M4 ("OnInv error contract") and the coverage gap the same entry
+// names ("M4 nil-vs-partial msgs untested with multi-entry inv"). OnInv's own
+// contract is "On error the message list is nil, never partial", and until now
+// the only unsupported-type test sent a single-entry inv, where nil and
+// partial are the same thing.
+//
+// Both directions are covered because they fail differently: an unsupported
+// entry AFTER real work proves the queued messages and collected tx hashes are
+// thrown away, and one BEFORE proves the return does not depend on having
+// queued something first. net_processing.cpp:2514-2516 sets
+// pfrom->fDisconnect and keeps looping; this port returns instead, because the
+// caller drops the peer and messages for a dropped peer are not worth sending.
+//
+// The availability state each block entry set does stand — it is state, not
+// output, and OnInv's doc comment says so.
+func TestOnInv_AnErrorDiscardsEverythingAlreadyQueued(t *testing.T) {
+	unknownA := chainhash.Hash{0xB1}
+	unknownB := chainhash.Hash{0xB2}
+	txA := chainhash.Hash{0xC1}
+	bad := wire.NewInvVect(wire.InvTypeFilteredBlock, &chainhash.Hash{0xDD})
+
+	tests := []struct {
+		name            string
+		entries         []*wire.InvVect
+		wantLastUnknown chainhash.Hash
+	}{
+		{
+			name:            "the unsupported entry lands after a block inv",
+			entries:         []*wire.InvVect{blockInv(unknownA), bad},
+			wantLastUnknown: unknownA,
+		},
+		{
+			name:            "the unsupported entry lands after a tx inv",
+			entries:         []*wire.InvVect{txInv(txA), bad},
+			wantLastUnknown: chainhash.Hash{},
+		},
+		{
+			name:            "the unsupported entry lands after both halves",
+			entries:         []*wire.InvVect{blockInv(unknownA), txInv(txA), bad, blockInv(unknownB)},
+			wantLastUnknown: unknownA,
+		},
+		{
+			name:            "the unsupported entry lands first",
+			entries:         []*wire.InvVect{bad, blockInv(unknownA), txInv(txA)},
+			wantLastUnknown: chainhash.Hash{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDownloadFixture(t, 3)
+			peer := fullNodePeer("1.2.3.4:8333")
+
+			msgs, txHashes, err := f.bd.OnInv(peer, mixedInvMsg(t, tc.entries...))
+			require.Error(t, err)
+			require.ErrorIs(t, err, ErrProtocolViolation)
+			require.Nil(t, msgs, "the message list is nil, never partial")
+			require.Nil(t, txHashes, "the collected tx hashes are discarded with the messages")
+
+			require.Equal(t, tc.wantLastUnknown, peer.State.hashLastUnknownBlock,
+				"availability updates made before the bad entry stand; nothing after it runs")
+		})
+	}
+}
+
+// TestOnInv_NilEntriesDoNotTruncateTheBatch is the other half of the M4 gap:
+// OnInv skips a nil entry, and a multi-entry message is what proves the skip
+// is a continue and not an early return. A nil entry cannot arrive off the
+// wire — wire's own decoder never produces one — so this pins the guard's
+// contract for every in-process caller instead (PeerManager.Inv and the
+// scripted peers), in both orders.
+func TestOnInv_NilEntriesDoNotTruncateTheBatch(t *testing.T) {
+	unknownA := chainhash.Hash{0xE1}
+	unknownB := chainhash.Hash{0xE2}
+	txA := chainhash.Hash{0xF1}
+	txB := chainhash.Hash{0xF2}
+
+	tests := []struct {
+		name     string
+		entries  []*wire.InvVect
+		wantMsgs int
+		wantTxs  []chainhash.Hash
+	}{
+		{
+			name:     "nil first, then a block inv",
+			entries:  []*wire.InvVect{nil, blockInv(unknownA)},
+			wantMsgs: 1,
+		},
+		{
+			name:     "nil between two distinct block invs",
+			entries:  []*wire.InvVect{blockInv(unknownA), nil, blockInv(unknownB)},
+			wantMsgs: 2,
+		},
+		{
+			name:     "nil last",
+			entries:  []*wire.InvVect{blockInv(unknownA), nil},
+			wantMsgs: 1,
+		},
+		{
+			name:    "nil between two tx invs",
+			entries: []*wire.InvVect{txInv(txA), nil, txInv(txB)},
+			wantTxs: []chainhash.Hash{txA, txB},
+		},
+		{
+			name:     "nil between the two halves",
+			entries:  []*wire.InvVect{txInv(txA), nil, blockInv(unknownA)},
+			wantMsgs: 1,
+			wantTxs:  []chainhash.Hash{txA},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDownloadFixture(t, 3)
+			peer := fullNodePeer("1.2.3.4:8333")
+
+			msgs, txHashes, err := f.bd.OnInv(peer, mixedInvMsg(t, tc.entries...))
+			require.NoError(t, err)
+			require.Len(t, msgs, tc.wantMsgs)
+
+			if tc.wantTxs == nil {
+				require.Empty(t, txHashes)
+			} else {
+				require.Equal(t, tc.wantTxs, txHashes)
+			}
+		})
+	}
+}
+
+// TestNewGetHeaders_CopiesTheLocator guards the invariant the shared builder
+// exists for. Phase-2 ledger, Task 6 minor M6: "locator-copy duplication" —
+// HeaderSync.getHeaders and BlockDownloader.getHeadersFor carried the
+// identical copy loop, and Task 25 extracted it into newGetHeaders.
+//
+// wire.MsgGetHeaders holds []*chainhash.Hash. A builder that appended
+// &locator[i] would publish pointers INTO the caller's slice, so a later
+// writer of that slice would rewrite an already-built message. Both original
+// loops copied deliberately, and now one helper has to.
+func TestNewGetHeaders_CopiesTheLocator(t *testing.T) {
+	f := newDownloadFixture(t, 12)
+
+	locator := f.idx.Locator()
+	require.Greater(t, len(locator), 1, "the fixture must produce a multi-entry locator")
+
+	original := append([]chainhash.Hash(nil), locator...)
+	stop := chainhash.Hash{0x99}
+
+	msg := newGetHeaders(locator, stop)
+	require.Equal(t, stop, msg.HashStop)
+	require.Equal(t, uint32(wire.ProtocolVersion), msg.ProtocolVersion)
+	require.Len(t, msg.BlockLocatorHashes, len(original))
+
+	for i := range original {
+		require.NotSame(t, &locator[i], msg.BlockLocatorHashes[i],
+			"entry %d must be a copy, not a pointer into the caller's slice", i)
+	}
+
+	// Overwrite the source slice: the built message must not move.
+	for i := range locator {
+		locator[i] = chainhash.Hash{byte(i + 1)}
+	}
+
+	for i := range original {
+		require.Equal(t, original[i], *msg.BlockLocatorHashes[i],
+			"entry %d changed after the source slice was overwritten", i)
+	}
+
+	require.Empty(t, newGetHeaders(nil, stop).BlockLocatorHashes,
+		"an empty locator produces a message with no locator hashes, not a panic")
+}
+
+// TestGetHeaders_BothCallSitesKeepTheirOwnHashStop pins what the extraction in
+// Task 25 had to preserve: the two callers share the locator copy but not the
+// stop rule. HeaderSync sends the next checkpoint while headers-first mode
+// runs (legacy netsync manager.go startSync); the inv answerer sends the hash
+// the peer just announced (net_processing.cpp:2489-2493, `inv.hash`).
+func TestGetHeaders_BothCallSitesKeepTheirOwnHashStop(t *testing.T) {
+	f := newDownloadFixture(t, 12)
+
+	cpHash := chainhash.Hash{0xC0}
+
+	hs, err := NewHeaderSync(HeaderSyncConfig{
+		Index:  f.idx,
+		Params: syncTestParams([]chaincfg.Checkpoint{{Height: 1000, Hash: &cpHash}}),
+	})
+	require.NoError(t, err)
+
+	// headersFirstMode is armed by the first sync peer, not by construction
+	// (PeerEstablished, headersync.go:517-524), so the round has to be started
+	// for the checkpoint hashStop rule to apply.
+	require.NotEmpty(t, hs.PeerEstablished(fullNodePeer("5.6.7.8:8333")))
+	require.True(t, hs.IsHeadersFirstMode(), "the checkpoint sits above the fixture tip")
+
+	locator := f.idx.Locator()
+
+	fromSync := hs.getHeaders(locator)
+	require.Equal(t, cpHash, fromSync.HashStop, "headers-first sync stops at the next checkpoint")
+	require.Equal(t, locator, locatorValues(fromSync))
+
+	announced := chainhash.Hash{0x77}
+
+	fromInv := f.bd.getHeadersFor(announced)
+	require.Equal(t, announced, fromInv.HashStop, "the inv answerer stops at the announced hash")
+	require.Equal(t, locator, locatorValues(fromInv))
+}

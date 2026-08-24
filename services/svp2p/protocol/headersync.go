@@ -744,23 +744,38 @@ func (hs *HeaderSync) OnHeaders(peer *SyncPeer, msg *wire.MsgHeaders) ([]wire.Me
 	// sequence, checked before any header is accepted →
 	// Misbehaving(pfrom, 20, "disconnected headers"),
 	// error("non-continuous headers sequence").
-	var hashLastBlock chainhash.Hash
+	//
+	// Phase-2 ledger, Task 5 minor: "hoist header.BlockHash() once per loop
+	// iteration (4 hashes/header -> 3)". This scan already hashes every
+	// header, so it keeps what it computed and hands it on: acceptHeaders, the
+	// proof-of-work check and the post-insert lookup all read hashes[i]
+	// instead of hashing again, which makes it one BlockHash() per header for
+	// the whole handler. The slice is discarded unread on the
+	// non-continuous return below.
+	var (
+		hashLastBlock chainhash.Hash
+		hashes        = make([]chainhash.Hash, len(headers))
+	)
 
-	for _, header := range headers {
+	for i, header := range headers {
 		if hashLastBlock != (chainhash.Hash{}) && header.PrevBlock != hashLastBlock {
 			return nil, scoreNonContinuousHeaders, nil
 		}
 
 		hashLastBlock = header.BlockHash()
+		hashes[i] = hashLastBlock
 	}
 
-	return hs.acceptHeaders(peer, headers)
+	return hs.acceptHeaders(peer, headers, hashes)
 }
 
 // acceptHeaders is the ProcessNewBlockHeaders half of the HEADERS handler: it
 // validates and inserts each header, enforces the checkpoint, and decides what
 // to ask for next.
-func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader) ([]wire.Message, int, error) {
+//
+// hashes carries each header's BlockHash(), computed once by the continuity
+// scan in OnHeaders; hashes[i] belongs to headers[i].
+func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader, hashes []chainhash.Hash) ([]wire.Message, int, error) {
 	var (
 		lastAccepted       chainhash.Hash
 		lastAcceptedHeight int32
@@ -776,8 +791,8 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 	roundOwner := hs.headersFirstMode && peer.State.fSyncStarted
 	checkpointRound := roundOwner && hs.nextCheckpoint != nil
 
-	for _, header := range headers {
-		hash := header.BlockHash()
+	for i, header := range headers {
+		hash := hashes[i]
 
 		// AcceptBlockHeader (validation.cpp:6104-6117) checks for a duplicate
 		// FIRST and returns early: a header already in mapBlockIndex is
@@ -795,7 +810,7 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 		node, known := hs.cfg.Index.Lookup(hash)
 
 		if !known {
-			inserted, score, ok, err := hs.acceptHeader(header)
+			inserted, score, ok, err := hs.acceptHeader(header, hash)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -928,11 +943,14 @@ func (hs *HeaderSync) acceptHeaders(peer *SyncPeer, headers []*wire.BlockHeader)
 // refusal such as time-too-new, where SVNode refuses the header but neither
 // scores nor disconnects the peer. err is set only for a refusal that must
 // disconnect the peer.
-func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (node HeaderNode, score int, accepted bool, err error) {
+//
+// hash is header.BlockHash(), passed in rather than recomputed (Task 5 minor,
+// see OnHeaders).
+func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader, hash chainhash.Hash) (node HeaderNode, score int, accepted bool, err error) {
 	// AcceptBlockHeader calls CheckBlockHeader before the mapBlockIndex
 	// insert; HeaderIndex.AddHeader deliberately carries only the insert, so
 	// the PoW check belongs here.
-	if !hs.checkBlockHeaderPoW(header) {
+	if !hs.checkBlockHeaderPoW(header, hash) {
 		return HeaderNode{}, scoreInvalidHeader, false, nil
 	}
 
@@ -1008,10 +1026,10 @@ func (hs *HeaderSync) acceptHeader(header *wire.BlockHeader) (node HeaderNode, s
 		return HeaderNode{}, scorePrevBlkNotFound, false, nil
 	}
 
-	node, ok = hs.cfg.Index.Lookup(header.BlockHash())
+	node, ok = hs.cfg.Index.Lookup(hash)
 	if !ok {
 		return HeaderNode{}, 0, false, errors.New(errors.ERR_SERVICE_ERROR,
-			"svp2p: header %s vanished from the index directly after insert", header.BlockHash())
+			"svp2p: header %s vanished from the index directly after insert", hash)
 	}
 
 	return node, 0, true, nil
@@ -1125,7 +1143,10 @@ func (hs *HeaderSync) lastCheckpointInIndex() *chaincfg.Checkpoint {
 //
 // Still unported, deliberately: the historic difficulty eras (see difficulty.go)
 // and the time-too-old rule (see acceptHeader).
-func (hs *HeaderSync) checkBlockHeaderPoW(header *wire.BlockHeader) bool {
+//
+// hash is header.BlockHash(). It is a parameter rather than a local because
+// every caller already holds it (Task 5 minor, see OnHeaders).
+func (hs *HeaderSync) checkBlockHeaderPoW(header *wire.BlockHeader, hash chainhash.Hash) bool {
 	var bits model.NBit
 
 	binary.LittleEndian.PutUint32(bits[:], header.Bits)
@@ -1141,8 +1162,6 @@ func (hs *HeaderSync) checkBlockHeaderPoW(header *wire.BlockHeader) bool {
 	if hs.cfg.Params.PowLimit != nil && target.Cmp(hs.cfg.Params.PowLimit) > 0 {
 		return false
 	}
-
-	hash := header.BlockHash()
 
 	bigEndian := make([]byte, len(hash))
 	for i := range hash {
@@ -1245,18 +1264,38 @@ func (hs *HeaderSync) locatorFrom(hash chainhash.Hash) []chainhash.Hash {
 // that asks a peer for exactly the headers up to the next checkpoint.
 // Otherwise hashStop is the zero hash net_processing.cpp always sends.
 func (hs *HeaderSync) getHeaders(locator []chainhash.Hash) *wire.MsgGetHeaders {
+	var hashStop chainhash.Hash
+	if hs.headersFirstMode && hs.nextCheckpoint != nil {
+		hashStop = *hs.nextCheckpoint.Hash
+	}
+
+	return newGetHeaders(locator, hashStop)
+}
+
+// newGetHeaders builds a getheaders message from a locator and a hashStop.
+//
+// Phase-2 ledger, Task 6 minor M6: "locator-copy duplication". HeaderSync's
+// getHeaders above and BlockDownloader.getHeadersFor (blockdownload.go) each
+// carried this same loop; it lives here once now. hashStop stays the caller's
+// decision, because the two callers answer different questions: HeaderSync
+// sends the next checkpoint while headers-first mode runs, and the inv
+// answerer sends the hash the peer just announced.
+//
+// The loop copies each hash into its own variable on purpose.
+// wire.MsgGetHeaders holds []*chainhash.Hash, so appending &locator[i] would
+// publish pointers into the caller's slice and let a later write to it rewrite
+// an already-built message.
+//
+// A locator holds one hash per height step with an exponential tail, so it
+// stays far below MaxBlockLocatorsPerMsg (500) at any reachable height.
+func newGetHeaders(locator []chainhash.Hash, hashStop chainhash.Hash) *wire.MsgGetHeaders {
 	msg := wire.NewMsgGetHeaders()
 	msg.ProtocolVersion = wire.ProtocolVersion
+	msg.HashStop = hashStop
 
-	// A locator holds one hash per height step with an exponential tail, so it
-	// stays far below MaxBlockLocatorsPerMsg (500) at any reachable height.
 	for i := range locator {
 		hash := locator[i]
 		msg.BlockLocatorHashes = append(msg.BlockLocatorHashes, &hash)
-	}
-
-	if hs.headersFirstMode && hs.nextCheckpoint != nil {
-		msg.HashStop = *hs.nextCheckpoint.Hash
 	}
 
 	return msg

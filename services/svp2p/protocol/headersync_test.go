@@ -1203,7 +1203,7 @@ func TestCheckBlockHeaderPoW_MainnetVector(t *testing.T) {
 	hs, err := NewHeaderSync(HeaderSyncConfig{Index: idx, Params: &mainnet})
 	require.NoError(t, err)
 
-	require.True(t, hs.checkBlockHeaderPoW(&header))
+	require.True(t, hs.checkBlockHeaderPoW(&header, header.BlockHash()))
 
 	// Same header, different nonce: the work is gone and the check must say so.
 	// Grinding to a definite failure keeps the row deterministic.
@@ -1214,7 +1214,7 @@ func TestCheckBlockHeaderPoW_MainnetVector(t *testing.T) {
 		broken.Nonce++
 	}
 
-	require.False(t, hs.checkBlockHeaderPoW(&broken))
+	require.False(t, hs.checkBlockHeaderPoW(&broken, broken.BlockHash()))
 }
 
 // TestHeaderSync_Checkpoints pins the headers-first-to-next-checkpoint scheme
@@ -1625,7 +1625,7 @@ func TestHeaderSync_ContextualDifficulty(t *testing.T) {
 		// powLimit, so the cheap CheckBlockHeader proof-of-work check passes
 		// and only the contextual check can catch it.
 		bad := timedChild(f.tip(), testEasyBits-1, 9001, tip.Time+600)
-		require.True(t, hs.checkBlockHeaderPoW(bad))
+		require.True(t, hs.checkBlockHeaderPoW(bad, bad.BlockHash()))
 
 		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{bad}))
 
@@ -2023,7 +2023,7 @@ func TestHeaderSync_TimeTooNew(t *testing.T) {
 		f, hs, peer, tip := newAtTip(t)
 
 		past := timedChild(f.tip(), testEasyBits, 6002, tip.Time+MaxFutureBlockTime+1)
-		require.True(t, hs.checkBlockHeaderPoW(past))
+		require.True(t, hs.checkBlockHeaderPoW(past, past.BlockHash()))
 
 		msgs, misbehavior, err := hs.OnHeaders(peer, headersMsg([]*wire.BlockHeader{past}))
 

@@ -15,9 +15,9 @@ var ErrBlockStreamClosed = errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: block
 
 // minTxPayloadBytes is the smallest byte count a serialized transaction can
 // occupy: version 4 + input count varint 1 + output count varint 1 +
-// nLockTime 4. It mirrors minTxPayload in go-wire msg_tx.go, which
-// maxTxPerBlock in msg_block.go uses to bound the transaction count on the
-// buffered decode path.
+// nLockTime 4. It mirrors minTxPayload in go-wire msg_tx.go:72, which
+// maxTxPerBlock in msg_block.go:40-42 uses to bound the transaction count on
+// the buffered decode path.
 const minTxPayloadBytes = 10
 
 // wireHeader is the 24 byte message header, kept raw so a non-block message
@@ -111,11 +111,14 @@ func newBlockStream(r io.Reader, length uint64, pver uint32) (*BlockStream, erro
 	}
 
 	// Bound the count the way the buffered path does. go-wire rejects above
-	// maxTxPerBlock, which is MaxBlockPayload/minTxPayload; here the divisor
-	// applies to the unread remainder of this payload, so the bound is
-	// tighter than the buffered path's and never looser. Consumers size
-	// their ingest from TxCount, so this must not admit a number the
-	// buffered path would have refused.
+	// maxTxPerBlock, which is (MaxBlockPayload/minTxPayload) + 1 — the
+	// quotient PLUS ONE, msg_block.go:40-42 (phase-2 ledger, Task 7 nit: this
+	// comment used to name the bare quotient). Here the divisor applies to the
+	// unread remainder of this payload, so the bound is tighter than the
+	// buffered path's and never looser: the remainder can at most equal
+	// MaxBlockPayload, which leaves this bound one below theirs even then.
+	// Consumers size their ingest from TxCount, so this must not admit a
+	// number the buffered path would have refused.
 	if count > uint64(b.lr.N)/minTxPayloadBytes { //nolint:gosec // lr.N is non-negative
 		return b, errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
 			"svp2p: block declares %d transactions in %d remaining payload bytes", count, b.lr.N)

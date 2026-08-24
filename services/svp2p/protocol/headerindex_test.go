@@ -1049,3 +1049,182 @@ func TestActiveChainRange(t *testing.T) {
 		require.Equal(t, *main[7], got[1])
 	})
 }
+
+// TestLocatorFrom_StaysOnTheRequestedBranch closes the Phase 2 Task 2 minor
+// the phase-2 ledger recorded as "locator tests assert heights not branch
+// identity (add LocatorFrom side-chain case later)". TestLocator_HeightSequences
+// above pins the height sequence chain.cpp CChain::GetLocator produces and
+// pins LocatorFrom(tip) against Locator(), but every hash it walks is on the
+// one and only branch in the index, so nothing there can tell a locator built
+// from the requested node apart from one built from the tip.
+//
+// The rule under test is chain.cpp CChain::GetLocator's walk itself: it steps
+// back through pprev from the node it was given. Above the fork that is the
+// side branch's own ancestry; at and below the fork the two branches share
+// nodes, so the same hashes must appear.
+func TestLocatorFrom_StaysOnTheRequestedBranch(t *testing.T) {
+	const (
+		mainLen    = 40
+		forkHeight = 8
+		sideLen    = mainLen - forkHeight
+	)
+
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	main := buildChain(t, idx, nc, genesis, mainLen)
+	side := buildChain(t, idx, nc, main[forkHeight-1], sideLen)
+
+	mainTip := main[len(main)-1]
+	sideTip := side[len(side)-1]
+
+	// Equal difficulty and equal height, so the branches carry equal work and
+	// the first-seen one keeps the tip (AddHeader's strictly-greater test).
+	// That is what makes the tip locator and the side-branch locator
+	// distinguishable at all.
+	tipHash, tipHeight := idx.Tip()
+	require.Equal(t, mainTip.BlockHash(), tipHash)
+	require.Equal(t, int32(mainLen), tipHeight)
+
+	sideNode, ok := idx.Lookup(sideTip.BlockHash())
+	require.True(t, ok)
+	require.Equal(t, int32(mainLen), sideNode.Height, "both branch tips sit at the same height")
+
+	// byHeight maps a height to the hash on each branch, so every locator
+	// entry can be checked for branch identity and not only for height.
+	mainAt := func(height int32) chainhash.Hash {
+		if height == 0 {
+			return genesis.BlockHash()
+		}
+
+		return main[height-1].BlockHash()
+	}
+
+	sideAt := func(height int32) chainhash.Hash {
+		if height <= forkHeight {
+			return mainAt(height)
+		}
+
+		return side[height-forkHeight-1].BlockHash()
+	}
+
+	locator := idx.LocatorFrom(sideTip.BlockHash())
+	require.NotEmpty(t, locator)
+	require.Equal(t, sideTip.BlockHash(), locator[0], "the walk starts at the node it was asked for")
+	require.Equal(t, genesis.BlockHash(), locator[len(locator)-1], "genesis is always last")
+
+	// The height sequence is a property of GetLocator's stepping, not of the
+	// branch, so the side branch must produce exactly the sequence the main
+	// chain at the same height does.
+	require.Equal(t, heightsOf(t, idx, idx.Locator()), heightsOf(t, idx, locator))
+
+	var aboveFork int
+
+	for _, hash := range locator {
+		n, found := idx.Lookup(hash)
+		require.True(t, found)
+
+		require.Equal(t, sideAt(n.Height), hash,
+			"locator entry at height %d must be the side branch's own node", n.Height)
+
+		if n.Height > forkHeight {
+			aboveFork++
+
+			require.NotEqual(t, mainAt(n.Height), hash,
+				"above the fork the side branch and the main chain differ at height %d", n.Height)
+
+			continue
+		}
+
+		require.Equal(t, mainAt(n.Height), hash,
+			"at and below the fork both branches share the node at height %d", n.Height)
+	}
+
+	require.Greater(t, aboveFork, 1,
+		"the fixture must put more than one locator entry above the fork, or branch identity is untested")
+
+	require.NotEqual(t, idx.Locator(), locator, "the tip locator and the side-branch locator must differ")
+}
+
+// TestSkipPointer_SideChainFollowsItsOwnAncestry closes the Phase 2 Task 6b
+// minor: "explicit side-chain pskip recurrence row would make
+// skip-follows-pprev-ancestry explicit".
+// TestSkipPointer_MatchesGetSkipHeightRecurrence above checks the recurrence
+// on a single linear chain, where the node at a given height is unique — so it
+// cannot distinguish "pskip is the ancestor of pprev" from "pskip is whatever
+// node sits at that height".
+//
+// block_index.cpp BuildSkipNL (block_index.cpp:107-112) is
+// pprev->GetAncestor(GetSkipHeight(nHeight)): the jump is anchored on the
+// node's OWN parent, so a side-branch node's pskip is a side-branch node
+// wherever the skip height is above the fork. GetAncestor over that side
+// branch must then agree with a plain pprev walk at every height.
+func TestSkipPointer_SideChainFollowsItsOwnAncestry(t *testing.T) {
+	const (
+		mainLen    = 300
+		forkHeight = 9
+		sideLen    = mainLen - forkHeight
+	)
+
+	genesis := testGenesis()
+	nc := &nonceCounter{}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	main := buildChain(t, idx, nc, genesis, mainLen)
+	side := buildChain(t, idx, nc, main[forkHeight-1], sideLen)
+
+	sideTip := side[len(side)-1]
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	var skipsAboveFork int
+
+	for _, h := range side {
+		n := idx.nodes[h.BlockHash()]
+
+		wantHeight := getSkipHeight(n.height)
+
+		// The naive walk starts at the node's OWN parent, which is what pins
+		// the branch: on the side branch it can never reach a main-chain node
+		// above the fork.
+		want, ok := naivePrevWalk(n.prev, wantHeight)
+		require.True(t, ok, "height %d must be reachable from the parent of height %d", wantHeight, n.height)
+
+		require.NotNil(t, n.skip, "node at height %d must have a skip pointer", n.height)
+		require.Equal(t, want.hash, n.skip.hash)
+		require.Equal(t, wantHeight, n.skip.height)
+
+		if wantHeight > forkHeight {
+			skipsAboveFork++
+
+			require.NotEqual(t, main[wantHeight-1].BlockHash(), n.skip.hash,
+				"the skip pointer of the side-branch node at height %d must not land on the main chain", n.height)
+		}
+	}
+
+	require.Greater(t, skipsAboveFork, 1,
+		"the fixture must produce more than one skip target above the fork, or branch ancestry is untested")
+
+	// And the accelerated descent must agree with the plain walk over the
+	// side branch at every sampled height, main-chain nodes included below
+	// the fork.
+	sideTipNode := idx.nodes[sideTip.BlockHash()]
+	require.Equal(t, int32(mainLen), sideTipNode.height)
+
+	for _, height := range sampleHeightsFor(mainLen) {
+		want, wantOK := naivePrevWalk(sideTipNode, height)
+
+		got, gotOK := ancestorLocked(sideTipNode, height)
+		require.Equal(t, wantOK, gotOK)
+
+		if wantOK {
+			require.Equal(t, want.hash, got.hash, "descent from the side tip to height %d", height)
+		}
+	}
+}

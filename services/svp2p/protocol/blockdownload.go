@@ -629,6 +629,23 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 // branchBetween returns the nodes on best's branch at heights from..to
 // inclusive, in ascending height order.
 //
+// DISPOSITION, Task 25, on the phase-2 ledger line "M3 window
+// materialization": nothing changed, because the window this materializes is
+// already asserted end to end. Its extent is pinned at both edges and at full
+// width — the whole 1024-block fill and the last node's height, in
+// blockdownload_test.go's
+// TestFindNextBlocksToDownload_WindowAdvancesOnlyOnContiguousCompletion; the
+// BlockDownloadWindow+1 detection slot, which names a staller in that same
+// test and in TestSendGetDataBlocks_NamesTheStaller; and the bound holding
+// across every peer on a shared window
+// (TestSendGetDataBlocks_SchedulesAcrossEveryUsefulPeer, which fills heights
+// MaxBlocksInTransitPerPeer+1..BlockDownloadWindow and requires no scheduled
+// node above it). Ascending order and the reorg re-anchor are pinned by
+// TestFindNextBlocksToDownload_ReturnsSuccessorsInOrder and _FollowsAPeerReorg.
+// The remaining difference from C++ is cost, not result: C++ walks the range
+// in 128-block chunks, this takes one Ancestor call plus a ParentHash walk for
+// the reason stated below. No gap found, so no change was made.
+//
 // C++ walks this range with CBlockIndex::GetAncestor in chunks of 128 and then
 // follows pprev backwards inside each chunk, because its skiplist makes one
 // GetAncestor cost about a hundred pointer steps. HeaderIndex.Ancestor is a
@@ -1088,10 +1105,34 @@ func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Messa
 				continue
 			}
 
-			// A narrow deviation: C++ answers every inv entry on its own, so a
-			// hash repeated inside one message draws one getheaders per copy.
-			// Nothing about our state changes between them, so the copies are
-			// identical and wasted. One per message is enough.
+			// A narrow deviation: C++ answers every inv entry on its own
+			// (net_processing.cpp:2461-2462, the per-entry loop), so a hash
+			// repeated inside one message draws one getheaders per copy
+			// (:2489-2493). Nothing about our state changes between them, so
+			// the copies are identical and wasted. One per message is enough.
+			//
+			// DECISION, Task 25, on the phase-2 ledger line "M5 N-getheaders
+			// on distinct unknown invs": this rule is NOT widened to distinct
+			// hashes. N distinct unknown hashes still draw N getheaders, as
+			// SVNode sends them. The reason is in the message a collapsed
+			// answer would have to build: hashStop is that entry's own hash
+			// (:2492) and it TRUNCATES the peer's reply, so one getheaders can
+			// bound only one of the announced branches. Collapsing three
+			// announcements onto the first hash's hashStop would leave the
+			// other two unrequested, and nothing re-asks — OnHeaders chains
+			// another getheaders only off a full MaxHeadersResults batch. The
+			// duplicate-hash case differs in kind, which is why it is the only
+			// one collapsed: those copies are byte-identical, so dropping them
+			// loses nothing.
+			//
+			// The cost accepted with that: a peer spends 36 bytes per
+			// fabricated hash and draws a full locator back for each one.
+			// SVNode carries the identical exposure at the identical site, so
+			// bounding it here would be a divergence rather than a port; it is
+			// recorded as a residual instead, beside the getheaders flood
+			// limit (Task 8 residual) that guards the opposite direction.
+			// TestOnInv_DistinctUnknownBlocksEachDrawTheirOwnGetheaders pins
+			// the behavior this decision keeps.
 			if _, dup := requested[inv.Hash]; dup {
 				continue
 			}
@@ -1244,19 +1285,12 @@ func (bd *BlockDownloader) RequestTxs(peer *SyncPeer, hashes []chainhash.Hash, r
 // mapBlockIndex.GetBestHeader, and unlike HeaderSync's getheaders it never
 // carries a checkpoint hashStop — the stop here is the block the peer just
 // announced.
+//
+// The message itself is built by newGetHeaders (headersync.go), shared with
+// HeaderSync.getHeaders since Task 25 — phase-2 ledger Task 6 minor M6,
+// "locator-copy duplication".
 func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeaders {
-	msg := wire.NewMsgGetHeaders()
-	msg.ProtocolVersion = wire.ProtocolVersion
-
-	locator := bd.idx.Locator()
-	for i := range locator {
-		hash := locator[i]
-		msg.BlockLocatorHashes = append(msg.BlockLocatorHashes, &hash)
-	}
-
-	msg.HashStop = stop
-
-	return msg
+	return newGetHeaders(bd.idx.Locator(), stop)
 }
 
 // CheckStall is the periodic timer event, driven per peer by the caller. It
