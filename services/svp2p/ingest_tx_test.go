@@ -121,6 +121,62 @@ func TestTxIngestor_AcceptedTxFeedsAnnounceSeam(t *testing.T) {
 	require.Equal(t, uint64(321), announce.calls[0].size)
 }
 
+// TestTxIngestor_ReleasedOrphansFeedAnnounceSeam is Task 15's last-mile
+// wiring: orphans the bridge's release walk promoted alongside the primary
+// accepted tx (bridge.IngestTxResult.ReleasedOrphans) must reach the same
+// announce seam, not just the primary tx. G6 shape: asserts the announce
+// calls for the released orphans by hash/fee/size, not merely that the
+// count went up.
+func TestTxIngestor_ReleasedOrphansFeedAnnounceSeam(t *testing.T) {
+	primaryHash := chainhash.HashH([]byte("primary"))
+	orphan1Hash := chainhash.HashH([]byte("released-1"))
+	orphan2Hash := chainhash.HashH([]byte("released-2"))
+
+	br := &recordingTxBridge{result: bridge.IngestTxResult{
+		Accepted: true,
+		TxHash:   primaryHash,
+		Fee:      10,
+		Size:     20,
+		ReleasedOrphans: []bridge.ReleasedOrphan{
+			{TxHash: orphan1Hash, Fee: 30, Size: 40},
+			{TxHash: orphan2Hash, Fee: 50, Size: 60},
+		},
+	}}
+	announce := &announceRecorder{}
+
+	ing := &txIngestor{bridge: br, announce: announce.put}
+
+	outcome := ing.Ingest(t.Context(), wire.NewMsgTx(1), "peer1:8333")
+	require.True(t, outcome.Accepted)
+
+	require.Equal(t, 3, announce.callCount(), "the primary accepted tx plus both released orphans must all reach the announce seam")
+	require.Equal(t, primaryHash, announce.calls[0].hash)
+	require.Equal(t, uint64(10), announce.calls[0].fee)
+	require.Equal(t, uint64(20), announce.calls[0].size)
+	require.Equal(t, orphan1Hash, announce.calls[1].hash)
+	require.Equal(t, uint64(30), announce.calls[1].fee)
+	require.Equal(t, uint64(40), announce.calls[1].size)
+	require.Equal(t, orphan2Hash, announce.calls[2].hash)
+	require.Equal(t, uint64(50), announce.calls[2].fee)
+	require.Equal(t, uint64(60), announce.calls[2].size)
+}
+
+// TestTxIngestor_ReleasedOrphansWithNilAnnounceDoNotPanic pairs with
+// TestTxIngestor_AcceptedTxWithNilAnnounceDoesNotPanic: a *txIngestor built
+// without its announce field must not panic when the bridge also reports
+// released orphans, not only when it reports a bare accepted tx.
+func TestTxIngestor_ReleasedOrphansWithNilAnnounceDoNotPanic(t *testing.T) {
+	br := &recordingTxBridge{result: bridge.IngestTxResult{
+		Accepted:        true,
+		ReleasedOrphans: []bridge.ReleasedOrphan{{TxHash: chainhash.HashH([]byte("orphan"))}},
+	}}
+	ing := &txIngestor{bridge: br}
+
+	require.NotPanics(t, func() {
+		ing.Ingest(t.Context(), wire.NewMsgTx(1), "peer1:8333")
+	})
+}
+
 func TestTxIngestor_OrphanAndRejectDoNotAnnounce(t *testing.T) {
 	t.Run("orphan", func(t *testing.T) {
 		br := &recordingTxBridge{result: bridge.IngestTxResult{Orphan: true}}

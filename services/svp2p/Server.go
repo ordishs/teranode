@@ -86,6 +86,17 @@ type Server struct {
 	manager         *protocol.PeerManager
 	admission       *bridge.Admission
 
+	// stoppableBridge is the concrete bridge newBlockIngestor built, held
+	// only so Stop can release its background goroutines (orphanPool's TTL
+	// ticker and eviction worker — orphans.go, fix round 1 Issues I1/I4).
+	// bridge.Bridge itself carries no Stop method — spec §4.4 keeps that
+	// interface to what protocol needs, and protocol never stops a bridge —
+	// so this is typed as the narrow local interface below rather than
+	// widening bridge.Bridge for one caller. nil when newBlockIngestor found
+	// no injected dependencies (a depless caller), matching every other
+	// nil-means-"not built" field in this struct.
+	stoppableBridge stoppableBridge
+
 	// blocksFinalConsumer is the block announcement relay's Kafka leg
 	// (bridge/kafka.go). nil when settings.Kafka.BlocksFinalConfig is unset,
 	// which is not an error: block announcements just do not go out this way.
@@ -313,7 +324,41 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	return nil
 }
 
+// Stop's ctx is discarded rather than threaded through to the teardowns
+// below: ServiceManager calls Stop synchronously and relies on the callee
+// to honour whatever deadline it was given, but nothing here currently
+// does. This matters most for stoppableBridge.Stop, which can block on an
+// in-flight orphan-pool validate call with no bound of its own in the
+// production-default batched validator path — see that method's own doc
+// comment (orphans.go's orphanPool.stop) for the traced reason. A future
+// fix would thread ctx into these teardowns and give stoppableBridge.Stop
+// a ctx parameter to respect; this task does not build that, only names
+// where a reader of the shutdown path would look for it.
 func (s *Server) Stop(_ context.Context) error {
+	// admission and stoppableBridge are released via defer, not inline
+	// below, so an early return from blocksFinalConsumer.Close or
+	// manager.Stop still releases their background goroutines rather than
+	// leaking them (fix round 2, Minor 3): both own a goroutine that only
+	// their own Stop call releases (admission's failure-map eviction loop;
+	// stoppableBridge's orphan-pool TTL ticker and eviction worker), and
+	// leaking either on an error path is strictly worse than the small
+	// ordering risk of releasing them without every peer goroutine having
+	// joined first — which is itself only possible on this same abnormal,
+	// something-already-failed path, since the ordinary success path still
+	// runs this defer after the manager.Stop() call below has already
+	// completed, preserving the original ordering exactly.
+	defer func() {
+		if s.admission != nil {
+			s.admission.Stop()
+			s.admission = nil
+		}
+
+		if s.stoppableBridge != nil {
+			s.stoppableBridge.Stop()
+			s.stoppableBridge = nil
+		}
+	}()
+
 	// The header index subscription goroutine (runHeaderIndexSubscription)
 	// is ctx-owned: it exits on the Start ctx's cancellation, which the
 	// daemon triggers before calling Stop. Nothing to join here.
@@ -353,20 +398,18 @@ func (s *Server) Stop(_ context.Context) error {
 	}
 
 	// Peers are joined next: PeerManager.Stop waits for every peer goroutine,
-	// and a peer may still be running an ingest that goes through Admission.
-	// Releasing Admission's eviction goroutine before those callers are gone
-	// would stop the failure map underneath a live ingest.
+	// and a peer may still be running an ingest that goes through Admission
+	// or the bridge's orphan pool. Releasing either's background goroutine
+	// before those callers are gone would pull the failure map, or the pool,
+	// out from under a live ingest — which is why both releases live in the
+	// defer above rather than here: on the ordinary (no error) path the
+	// defer still runs after this call returns, preserving that ordering
+	// exactly; it only fires ahead of a joined manager on the abnormal path
+	// where manager.Stop itself never got the chance to run.
 	if s.manager != nil {
 		if err := s.manager.Stop(); err != nil {
 			return err
 		}
-	}
-
-	// Admission is not ctx-owned: its failure map runs a background eviction
-	// goroutine that only Stop releases.
-	if s.admission != nil {
-		s.admission.Stop()
-		s.admission = nil
 	}
 
 	return nil
@@ -456,22 +499,40 @@ func (s *Server) newBlockIngestor() (*blockIngestor, error) {
 
 	s.admission = bridge.NewAdmission(s.logger, s.settings)
 
+	br := bridge.New(
+		s.logger,
+		s.settings,
+		s.blockchainClient,
+		s.deps.ValidationClient,
+		s.deps.SubtreeStore,
+		s.deps.TempStore,
+		s.deps.UtxoStore,
+		s.deps.SubtreeValidation,
+		s.deps.BlockValidation,
+		s.deps.BlockAssembly,
+	)
+
+	// br's concrete type (bridge.New's *svp2pBridge) has a Stop method
+	// (bridge.go) even though bridge.Bridge itself does not declare one;
+	// this compiles only because that stays true, so a future bridge.New
+	// that stops satisfying stoppableBridge fails the build here rather
+	// than silently degrading Stop into a no-op.
+	s.stoppableBridge = br
+
 	return &blockIngestor{
-		logger: s.logger,
-		bridge: bridge.New(
-			s.logger,
-			s.settings,
-			s.blockchainClient,
-			s.deps.ValidationClient,
-			s.deps.SubtreeStore,
-			s.deps.TempStore,
-			s.deps.UtxoStore,
-			s.deps.SubtreeValidation,
-			s.deps.BlockValidation,
-			s.deps.BlockAssembly,
-		),
+		logger:    s.logger,
+		bridge:    br,
 		admission: s.admission,
 	}, nil
+}
+
+// stoppableBridge is the narrow slice of *svp2pBridge Server.Stop needs:
+// releasing the orphan pool's background goroutines. bridge.Bridge (the
+// interface protocol is shaped against, spec §4.4) deliberately does not
+// declare Stop — protocol never stops a bridge — so this local interface is
+// how Server reaches it without widening that one.
+type stoppableBridge interface {
+	Stop()
 }
 
 // hydrateHeaderIndex builds a fresh, genesis-rooted header index from the

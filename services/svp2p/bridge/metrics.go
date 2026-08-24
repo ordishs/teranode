@@ -36,6 +36,15 @@ var (
 	// Class labels: tx_invalid, service, processing, policy, other.
 	prometheusSvp2pBridgePrewarmErrors *prometheus.CounterVec
 
+	// prometheusSvp2pBridgeOrphanEvictionQueueDrops counts final-validation
+	// attempts lost because the orphan pool's eviction-hand-off queue
+	// (orphans.go, orphanEvictionQueueSize) was full when onEvict tried to
+	// hand one off — fix round 1, Issue I1's best-effort trade, surfaced as
+	// a metric per fix round 2's Minor 2 rather than left to a Debugf line
+	// only: a sustained drop rate is invisible at info level, and the
+	// package already registers other metrics here for this reason.
+	prometheusSvp2pBridgeOrphanEvictionQueueDrops prometheus.Counter
+
 	prometheusMetricsInitOnce sync.Once
 )
 
@@ -167,4 +176,12 @@ func _initPrometheusMetrics() {
 		Help:      "Number of validator errors observed during the pre-warm path in validateTransactions, by class",
 	}, []string{"class"})
 	prometheus.MustRegister(prometheusSvp2pBridgePrewarmErrors)
+
+	prometheusSvp2pBridgeOrphanEvictionQueueDrops = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "svp2p_bridge",
+		Name:      "orphan_eviction_queue_drops_total",
+		Help:      "Number of orphan final-validation attempts dropped because the eviction hand-off queue was full",
+	})
+	prometheus.MustRegister(prometheusSvp2pBridgeOrphanEvictionQueueDrops)
 }

@@ -12,6 +12,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-chaincfg"
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -24,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
@@ -170,6 +172,16 @@ type svp2pBridge struct {
 	// reasoning. Cleared on the accepted-block path (ingest.go IngestBlock,
 	// mirroring manager.go:1855).
 	rejectedTxns *txmap.SyncedMap[chainhash.Hash, struct{}]
+
+	// orphanPool holds transactions IngestTx classified Orphan
+	// (orphans.go), ported from legacy's own sm.orphanTxs
+	// (netsync/manager.go:458, bounded and timed out at construction :3165
+	// with legacy_maxOrphanTxs/legacy_orphanEvictionDuration). Owned once
+	// here, not per-peer, for the same reason rejectedTxns is: see that
+	// field's own doc comment. Kept distinct from rejectedTxns by meaning,
+	// not just by type — a reject is "we refuse this", an orphan is "we
+	// cannot judge this yet" (see IngestTxResult's own doc comment).
+	orphanPool *orphanPool
 }
 
 // New constructs the bridge with its eight injected Teranode dependencies,
@@ -192,7 +204,7 @@ func New(
 ) *svp2pBridge {
 	initPrometheusMetrics()
 
-	return &svp2pBridge{
+	sm := &svp2pBridge{
 		logger:            logger,
 		settings:          tSettings,
 		chainParams:       tSettings.ChainCfgParams,
@@ -207,6 +219,12 @@ func New(
 		headerEvents:      make(chan HeaderEvent, 16),
 		rejectedTxns:      txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns),
 	}
+
+	sm.orphanPool = newOrphanPool(tSettings, logger, func(ctx context.Context, tx *bt.Tx) (*meta.Data, error) {
+		return validationClient.Validate(ctx, tx, 0)
+	})
+
+	return sm
 }
 
 // HeaderEvents returns the bridge's tip-change notification channel. It is on
@@ -223,4 +241,19 @@ func New(
 // doc comment's OPEN QUESTION above.
 func (b *svp2pBridge) HeaderEvents() <-chan HeaderEvent {
 	return b.headerEvents
+}
+
+// Stop releases the orphan pool's background goroutines: expiringmap's own
+// TTL ticker and this task's eviction-validation worker (orphans.go, fix
+// round 1 Issues I1/I4). Not part of the Bridge interface — spec §4.4 keeps
+// that interface narrow to what protocol needs, and protocol never stops a
+// bridge — so a caller reaches this through a concrete *svp2pBridge or a
+// small local interface, the same way Server.go already handles
+// bridge.Admission's own Stop. Safe to call at most once per bridge
+// lifetime; a nil orphanPool (a depless test harness that built a
+// svp2pBridge by literal rather than through New) is a no-op.
+func (b *svp2pBridge) Stop() {
+	if b.orphanPool != nil {
+		b.orphanPool.stop()
+	}
 }

@@ -41,10 +41,20 @@ type IngestTxResult struct {
 	Size uint64
 
 	// Orphan reports a missing-parent/locked classification
-	// (errors.ErrTxMissingParent or errors.ErrTxLocked). Task 15 owns the
-	// orphan transaction pool; IngestTx classifies and stops here — nothing
-	// is queued or retried by this task.
+	// (errors.ErrTxMissingParent or errors.ErrTxLocked). The transaction is
+	// added to the orphan pool (orphans.go) before this returns; a reject
+	// is "we refuse this", an orphan is "we cannot judge this yet" — the
+	// two sets stay distinct (see svp2pBridge.orphanPool's own doc
+	// comment).
 	Orphan bool
+
+	// ReleasedOrphans lists orphans the release walk promoted to accepted
+	// as a side effect of THIS tx's acceptance (orphans.go's release,
+	// legacy's own processOrphanTransactions, netsync/manager.go:1309).
+	// Populated only when Accepted; nil on every other outcome. The
+	// caller feeds each one to the same announce seam it feeds TxHash/Fee/
+	// Size for the primary accepted tx (services/svp2p/ingest.go).
+	ReleasedOrphans []ReleasedOrphan
 
 	// Reject is the wire.MsgReject to send to the peer, when the
 	// transaction failed validation for a reason other than orphan. nil on
@@ -121,6 +131,11 @@ func (sm *svp2pBridge) IngestTx(ctx context.Context, txBytes []byte, peerAddr st
 	if err != nil {
 		if errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxLocked) {
 			sm.logger.Debugf("[IngestTx][%s] orphan transaction from %s: %v", txHash, peerAddr, err)
+
+			if sm.orphanPool != nil {
+				sm.orphanPool.add(btTx)
+			}
+
 			return IngestTxResult{TxHash: txHash, Orphan: true}, nil
 		}
 
@@ -137,11 +152,21 @@ func (sm *svp2pBridge) IngestTx(ctx context.Context, txBytes []byte, peerAddr st
 		return IngestTxResult{TxHash: txHash, Reject: reject}, nil
 	}
 
+	var released []ReleasedOrphan
+	if sm.orphanPool != nil {
+		// process any orphan transactions that were waiting for this
+		// transaction to be accepted (manager.go:1295-1305, the recursive
+		// call this task ports as orphanPool.release's iterative
+		// worklist — see that method's own doc comment for G3).
+		released = sm.orphanPool.release(ctx, txHash)
+	}
+
 	return IngestTxResult{
-		TxHash:   txHash,
-		Accepted: true,
-		Fee:      txMeta.Fee,
-		Size:     txMeta.SizeInBytes,
+		TxHash:          txHash,
+		Accepted:        true,
+		Fee:             txMeta.Fee,
+		Size:            txMeta.SizeInBytes,
+		ReleasedOrphans: released,
 	}, nil
 }
 

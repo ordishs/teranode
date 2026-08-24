@@ -216,6 +216,16 @@ func (t *txIngestor) Ingest(ctx context.Context, msg *wire.MsgTx, peerAddr strin
 		t.announce(result.TxHash, result.Fee, result.Size)
 	}
 
+	// Orphans released by this tx's acceptance (Task 15's orphan pool,
+	// bridge/orphans.go) feed the identical announce seam: they are
+	// accepted transactions too, just discovered a step later than the
+	// tx that unblocked them.
+	if t.announce != nil {
+		for _, released := range result.ReleasedOrphans {
+			t.announce(released.TxHash, released.Fee, released.Size)
+		}
+	}
+
 	return protocol.TxIngestOutcome{
 		Accepted: result.Accepted,
 		Orphan:   result.Orphan,
