@@ -1945,6 +1945,19 @@ func (m *PeerManager) syncLoop(ctx context.Context) {
 	}
 }
 
+// stallDisconnect is one peer a stall check condemned, carried with the action
+// that condemned it. The action travels with the peer because the two
+// DetectStalling clauses disconnect for DIFFERENT reasons — the download window
+// held shut, versus one block owed too long — and an operator reading the logs
+// has to be able to tell them apart. Until Task 25 both logged the single line
+// "stalling block download". SVNode keeps them apart with two distinct log
+// lines (net_processing.cpp:5620 and :5650); StallAction.DisconnectReason is
+// the one place this port's two texts live.
+type stallDisconnect struct {
+	peer   *Peer
+	action StallAction
+}
+
 func (m *PeerManager) syncTickOnce() {
 	handles := m.peerHandles()
 	now := time.Now().UnixMicro()
@@ -1959,9 +1972,11 @@ func (m *PeerManager) syncTickOnce() {
 
 	out, disconnect := m.syncPass(handles, ingests, now)
 
-	for _, peer := range disconnect {
-		m.logger.Warnf("[svp2p] disconnecting %s: stalling block download", peer.Info().Addr)
-		peer.Disconnect("stalling block download")
+	for _, d := range disconnect {
+		reason := d.action.DisconnectReason()
+
+		m.logger.Warnf("[svp2p] disconnecting %s: %s", d.peer.Info().Addr, reason)
+		d.peer.Disconnect(reason)
 	}
 
 	sendAll(out)
@@ -1982,7 +1997,7 @@ func (m *PeerManager) syncTickOnce() {
 // ingests must be index-aligned with handles, and is sampled by the caller
 // before syncMu is taken: IngestSnapshot takes the PEER lock, and the package
 // lock order forbids reaching for a peer lock while holding a manager one.
-func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, now int64) (out []outgoing, disconnect []*Peer) {
+func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, now int64) (out []outgoing, disconnect []stallDisconnect) {
 	m.syncMu.Lock()
 
 	if m.blockDownloader == nil {
@@ -2052,8 +2067,8 @@ func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, n
 		msgs := m.headerSync.PeerEstablished(h.sync)
 		markGetHeadersOutstanding(h.sync, msgs)
 
-		switch m.blockDownloader.CheckStall(h.sync, ingests[i], now) {
-		case StallActionDisconnect:
+		switch action := m.blockDownloader.CheckStall(h.sync, ingests[i], now); action {
+		case StallActionDisconnect, StallActionDisconnectTimeout:
 			// The caller disconnects; runPeer then drives FinalizeNode, which is
 			// what releases the slot and the peer's downloads. CheckStall itself
 			// mutated nothing on this branch.
@@ -2089,7 +2104,10 @@ func (m *PeerManager) syncPass(handles []peerHandle, ingests []IngestSnapshot, n
 			// point, but there PushMessage precedes the fDisconnect flag. It is
 			// the same reasoning OnInv states for its own error path: messages
 			// queued for a peer we are about to drop are not worth sending.
-			disconnect = append(disconnect, h.peer)
+			// Both clauses land here because the ACTION the caller must take is
+			// identical; only the reason differs, and it rides along so the log
+			// and the peer's own disconnect reason can name the rule that fired.
+			disconnect = append(disconnect, stallDisconnect{peer: h.peer, action: action})
 
 			continue
 

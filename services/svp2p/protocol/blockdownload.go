@@ -157,10 +157,21 @@ const (
 	// StallActionNone means the peer is healthy; do nothing.
 	StallActionNone StallAction = iota
 
-	// StallActionDisconnect means the peer stalled block download past
-	// BlockStallingTimeout. The caller must disconnect it and then call
-	// PeerDisconnected on both this machine and HeaderSync.
+	// StallActionDisconnect means the peer held the head of the download
+	// window past BlockStallingTimeout while delivering below the rate floor
+	// — DetectStalling's first clause. The caller must disconnect it and then
+	// call PeerDisconnected on both this machine and HeaderSync.
 	StallActionDisconnect
+
+	// StallActionDisconnectTimeout means the block at the head of this peer's
+	// queue has been owed past maxDownloadTime — DetectStalling's SECOND
+	// clause. The caller does exactly what StallActionDisconnect asks; the
+	// two are separate values only so an operator can tell which rule fired,
+	// as SVNode's two distinct log lines do (net_processing.cpp:5620 "is
+	// stalling block download" vs :5650 "Timeout downloading block"). Both
+	// were one action and one log line until Task 25 — the phase-3 ledger
+	// residual "Distinguishing the two disconnect logs".
+	StallActionDisconnectTimeout
 
 	// StallActionRotateSyncPeer means the sync peer made no progress for
 	// MaxLastBlockTime. The sync slot and the peer's in-flight blocks are
@@ -170,12 +181,35 @@ const (
 	StallActionRotateSyncPeer
 )
 
+// DisconnectReason is the operator-legible reason a stall check condemned a
+// peer, or "" for an action that is not a disconnect. It names the RULE, not
+// just the symptom: the two disconnect clauses have different causes and
+// different operator responses, and until Task 25 both logged the single line
+// "stalling block download", so a reader of the logs could not tell a peer
+// holding the window shut from one that simply took too long over one block.
+// SVNode keeps them apart the same way, with two distinct log lines
+// (net_processing.cpp:5620 and :5650).
+func (a StallAction) DisconnectReason() string {
+	switch a {
+	case StallActionDisconnect:
+		return "stalling block download: held the download window past the stall timeout while delivering below the rate floor"
+	case StallActionDisconnectTimeout:
+		return "block download timeout: the block at the head of its queue was owed past the download time budget"
+	case StallActionNone, StallActionRotateSyncPeer:
+		return ""
+	default:
+		return ""
+	}
+}
+
 func (a StallAction) String() string {
 	switch a {
 	case StallActionNone:
 		return "none"
 	case StallActionDisconnect:
 		return "disconnect"
+	case StallActionDisconnectTimeout:
+		return "disconnect-timeout"
 	case StallActionRotateSyncPeer:
 		return "rotate-sync-peer"
 	default:
@@ -1299,16 +1333,12 @@ func (bd *BlockDownloader) getHeadersFor(stop chainhash.Hash) *wire.MsgGetHeader
 //
 // The first is net_processing.cpp DetectStalling: a peer whose nStallingSince
 // clock has run past BlockStallingTimeout is holding the head of the download
-// window and is disconnected. C++ additionally re-arms that clock instead of
-// disconnecting when the peer is still delivering bytes at a healthy rate
-// (IsBlockDownloadStallingFromPeer); this port always takes the disconnect
-// branch — the branch C++ takes for a peer delivering nothing. Task 6b built the
-// meter that half needs (downloadStallingFrom), so carrying the re-arm here is
-// now a small, separate change; it is left alone because the bound on the gap is
-// narrow either way. nStallingSince is only ever set on a peer that is blocking
-// the window, any block it delivers clears it (see removeFromFlight), and a peer
-// that is genuinely delivering now has its block raced to someone else long
-// before this clock expires.
+// window, and is disconnected ONLY IF it is also delivering below the rate floor
+// (IsBlockDownloadStallingFromPeer). A peer still delivering has its clock
+// re-armed instead and keeps its blocks. Phase 2 could take the disconnect
+// branch alone, because no per-peer meter existed; Task 6b built one, and Task
+// 25 carried the re-arm — the phase-3 ledger residual "Staller clause bandwidth
+// re-arm ... The meter now exists, so it is a few lines".
 //
 // The second is the Teranode sync-peer rotation, carried from legacy netsync
 // manager.go handleCheckSyncPeer and maxLastBlockTime (PR 1067). It is a
@@ -1406,9 +1436,29 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 	defer sampleIngest(state, ingest, nowMicros)
 
 	if state.nStallingSince != 0 && state.nStallingSince < nowMicros-microsPerSecond*int64(BlockStallingTimeout/time.Second) {
-		// net_processing.cpp: "Peer=%d is stalling block download (current
-		// speed %d), disconnecting".
-		return StallActionDisconnect
+		// DetectStalling's own two-way branch (net_processing.cpp:5618-5626).
+		// The expired clock alone does not condemn the peer: C++ asks
+		// IsBlockDownloadStallingFromPeer first and disconnects only a peer
+		// whose block bandwidth is under the floor.
+		if bd.downloadStallingFrom(peer, nowMicros) {
+			// net_processing.cpp: "Peer=%d is stalling block download (current
+			// speed %d), disconnecting".
+			return StallActionDisconnect
+		}
+
+		// The else branch: "Resetting stall (current speed %d) for peer=%d",
+		// then state->nStallingSince = GetTimeMicros(). A peer that is still
+		// delivering keeps its blocks and owes a fresh BlockStallingTimeout,
+		// which is what stops the next tick condemning it again on the same
+		// expired clock.
+		//
+		// C++ re-reads its clock here; this machine reads no clock by contract,
+		// so the caller's nowMicros stands in. The two differ only by the
+		// microseconds the bandwidth read itself takes.
+		//
+		// Called under PeerManager.syncMu like every other write in this
+		// machine, and it writes only this peer's own state.
+		state.nStallingSince = nowMicros
 	}
 
 	// DetectStalling's second half (net_processing.cpp:5629-5661): the block at
@@ -1450,8 +1500,9 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 	// base rather than patching the binary.
 	if len(state.vBlocksInFlight) > 0 && nowMicros > state.nDownloadingSince+bd.maxDownloadTimeMicros(peer) {
 		// net_processing.cpp: "Timeout downloading block %s from peer=%d,
-		// disconnecting".
-		return StallActionDisconnect
+		// disconnecting" (:5650-5652) — a DIFFERENT line from the staller
+		// clause's, which is why this returns a different action.
+		return StallActionDisconnectTimeout
 	}
 
 	// legacy netsync handleCheckSyncPeer only ever examines the sync peer. This

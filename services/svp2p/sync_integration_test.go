@@ -827,8 +827,7 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	// the window's edge, so nStallingSince never starts.
 	require.Equal(t, int32(1), h.server.manager.ConnectedCount(),
 		"a rotation must leave the rotated peer connected")
-	require.False(t, h.logger.contains("stalling block download"),
-		"the stall must be caught by the rotation, not by the block-stalling disconnect")
+	noStallDisconnect(t, h, "the stall must be caught by the rotation, not by a DetectStalling disconnect")
 
 	// Nor is it the parallel fetch, which after Task 6b is the mechanism that
 	// normally reaches a peer sitting on a block first — its fuse is 30 seconds
@@ -1014,8 +1013,19 @@ func TestIntegrationRacesABlockAwayFromASilentPeer(t *testing.T) {
 	// disconnect, no rotation, no partial download thrown away but its own.
 	require.Equal(t, int32(2), h.server.manager.ConnectedCount(),
 		"a race must not cost the slow peer its connection")
-	require.False(t, h.logger.contains("stalling block download"),
-		"the recovery here is the race, not the stall or timeout disconnect")
+	noStallDisconnect(t, h, "the recovery here is the race, not the stall or timeout disconnect")
+}
+
+// noStallDisconnect asserts that NEITHER DetectStalling clause disconnected
+// anyone. Both reasons have to be named: Task 25 split the single shared log
+// line "stalling block download" into one text per rule, so a check for either
+// text alone would quietly stop covering the other. The strings come from the
+// production accessor rather than being copied here, so they cannot drift.
+func noStallDisconnect(t *testing.T, h *syncHarness, msg string) {
+	t.Helper()
+
+	require.False(t, h.logger.contains(protocol.StallActionDisconnect.DisconnectReason()), msg)
+	require.False(t, h.logger.contains(protocol.StallActionDisconnectTimeout.DisconnectReason()), msg)
 }
 
 // TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer covers what the race
@@ -1045,7 +1055,12 @@ func TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer(t *testing.T) {
 	h.waitFor(t, func() bool { return silent.requestedCount() > 0 },
 		60*time.Second, "the silent peer was never asked for a block")
 
-	want := fmt.Sprintf("disconnecting %s: stalling block download", silent.addr)
+	// The rule is named in the log now, so this pins the TIMEOUT clause
+	// specifically rather than the shared text both clauses used to share —
+	// which is what the test's own preamble above always claimed to be
+	// asserting (Task 25, phase-3 ledger residual "Distinguishing the two
+	// disconnect logs").
+	want := fmt.Sprintf("disconnecting %s: %s", silent.addr, protocol.StallActionDisconnectTimeout.DisconnectReason())
 
 	h.waitFor(t, func() bool { return h.logger.contains(want) },
 		60*time.Second, "the silent peer was never disconnected by the download timeout")

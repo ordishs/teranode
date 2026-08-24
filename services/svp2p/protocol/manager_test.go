@@ -1003,7 +1003,7 @@ func (f *rotationFixture) setup(fn func()) {
 }
 
 // pass runs one sync tick at the given clock, with no peer ingesting.
-func (f *rotationFixture) pass(now int64) (out []outgoing, disconnect []*Peer) {
+func (f *rotationFixture) pass(now int64) (out []outgoing, disconnect []stallDisconnect) {
 	return f.m.syncPass(f.handles, make([]IngestSnapshot, len(f.handles)), now)
 }
 
@@ -1330,7 +1330,7 @@ func TestSyncPass_ADisconnectUnwindsTheSlotTheSweepJustGranted(t *testing.T) {
 
 	_, disconnect := f.pass(testNow + micros(BlockStallingTimeout) + 1)
 
-	require.Equal(t, []*Peer{stalled.peer}, disconnect)
+	require.Equal(t, []stallDisconnect{{peer: stalled.peer, action: StallActionDisconnect}}, disconnect)
 
 	// THE HAZARD, pinned rather than argued: the doomed peer holds the slot and
 	// the round for the rest of this pass, and the peer after it is refused.
@@ -1637,7 +1637,7 @@ func TestSyncPass_ARotatedPeerThatStallsTheWindowStillGoes(t *testing.T) {
 
 	_, disconnect := f.pass(testNow + micros(BlockStallingTimeout) + 1)
 
-	require.Equal(t, []*Peer{stalled.peer}, disconnect,
+	require.Equal(t, []stallDisconnect{{peer: stalled.peer, action: StallActionDisconnect}}, disconnect,
 		"the staller rule must still reach a peer that holds no sync slot")
 }
 
@@ -1734,7 +1734,8 @@ func TestSyncPass_ReHandedBlocksToASilentRotatedPeerAreReleasedAgain(t *testing.
 
 	_, disconnect = f.pass(third)
 
-	require.Equal(t, []*Peer{silent.peer}, disconnect)
+	require.Equal(t, []stallDisconnect{{peer: silent.peer, action: StallActionDisconnect}}, disconnect,
+		"the staller clause fired, not the per-block timeout — see the tick spacing above")
 
 	// The disconnect the manager then performs is what releases them.
 	f.m.peerGone(silent.sync)
@@ -2243,7 +2244,8 @@ func TestSyncPass_TimesOutASilentRotatedPeerAndRehomesItsBlocks(t *testing.T) {
 
 	out, disconnect = f.pass(timedOut)
 
-	require.Equal(t, []*Peer{silent.peer}, disconnect, "the front block's clock is what disconnects it")
+	require.Equal(t, []stallDisconnect{{peer: silent.peer, action: StallActionDisconnectTimeout}}, disconnect,
+		"the front block's clock is what disconnects it")
 	require.Equal(t, int64(0), silent.sync.State.nStallingSince, "no staller rule was involved")
 
 	// The head of the hole reaches the healthy peer on this very pass, and by

@@ -1416,7 +1416,7 @@ func TestCheckStall_TimesOutTheFrontBlock(t *testing.T) {
 			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)),
 				"the peer survives up to and including the timeout")
 
-			require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)+1),
+			require.Equal(t, StallActionDisconnectTimeout, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)+1),
 				"one microsecond past it, the front block has timed out")
 		})
 	}
@@ -1465,7 +1465,7 @@ func TestBlockReceived_ReArmsTheClockOnlyForTheFrontBlock(t *testing.T) {
 
 		// The re-arm is what buys the second block its own full window.
 		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, later+micros(10*time.Minute)))
-		require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, later+micros(10*time.Minute)+1))
+		require.Equal(t, StallActionDisconnectTimeout, f.bd.CheckStall(peer, noIngest, later+micros(10*time.Minute)+1))
 	})
 
 	t.Run("a block behind the front does not", func(t *testing.T) {
@@ -1483,7 +1483,7 @@ func TestBlockReceived_ReArmsTheClockOnlyForTheFrontBlock(t *testing.T) {
 			"delivering a later block must not buy the withheld front block more time")
 		require.Equal(t, []chainhash.Hash{first.Hash}, peer.State.vBlocksInFlight)
 
-		require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Minute)+1))
+		require.Equal(t, StallActionDisconnectTimeout, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Minute)+1))
 	})
 
 	t.Run("the clock never moves backwards", func(t *testing.T) {
@@ -1519,7 +1519,7 @@ func TestCheckStall_TimesOutARotatedPeerHoldingBlocks(t *testing.T) {
 
 	require.Equal(t, int64(0), peer.State.nStallingSince, "no other peer has named it a staller")
 
-	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Minute)+1),
+	require.Equal(t, StallActionDisconnectTimeout, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Minute)+1),
 		"the timeout must run before the fSyncStarted early return")
 }
 
@@ -1562,7 +1562,7 @@ func TestCheckStall_TheTimeoutIgnoresThroughput(t *testing.T) {
 
 	ingest.BytesRead += perTick
 
-	require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, ingest, testNow+micros(10*time.Minute)+1),
+	require.Equal(t, StallActionDisconnectTimeout, f.bd.CheckStall(peer, ingest, testNow+micros(10*time.Minute)+1),
 		"past the window a peer in full flow goes anyway, partial block and all")
 }
 
@@ -1627,7 +1627,7 @@ func TestCheckStall_HonoursTheConfiguredTimeoutWindow(t *testing.T) {
 			require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 1), testNow))
 
 			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)))
-			require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)+1))
+			require.Equal(t, StallActionDisconnectTimeout, f.bd.CheckStall(peer, noIngest, testNow+micros(tc.want)+1))
 		})
 	}
 }
@@ -1677,7 +1677,7 @@ func TestCheckStall_TimeoutAndRotationOrder(t *testing.T) {
 
 		action, when := dribble(t, f, 2*MaxBlockDownloadTime)
 
-		require.Equal(t, StallActionDisconnect, action,
+		require.Equal(t, StallActionDisconnectTimeout, action,
 			"a dribbling peer goes on the front block's clock, not on the throughput cap")
 		require.Equal(t, 11*time.Minute, when,
 			"the first tick past the 10 minute window is what catches it")
@@ -2508,4 +2508,130 @@ func TestGetHeaders_BothCallSitesKeepTheirOwnHashStop(t *testing.T) {
 	fromInv := f.bd.getHeadersFor(announced)
 	require.Equal(t, announced, fromInv.HashStop, "the inv answerer stops at the announced hash")
 	require.Equal(t, locator, locatorValues(fromInv))
+}
+
+// TestCheckStall_ReArmsTheStallClockForAPeerStillDelivering closes the phase-3
+// ledger residual "Staller clause bandwidth re-arm ... parked for Task 25".
+//
+// net_processing.cpp DetectStalling (:5601-5626) does NOT disconnect every peer
+// whose nStallingSince has run past the timeout. It asks
+// IsBlockDownloadStallingFromPeer (:105-109) first, and takes the disconnect
+// only when the peer's block bandwidth is under the floor:
+//
+//	if(IsBlockDownloadStallingFromPeer(config, pto, avgbw)) {
+//	    ... pto->fDisconnect = true; return true;
+//	}
+//	else {
+//	    LogPrint(... "Resetting stall (current speed %d) for peer=%d\n" ...);
+//	    state->nStallingSince = GetTimeMicros();
+//	}
+//
+// Phase 2 could only take the disconnect branch, because no per-peer meter
+// existed; Task 6b built one (downloadStallingFrom), so the else branch is
+// carried here. The re-arm is the load-bearing half: a peer that is genuinely
+// delivering keeps its blocks AND gets a fresh full BlockStallingTimeout, so
+// the same tick cannot condemn it again a microsecond later.
+func TestCheckStall_ReArmsTheStallClockForAPeerStillDelivering(t *testing.T) {
+	const rate = 4 * BlockStallingMinDownloadRate
+
+	expired := testNow + micros(BlockStallingTimeout) + 1
+
+	t.Run("a peer above the rate floor is re-armed, not disconnected", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := f.deliveringPeer(t, "1.2.3.4:8333", rate, testNow)
+		require.False(t, f.bd.downloadStallingFrom(peer, testNow), "the fixture must be above the floor")
+
+		peer.State.nStallingSince = testNow
+
+		// The ingest keeps running across the gap, which is what the C++
+		// "current speed" reading describes.
+		still := IngestSnapshot{Active: true, StartedMicros: testNow, BytesRead: rate * 12}
+
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, still, expired),
+			"C++ takes the else branch for a peer still delivering")
+		require.Equal(t, expired, peer.State.nStallingSince,
+			"the else branch sets nStallingSince = now; without it the peer is condemned again next tick")
+	})
+
+	t.Run("the re-armed clock buys a full timeout", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := f.deliveringPeer(t, "1.2.3.4:8333", rate, testNow)
+		peer.State.nStallingSince = testNow
+
+		still := IngestSnapshot{Active: true, StartedMicros: testNow, BytesRead: rate * 12}
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, still, expired))
+		require.Equal(t, expired, peer.State.nStallingSince)
+
+		// Delivery stops. The clock restarted at "expired", so the peer owes
+		// another full BlockStallingTimeout before it can be condemned.
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, expired+1))
+		require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, expired+micros(BlockStallingTimeout)))
+
+		require.Equal(t, StallActionDisconnect,
+			f.bd.CheckStall(peer, noIngest, expired+micros(BlockStallingTimeout)+1),
+			"once the re-armed clock expires with no delivery, the disconnect branch runs")
+	})
+
+	t.Run("a peer below the rate floor is still disconnected", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := f.deliveringPeer(t, "1.2.3.4:8333", BlockStallingMinDownloadRate-1, testNow)
+		require.True(t, f.bd.downloadStallingFrom(peer, testNow))
+
+		peer.State.nStallingSince = testNow
+
+		dribble := IngestSnapshot{Active: true, StartedMicros: testNow, BytesRead: BlockStallingMinDownloadRate}
+
+		require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, dribble, expired),
+			"IsBlockDownloadStallingFromPeer is true below the floor, so the disconnect branch runs")
+		require.Equal(t, testNow, peer.State.nStallingSince,
+			"the disconnect branch never re-arms the clock")
+	})
+
+	t.Run("no rate evidence at all is still a disconnect", func(t *testing.T) {
+		f := newDownloadFixture(t, 3)
+
+		peer := f.peerAt(t, "1.2.3.4:8333", 3)
+		peer.State.nStallingSince = testNow
+
+		// A peer nothing has measured reads as stalling, which is the state a
+		// C++ association whose bandwidth average decayed to zero is in.
+		require.Equal(t, StallActionDisconnect, f.bd.CheckStall(peer, noIngest, expired))
+	})
+}
+
+// TestStallAction_DisconnectReasonNamesTheRule closes the phase-3 ledger
+// residual "Distinguishing the two disconnect logs. The staller clause and the
+// download timeout both log 'stalling block download', so an operator cannot
+// tell which fired."
+//
+// SVNode logs the two rules with two different lines — "Peer=%d is stalling
+// block download (current speed %d), disconnecting" (net_processing.cpp:5620)
+// and "Timeout downloading block %s from peer=%d, disconnecting" (:5650) — and
+// this is where the port's two texts are kept apart. The manager logs whatever
+// this returns and hands the same string to Peer.Disconnect, so a collapse back
+// to one text would be invisible without this test.
+func TestStallAction_DisconnectReasonNamesTheRule(t *testing.T) {
+	staller := StallActionDisconnect.DisconnectReason()
+	timeout := StallActionDisconnectTimeout.DisconnectReason()
+
+	require.NotEmpty(t, staller)
+	require.NotEmpty(t, timeout)
+	require.NotEqual(t, staller, timeout,
+		"an operator must be able to tell the two disconnect rules apart in the logs")
+
+	// Each names its own rule, not just the shared symptom.
+	require.Contains(t, staller, "stall")
+	require.Contains(t, timeout, "timeout")
+
+	require.Empty(t, StallActionNone.DisconnectReason(), "no disconnect, no reason")
+	require.Empty(t, StallActionRotateSyncPeer.DisconnectReason(),
+		"a rotation keeps the peer connected, so it has no disconnect reason")
+
+	// The two actions must also stay distinguishable as values, since that is
+	// what carries the rule from CheckStall to the log.
+	require.NotEqual(t, StallActionDisconnect, StallActionDisconnectTimeout)
+	require.NotEqual(t, StallActionDisconnect.String(), StallActionDisconnectTimeout.String())
 }

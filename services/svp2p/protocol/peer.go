@@ -483,9 +483,11 @@ func NewPeer(cfg PeerConfig) *Peer {
 //     reads that flag itself: syncDispatcher.BlockDone turns it into the error
 //     returned here, so the classification stays with the scheduler.
 //   - The idle timeout, when no running ingest excuses it (see ingestAlive).
-//   - StallActionDisconnect, the net_processing.cpp DetectStalling rule, decided
-//     by the manager's stall ticker (blockdownload.go CheckStall). It arrives as
-//     Disconnect from outside this loop, not as a returned error.
+//   - StallActionDisconnect or StallActionDisconnectTimeout, the two
+//     net_processing.cpp DetectStalling rules, decided by the manager's stall
+//     ticker (blockdownload.go CheckStall). Either arrives as Disconnect from
+//     outside this loop, not as a returned error, carrying the rule's own
+//     reason text (StallAction.DisconnectReason).
 //   - The ban threshold, reached by the handshake's own scoring or by a
 //     misbehavior delta a sync machine returned (checkBanThreshold).
 //   - HeaderSync's two round-ending errors, ErrCheckpointMismatch and
