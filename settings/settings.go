@@ -719,6 +719,13 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// typed field exists so svp2p can honor the SAME operator switch
 			// without reaching into gocore config itself; the default matches
 			// legacy's zero value, so behavior is unchanged on both sides.
+			//
+			// CUTOVER ITEM: `legacy_config_*` is legacy's own reflection
+			// namespace, and the legacy service is DELETED at cutover (spec
+			// §10 item 6). This key dies with the service it belongs to, so
+			// the cutover change must rename it to an svp2p-owned key and
+			// migrate any operator who set it. Do not let svp2p inherit a
+			// key whose namespace no longer exists.
 			DisableBanning: getBool("legacy_config_DisableBanning", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
