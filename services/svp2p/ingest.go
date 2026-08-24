@@ -190,8 +190,30 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 // ParentMissing branch above already answers it, and it is our chain that is
 // behind, not the peer that is wrong.
 //
-// The direction of the failure mode is the argument for an allow-list. A code
-// wrongly on it costs an honest peer its connection while our own service
+// SVNode fences the same distinction, by reject code rather than by error type,
+// and this list is the port's analogue of that fence. BlockDownloadTracker::
+// BlockChecked reaches Misbehaving only inside
+//
+//	if(nodestate && state.GetRejectCode() > 0 && state.GetRejectCode() < REJECT_INTERNAL)
+//
+// (net/block_download_tracker.cpp:117-127). REJECT_INTERNAL is 0x100, and
+// validation.h:1145-1150 says what lives at or above it: codes that "signal
+// internal conditions. They cannot and should not be sent over the P2P
+// network." Below it are the wire reject codes — REJECT_INVALID,
+// REJECT_MALFORMED, REJECT_CHECKPOINT and the rest
+// (consensus/validation.h:13-24). So SVNode scores a peer only for a verdict it
+// could have put on the wire, and never for one describing its own internal
+// state. That is exactly the line this allow-list draws: our four admitted
+// codes are the ones that describe the block, and every excluded code — a
+// ProcessingError about our own pipeline, a subtree bookkeeping failure, a
+// storage fault — is an internal condition in SVNode's sense.
+//
+// Stated explicitly rather than left implicit, because without the fence the
+// port would score strictly MORE broadly than SVNode does, and nothing would
+// catch it until the parity harness exists.
+//
+// The direction of the failure mode is the second argument for an allow-list. A
+// code wrongly on it costs an honest peer its connection while our own service
 // recovers; a code wrongly off it costs one re-offer of the block, and the
 // stall rules still deal with a peer that keeps failing. So an unclassified
 // reject keeps the peer — the same principle IngestOutcome.PeerFault's own doc

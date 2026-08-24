@@ -39,6 +39,40 @@ const (
 	// on its own. That is SVNode's own arithmetic, and it is why the reject
 	// disconnects immediately as well as scoring: the score is what survives
 	// the reconnect.
+	//
+	// SVNode gates that Misbehaving call TWICE, and this port satisfies both
+	// gates rather than skipping them.
+	//
+	// The first gate is the reject-code window at block_download_tracker.cpp
+	// :117 — see isPeerAttributableReject (services/svp2p/ingest.go), which is
+	// this port's analogue of it and carries the citation.
+	//
+	// The second is the per-block `punish` flag at :124 (`nDoS > 0 &&
+	// it->second.punish`), recorded by MarkBlockAsReceived(blockSource, punish,
+	// state) at :68-73 and declared at block_download_tracker.h:97-101. Its
+	// three call sites split, and the split is entirely about BIP 152:
+	//
+	//   - punish=TRUE at net_processing.cpp:4058, in ProcessBlockMessage
+	//     (:4027) — the ordinary solicited `block` message path.
+	//   - punish=FALSE at net_processing.cpp:3683, in ProcessBlockTxnMessage
+	//     (:3613), whose own comment gives the reason: "BIP 152 permits peers
+	//     to relay compact blocks after validating the header only; we should
+	//     not punish peers if the block turns out to be invalid."
+	//   - punish=FALSE at net_processing.cpp:3984, in
+	//     ProcessCompactBlockMessage (:3731), the fBlockReconstructed branch —
+	//     a compact block optimistically reconstructed while it is in flight
+	//     from a different peer.
+	//
+	// Both false sites are compact-block paths, and compact blocks are out of
+	// scope for this phase (spec §10 item 5). This port has no BLOCKTXN and no
+	// cmpctblock path at all, so ProcessBlockMessage is the only analogue any
+	// svp2p ingest entry has, every reachable case is punish=true, and scoring
+	// every PeerFault unconditionally is faithful rather than approximate.
+	//
+	// FORWARD TRIGGER: whoever adds compact blocks MUST add the punish flag in
+	// the same change. Without it this port will ban peers for compact blocks
+	// they relayed innocently on a header-only check — precisely the outcome
+	// BIP 152 and the comment at :3681-3683 exist to prevent.
 	scoreInvalidBlock = 100
 
 	// dialRetryBase and dialRetryMax bound the outbound reconnect backoff,
