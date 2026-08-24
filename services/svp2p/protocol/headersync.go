@@ -253,10 +253,43 @@ type SyncPeer struct {
 	// connection state) never touches it, so the peer-lock-then-manager-lock
 	// order documented in peer.go handleMessage is not in play here.
 	getHeadersOutstanding int
+
+	// fSentAddr mirrors CNode::fSentAddr (net.h): this connection has already
+	// been answered one getaddr. SVNode answers only one per connection,
+	// "to reduce resource waste and discourage addr stamping of INV
+	// announcements" (net_processing.cpp:4111-4113); the legacy service's own
+	// sentAddrs does the same (services/legacy/peer_server.go:378, :1753).
+	//
+	// Locking: guarded by PeerManager.syncMu, like every other field on this
+	// struct. PeerManager.GetAddr reads and writes it inside one syncMu-held
+	// section, so the read-then-set cannot interleave with a second getaddr.
+	fSentAddr bool
+
+	// fGetAddr mirrors CNode::fGetAddr (net.h): WE sent this peer a getaddr
+	// and its addr reply has not arrived yet. It is set when the outbound
+	// handshake completes (PeerManager.Established,
+	// net_processing.cpp:1867-1870) and cleared by the first addr message that
+	// arrives — C++ does both halves atomically, `pfrom->fGetAddr.exchange(false)`
+	// (net_processing.cpp:2290-2291), and PeerManager.Addr reproduces that
+	// exchange under syncMu.
+	//
+	// It is what lifts the unsolicited-addr fence (addrrelay.go
+	// processAddrEntries): an addr nobody asked for may only tell us about the
+	// sender itself.
+	fGetAddr bool
+
+	// addrKnown mirrors CNode::addrKnown (net.h:968): the addresses already
+	// exchanged with this peer in either direction, so neither side sends the
+	// same one twice. See knownAddrSet (addrrelay.go) for the capacity choice
+	// and why this is an exact set rather than SVNode's rolling bloom filter.
+	//
+	// Locking: guarded by PeerManager.syncMu, like knownBlocks and knownTxs on
+	// peerSyncState.
+	addrKnown *knownAddrSet
 }
 
 func NewSyncPeer(addr string, services wire.ServiceFlag, state *peerSyncState) *SyncPeer {
-	return &SyncPeer{Addr: addr, Services: services, State: state}
+	return &SyncPeer{Addr: addr, Services: services, State: state, addrKnown: newKnownAddrSet(knownAddrCap)}
 }
 
 // HeaderSync is the headers-first sync state machine: the net_processing.cpp

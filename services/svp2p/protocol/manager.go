@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"crypto/rand"
 	"net"
 	"sync"
 	"time"
@@ -160,12 +161,28 @@ type PeerManager struct {
 	activeTip HeaderNode
 	syncTick  time.Duration
 
+	// addrMan is the CAddrMan port (addrman.go), or nil when address handling
+	// is not wired — in which case getaddr is never answered and never sent,
+	// and an inbound addr is processed for its DoS rules but stored nowhere.
+	// It is guarded by mu (the registry lock), not syncMu: AddrMan is
+	// self-synchronising and deliberately outside the sync-state graph (see
+	// addrman.go's own LOCKING note), and every one of its methods is a
+	// blocking call that must not run under syncMu.
+	addrMan *AddrMan
+
+	// addrRelaySeed is CConnman's nSeed0/nSeed1 as used by
+	// GetDeterministicRandomizer(RANDOMIZER_ID_ADDRESS_RELAY) (net.cpp:3429):
+	// the node-global secret that makes the addr forwarding pick unpredictable
+	// to anyone who does not know it. Generated once at construction and never
+	// written again, so it needs no lock.
+	addrRelaySeed [32]byte
+
 	quit chan struct{}
 	wg   sync.WaitGroup
 }
 
 func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList *BanList) *PeerManager {
-	return &PeerManager{
+	m := &PeerManager{
 		logger:    logger,
 		tSettings: tSettings,
 		banList:   banList,
@@ -173,6 +190,33 @@ func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList
 		quit:      make(chan struct{}),
 		syncTick:  defaultSyncTick,
 	}
+
+	// net.cpp CConnman::Start seeds nSeed0/nSeed1 from GetRand; a failed read
+	// leaves the zero seed, which still gives a stable daily pick and only
+	// costs the unpredictability, so it is logged rather than fatal.
+	if _, err := rand.Read(m.addrRelaySeed[:]); err != nil {
+		logger.Warnf("[svp2p] addr relay seed could not be randomized: %v", err)
+	}
+
+	return m
+}
+
+// SetAddrMan gives the manager the address table getaddr and addr work from.
+// It must be called before Start; a nil AddrMan leaves address handling off.
+func (m *PeerManager) SetAddrMan(addrMan *AddrMan) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.addrMan = addrMan
+}
+
+// addrManager reads the address table under mu. Never called with syncMu held:
+// every AddrMan method is a blocking call.
+func (m *PeerManager) addrManager() *AddrMan {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.addrMan
 }
 
 // ConfigureSync gives the manager the shared header index and, when an
@@ -590,6 +634,16 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 	txIngestor := m.txIngestor
 	m.syncMu.Unlock()
 
+	// Read independently of SyncEnabled() for the same reason txIngestor is:
+	// address handling has no dependency on the block-sync machines. A nil
+	// AddrMan leaves PeerConfig.Addrs nil, which is what turns getaddr and
+	// addr handling off (peer.go dispatchAddr).
+	var addrs addrDispatcher
+
+	if m.addrManager() != nil {
+		addrs = m
+	}
+
 	peer := NewPeer(PeerConfig{
 		Handshake: HandshakeConfig{
 			Inbound:   inbound,
@@ -610,6 +664,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 		PingInterval: pingInterval,
 		BanThreshold: banScoreThreshold,
 		Sync:         dispatch,
+		Addrs:        addrs,
 		SyncPeer:     syncPeer,
 		Ingestor:     ingestor,
 		Fetcher:      fetcher,
@@ -754,6 +809,219 @@ func (m *PeerManager) Established(syncPeer *SyncPeer, services wire.ServiceFlag)
 	markGetHeadersOutstanding(syncPeer, msgs)
 
 	return msgs
+}
+
+// GetAddrRequest is the outbound half of ProcessVersionMessage's
+// `if(!pfrom->fInbound)` block: "Get recent addresses"
+// (net_processing.cpp:1867-1871). The OUTBOUND side asks its peer for
+// addresses and arms fGetAddr; an inbound connection is never asked, the same
+// asymmetry ProcessGetAddrMessage enforces in the other direction.
+//
+// Two differences from C++, both forced and both harmless. It is sent at
+// verack rather than at version, because this port has no version-time send
+// hook (the handshake machine owns that exchange). And SVNode's own condition,
+// `fOneShot || nVersion >= CADDR_TIME_VERSION || GetAddressCount() < 1000`,
+// collapses to "always": this port has no one-shot connections, and
+// MinPeerProtoVersion (31800) already exceeds CADDR_TIME_VERSION (31402), so
+// the middle test holds for every peer that completed a handshake. The
+// addrman gate replaces it, and it is applied at the wiring point (runPeer
+// leaves PeerConfig.Addrs nil when there is no address table), so reaching
+// this method at all means there is somewhere to put the reply.
+//
+// NOT carried from the same C++ block: the self-advertisement immediately
+// above it (net_processing.cpp:1847-1864, GetLocalAddress + PushAddress,
+// gated on fListen && !IsInitialBlockDownload()). This port advertises its
+// local address only in a getaddr REPLY (selectGetAddrResponse's bestLocal,
+// which is legacy's own shape). Unsolicited self-advertisement to every
+// outbound peer is a separate behavior and is deliberately left out rather
+// than half-built.
+func (m *PeerManager) GetAddrRequest(syncPeer *SyncPeer, inbound bool) []wire.Message {
+	if inbound || syncPeer == nil {
+		return nil
+	}
+
+	m.syncMu.Lock()
+	syncPeer.fGetAddr = true
+	m.syncMu.Unlock()
+
+	return []wire.Message{wire.NewMsgGetAddr()}
+}
+
+// GetAddr is ProcessGetAddrMessage (net_processing.cpp:4096-4129) — the
+// decision itself lives in selectGetAddrResponse (addrrelay.go); this is the
+// state and I/O around it. localAddr is the connection's own local address,
+// which is what stands in for legacy's addrmgr GetBestLocalAddress
+// (services/legacy/peer_server.go:1770): on an inbound connection it is the
+// address this peer actually reached us on, which is the best possible answer
+// to "how do others find us" for that particular peer.
+func (m *PeerManager) GetAddr(syncPeer *SyncPeer, inbound bool, localAddr *wire.NetAddress) []wire.Message {
+	if syncPeer == nil {
+		return nil
+	}
+
+	addrMan := m.addrManager()
+	if addrMan == nil {
+		return nil
+	}
+
+	// AddrMan.GetAddr takes its own lock and must not run under syncMu.
+	cached := addrMan.GetAddr()
+
+	now := time.Now().Unix()
+	bestLocal := bestLocalAddress(localAddr, wire.SFNodeNetwork, now)
+
+	m.syncMu.Lock()
+
+	send := selectGetAddrResponse(inbound, syncPeer.fSentAddr, cached, bestLocal, syncPeer.addrKnown)
+
+	// fSentAddr is set for a request we ANSWERED, not for one we refused:
+	// ProcessGetAddrMessage returns before `pfrom->fSentAddr = true` on both
+	// of its refusal paths (net_processing.cpp:4109, :4118), so an ignored
+	// getaddr does not consume the connection's one answer.
+	if inbound && !syncPeer.fSentAddr {
+		syncPeer.fSentAddr = true
+
+		// CNode::PushAddress marks nothing, but SendMessages "will filter it
+		// again for knowns that were added after addresses were pushed"
+		// (net.h:1242-1244) against the same set; legacy marks explicitly at
+		// its own send site (pushAddrMsg's addKnownAddresses,
+		// peer_server.go:531). Marking here is that explicit form.
+		for _, a := range send {
+			syncPeer.addrKnown.mark(a)
+		}
+	}
+
+	m.syncMu.Unlock()
+
+	msg := addrMessageFor(send)
+	if msg == nil {
+		return nil
+	}
+
+	return []wire.Message{msg}
+}
+
+// Addr is ProcessAddrMessage (net_processing.cpp:2270-2368) plus RelayAddress
+// (:998-1041) — the decisions live in processAddrEntries and
+// selectAddrRelayTargets (addrrelay.go); this is the state, the addrman write
+// and the forwarding sends around them.
+//
+// Ordering matters in one place and is not incidental: the source peer's
+// addrKnown is marked BEFORE relay targets are chosen, exactly as C++ marks at
+// :2350 and relays at :2355. RelayAddress considers every inbound peer,
+// including the sender, and it is CNode::PushAddress's addrKnown test
+// (net.h:1245) that keeps the sender from being handed back the address it
+// just gave us.
+func (m *PeerManager) Addr(syncPeer *SyncPeer, msg *wire.MsgAddr, inbound bool, remoteAddr *wire.NetAddress) (int, error) {
+	if syncPeer == nil || msg == nil {
+		return 0, nil
+	}
+
+	addrMan := m.addrManager()
+
+	// Snapshotted before syncMu, like every other pass that needs both the
+	// registry and the sync state (see peerHandles).
+	handles := m.peerHandles()
+
+	peerAddr := addrFromNetAddr(remoteAddr)
+	now := time.Now().Unix()
+
+	m.syncMu.Lock()
+
+	// `pfrom->fGetAddr.exchange(false)` (net_processing.cpp:2290-2291): read
+	// and clear in one step, so a second addr message on the same connection
+	// is unsolicited even if the first was not.
+	requestedAddr := syncPeer.fGetAddr
+	syncPeer.fGetAddr = false
+
+	m.syncMu.Unlock()
+
+	result := processAddrEntries(msg.AddrList, peerAddr, inbound, requestedAddr, now)
+
+	if result.err != nil {
+		return result.score, result.err
+	}
+
+	// Built BEFORE syncMu is taken, for the same reason RelayBlock snapshots
+	// Peer.WantsHeaders first: the package lock order is peer lock then
+	// manager lock, so no Peer method may be called while a manager lock is
+	// held. SyncPeer.Addr is written once at construction (runPeer) and never
+	// again, so reading it here needs no lock either.
+	candidates := make([]addrRelayCandidate, 0, len(handles))
+
+	for _, h := range handles {
+		if !h.established || h.sync == nil {
+			continue
+		}
+
+		candidates = append(candidates, addrRelayCandidate{
+			peer:    h.peer,
+			sync:    h.sync,
+			addr:    h.sync.Addr,
+			inbound: h.peer.Inbound(),
+		})
+	}
+
+	m.syncMu.Lock()
+
+	for _, a := range result.known {
+		syncPeer.addrKnown.mark(a)
+	}
+
+	// Chosen and marked under one syncMu section, so two concurrent addr
+	// messages carrying the same address cannot both decide to forward it to
+	// the same peer.
+	//
+	// This does put selectAddrRelayTargets' hashing under syncMu, which is
+	// worth pricing rather than glossing: it is one double-SHA256 per
+	// candidate per forwarded address, and both factors are bounded — the
+	// forwarded list is at most addrForwardBatchMax (10) entries, and an addr
+	// message is a rare event compared with the inv and headers traffic that
+	// shares this lock. C++ holds its own locks across RelayAddress for the
+	// same reason: the pick and the addrKnown marks have to agree.
+	type forward struct {
+		peer  *Peer
+		addrs []Address
+	}
+
+	pending := make(map[*Peer]*forward, len(candidates))
+
+	for _, a := range result.forward {
+		reachable := newNetAddr(a.IP()).isRoutable()
+
+		for _, tgt := range selectAddrRelayTargets(candidates, a, reachable, now, m.addrRelaySeed) {
+			if tgt.sync.addrKnown.has(a) {
+				continue
+			}
+
+			tgt.sync.addrKnown.mark(a)
+
+			f, ok := pending[tgt.peer]
+			if !ok {
+				f = &forward{peer: tgt.peer}
+				pending[tgt.peer] = f
+			}
+
+			f.addrs = append(f.addrs, a)
+		}
+	}
+
+	m.syncMu.Unlock()
+
+	// Sent with no lock held, like every other send site in this package.
+	for _, f := range pending {
+		if out := addrMessageFor(f.addrs); out != nil {
+			f.peer.send([]wire.Message{out})
+		}
+	}
+
+	// AddrMan.Add takes its own lock, so it runs outside syncMu. The two-hour
+	// penalty is AddNewAddresses' own nTimePenalty (net_processing.cpp:2362).
+	if addrMan != nil && len(result.store) > 0 {
+		addrMan.AddMany(result.store, sourceIPOf(peerAddr), addrTimePenaltySource)
+	}
+
+	return result.score, nil
 }
 
 // markGetHeadersOutstanding records, on syncPeer, that a getheaders just left

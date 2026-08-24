@@ -229,6 +229,38 @@ type syncDispatcher interface {
 	BlockDone(sp *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) error
 }
 
+// addrDispatcher is the peer loop's view of the manager-owned address table
+// handling (AddrMan plus the per-connection addr state on SyncPeer).
+// PeerManager implements it. Every method takes PeerManager's locks itself, so
+// the peer loop calls them WITHOUT holding the peer lock: the package lock
+// order is peer lock, then manager lock.
+//
+// It is a separate interface from syncDispatcher, not three more methods on
+// it, because the two are wired independently: block sync is gated on
+// SyncEnabled() and address handling on whether an AddrMan was supplied
+// (manager.go runPeer). Either can be on with the other off.
+type addrDispatcher interface {
+	// GetAddrRequest is the handshake-complete event: an outbound connection
+	// asks its peer for addresses (net_processing.cpp:1867-1871). It returns
+	// nothing for an inbound connection, which SVNode never asks.
+	GetAddrRequest(sp *SyncPeer, inbound bool) []wire.Message
+
+	// GetAddr answers one getaddr. It cannot end the connection: SVNode
+	// ignores a getaddr it will not answer and scores nothing
+	// (ProcessGetAddrMessage, net_processing.cpp:4096-4129). inbound gates the
+	// whole handler (the fingerprinting defense) and localAddr is this
+	// connection's own local address, which the reply advertises.
+	GetAddr(sp *SyncPeer, inbound bool, localAddr *wire.NetAddress) []wire.Message
+
+	// Addr dispatches one addr message. The int is a misbehavior delta and a
+	// non-nil error means this peer must be disconnected; BOTH can be
+	// non-zero at once, because SVNode's oversized-addr path scores and
+	// returns an error (net_processing.cpp:2284-2287). remoteAddr is the
+	// connection's own peer address, which the unsolicited-addr fence
+	// compares the message's entries against.
+	Addr(sp *SyncPeer, msg *wire.MsgAddr, inbound bool, remoteAddr *wire.NetAddress) (int, error)
+}
+
 type PeerConfig struct {
 	Handshake    HandshakeConfig
 	Conn         *transport.Conn
@@ -240,6 +272,11 @@ type PeerConfig struct {
 	// Sync is the manager's sync dispatch, or nil when block sync is not
 	// wired (the Phase 1 shape: handshake and ping only).
 	Sync syncDispatcher
+
+	// Addrs is the manager's address table dispatch, or nil when no AddrMan
+	// was supplied. Without it getaddr is neither answered nor sent and an
+	// inbound addr is ignored entirely — see dispatchAddr.
+	Addrs addrDispatcher
 
 	// SyncPeer is this peer's CNodeState entry, owned by PeerManager and
 	// mutated only under its sync-state mutex.
@@ -605,7 +642,18 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 	// doc comment) and never returns an error that disconnects the peer.
 	p.dispatchTx(msg, est)
 
-	return nil
+	// Address handling is independent of the sync machines too, for the same
+	// reason (see dispatchAddr's own doc comment), and unlike tx ingestion it
+	// CAN end the connection.
+	if err := p.dispatchAddr(msg, est, firstEstablished); err != nil {
+		return err
+	}
+
+	// The unsupported-message policy runs LAST, so a message that reaches
+	// either of the two branches above is handled there rather than judged
+	// here. It is the only dispatch step that must run with cfg.Sync nil as
+	// well as set (see its own doc comment).
+	return p.dispatchUnsupported(msg, est)
 }
 
 // dispatchSync feeds one post-handshake message to the manager-owned sync
@@ -664,6 +712,143 @@ func (p *Peer) dispatchSync(msg wire.Message, established, firstEstablished bool
 		// Handed to the serve goroutine rather than answered here: see
 		// queueGetData.
 		p.queueGetData(m)
+	}
+
+	return nil
+}
+
+// dispatchAddr routes the two address messages to the manager-owned address
+// table handling, and asks an outbound peer for addresses once its handshake
+// completes.
+//
+// Kept separate from dispatchSync for exactly the reason dispatchTx is (see
+// that method's doc comment): address handling is not part of the
+// HeaderSync/BlockDownloader machine graph dispatchSync feeds, and it must
+// still run on a connection where cfg.Sync is nil. PeerManager gates block
+// sync on SyncEnabled() and wires cfg.Sync only when it is on (manager.go
+// runPeer); the address table has no such dependency, so folding these two
+// messages into dispatchSync would silently disable getaddr and addr on any
+// node running without block sync configured.
+//
+// Locking: cfg.Addrs' methods take PeerManager's locks themselves, so this
+// runs with the peer lock RELEASED — handleMessage calls it after unlocking,
+// like dispatchSync. The package lock order is peer lock then manager lock.
+// Handshake.Inbound, LocalAddr and RemoteAddr are set once at construction and
+// never written, so they are read here without any lock at all, unlike the
+// handshake fields Info() guards.
+func (p *Peer) dispatchAddr(msg wire.Message, established, firstEstablished bool) error {
+	if p.cfg.Addrs == nil {
+		return nil
+	}
+
+	// net_processing.cpp:1867-1871, the outbound half of
+	// ProcessVersionMessage's `if(!pfrom->fInbound)` block: "Get recent
+	// addresses". Sent at verack rather than at version because this port has
+	// no version-time send hook — the handshake machine owns that exchange.
+	if firstEstablished {
+		p.send(p.cfg.Addrs.GetAddrRequest(p.cfg.SyncPeer, p.cfg.Handshake.Inbound))
+	}
+
+	// The same pre-handshake gate dispatchSync and dispatchTx apply
+	// (net_processing.cpp ProcessMessage, "Must have a version message before
+	// anything else"). ADDR specifically sits BELOW the fSuccessfullyConnected
+	// check in the C++ dispatch chain (net_processing.cpp:4729-4737), so this
+	// is fidelity rather than convention.
+	if !established {
+		return nil
+	}
+
+	switch m := msg.(type) {
+	case *wire.MsgGetAddr:
+		p.send(p.cfg.Addrs.GetAddr(p.cfg.SyncPeer, p.cfg.Handshake.Inbound, p.cfg.Handshake.LocalAddr))
+
+	case *wire.MsgAddr:
+		delta, err := p.cfg.Addrs.Addr(p.cfg.SyncPeer, m, p.cfg.Handshake.Inbound, p.cfg.Handshake.RemoteAddr)
+
+		// Scored BEFORE the error is acted on, matching SVNode's own order:
+		// ProcessAddrMessage calls Misbehaving(pfrom, 20, "oversized-addr")
+		// and only then returns the error (net_processing.cpp:2285-2286). A
+		// disconnect that skipped the score would lose the evidence the ban
+		// threshold is counting.
+		if scoreErr := p.scoreMisbehavior(delta); scoreErr != nil && err == nil {
+			return scoreErr
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// dispatchUnsupported applies spec §6's unsupported-message policy: the
+// `mempool` and filter/cfilter families end the connection, `reject` and
+// `notfound` are logged and nothing else. Before this existed all six fell
+// through dispatchSync's switch, which has no default, and were silently
+// ignored.
+//
+// It is deliberately NOT part of dispatchSync: none of these messages touches
+// sync state, none needs the manager's sync-state mutex, and the policy must
+// hold on a connection where cfg.Sync is nil — the same reason dispatchTx is
+// its own method (see its doc comment).
+//
+// The disconnect half is the legacy service's current behavior, which spec §6
+// says to keep: OnMemPool's "we do not support onMempool requests ... normally
+// this would only be sent with bloom filtering on, which we do not support"
+// (services/legacy/peer_server.go:874-887) and the three filter handlers'
+// DisconnectWithWarning (:1711-1734). Legacy has no cfilter handlers at all,
+// so for that family spec §6 is the only source, and it groups them with the
+// bloom filters for the same reason: this node serves no filters of either
+// kind, and a peer that asked for one is better told at once than left
+// waiting.
+//
+// Neither branch scores misbehavior. Legacy disconnects these without
+// addBanScore, and a peer asking for a service we simply do not offer is not
+// evidence of malice.
+//
+// Three of the ten refused commands cannot reach here over a real socket:
+// go-wire's makeEmptyMessage does not know getcfheaders, cfheaders or
+// cfcheckpt (go-wire message.go:193-200, v1.2.10), so its decoder rejects
+// them as "unhandled command" and transport fails the connection first. They
+// are listed anyway — the outcome is a disconnect either way, the list is then
+// the complete statement of the policy rather than a statement about one
+// dependency's decoder, and it stays correct if go-wire ever learns the
+// types.
+//
+// The log-only half is legacy's OnReject (:1828-1835) and OnNotFound
+// (:1836-1843), both at Warn. It is also parity with SVNode for notfound,
+// which ignores an inbound one outright with the explicit comment "We do not
+// care about the NOTFOUND message, but logging an Unknown Command message
+// would be undesirable as we transmit it ourselves"
+// (net_processing.cpp:4847-4850). Consuming a notfound to release an in-flight
+// block assignment early would be an improvement over both references and is
+// deliberately not built here (serving.go's own note on this).
+func (p *Peer) dispatchUnsupported(msg wire.Message, established bool) error {
+	// net_processing.cpp ProcessMessage drops everything that arrives before
+	// the handshake completes, and the handshake machine already scores those
+	// messages. This applies the same gate dispatchSync and dispatchTx do.
+	if !established {
+		return nil
+	}
+
+	switch m := msg.(type) {
+	case *wire.MsgMemPool,
+		*wire.MsgFilterLoad, *wire.MsgFilterAdd, *wire.MsgFilterClear,
+		*wire.MsgGetCFilters, *wire.MsgGetCFHeaders, *wire.MsgGetCFCheckpt,
+		*wire.MsgCFilter, *wire.MsgCFHeaders, *wire.MsgCFCheckpt:
+		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
+			"svp2p: %s from %s is not supported by this node", msg.Command(), p.cfg.Conn.RemoteAddr(), ErrUnsupportedMessage)
+
+	case *wire.MsgReject:
+		// services/legacy/peer_server.go:1828-1835, field for field.
+		p.cfg.Logger.Warnf("[svp2p] received reject from %s, cmd: %s, code: %s, reason: %s, hash: %s",
+			p.cfg.Conn.RemoteAddr(), m.Cmd, m.Code.String(), m.Reason, m.Hash.String())
+
+	case *wire.MsgNotFound:
+		// services/legacy/peer_server.go:1836-1843, field for field.
+		p.cfg.Logger.Warnf("[svp2p] received notfound from %s, %d not found invs",
+			p.cfg.Conn.RemoteAddr(), len(m.InvList))
 	}
 
 	return nil
@@ -1033,6 +1218,12 @@ func (p *Peer) ingestAlive() bool {
 }
 
 func (p *Peer) Established() <-chan struct{} { return p.established }
+
+// Inbound reports the connection's direction. HandshakeConfig.Inbound is set
+// once at construction and never written, so this takes no lock — which is
+// what lets the manager read it while building an addr relay pass, before it
+// takes syncMu (the package lock order is peer lock then manager lock).
+func (p *Peer) Inbound() bool { return p.cfg.Handshake.Inbound }
 
 func (p *Peer) Disconnect(reason string) {
 	_ = p.disconnect(errors.New(errors.ERR_ERROR, "svp2p: disconnected: %s", reason))

@@ -142,6 +142,14 @@ func (h *addrHasher) uint256(v [32]byte) {
 	h.buf = append(h.buf, v[:]...)
 }
 
+// rawBytes appends bytes with NO length prefix — the shape of a plain
+// `Hash(first, last)` over a byte range, as CNetAddr::GetHash uses over its
+// 16 ip bytes (netaddress.cpp:309-315). Unlike varBytes this is not a
+// serialisation of a container, so nothing precedes the bytes.
+func (h *addrHasher) rawBytes(b []byte) {
+	h.buf = append(h.buf, b...)
+}
+
 // varBytes appends a std::vector<uint8_t> as CompactSize(len) followed by the
 // bytes (serialize.h:718: `WriteCompactSize(os, v.size());`).
 func (h *addrHasher) varBytes(b []byte) {

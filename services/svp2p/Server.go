@@ -84,7 +84,14 @@ type Server struct {
 	listenAddresses []string
 	banList         *protocol.BanList
 	manager         *protocol.PeerManager
-	admission       *bridge.Admission
+
+	// addrMan is the CAddrMan port (protocol/addrman.go), handed to the peer
+	// manager in Init and given its persistence goroutine in Start. It is
+	// always constructed; legacy_savePeers is what decides whether it has a
+	// peers.json path, and an empty path is the disabled state (no file read,
+	// none written, no goroutine).
+	addrMan   *protocol.AddrMan
+	admission *bridge.Admission
 
 	// stoppableBridge is the concrete bridge newBlockIngestor built, held
 	// only so Stop can release its background goroutines (orphanPool's TTL
@@ -216,6 +223,29 @@ func (s *Server) Init(_ context.Context) error {
 	s.banList = banList
 	s.manager = protocol.NewPeerManager(s.logger, s.settings, banList)
 
+	// The address table. Persistence is behind legacy_savePeers, which
+	// defaults to false ("by default we do not save the peers",
+	// settings/settings.go:674); an empty path is that disabled state
+	// (protocol/addrman_persist.go). No new settings key is introduced here —
+	// legacy_savePeers and legacy WorkingDir both already exist, and the
+	// filename matches the banlist.json convention immediately above.
+	peersPath := ""
+	if s.settings.Legacy.SavePeers && s.settings.Legacy.WorkingDir != "" {
+		peersPath = filepath.Join(s.settings.Legacy.WorkingDir, "peers.json")
+	}
+
+	s.addrMan = protocol.NewAddrMan(s.logger, protocol.AddrManOptions{Path: peersPath})
+
+	// A snapshot that cannot be read is not fatal: Load has already logged
+	// what to do about it and has latched the table into never-overwrite mode,
+	// so the operator's file survives for inspection while the node cold
+	// starts (protocol/addrman_persist.go Load).
+	if err := s.addrMan.Load(); err != nil {
+		s.logger.Warnf("[svp2p] starting with an empty address table: %v", err)
+	}
+
+	s.manager.SetAddrMan(s.addrMan)
+
 	return nil
 }
 
@@ -294,6 +324,13 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	}
 
 	go s.runHeaderIndexSubscription(ctx, headerNotifications)
+
+	// Started before the manager, so the periodic snapshot is running by the
+	// time the first peer can add an address. It is a no-op when persistence
+	// is disabled.
+	if s.addrMan != nil {
+		s.addrMan.StartPersistence()
+	}
 
 	if err := s.manager.Start(ctx, s.listenAddresses); err != nil {
 		return err
@@ -487,6 +524,16 @@ func (s *Server) Stop(_ context.Context) error {
 	// got the chance to run.
 	if s.manager != nil {
 		if err := s.manager.Stop(); err != nil {
+			return err
+		}
+	}
+
+	// Stopped AFTER the manager, which is the reverse of the start order and
+	// the only correct one: Stop joins the snapshot goroutine and then writes
+	// the final peers.json, so it must run once no peer can still be adding
+	// an address. It is idempotent and a no-op when persistence is disabled.
+	if s.addrMan != nil {
+		if err := s.addrMan.Stop(); err != nil {
 			return err
 		}
 	}
