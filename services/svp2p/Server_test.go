@@ -11,6 +11,7 @@ import (
 
 	bt "github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
@@ -453,4 +454,114 @@ func TestServerHealth(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 200, code)
 	require.Equal(t, "OK", msg)
+}
+
+// divergentBestHeaderClient wraps a REAL sqlitememory-backed blockchain
+// client (the project's no-mocked-store rule stands: genesis, height ranges
+// and every other call still come from that store) and injects exactly one
+// divergence — the shape a badly diverged or untrusted store can present to
+// hydration. GetBestBlockHeader answers with a header the store never linked
+// to genesis, and GetBlockHeader then hands back a fresh unknown parent on
+// every hop, so the backward reconciliation walk never reaches an indexed
+// ancestor. Without a depth cap that walk does not terminate.
+type divergentBestHeaderClient struct {
+	blockchain.ClientI
+
+	best *model.BlockHeader
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *divergentBestHeaderClient) GetBestBlockHeader(_ context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	// Height 0 keeps the forward walk a no-op, so the test measures the
+	// backward reconciliation walk alone.
+	return c.best, &model.BlockHeaderMeta{Height: 0}, nil
+}
+
+func (c *divergentBestHeaderClient) GetBlockHeader(_ context.Context, _ *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.calls++
+
+	unknownParent := chainhash.Hash{}
+	unknownParent[0] = byte(c.calls)
+	unknownParent[1] = byte(c.calls >> 8)
+
+	bits, err := model.NewNBitFromString("1d00ffff")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &model.BlockHeader{
+		Version:        1,
+		Timestamp:      1,
+		Nonce:          uint32(c.calls), //nolint:gosec // test-bounded counter
+		Bits:           *bits,
+		HashPrevBlock:  &unknownParent,
+		HashMerkleRoot: &chainhash.Hash{},
+	}, &model.BlockHeaderMeta{Height: 0}, nil
+}
+
+func (c *divergentBestHeaderClient) Calls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.calls
+}
+
+// TestServerReconcileWalkStopsAtDepthCap asserts the bound on
+// reconcileHeaderIndex. A store whose best header recedes forever must fail
+// hydration AT the cap, not walk without end. The cap is 10 x
+// headerBatchSize, so a batch size of 4 caps the walk at 40 hops and the
+// call count is asserted exactly: an error alone would not prove the walk
+// stopped where it was told to.
+func TestServerReconcileWalkStopsAtDepthCap(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
+	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.WorkingDir = t.TempDir()
+	tSettings.GRPCAdminAPIKey = "test-admin-key"
+
+	store, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+
+	realClient, err := blockchain.NewLocalClient(ulogger.TestLogger{}, tSettings, store, nil, nil)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// A best header that is genuinely absent from the index: its parent is a
+	// hash the store never held.
+	orphanParent := chainhash.Hash{0xff}
+	divergentBest := testHeaderBlock(t, 9999, &orphanParent).Header
+
+	client := &divergentBestHeaderClient{ClientI: realClient, best: divergentBest}
+
+	srv := New(ulogger.TestLogger{}, tSettings, client)
+
+	const batchSize = uint32(4)
+
+	srv.headerBatchSize = batchSize
+
+	wantCap := int(reconcileDepthCapMultiplier * batchSize)
+
+	require.NoError(t, srv.hydrateHeaderIndex(ctx))
+
+	err = srv.syncHeaderIndex(ctx)
+	require.Error(t, err, "hydration must fail when the store's best header cannot be reconciled")
+	require.ErrorContains(t, err, divergentBest.Hash().String(), "the error must name the diverged best header")
+	require.ErrorContains(t, err, "diverged", "the error must name the divergence")
+	require.True(t, errors.Is(err, errors.ErrServiceError), "the reconcile depth cap must fail as a service error, got %v", err)
+
+	require.Equal(t, wantCap, client.Calls(), "the reconciliation walk must stop at exactly the depth cap")
+
+	// The index must be left as hydration built it — genesis only, nothing
+	// from the unreconcilable branch linked in.
+	idx := srv.HeaderIndex()
+	require.NotNil(t, idx)
+
+	_, tipHeight := idx.Tip()
+	require.Equal(t, int32(0), tipHeight, "a failed reconciliation must not advance the index tip")
 }

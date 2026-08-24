@@ -42,6 +42,11 @@ import (
 // hydration and resync to the wire protocol's own headers-per-message cap.
 const defaultHeaderBatchSize = uint32(wire.MaxBlockHeadersPerMsg)
 
+// reconcileDepthCapMultiplier bounds the backward reconciliation walk to this
+// many headerBatchSize-sized batches. See reconcileHeaderIndex for the
+// argument behind the number and for why the walk needs a bound at all.
+const reconcileDepthCapMultiplier = uint32(10)
+
 // Deps carries the Teranode service dependencies the block-ingestion bridge
 // needs, in the same set legacy.New takes (daemon/daemon_services.go). They
 // are optional on this Server: the daemon always injects them via
@@ -772,6 +777,39 @@ func (s *Server) addHeaders(headers []*wire.BlockHeader, pass string) error {
 // regardless of how many rows came back, and each batch is returned in
 // descending height order, so it's walked oldest-first here so a header's
 // parent is always already indexed when AddHeader sees it.
+//
+// MEASURED, mainnet-scale replay (900000-header sqlitememory store, cold
+// cache, batch size 2000): 451 range reads, 1.85s, 1498 MiB allocated
+// through the walk, 16 GC cycles, 509 MiB retained afterwards — 281 MiB of
+// that is the header index itself (unavoidable, it is the product) and
+// 220 MiB is the store's response cache holding all 450 batches at ~501 KiB
+// each. GetBlockHeadersFromHeight caches every result unconditionally
+// (stores/blockchain/sql/GetBlockHeadersFromHeight.go, cacheTTL 2 minutes,
+// ttlcache with no capacity bound), and the walk never re-reads a height
+// range, so those 220 MiB are pure startup waste held for the TTL window.
+//
+// Tuning the batch size does NOT reduce it, and this was measured rather
+// than assumed: the same store walked at batch size 250 makes 3600 cache
+// entries instead of 450 and retains 221 MiB — the same 900000 headers,
+// merely re-partitioned.
+//
+// The 450 batches only ever co-exist in ONE scenario, also measured: a cold
+// walk over a store that is already populated, which is a restart of a
+// synced node. Nothing stores a block during that walk, so nothing clears
+// the cache. When blocks arrive WHILE the walk runs — live IBD or catch-up,
+// driven per notification through syncHeaderIndex — StoreBlock's
+// ResetResponseCache (stores/blockchain/sql/StoreBlock.go:171) wipes the
+// cache faster than the walk fills it: the same 900000-header replay,
+// interleaved, retains 1734 KiB instead of 220 MiB. Each notification-driven
+// walk also starts at idx.Tip()+1, so it fetches one batch rather than 450.
+// So the exposure is one TTL window on restart, and it is absent during IBD.
+//
+// The only real fix is a read that bypasses the store's response cache,
+// which needs a store-side change: every header-range reader in
+// stores/blockchain/sql caches unconditionally, and neither
+// blockchain.ClientI nor stores/blockchain.Store exposes a bypass or the
+// concrete *SQL.ResetResponseCache. Left as an external dependency rather
+// than reached into from here.
 func (s *Server) forwardWalkHeaderIndex(ctx context.Context, idx *protocol.HeaderIndex, targetHeight uint32) error {
 	_, tipHeight := idx.Tip()
 
@@ -805,18 +843,65 @@ func (s *Server) forwardWalkHeaderIndex(ctx context.Context, idx *protocol.Heade
 // follow: if best is not yet indexed, its ancestors were left behind on a
 // branch that stopped being best before the forward walk reached their
 // heights. It walks backward one header at a time via GetBlockHeader,
-// starting at best, until it reaches a header already in idx — a walk
-// guaranteed to terminate because genesis is always present from hydration
-// — then adds the recovered segment forward so every ancestor connects.
+// starting at best, until it reaches a header already in idx, then adds the
+// recovered segment forward so every ancestor connects.
+//
+// The walk is bounded. On a healthy store it terminates on its own, because
+// genesis is present from hydration and every chain reaches it. That
+// guarantee belongs to the store, not to us: a store that is badly diverged,
+// corrupt, or untrusted can answer with a chain of unknown parents that
+// never meets our index, and an unbounded walk then loops issuing one
+// GetBlockHeader per hop forever. So the walk stops after
+// reconcileDepthCapMultiplier x headerBatchSize hops and fails hydration.
+//
+// The cap has NO SVNode counterpart, and none is implied: SVNode loads its
+// own block index from its own datadir and never reconciles against a
+// separate authoritative header store. This is a Teranode-only hydration
+// path (spec §11: the blockchain service is authoritative, this index is
+// rebuilt every startup), so the number is justified on our own terms:
+//   - It must exceed any reorg depth we intend to survive. The forward walk
+//     already covers straightforward growth in headerBatchSize-sized steps
+//     (2000 headers, the wire headers-per-message cap), so ten of those —
+//     20000 headers, roughly five months of mainnet blocks — is far deeper
+//     than any reorg a running node should reconcile across, and it scales
+//     with the batch size rather than being a second independent constant.
+//   - It must be small enough that the failure is prompt: 20000 sequential
+//     GetBlockHeader calls is a bounded, observable cost, not a hang.
+//
+// Past the cap the answer is a service error naming the diverged best
+// header, not a retry and not a warning. ErrServiceError (not
+// ERR_THRESHOLD_EXCEEDED, which carries retry semantics and maps to gRPC
+// ResourceExhausted) is the right class because retrying the same walk
+// against the same store yields the same answer: the store's best chain and
+// our index disagree, hydration cannot produce a valid index, and the
+// service must fail to start rather than run on a knowingly broken one. No
+// peer is involved on this path, so no peer-scoring class applies either.
+//
+// Locking contract (Phase 2 carry, unchanged here): the sync-state machines
+// this feeds are caller-locked under PeerManager.syncMu, the lock order is
+// peer lock then manager lock, and nothing blocking runs under syncMu. This
+// function holds neither lock — it only issues store reads — and hands its
+// recovered headers to addHeaders, which takes syncMu inside
+// PeerManager.AddHeaders. The store reads therefore stay outside syncMu,
+// which is what keeps a slow or diverged store from blocking under it.
 func (s *Server) reconcileHeaderIndex(ctx context.Context, idx *protocol.HeaderIndex, best *model.BlockHeader) error {
 	if _, ok := idx.Lookup(*best.Hash()); ok {
 		return nil
 	}
 
+	maxDepth := reconcileDepthCapMultiplier * s.headerBatchSize
+
 	missing := []*model.BlockHeader{best}
 	current := best
 
-	for current.HashPrevBlock != nil {
+	for depth := uint32(0); current.HashPrevBlock != nil; depth++ {
+		if depth >= maxDepth {
+			return errors.NewServiceError(
+				"svp2p: reorg reconciliation from best header %s reached the %d-header depth cap without meeting an indexed ancestor: the blockchain store's best chain has diverged from the header index",
+				best.Hash(), maxDepth,
+			)
+		}
+
 		parent, _, err := s.blockchainClient.GetBlockHeader(ctx, current.HashPrevBlock)
 		if err != nil {
 			return errors.NewServiceError("svp2p: failed to fetch header %s while reconciling a reorg", current.HashPrevBlock, err)
