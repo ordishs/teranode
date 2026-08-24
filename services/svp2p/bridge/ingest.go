@@ -385,7 +385,8 @@ func (sm *svp2pBridge) IngestBlock(ctx context.Context, header *wire.BlockHeader
 	}()
 
 	// Wait for block assembly to be ready.
-	if err = blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight, sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly); err != nil {
+	if waitErr := blockassemblyutil.WaitForBlockAssemblyReady(ctx, sm.logger, sm.blockAssembly, blockHeight, sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly); waitErr != nil {
+		err = blockAssemblyNotReady(waitErr)
 		return err
 	}
 
@@ -501,4 +502,30 @@ func (sm *svp2pBridge) IngestBlock(ctx context.Context, header *wire.BlockHeader
 	}
 
 	return nil
+}
+
+// blockAssemblyNotReady re-codes the block-assembly readiness gate's failure as
+// a ServiceUnavailable error, which is what it is: our own block assembly is
+// behind, and the peer that delivered the block had nothing to do with it.
+//
+// WaitForBlockAssemblyReady (util/blockassemblyutil/blockassembly_wait.go)
+// exhausts retry.WithRetryCount(100) and returns a ProcessingError reading
+// "block assembly is behind, block height %d, block assembly height %d".
+// ERR_PROCESSING is NOT in errors.IsTransientLocalError's set
+// (errors/error_utils.go:68-77, {ErrServiceError, ErrStorageError,
+// ErrServiceUnavailable, ErrStorageUnavailable}), so under legacy's
+// shouldDisconnectOnBlockErr rule (services/legacy/peer_server.go:1203-1209,
+// !IsTransientLocalError) that exhaustion read as a peer fault and cost an
+// HONEST peer its connection.
+//
+// Re-coding here rather than string-matching at the classification seam keeps
+// the decision structural. ErrServiceUnavailable is the same code legacy's own
+// per-block backoff throttle uses (peer_server.go:1196-1199, "#1187"), so the
+// admission failure backoff (Admission.RecordFailure) bounds the retry cost
+// exactly as it does for every other local fault.
+//
+// The original error is wrapped, not discarded: the operator still sees which
+// heights were involved.
+func blockAssemblyNotReady(err error) error {
+	return errors.NewServiceUnavailableError("[svp2p] block assembly is not ready for this block", err)
 }

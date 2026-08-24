@@ -133,7 +133,9 @@ func (d *servingDispatcher) ContinueInv(sp *SyncPeer, hash chainhash.Hash) []wir
 
 func (d *servingDispatcher) BlockExpected(*SyncPeer, chainhash.Hash) bool { return false }
 
-func (d *servingDispatcher) BlockDone(*SyncPeer, chainhash.Hash, IngestOutcome) error { return nil }
+func (d *servingDispatcher) BlockDone(*SyncPeer, chainhash.Hash, IngestOutcome) (int, error) {
+	return 0, nil
+}
 
 // testWireBlock builds a small but real legacy-wire block: 80 byte header,
 // transaction count varint, transactions. Those are exactly the bytes

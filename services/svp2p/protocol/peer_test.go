@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/svp2p/transport"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -515,5 +517,209 @@ func TestPeerDisconnectStopsRun(t *testing.T) {
 		require.Error(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Disconnect did not stop Run")
+	}
+}
+
+// scoringDispatcher is a syncDispatcher whose only interesting method is
+// BlockDone: it returns the misbehavior delta and the disconnect verdict a
+// test wants, so the peer loop's score-then-disconnect ordering can be driven
+// without a PeerManager.
+type scoringDispatcher struct {
+	delta int
+	err   error
+}
+
+func (d *scoringDispatcher) Established(*SyncPeer, wire.ServiceFlag) []wire.Message { return nil }
+
+func (d *scoringDispatcher) Headers(*SyncPeer, *wire.MsgHeaders) ([]wire.Message, int, error) {
+	return nil, 0, nil
+}
+
+func (d *scoringDispatcher) Inv(*SyncPeer, *wire.MsgInv) ([]wire.Message, error) { return nil, nil }
+
+func (d *scoringDispatcher) GetHeaders(*SyncPeer, *wire.MsgGetHeaders) []wire.Message { return nil }
+
+func (d *scoringDispatcher) GetBlocks(*SyncPeer, *wire.MsgGetBlocks) []wire.Message { return nil }
+
+func (d *scoringDispatcher) GetData(*SyncPeer, *wire.MsgGetData) []getDataItem { return nil }
+
+func (d *scoringDispatcher) ContinueInv(*SyncPeer, chainhash.Hash) []wire.Message { return nil }
+
+// BlockExpected answers true so the block under test is solicited: an
+// unsolicited block is refused before it ever reaches the ingestor
+// (Peer.startIngest).
+func (d *scoringDispatcher) BlockExpected(*SyncPeer, chainhash.Hash) bool { return true }
+
+func (d *scoringDispatcher) BlockDone(*SyncPeer, chainhash.Hash, IngestOutcome) (int, error) {
+	return d.delta, d.err
+}
+
+// completingIngestor finishes an ingest immediately with a fixed outcome, so a
+// test can drive the peer loop's ingest-report handling rather than its idle
+// timer.
+type completingIngestor struct {
+	outcome IngestOutcome
+
+	started chan struct{}
+}
+
+func newCompletingIngestor(outcome IngestOutcome) *completingIngestor {
+	return &completingIngestor{outcome: outcome, started: make(chan struct{}, 1)}
+}
+
+func (c *completingIngestor) WatchProgress(r io.ReadCloser) IngestProgress {
+	return newTestProgress(r)
+}
+
+func (c *completingIngestor) Ingest(_ context.Context, req BlockIngestRequest) IngestOutcome {
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+
+	_, _ = io.Copy(io.Discard, req.TxReader)
+	_ = req.TxReader.Close()
+
+	return c.outcome
+}
+
+// TestPeerScoresAPeerFaultBlockBeforeDisconnecting is Task 20 part (b): a
+// block reject that IS the peer's fault must reach the ban counter, not only
+// the disconnect.
+//
+// SVNode scores it. PeerLogicValidation::BlockChecked (net/net_processing.cpp:903)
+// hands the validation state to BlockDownloadTracker::BlockChecked
+// (net/block_download_tracker.cpp:87), which at :113-127 reads the DoS level out
+// of the state and calls Misbehaving(node, nDoS, state.GetRejectReason()) for
+// every node that sourced the block. Misbehaving (net_processing.cpp:609-633)
+// adds to state->nMisbehavior and raises fShouldBan at the threshold. Before
+// this task svp2p disconnected on the reject and recorded nothing, so a peer
+// that reconnected arrived with a clean counter.
+//
+// The score is asserted even on the rows that also disconnect, because the
+// order is the point: SVNode scores first and acts second, the same order
+// dispatchAddr already keeps for oversized-addr (peer.go, net_processing.cpp
+// :2285-2286). A disconnect that skipped the score would lose the evidence the
+// ban threshold is counting.
+func TestPeerScoresAPeerFaultBlockBeforeDisconnecting(t *testing.T) {
+	// A delta of 100 is scoreInvalidBlock: every block-invalidity site in
+	// SVNode's validation.cpp uses state.DoS(100, ...) (e.g. :537
+	// bad-txns-oversize, :579 bad-cb-missing, :3714 blk-bad-inputs).
+	const invalidBlock = 100
+
+	tests := []struct {
+		name string
+
+		// delta and dispatchErr are what BlockDone reports for the block.
+		delta       int
+		dispatchErr error
+
+		// banThreshold is the peer's own threshold. A row that wants to
+		// observe a score WITHOUT the score itself ending the connection sets
+		// it above the delta.
+		banThreshold   int
+		disableBanning bool
+
+		wantScore int
+		wantDrop  bool
+	}{
+		{
+			// The reject the whole task is about: SVNode's own numbers, where
+			// one invalid block reaches the threshold on its own.
+			name:         "invalid block scores and drops",
+			delta:        invalidBlock,
+			dispatchErr:  errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: block was rejected"),
+			banThreshold: 100,
+			wantScore:    invalidBlock,
+			wantDrop:     true,
+		},
+		{
+			// The score has to land even when it is not yet fatal, because
+			// that is the whole point of a counter: the next reject from the
+			// same peer must find it.
+			name:         "score lands below the threshold and the peer stays",
+			delta:        invalidBlock,
+			banThreshold: 1000,
+			wantScore:    invalidBlock,
+			wantDrop:     false,
+		},
+		{
+			// legacy addBanScore (services/legacy/peer_server.go:539-543)
+			// returns before touching the counter when cfg.DisableBanning is
+			// set, and peer_server.go:1667-1676 is explicit that the peer is
+			// still "disconnected regardless of whether it was banned". So
+			// banning off suppresses the SCORE, never the disconnect.
+			name:           "banning disabled suppresses the score, not the disconnect",
+			delta:          invalidBlock,
+			dispatchErr:    errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: block was rejected"),
+			banThreshold:   100,
+			disableBanning: true,
+			wantScore:      0,
+			wantDrop:       true,
+		},
+		{
+			// A local fault carries no delta at all, so nothing is recorded
+			// against a peer that did its job.
+			name:         "local fault scores nothing and keeps the peer",
+			delta:        0,
+			banThreshold: 100,
+			wantScore:    0,
+			wantDrop:     false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ingestor := newCompletingIngestor(IngestOutcome{})
+
+			p, far := newIngestingTestPeer(t, time.Hour, time.Hour, ingestor)
+			p.cfg.Sync = &scoringDispatcher{delta: tc.delta, err: tc.dispatchErr}
+			p.cfg.BanThreshold = tc.banThreshold
+			p.cfg.DisableBanning = tc.disableBanning
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- p.Run(context.Background()) }()
+
+			defer p.Disconnect("test teardown")
+
+			completeHandshake(t, far)
+
+			genesis := syncGenesis()
+			far.writeAsync(blockFor(minedChild(genesis, testEasyBits, 40)))
+
+			select {
+			case <-ingestor.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the block never reached the ingestor")
+			}
+
+			if tc.wantDrop {
+				select {
+				case err := <-errCh:
+					require.Error(t, err, "a block the pipeline rejected must cost the peer its connection")
+				case <-time.After(5 * time.Second):
+					t.Fatal("the peer was never disconnected")
+				}
+			}
+
+			// Read the counter only once the loop has finished with this
+			// block: on a dropping row that is when Run returned, and on a
+			// staying row the score is the only observable, so poll it.
+			require.Eventually(t, func() bool {
+				p.mu.Lock()
+				defer p.mu.Unlock()
+
+				return p.hs.MisbehaviorScore() == tc.wantScore
+			}, 5*time.Second, 10*time.Millisecond,
+				"the ban counter must carry exactly the delta the reject earned")
+
+			if !tc.wantDrop {
+				select {
+				case err := <-errCh:
+					t.Fatalf("the peer was disconnected without a disconnect verdict: %v", err)
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
+		})
 	}
 }

@@ -132,22 +132,88 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 	// IngestBlock owns the stream from here: it releases it on every one of
 	// its own exit paths.
 	if err := b.bridge.IngestBlock(ctx, req.Header, req.TxCount, req.TxReader, req.PeerAddr); err != nil {
-		if errors.IsTransientLocalError(err) {
+		if !isPeerAttributableReject(err) {
 			backoff := b.admission.RecordFailure(hash)
 			b.logger.Warnf("[svp2p] block %s failed on a local fault, backing off for %s: %v", hash, backoff, err)
 
 			return protocol.IngestOutcome{Err: err, TransientLocal: true}
 		}
 
-		// Everything the pipeline rejects that is not a local fault is the
-		// peer's: a block that fails validation, or a payload that fails to
-		// decode.
+		// Only a fault of the block ITSELF is the peer's: a block that fails
+		// validation, or a payload that fails to decode.
 		return protocol.IngestOutcome{Err: err, PeerFault: true}
 	}
 
 	b.admission.ClearFailure(hash)
 
 	return protocol.IngestOutcome{}
+}
+
+// isPeerAttributableReject decides whether a pipeline reject is the delivering
+// peer's fault. It is an ALLOW-LIST of error codes that describe the BLOCK,
+// and it is a deliberate narrowing of the rule this seam inherited.
+//
+// The inherited rule was legacy's shouldDisconnectOnBlockErr
+// (services/legacy/peer_server.go:1203-1209): disconnect unless
+// errors.IsTransientLocalError(err). That is a DENY-LIST over exactly four
+// codes (errors/error_utils.go:68-77: ErrServiceError, ErrStorageError,
+// ErrServiceUnavailable, ErrStorageUnavailable), so every other code in the
+// tree — ERR_PROCESSING above all, which is how most of our own internal
+// failures are reported — reached the peer as a disconnect. The block-assembly
+// readiness gate was the concrete casualty: it exhausts its retries with a
+// ProcessingError, so a node whose block assembly fell behind dropped HONEST
+// peers. bridge.blockAssemblyNotReady now re-codes that one structurally, and
+// this inversion covers the rest of the same class.
+//
+// The list is derived from the reject SITES in the svp2p bridge, not from what
+// the pipeline happens to return:
+//
+//   - ErrBlockInvalid — every site is a property of the block bytes: coinbase
+//     and transaction decode failures (bridge/ingest.go:110,:143,
+//     bridge/handle_block.go:1871), an empty or out-of-range transaction count
+//     (bridge/ingest.go:312,:317), a bad header, a merkle root mismatch and a
+//     duplicate transaction (bridge/ingest.go:463,:477,:481, mirrored at
+//     bridge/handle_block.go:216,:237,:240,:481 — the CVE-2012-2459 check).
+//   - ErrBlockInvalidFormat — no bridge site emits it today (the decode
+//     failures above use ErrBlockInvalid), but it is the dedicated code for a
+//     malformed block, so it is admitted here rather than letting the first
+//     site that picks the more specific code silently stop disconnecting.
+//   - ErrTxInvalid, ErrTxInvalidDoubleSpend — a transaction IN the block is
+//     unspendable: a missing, out-of-range or nil-script previous output
+//     (bridge/handle_block.go:1660,:1665,:1671).
+//
+// Deliberately NOT on the list, each because the same code also covers our own
+// state: ERR_TX_ERROR (bridge/handle_block.go:1558,:1781-:1791 are txMap and
+// subtree bookkeeping), ERR_SUBTREE_ERROR (bridge/handle_block.go:410,:415,
+// :649 are our own subtree machinery), ERR_PROCESSING, and every service,
+// storage and UTXO code. ERR_BLOCK_PARENT_NOT_MINED is absent too: the
+// ParentMissing branch above already answers it, and it is our chain that is
+// behind, not the peer that is wrong.
+//
+// The direction of the failure mode is the argument for an allow-list. A code
+// wrongly on it costs an honest peer its connection while our own service
+// recovers; a code wrongly off it costs one re-offer of the block, and the
+// stall rules still deal with a peer that keeps failing. So an unclassified
+// reject keeps the peer — the same principle IngestOutcome.PeerFault's own doc
+// comment states for the flag itself (protocol/peer.go).
+//
+// Local precedence is checked FIRST and matches anywhere in the wrapped chain:
+// the bridge wraps freely (bridge/ingest.go:463 wraps whatever the header check
+// returned), so a storage fault under a peer-attributable head code keeps the
+// peer.
+func isPeerAttributableReject(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.IsTransientLocalError(err) {
+		return false
+	}
+
+	return errors.Is(err, errors.ErrBlockInvalid) ||
+		errors.Is(err, errors.ErrBlockInvalidFormat) ||
+		errors.Is(err, errors.ErrTxInvalid) ||
+		errors.Is(err, errors.ErrTxInvalidDoubleSpend)
 }
 
 // release closes a stream the pipeline never took ownership of, and keeps the

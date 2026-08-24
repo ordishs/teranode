@@ -22,8 +22,24 @@ const (
 	// pingInterval mirrors SVNode PING_INTERVAL (net.h: 2 * 60).
 	pingInterval = 2 * time.Minute
 
-	// banScoreThreshold mirrors SVNode DEFAULT_BANSCORE_THRESHOLD (100).
+	// banScoreThreshold mirrors SVNode DEFAULT_BANSCORE_THRESHOLD (100),
+	// validation.h:191.
 	banScoreThreshold = 100
+
+	// scoreInvalidBlock is what a block the pipeline rejected costs the peer
+	// that delivered it. BlockDownloadTracker::BlockChecked
+	// (net/block_download_tracker.cpp:113-127) scores the DoS level the
+	// validation state carries — Misbehaving(node, nDoS,
+	// state.GetRejectReason()) — and every block-invalidity site in SVNode's
+	// validation.cpp sets that level to 100: state.DoS(100, ...) at :537
+	// (bad-txns-oversize), :579 (bad-cb-missing), :589 (bad-cb-length), :3714
+	// (blk-bad-inputs), and so on throughout CheckBlock and ConnectBlock.
+	//
+	// 100 equals banScoreThreshold, so one invalid block reaches the threshold
+	// on its own. That is SVNode's own arithmetic, and it is why the reject
+	// disconnects immediately as well as scoring: the score is what survives
+	// the reconnect.
+	scoreInvalidBlock = 100
 
 	// dialRetryBase and dialRetryMax bound the outbound reconnect backoff,
 	// matching the retry semantics the bsvd connmgr gave the old service
@@ -712,12 +728,15 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 		IdleTimeout:  m.tSettings.Legacy.PeerIdleTimeout,
 		PingInterval: pingInterval,
 		BanThreshold: banScoreThreshold,
-		Sync:         dispatch,
-		Addrs:        addrs,
-		SyncPeer:     syncPeer,
-		Ingestor:     ingestor,
-		Fetcher:      fetcher,
-		TxIngestor:   txIngestor,
+		// The legacy `--nobanning` switch, read from the same setting the
+		// legacy service reads it from (see PeerConfig.DisableBanning).
+		DisableBanning: m.tSettings.Legacy.DisableBanning,
+		Sync:           dispatch,
+		Addrs:          addrs,
+		SyncPeer:       syncPeer,
+		Ingestor:       ingestor,
+		Fetcher:        fetcher,
+		TxIngestor:     txIngestor,
 		// A bound method value, not manager state snapshotted under a lock:
 		// markTxKnown takes syncMu itself on each call, so there is nothing
 		// to read here ahead of time the way ingestor/fetcher/txIngestor are.
@@ -1352,13 +1371,16 @@ func (m *PeerManager) BlockExpected(syncPeer *SyncPeer, hash chainhash.Hash) boo
 
 // BlockDone reports one block's ingest outcome to the download scheduler:
 // in-flight is cleared, the peer's progress clock is fed, and a pre-admission
-// timeout rotates the sync peer. A non-nil return means the peer must be
-// disconnected, which the caller does with no lock held.
-func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) error {
+// timeout rotates the sync peer. A non-nil error return means the peer must be
+// disconnected, which the caller does with no lock held; the int is the
+// misbehavior delta the outcome earned, which the caller applies FIRST (see
+// Peer.Run's ingest-report case).
+func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) (int, error) {
 	now := time.Now().UnixMicro()
 
 	var (
 		rotate     bool
+		delta      int
 		disconnect error
 	)
 
@@ -1376,7 +1398,7 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 
 	if m.blockDownloader == nil {
 		m.syncMu.Unlock()
-		return nil
+		return 0, nil
 	}
 
 	switch {
@@ -1440,6 +1462,15 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		// unclassified failure disconnects nobody either — the block goes back
 		// on offer and the stall rules deal with a peer that keeps failing.
 		if outcome.PeerFault {
+			// The reject is recorded against the peer as well as acted on.
+			// SVNode does both from one place: BlockDownloadTracker::BlockChecked
+			// (net/block_download_tracker.cpp:113-127) reads the DoS level out
+			// of the validation state and calls Misbehaving(node, nDoS,
+			// state.GetRejectReason()) for the node that sourced the block.
+			// Without the score a peer that reconnects arrives with a clean
+			// counter, so a peer feeding invalid blocks pays one reconnect per
+			// block instead of accumulating towards a ban.
+			delta = scoreInvalidBlock
 			disconnect = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
 				"svp2p: block %s was rejected", hash, outcome.Err)
 		}
@@ -1462,7 +1493,7 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		m.electSyncPeer(syncPeer)
 	}
 
-	return disconnect
+	return delta, disconnect
 }
 
 // RelayBlock is the block announcement relay's entry point: hash just

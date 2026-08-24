@@ -710,6 +710,16 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// DEFAULT_MAX_OUTBOUND_CONNECTIONS. Zero turns the svp2p
 			// addrman-driven dialer off; legacy_connect_peers overrides it.
 			TargetOutboundPeers: getInt("legacy_targetOutboundPeers", 8, alternativeContext...),
+			// NOT a new Phase 3 settings key: `legacy_config_DisableBanning`
+			// is the key the legacy service already honors as the bsvd
+			// `--nobanning` switch. Legacy reads it through the reflective
+			// `legacy_config_<Field>` loader (services/legacy/config.go:773
+			// setConfigValuesFromSettings, over config.go:155's
+			// DisableBanning field), which needs no typed accessor. This
+			// typed field exists so svp2p can honor the SAME operator switch
+			// without reaching into gocore config itself; the default matches
+			// legacy's zero value, so behavior is unchanged on both sides.
+			DisableBanning: getBool("legacy_config_DisableBanning", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),

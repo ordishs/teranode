@@ -17,6 +17,8 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockassembly"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/svp2p/bridge/bsvutil"
@@ -829,4 +831,54 @@ func TestPreAdmitAnswersTheBoundedLookups(t *testing.T) {
 		_, err := h.sm.PreAdmit(cancelled, &header)
 		require.Error(t, err)
 	})
+}
+
+// TestIngestBlock_BlockAssemblyBehindIsALocalFault is Task 20 part (a) at the
+// source. The block-assembly readiness gate is OUR service state: block
+// assembly lagging our own chain tip says nothing about the peer that
+// delivered the block.
+//
+// Before this task the gate's failure reached the peer loop as a raw
+// ProcessingError (util/blockassemblyutil/blockassembly_wait.go returns
+// "block assembly is behind, block height %d, block assembly height %d" once
+// retry.WithRetryCount(100) is exhausted). ERR_PROCESSING is not in
+// errors.IsTransientLocalError's set, so legacy's shouldDisconnectOnBlockErr
+// rule (services/legacy/peer_server.go:1203-1209) classified it as the peer's
+// fault and dropped an HONEST peer.
+//
+// This test drives the real gate on the real IngestBlock path and asserts the
+// classification the whole chain depends on. It reaches the failure by
+// cancelling the wait rather than by sitting through all 100 retries; the
+// exhaustion error's own text is covered verbatim by the classification table
+// in services/svp2p/ingest_test.go
+// (TestBlockIngestorClassifiesPipelineRejects), so both the wrap and the raw
+// error are pinned.
+func TestIngestBlock_BlockAssemblyBehindIsALocalFault(t *testing.T) {
+	ctx := context.Background()
+
+	block := buildCoinbaseOnlyBlock(t)
+	txs := block.Transactions()
+	header := block.MsgBlock().Header
+
+	h := newIngestHarness(ctx, t, "ingest_ba_behind", false, 0)
+
+	// Block assembly is stuck far below the block's height, with no slack.
+	h.sm.settings.BlockValidation.MaxBlocksBehindBlockAssembly = 0
+
+	ba := blockassembly.NewMock()
+	ba.On("GetBlockAssemblyState", mock.Anything).Return(&blockassembly_api.StateMessage{CurrentHeight: 0}, nil)
+	h.sm.blockAssembly = ba
+
+	waitCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+
+	stream := &countingCloser{Reader: bytes.NewReader(serializeTxStream(t, txs))}
+
+	err := h.sm.IngestBlock(waitCtx, &header, uint64(len(txs)), stream, "peer")
+	require.Error(t, err)
+	require.True(t, errors.IsTransientLocalError(err),
+		"our own block assembly being behind must classify as a transient LOCAL fault, never as a peer fault")
+	require.ErrorIs(t, err, errors.ErrServiceUnavailable,
+		"the readiness gate reports service unavailability, the same code legacy's per-block backoff throttle uses")
+	require.Equal(t, 1, stream.count(), "every IngestBlock exit path releases the stream")
 }

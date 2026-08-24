@@ -224,9 +224,11 @@ type syncDispatcher interface {
 	// what makes an inbound block solicited.
 	BlockExpected(sp *SyncPeer, hash chainhash.Hash) bool
 
-	// BlockDone reports one block's ingest outcome to the scheduler. A non-nil
-	// error means this peer must be disconnected.
-	BlockDone(sp *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) error
+	// BlockDone reports one block's ingest outcome to the scheduler; the int
+	// is a misbehavior delta and a non-nil error means this peer must be
+	// disconnected. Both can come back together, and the caller scores before
+	// it acts on the error — see Run's ingest-report case.
+	BlockDone(sp *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) (int, error)
 }
 
 // addrDispatcher is the peer loop's view of the manager-owned address table
@@ -271,6 +273,25 @@ type PeerConfig struct {
 	IdleTimeout  time.Duration
 	PingInterval time.Duration
 	BanThreshold int
+
+	// DisableBanning suppresses misbehavior SCORING, never a disconnect.
+	//
+	// It carries the legacy `--nobanning` switch, which reaches the legacy
+	// service as the `legacy_config_DisableBanning` setting
+	// (services/legacy/config.go:155 declares the field; config.go:773's
+	// setConfigValuesFromSettings maps the `legacy_config_<Field>` prefix onto
+	// it — the `nobanning` struct tag itself is inert, see
+	// services/legacy/peer_server_test.go:1040-1041). Legacy addBanScore
+	// (peer_server.go:539-543) returns before touching the counter when it is
+	// set, and peer_server.go:1667-1676 states the other half explicitly: the
+	// peer is "disconnected regardless of whether it was banned". So an
+	// operator running with banning off still drops a peer that sends an
+	// invalid block; only the accumulated record is given up.
+	//
+	// SVNode has no equivalent — Misbehaving (net_processing.cpp:609) is
+	// unconditional and only `-banscore` is tunable — so this is a Teranode
+	// behavior carried from legacy, cited by file rather than by C++ line.
+	DisableBanning bool
 
 	// Sync is the manager's sync dispatch, or nil when block sync is not
 	// wired (the Phase 1 shape: handshake and ping only).
@@ -570,8 +591,23 @@ func (p *Peer) Run(ctx context.Context) error {
 
 			if p.cfg.Sync != nil {
 				// A block the pipeline rejected is the peer's fault, and the
-				// dispatcher says so by returning an error.
-				if err := p.cfg.Sync.BlockDone(p.cfg.SyncPeer, report.hash, report.outcome); err != nil {
+				// dispatcher says so by returning an error. It also returns
+				// the misbehavior delta the reject earned.
+				delta, err := p.cfg.Sync.BlockDone(p.cfg.SyncPeer, report.hash, report.outcome)
+
+				// Scored BEFORE the error is acted on, matching SVNode's own
+				// order and dispatchAddr's: BlockDownloadTracker::BlockChecked
+				// calls Misbehaving(node, nDoS, ...) for the sourcing node and
+				// the ban decision follows from the counter
+				// (net/block_download_tracker.cpp:113-127,
+				// net_processing.cpp:609-633). A disconnect that skipped the
+				// score would lose the evidence the ban threshold is counting,
+				// and the peer would reconnect with a clean record.
+				if scoreErr := p.scoreMisbehavior(delta); scoreErr != nil && err == nil {
+					return p.disconnect(scoreErr)
+				}
+
+				if err != nil {
 					return p.disconnect(err)
 				}
 			}
@@ -920,6 +956,14 @@ func (p *Peer) send(msgs []wire.Message) {
 // the handshake scores against, so both feed one ban threshold.
 func (p *Peer) scoreMisbehavior(delta int) error {
 	if delta <= 0 {
+		return nil
+	}
+
+	// legacy addBanScore (services/legacy/peer_server.go:539-543): "No warning
+	// is logged and no score is calculated if banning is disabled." The
+	// disconnect is NOT suppressed here — every caller acts on its own error
+	// independently of what this returns.
+	if p.cfg.DisableBanning {
 		return nil
 	}
 

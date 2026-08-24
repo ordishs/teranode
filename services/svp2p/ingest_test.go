@@ -347,3 +347,122 @@ func TestBlockIngestorBacksOffLocalFailures(t *testing.T) {
 	require.Equal(t, 1, br.callCount(), "a backed-off block must not reach the pipeline again")
 	require.Equal(t, 1, second.closeCount(), "a skipped block still has to release the stream")
 }
+
+// TestBlockIngestorClassifiesPipelineRejects is Task 20 part (a): the outcome
+// classification is an ALLOW-LIST of peer-attributable faults, not the
+// deny-list it inherited.
+//
+// The inherited rule was legacy's shouldDisconnectOnBlockErr
+// (services/legacy/peer_server.go:1203-1209), which returns
+// !errors.IsTransientLocalError(err) — so every error code outside
+// {ErrServiceError, ErrStorageError, ErrServiceUnavailable,
+// ErrStorageUnavailable} disconnected the delivering peer. That set omits
+// ERR_PROCESSING, and the block-assembly readiness gate exhausts its retries
+// with exactly a ProcessingError ("block assembly is behind",
+// util/blockassemblyutil/blockassembly_wait.go). An honest peer therefore lost
+// its connection because OUR block assembly lagged.
+//
+// The expectations below are derived from the reject SITES in the svp2p
+// bridge, never from the classifier: every ErrBlockInvalid site is a property
+// of the block bytes (decode failures at bridge/ingest.go:110,:143,
+// bridge/handle_block.go:1871; transaction count at bridge/ingest.go:312,:317;
+// header, merkle root and duplicate-transaction at bridge/ingest.go:463,:477,
+// :481), and every ErrTxInvalid site is a property of a transaction IN the
+// block (bridge/handle_block.go:1660,:1665,:1671). Everything else names our
+// own service state.
+func TestBlockIngestorClassifiesPipelineRejects(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+
+		// peerFault is the disconnect verdict. TransientLocal is asserted as
+		// its complement on every row, because the two flags are what the
+		// scheduler picks between: charge the peer, or refresh its stall clock.
+		peerFault bool
+	}{
+		{
+			// The bug this task exists to fix. blockassemblyutil's
+			// WaitForBlockAssemblyReady gives up after retry.WithRetryCount(100)
+			// and returns this; the delivering peer had nothing to do with it.
+			name: "block assembly readiness exhausted",
+			err:  errors.NewProcessingError("block assembly is behind, block height 100, block assembly height 88"),
+		},
+		{
+			name: "our own lookup failed",
+			err:  errors.NewProcessingError("failed to check if block exists"),
+		},
+		{
+			name: "service fault",
+			err:  errors.NewServiceError("utxo store is unavailable"),
+		},
+		{
+			name: "service unavailable",
+			err:  errors.NewServiceUnavailableError("blockchain client is not ready"),
+		},
+		{
+			name: "storage fault",
+			err:  errors.NewStorageError("no aerospike nodes available"),
+		},
+		{
+			name: "subtree machinery fault",
+			err:  errors.NewSubtreeError("failed to create subtree 3"),
+		},
+		{
+			// bridge/handle_block.go:1558,:1781-:1791 are all our own txMap and
+			// subtree bookkeeping under one generic code, so ERR_TX_ERROR is
+			// deliberately NOT on the allow-list.
+			name: "generic tx error from our own bookkeeping",
+			err:  errors.NewTxError("failed to add node to subtree"),
+		},
+		{
+			name:      "block invalid",
+			err:       errors.NewBlockInvalidError("merkle root mismatch"),
+			peerFault: true,
+		},
+		{
+			name: "block format invalid",
+			// No constructor and no current bridge site uses this code — the
+			// decode failures at bridge/ingest.go:110,:143 use ErrBlockInvalid
+			// — but it is the dedicated code for a malformed block, so the
+			// allow-list admits it rather than waiting for the first site that
+			// picks the more specific one to silently stop disconnecting.
+			err:       errors.New(errors.ERR_BLOCK_INVALID_FORMAT, "failed to decode transaction 3 of 9"),
+			peerFault: true,
+		},
+		{
+			name:      "transaction in the block is invalid",
+			err:       errors.NewTxInvalidError("tx input 0 references missing previous transaction"),
+			peerFault: true,
+		},
+		{
+			name:      "transaction in the block double spends",
+			err:       errors.NewTxInvalidDoubleSpendError("tx double spends"),
+			peerFault: true,
+		},
+		{
+			// Local precedence: a local fault ANYWHERE in the wrapped chain
+			// keeps the peer, even under a peer-attributable head code. The
+			// bridge wraps freely (bridge/ingest.go:463 wraps whatever the
+			// header check returned), so the safe direction is a re-offer.
+			name: "block invalid wrapping a storage fault keeps the peer",
+			err:  errors.NewBlockInvalidError("invalid block header", errors.NewStorageError("aerospike timeout")),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			br := &stubBridge{err: tc.err}
+			ingestor, _ := newTestIngestor(t, br)
+
+			stream := &countingStream{Reader: bytes.NewReader(nil)}
+			outcome := ingestor.Ingest(context.Background(), testIngestRequest(testIngestHeader(), stream))
+
+			require.Error(t, outcome.Err)
+			require.Equal(t, tc.peerFault, outcome.PeerFault)
+			require.Equal(t, !tc.peerFault, outcome.TransientLocal,
+				"every reject is either the peer's fault or a stall-clock refresh, never neither and never both")
+			require.False(t, outcome.Rotate, "a pipeline reject is not a pre-admission timeout")
+			require.Equal(t, 1, br.callCount())
+		})
+	}
+}

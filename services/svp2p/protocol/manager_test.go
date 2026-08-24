@@ -673,13 +673,17 @@ func TestManagerDuplicateReleasesTheHolderRecord(t *testing.T) {
 	m.syncMu.Unlock()
 
 	// B is refused by the admission dedup: A still holds the admission slot.
-	require.NoError(t, m.BlockDone(peerB, block.Hash, IngestOutcome{
+	delta, err := m.BlockDone(peerB, block.Hash, IngestOutcome{
 		Duplicate: true,
 		Err:       errors.NewServiceError("duplicate block already in flight"),
-	}))
+	})
+	require.NoError(t, err)
+	require.Zero(t, delta, "a duplicate is benign: the peer is not at fault and earns no score")
 
 	// A's ingest completes.
-	require.NoError(t, m.BlockDone(peerA, block.Hash, IngestOutcome{}))
+	delta, err = m.BlockDone(peerA, block.Hash, IngestOutcome{})
+	require.NoError(t, err)
+	require.Zero(t, delta)
 
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
@@ -750,15 +754,22 @@ func TestManagerBlockDoneDisconnectsOnlyOnPeerFault(t *testing.T) {
 
 	fault := errors.New(errors.ERR_ERROR, "svp2p: test failure")
 
+	// Task 20 part (b) adds the delta column: a reject that disconnects must
+	// also be recorded against the peer, and nothing else may be scored.
+	// SVNode scores exactly the same set — BlockDownloadTracker::BlockChecked
+	// (net/block_download_tracker.cpp:113-127) calls Misbehaving only under
+	// state.IsInvalid(nDoS), so a local fault, a rotation and an unclassified
+	// failure all score zero.
 	for _, tc := range []struct {
 		name    string
 		outcome IngestOutcome
 		drops   bool
+		delta   int
 	}{
 		{name: "pre-admission timeout", outcome: IngestOutcome{Err: fault, Rotate: true}},
 		{name: "transient local", outcome: IngestOutcome{Err: fault, TransientLocal: true}},
 		{name: "unclassified", outcome: IngestOutcome{Err: fault}},
-		{name: "peer fault", outcome: IngestOutcome{Err: fault, PeerFault: true}, drops: true},
+		{name: "peer fault", outcome: IngestOutcome{Err: fault, PeerFault: true}, drops: true, delta: scoreInvalidBlock},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			peer := NewSyncPeer("1.2.3.4:8333", wire.SFNodeNetwork, newPeerSyncState())
@@ -767,7 +778,10 @@ func TestManagerBlockDoneDisconnectsOnlyOnPeerFault(t *testing.T) {
 			require.True(t, m.blockDownloader.MarkBlockAsInFlight(peer, block, testNow))
 			m.syncMu.Unlock()
 
-			err := m.BlockDone(peer, block.Hash, tc.outcome)
+			delta, err := m.BlockDone(peer, block.Hash, tc.outcome)
+
+			require.Equal(t, tc.delta, delta,
+				"only a peer-attributable reject may reach the ban counter")
 
 			if tc.drops {
 				require.Error(t, err, "a block the pipeline rejected must cost the peer its connection")
@@ -2362,7 +2376,9 @@ func TestBlockDone_ARacedBlockDeliveredTwiceLosesNothing(t *testing.T) {
 		"a raced block is solicited from BOTH holders, or the second copy would be refused as unsolicited")
 
 	// The winning ingest completes.
-	require.NoError(t, f.m.BlockDone(winner.sync, block.Hash, IngestOutcome{}))
+	delta, err := f.m.BlockDone(winner.sync, block.Hash, IngestOutcome{})
+	require.NoError(t, err)
+	require.Zero(t, delta)
 
 	require.False(t, f.m.blockDownloader.IsInFlightFrom(winner.sync, block.Hash))
 	require.True(t, f.m.blockDownloader.IsInFlightFrom(loser.sync, block.Hash),
@@ -2370,7 +2386,9 @@ func TestBlockDone_ARacedBlockDeliveredTwiceLosesNothing(t *testing.T) {
 
 	// The losing copy arrives and is refused by the admission gate as a
 	// duplicate.
-	require.NoError(t, f.m.BlockDone(loser.sync, block.Hash, IngestOutcome{Duplicate: true}))
+	delta, err = f.m.BlockDone(loser.sync, block.Hash, IngestOutcome{Duplicate: true})
+	require.NoError(t, err)
+	require.Zero(t, delta, "losing an admission race is not misbehavior")
 
 	require.False(t, f.m.blockDownloader.IsInFlight(block.Hash), "no claim survives either ingest")
 	require.Equal(t, 0, winner.sync.State.nBlocksInFlight)
@@ -2452,5 +2470,74 @@ func TestManagerServesChainQueries(t *testing.T) {
 	for i, iv := range inv.InvList {
 		require.Equal(t, wire.InvTypeBlock, iv.Type)
 		require.Equal(t, chain[i].BlockHash(), iv.Hash, "inv %d", i)
+	}
+}
+
+// TestManagerCarriesDisableBanningToItsPeers closes the wiring gap between the
+// operator switch and the code that reads it. PeerConfig.DisableBanning is what
+// Peer.scoreMisbehavior consults, and nothing else populates it — a manager that
+// forgot to pass the setting through would leave the switch inert with no signal
+// at all, which is exactly the failure mode
+// settings.TestDisableBanning_LoaderReadsKey guards one layer up.
+//
+// The switch itself is legacy's, read from the same key legacy reads
+// (`legacy_config_DisableBanning`; services/legacy/config.go:155 and :773). See
+// PeerConfig.DisableBanning for why it suppresses the score and never the
+// disconnect.
+func TestManagerCarriesDisableBanningToItsPeers(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		name := "banning enabled"
+		if disabled {
+			name = "banning disabled"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			genesis := syncGenesis()
+
+			idx, err := NewHeaderIndex(genesis)
+			require.NoError(t, err)
+
+			m := syncTestManager(t, idx, &recordingIngestor{})
+			m.tSettings.Legacy.DisableBanning = disabled
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+
+			defer func() { require.NoError(t, m.Stop()) }()
+
+			far := dialScripted(t, m.ListenAddrs()[0])
+			defer func() { _ = far.nc.Close() }()
+
+			far.completeOutboundHandshake(t)
+
+			// Polled on OUR side only: the peer registry and the peer's own
+			// immutable config. Nothing here reads across the socket, so there
+			// is no far-side goroutine to order against.
+			var built *Peer
+
+			require.Eventually(t, func() bool {
+				m.mu.Lock()
+				defer m.mu.Unlock()
+
+				for p := range m.peers {
+					built = p
+					return true
+				}
+
+				return false
+			}, 10*time.Second, 20*time.Millisecond, "the manager never registered the peer")
+
+			// cfg is written once by NewPeer and never mutated, so this needs
+			// no lock and cannot race the peer's own goroutine.
+			require.Equal(t, disabled, built.cfg.DisableBanning,
+				"the peer must carry the operator's banning setting, not a hardcoded default")
+
+			// The threshold stays SVNode's own DEFAULT_BANSCORE_THRESHOLD
+			// (validation.h:191) either way: banning off suppresses the score,
+			// never the threshold that acts on it.
+			require.Equal(t, banScoreThreshold, built.cfg.BanThreshold)
+		})
 	}
 }
