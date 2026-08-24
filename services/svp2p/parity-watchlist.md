@@ -180,7 +180,31 @@ so never has this branch.
 - **Observe:** `notfound` plus the log line, and that the connection survives.
 - **Pass:** interop gap confirmed and bounded, not a crash or a stall.
 
-### 10. Addr forwarding widths
+### 10. Inv-driven getheaders amplification
+
+**Task 25 (59dc6310c), the opposite direction to scenario 6.**
+
+A peer that announces N distinct unknown block hashes draws N getheaders in reply,
+one per hash — SVNode's own behavior (`ProcessInvMessage` answers inside the
+per-entry loop, `net_processing.cpp:2461-2462`, pushing at `:2489-2493` with that
+entry's own hash as hashStop at `:2492`). The rule is not collapsible: hashStop
+TRUNCATES the peer's reply, so one getheaders can bound only one announced branch.
+The cost is 36 bytes in, a full locator out, per fabricated hash, up to
+`wire.MaxInvPerMsg`.
+
+SVNode carries this identically at the identical site, so bounding it here would be
+a divergence rather than a port — which is exactly why the harness, not a unit
+test, is the right place to judge it.
+
+- **Script:** a peer sending a maximal inv of distinct hashes that no chain
+  contains.
+- **Observe:** our outbound bytes versus the peer's inbound bytes, and whether
+  serving other peers degrades.
+- **Pass:** amplification no worse than SVNode's on the identical input. Read this
+  together with scenario 6 — that one guards what a peer can make us SERVE, this
+  one guards what a peer can make us ASK.
+
+### 11. Addr forwarding widths
 
 Task 18 ported `RelayAddress` (`net_processing.cpp:998-1041`) including the
 daily-hash target pick (`:1010`) and both relay widths (`:1000-1001`). Legacy
