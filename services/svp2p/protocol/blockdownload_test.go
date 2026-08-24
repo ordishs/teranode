@@ -2136,3 +2136,87 @@ func TestBlockParentMissing_AnUnknownHashIsNotStamped(t *testing.T) {
 		"a hash this peer does not hold in flight releases nothing")
 	require.Empty(t, f.bd.retryAfter)
 }
+
+// TestCheckStall_HonoursTheConfiguredRateFloor covers the rotation rate floor
+// once it is an operator setting rather than the MinBlockDownloadBytesPerSec
+// constant.
+//
+// The semantics are legacy's, not this port's invention. Legacy compares the
+// tick's byte delta against the floor with UNSIGNED operands (services/legacy/
+// netsync/manager.go:266 `recvDiff/... < minSyncPeerNetworkSpeed`), so a floor
+// of 0 makes the comparison false on every tick and no violation is ever
+// recorded: 0 disables the floor. Legacy also states the consequence it must
+// then guard against — "regardless of how the speed threshold is configured (it
+// may be 0, which would otherwise make any rate pass)", manager.go:321-326 —
+// and answers it with a separate zero-bytes test, which is the last case below.
+func TestCheckStall_HonoursTheConfiguredRateFloor(t *testing.T) {
+	// One step past the rotation window, so the second CheckStall below is the
+	// one that judges throughput. It stays far inside MaxBlockDownloadTime, so
+	// the wall-clock cap on the suppression is not what decides these cases.
+	const window = MaxLastBlockTime + time.Second
+
+	// Half the stock floor: below the default, comfortably above zero.
+	const belowDefault = uint64(MinBlockDownloadBytesPerSec) / 2
+
+	tests := []struct {
+		name   string
+		floor  uint64
+		perSec uint64
+		want   StallAction
+	}{
+		{
+			name:   "the stock floor rotates a peer delivering below it",
+			floor:  MinBlockDownloadBytesPerSec,
+			perSec: belowDefault,
+			want:   StallActionRotateSyncPeer,
+		},
+		{
+			name:   "the stock floor keeps a peer delivering exactly at it",
+			floor:  MinBlockDownloadBytesPerSec,
+			perSec: MinBlockDownloadBytesPerSec,
+			want:   StallActionNone,
+		},
+		{
+			name:   "a lowered floor keeps the same below-default peer",
+			floor:  belowDefault / 2,
+			perSec: belowDefault,
+			want:   StallActionNone,
+		},
+		{
+			name:   "a floor of zero keeps a peer at any rate at all",
+			floor:  0,
+			perSec: 1,
+			want:   StallActionNone,
+		},
+		{
+			name:   "a floor of zero still rotates a peer delivering nothing",
+			floor:  0,
+			perSec: 0,
+			want:   StallActionRotateSyncPeer,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// A fresh fixture per case: a rotation clears the sync slot and the
+			// peer's in-flight claims, so the cases cannot share peer state.
+			f := newDownloadFixture(t, 3)
+			peer := f.syncingPeer(t, "1.2.3.4:8333")
+
+			f.bd.minDownloadBytesPerSec = tc.floor
+
+			ingest := IngestSnapshot{Active: true, StartedMicros: testNow}
+
+			// Seeds the sample every rate below is measured against.
+			require.Equal(t, StallActionNone, f.bd.CheckStall(peer, ingest, testNow))
+
+			ingest.BytesRead = tc.perSec * uint64(window/time.Second)
+
+			require.Equal(t, tc.want, f.bd.CheckStall(peer, ingest, testNow+micros(window)),
+				"floor %d B/s against a peer delivering %d B/s", tc.floor, tc.perSec)
+
+			require.Equal(t, tc.want != StallActionRotateSyncPeer, peer.State.fSyncStarted,
+				"the sync slot must follow the rotation decision")
+		})
+	}
+}

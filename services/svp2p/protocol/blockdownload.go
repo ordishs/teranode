@@ -111,9 +111,15 @@ const BlockDownloadMaxParallelFetch = 3
 
 // MinBlockDownloadBytesPerSec carries services/legacy/peer/peer.go
 // minBlockDownloadBytesPerSec (51200), which is also the legacy
-// -minsyncpeernetworkspeed default (services/legacy/config.go
+// -minsyncpeernetworkspeed default (services/legacy/config.go:48
 // defaultMinSyncPeerNetworkSpeed). It is the rate a block ingest must sustain
 // to count as progress for the rotation clock.
+//
+// It is the DEFAULT of that rate, not the rate itself: legacy holds it per
+// instance from a flag (netsync/manager.go:579), and so does this port, in
+// BlockDownloader.minDownloadBytesPerSec, seeded here and overridden from
+// settings.Legacy.MinSyncPeerNetworkSpeed. It remains a separate rule from
+// BlockStallingMinDownloadRate above — see that comment.
 const MinBlockDownloadBytesPerSec = 51200
 
 // microsPerSecond mirrors the net_processing.cpp MICROS_PER_SECOND used by
@@ -304,6 +310,21 @@ type BlockDownloader struct {
 	// deliver honestly wants a longer fuse than one on a fast link.
 	slowFetchTimeout time.Duration
 	maxParallelFetch int
+
+	// minDownloadBytesPerSec is the sync-peer rotation rate floor, seeded with
+	// MinBlockDownloadBytesPerSec and overridden from
+	// settings.Legacy.MinSyncPeerNetworkSpeed by PeerManager.ConfigureSync.
+	// Legacy holds the same value per instance from its own
+	// -minsyncpeernetworkspeed flag (services/legacy/netsync/manager.go:579
+	// minSyncPeerNetworkSpeed, seeded at manager.go:3177 from
+	// config.go:154).
+	//
+	// ZERO DISABLES THE FLOOR, which is legacy's semantics: manager.go:266
+	// compares the tick's byte delta against it with unsigned operands, so
+	// nothing is ever below 0 and no violation is ever recorded. It does NOT
+	// make a silent peer look healthy — the zero-delta guard in
+	// ingestProgressing is what legacy's manager.go:321-326 guard is for.
+	minDownloadBytesPerSec uint64
 }
 
 // NewBlockDownloader builds a downloader over the header index and the
@@ -337,6 +358,8 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 
 		slowFetchTimeout: BlockDownloadSlowFetchTimeout,
 		maxParallelFetch: BlockDownloadMaxParallelFetch,
+
+		minDownloadBytesPerSec: MinBlockDownloadBytesPerSec,
 	}, nil
 }
 
@@ -1443,7 +1466,7 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 	// The suppression is capped at MaxBlockDownloadTime
 	// (services/legacy/peer/peer.go), so a peer that dribbles bytes just above
 	// the rate floor cannot hold the sync slot for ever.
-	if ingestProgressing(state, ingest, nowMicros) {
+	if bd.ingestProgressing(state, ingest, nowMicros) {
 		return StallActionNone
 	}
 
@@ -1463,7 +1486,16 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 // actually moved (a zero delta is not "downloading", whatever the rate floor
 // is configured to), and guards the unsigned subtraction — a count that went
 // backwards means a new ingest started, which is not evidence about this one.
-func ingestProgressing(state *peerSyncState, ingest IngestSnapshot, nowMicros int64) bool {
+//
+// The rate it compares against is bd.minDownloadBytesPerSec, the operator's
+// floor, not the MinBlockDownloadBytesPerSec constant that seeds it. A floor of
+// 0 makes the final comparison true for any non-zero delta, which is legacy's
+// own behavior at manager.go:266 and 328 — and the reason the zero-delta guard
+// above it is load-bearing rather than an optimisation.
+//
+// LOCKING: caller-locked under PeerManager.syncMu, like every other read of
+// peerSyncState in this file. Nothing here blocks.
+func (bd *BlockDownloader) ingestProgressing(state *peerSyncState, ingest IngestSnapshot, nowMicros int64) bool {
 	if !ingest.Active {
 		return false
 	}
@@ -1487,7 +1519,7 @@ func ingestProgressing(state *peerSyncState, ingest IngestSnapshot, nowMicros in
 	}
 
 	// delta bytes over elapsed microseconds, compared in bytes per second.
-	return delta*uint64(microsPerSecond) >= MinBlockDownloadBytesPerSec*uint64(elapsed) //nolint:gosec // both are positive here
+	return delta*uint64(microsPerSecond) >= bd.minDownloadBytesPerSec*uint64(elapsed) //nolint:gosec // both are positive here
 }
 
 // shouldRace is the parallel-fetch decision of net_processing.cpp:461-506, asked

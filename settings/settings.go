@@ -710,6 +710,19 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// DEFAULT_MAX_OUTBOUND_CONNECTIONS. Zero turns the svp2p
 			// addrman-driven dialer off; legacy_connect_peers overrides it.
 			TargetOutboundPeers: getInt("legacy_targetOutboundPeers", 8, alternativeContext...),
+			// The sync-peer rotation rate floor, default as legacy's own
+			// defaultMinSyncPeerNetworkSpeed (services/legacy/config.go:48).
+			// 0 disables the floor, which is legacy's semantics and not this
+			// port's invention: services/legacy/netsync/manager.go:266
+			// compares the tick's byte delta against the floor with unsigned
+			// operands, so nothing is ever below a floor of 0.
+			//
+			// OPERATOR TRAP: this key steers the svp2p bridge ONLY. The
+			// legacy service reads the SAME rule from
+			// `legacy_config_MinSyncPeerNetworkSpeed` through its reflective
+			// loader (config.go:773 over config.go:154). Setting one does
+			// nothing to the other, and cutover must reconcile the two.
+			MinSyncPeerNetworkSpeed: getUint64("legacy_minSyncPeerNetworkSpeed", 51200, alternativeContext...),
 			// NOT a new Phase 3 settings key: `legacy_config_DisableBanning`
 			// is the key the legacy service already honors as the bsvd
 			// `--nobanning` switch. Legacy reads it through the reflective

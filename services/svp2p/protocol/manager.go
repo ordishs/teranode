@@ -169,6 +169,20 @@ type SyncConfig struct {
 	// one stalled holder already reaches it.
 	BlockDownloadSlowFetchTimeout time.Duration
 	BlockDownloadMaxParallelFetch int
+
+	// MinSyncPeerNetworkSpeed carries settings.Legacy.MinSyncPeerNetworkSpeed:
+	// the download rate, in bytes per second, below which a sync peer that has
+	// completed no block inside the rotation window loses the sync slot.
+	//
+	// It is a POINTER, alone among the numeric fields here, because 0 is a
+	// meaningful operator value rather than an absent one — it disables the
+	// floor, which is legacy's own semantics (netsync/manager.go:266 compares
+	// unsigned, so nothing is below a floor of 0). The "zero keeps the
+	// default" convention the fields above use would make that value
+	// unreachable. nil keeps MinBlockDownloadBytesPerSec, so a caller that
+	// sets nothing — every test that builds a bare SyncConfig — keeps legacy's
+	// floor rather than silently losing it.
+	MinSyncPeerNetworkSpeed *uint64
 }
 
 // PeerManager owns listeners, the outbound dialer, the peer registry, and the
@@ -379,6 +393,13 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 
 	if cfg.BlockDownloadMaxParallelFetch > 0 {
 		blockDownloader.maxParallelFetch = cfg.BlockDownloadMaxParallelFetch
+	}
+
+	// Nil, not zero, is what means unset here — see the field's own note. A
+	// configured 0 is carried through as 0 and disables the rotation rate
+	// floor, the way legacy's -minsyncpeernetworkspeed=0 does.
+	if cfg.MinSyncPeerNetworkSpeed != nil {
+		blockDownloader.minDownloadBytesPerSec = *cfg.MinSyncPeerNetworkSpeed
 	}
 
 	serving, err := NewServing(cfg.Index, headerSync)
@@ -2176,6 +2197,27 @@ func (m *PeerManager) ConnectedCount() int32 {
 	defer m.mu.Unlock()
 
 	return int32(len(m.peers)) //nolint:gosec // peer count is small
+}
+
+// SyncRateFloor reports the sync-peer rotation rate floor the downloader is
+// running with, in bytes per second: the value
+// settings.Legacy.MinSyncPeerNetworkSpeed travelled to through ConfigureSync,
+// or 0 when sync is not configured at all. Zero is also the operator value that
+// disables the floor, so the two are not distinguishable here — a caller that
+// needs that distinction should ask SyncEnabled first.
+//
+// It exists so the service-level wiring test can prove an operator's setting
+// reaches the machine that reads it, and it is the only way to observe that
+// from outside this package.
+func (m *PeerManager) SyncRateFloor() uint64 {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	if m.blockDownloader == nil {
+		return 0
+	}
+
+	return m.blockDownloader.minDownloadBytesPerSec
 }
 
 func (m *PeerManager) Snapshots() []PeerSnapshot {

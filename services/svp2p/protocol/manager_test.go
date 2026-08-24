@@ -2541,3 +2541,61 @@ func TestManagerCarriesDisableBanningToItsPeers(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigureSync_CarriesTheSyncPeerRateFloor walks the plumbing the rotation
+// rate floor travels: settings.Legacy through SyncConfig into the downloader
+// that reads it. The behavior it produces is covered by
+// TestCheckStall_HonoursTheConfiguredRateFloor; what this pins is that an
+// operator's value arrives at all, and — because 0 is a MEANINGFUL value here,
+// unlike every other numeric field on SyncConfig — that an unset field is told
+// apart from a deliberate 0.
+func TestConfigureSync_CarriesTheSyncPeerRateFloor(t *testing.T) {
+	newManager := func(t *testing.T, cfg SyncConfig) *BlockDownloader {
+		t.Helper()
+
+		genesis := testGenesis()
+
+		idx, err := NewHeaderIndex(genesis)
+		require.NoError(t, err)
+
+		tSettings := managerSettings()
+		tSettings.ChainCfgParams = syncTestParams(nil)
+
+		banList, err := NewBanList("")
+		require.NoError(t, err)
+
+		m := NewPeerManager(ulogger.TestLogger{}, tSettings, banList)
+
+		cfg.Index = idx
+		cfg.Ingestor = &recordingIngestor{}
+		cfg.TickInterval = 20 * time.Millisecond
+
+		require.NoError(t, m.ConfigureSync(cfg))
+
+		return m.blockDownloader
+	}
+
+	t.Run("a configured floor reaches the downloader", func(t *testing.T) {
+		floor := uint64(4096)
+
+		bd := newManager(t, SyncConfig{MinSyncPeerNetworkSpeed: &floor})
+
+		require.Equal(t, uint64(4096), bd.minDownloadBytesPerSec)
+	})
+
+	t.Run("unset keeps the legacy default, never zero", func(t *testing.T) {
+		bd := newManager(t, SyncConfig{})
+
+		require.Equal(t, uint64(MinBlockDownloadBytesPerSec), bd.minDownloadBytesPerSec,
+			"a caller that sets nothing must keep the floor, not lose it")
+	})
+
+	t.Run("an explicit zero disables the floor", func(t *testing.T) {
+		floor := uint64(0)
+
+		bd := newManager(t, SyncConfig{MinSyncPeerNetworkSpeed: &floor})
+
+		require.Zero(t, bd.minDownloadBytesPerSec,
+			"0 is legacy's disable value (netsync/manager.go:266) and must survive the plumbing")
+	})
+}

@@ -599,6 +599,8 @@ func (s *Server) startSync(ctx context.Context) error {
 		txInvProducer = s.legacyInvProducer
 	}
 
+	minSyncPeerNetworkSpeed := s.settings.Legacy.MinSyncPeerNetworkSpeed
+
 	if err := s.manager.ConfigureSync(protocol.SyncConfig{
 		Index:                            s.HeaderIndex(),
 		Ingestor:                         ingestor,
@@ -615,6 +617,14 @@ func (s *Server) startSync(ctx context.Context) error {
 
 		BlockDownloadSlowFetchTimeout: s.settings.Legacy.BlockDownloadSlowFetchTimeout,
 		BlockDownloadMaxParallelFetch: s.settings.Legacy.BlockDownloadMaxParallelFetch,
+
+		// Passed by address, unlike the fields above: 0 is an operator value
+		// here (it disables the rotation rate floor, as legacy's
+		// -minsyncpeernetworkspeed=0 does), so "unset" cannot be spelled with
+		// a zero. Copied into a local first rather than pointing into the
+		// settings struct, so the downloader cannot observe a later write to
+		// it.
+		MinSyncPeerNetworkSpeed: &minSyncPeerNetworkSpeed,
 	}); err != nil {
 		return err
 	}
