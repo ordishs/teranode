@@ -75,6 +75,13 @@ type SyncConfig struct {
 	// "cfg.Ingestor == nil" early return.
 	TxIngestor TxIngestor
 
+	// TxInvProducer is the tx-inv round trip's Kafka producer (Task 16), or
+	// nil when settings.Kafka.LegacyInvConfig is not set. Like TxIngestor it
+	// gates nothing else here: a manager with no producer still syncs, tx
+	// invs from the wire are simply never produced to Kafka (OnInv's
+	// collected hashes have nowhere to go, so PeerManager.Inv drops them).
+	TxInvProducer TxInvProducer
+
 	// DisableCheckpoints mirrors legacy netsync Config.DisableCheckpoints.
 	DisableCheckpoints bool
 
@@ -146,6 +153,7 @@ type PeerManager struct {
 	ingestor        BlockIngestor
 	fetcher         BlockTxFetcher
 	txIngestor      TxIngestor
+	txInvProducer   TxInvProducer
 	// activeTip is our own best chain tip (the chainActive counterpart),
 	// fed from the blockchain service and always a header present in the
 	// index — the download scheduler cannot place a tip it cannot look up.
@@ -192,6 +200,7 @@ func (m *PeerManager) ConfigureSync(cfg SyncConfig) error {
 	// ingestion has no dependency on the header-sync/block-download
 	// machines that check gates.
 	m.txIngestor = cfg.TxIngestor
+	m.txInvProducer = cfg.TxInvProducer
 
 	if cfg.TickInterval > 0 {
 		m.syncTick = cfg.TickInterval
@@ -635,8 +644,26 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 // peerGone is net_processing.cpp FinalizeNode. A rotation must NOT come here:
 // CheckStall's rotate branch has already released the slot and the peer's
 // downloads, and the peer stays connected.
+//
+// This is also the ONLY correct owner of syncPeer.State.requestedTxns'
+// TTL-eviction goroutine (fix round 2, Important 3/4): every connection gets
+// one (runPeer's own NewSyncPeer call, unconditional on whether sync is
+// configured at all), so it must be released on every real disconnect,
+// unconditional on m.headerSync too — checked and stopped BEFORE the
+// headerSync-nil early return below, not after, which is exactly the bug
+// an earlier version of this method had: with no block ingestor injected
+// (a depless server, or the bridge dependencies simply not wired yet),
+// m.headerSync is nil, every peerGone call returned before reaching
+// anything that stopped this goroutine, and every connect/disconnect cycle
+// leaked one. clearPeer is NOT the right place either — see that method's
+// own doc comment for why (it also runs on a rotation, where the peer
+// stays connected).
 func (m *PeerManager) peerGone(syncPeer *SyncPeer) {
 	m.syncMu.Lock()
+
+	if syncPeer != nil && syncPeer.State != nil && syncPeer.State.requestedTxns != nil {
+		syncPeer.State.requestedTxns.Stop()
+	}
 
 	if m.headerSync == nil {
 		m.syncMu.Unlock()
@@ -785,10 +812,14 @@ func (m *PeerManager) Headers(syncPeer *SyncPeer, msg *wire.MsgHeaders) ([]wire.
 	return msgs, score, err
 }
 
-// Inv dispatches the NetMsgType::INV event.
+// Inv dispatches the NetMsgType::INV event. Its tx half is the PRODUCE side
+// of Task 16's tx-inv round trip: BlockDownloader.OnInv collects the tx
+// hashes under syncMu, and this method hands them to the Kafka producer
+// (TxInvProducer) only after releasing it — a Kafka produce can block, and
+// no lock in this package may be held across one (spec §4.3, the same
+// collect-under-lock/send-after-unlock shape RelayBlock and RelayTxs use).
 func (m *PeerManager) Inv(syncPeer *SyncPeer, msg *wire.MsgInv) ([]wire.Message, error) {
 	m.syncMu.Lock()
-	defer m.syncMu.Unlock()
 
 	// Mark every announced block known to this peer before anything else runs
 	// — legacy netsync processInvMsg's unconditional peer.AddKnownInventory
@@ -810,13 +841,83 @@ func (m *PeerManager) Inv(syncPeer *SyncPeer, msg *wire.MsgInv) ([]wire.Message,
 	}
 
 	if m.blockDownloader == nil {
+		m.syncMu.Unlock()
 		return nil, nil
 	}
 
-	msgs, err := m.blockDownloader.OnInv(syncPeer, msg)
+	msgs, txHashes, err := m.blockDownloader.OnInv(syncPeer, msg)
 	markGetHeadersOutstanding(syncPeer, msgs)
 
+	producer := m.txInvProducer
+
+	m.syncMu.Unlock()
+
+	if err == nil && producer != nil && syncPeer != nil && len(txHashes) > 0 {
+		producer.Produce(syncPeer.Addr, txHashes)
+	}
+
 	return msgs, err
+}
+
+// InvFromKafka is the CONSUME side of Task 16's tx-inv round trip: legacy's
+// kafkaINVListener (netsync/manager.go:3417-3441) plus handleInvMsg/
+// processInvMsg's tx branch, entered here once bridge/kafka.go has already
+// decoded the Kafka message and applied the RUNNING gate (processInvs,
+// manager.go:2270-2280) — that gate needs the blockchain client's FSM state,
+// which this package never imports (spec §4.4), so it is checked by the
+// caller before this method is ever reached. Headers-first suppression is
+// checked here instead (BlockDownloader.RequestTxs), because it is this
+// package's own state.
+//
+// peerAddr identifies the peer the original inv came from, exactly as
+// carried on the wire in KafkaInvTopicMessage.PeerAddress. A peerAddr that
+// matches no currently-connected peer is a departed peer — dropped with a
+// log, never treated as an error, mirroring legacy's own
+// newInvFromKafkaMessage "peer could not be found in peer list" path
+// (netsync/inv_msg.go:129-131), which kafkaINVListener logs and discards
+// rather than retrying (netsync/manager.go:3428-3431).
+func (m *PeerManager) InvFromKafka(peerAddr string, hashes []chainhash.Hash) {
+	if len(hashes) == 0 {
+		return
+	}
+
+	// Snapshotted OUTSIDE syncMu, matching RelayBlock/RelayTxs's own
+	// collect-under-mu-first shape (peerHandles takes only mu, never syncMu).
+	handles := m.peerHandles()
+
+	var target *peerHandle
+
+	for i := range handles {
+		if handles[i].sync != nil && handles[i].sync.Addr == peerAddr {
+			target = &handles[i]
+			break
+		}
+	}
+
+	if target == nil {
+		m.logger.Debugf("[svp2p] dropping inv-from-kafka for departed peer %s", peerAddr)
+		return
+	}
+
+	m.syncMu.Lock()
+
+	if m.blockDownloader == nil {
+		m.syncMu.Unlock()
+		return
+	}
+
+	var rejected func(chainhash.Hash) bool
+	if m.txIngestor != nil {
+		rejected = m.txIngestor.Rejected
+	}
+
+	gdmsg := m.blockDownloader.RequestTxs(target.sync, hashes, rejected)
+
+	m.syncMu.Unlock()
+
+	if gdmsg != nil {
+		target.peer.send([]wire.Message{gdmsg})
+	}
 }
 
 // markTxKnown records hash as known to syncPeer — the tx-side counterpart
@@ -1748,6 +1849,18 @@ func (m *PeerManager) Stop() error {
 	}
 
 	m.wg.Wait()
+
+	// Released only after every peer goroutine has joined above: those
+	// goroutines are the only callers of RequestTxs/OnInv that touch
+	// blockDownloader.requestedTxns, so this ordering is the same
+	// "join producers before releasing what they used" guarantee legacy's
+	// own Stop documents for its DC11 producer flush (netsync/manager.go:
+	// 3078-3086, "handlerDone above guarantees no more sends").
+	m.syncMu.Lock()
+	if m.blockDownloader != nil {
+		m.blockDownloader.Stop()
+	}
+	m.syncMu.Unlock()
 
 	return nil
 }

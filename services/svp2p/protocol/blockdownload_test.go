@@ -782,9 +782,10 @@ func TestOnInv_UnknownBlockAsksForHeaders(t *testing.T) {
 
 	unknown := chainhash.Hash{0xAB}
 
-	msgs, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeBlock, unknown))
+	msgs, txHashes, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeBlock, unknown))
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
+	require.Empty(t, txHashes)
 
 	getHeaders, ok := msgs[0].(*wire.MsgGetHeaders)
 	require.True(t, ok)
@@ -807,9 +808,10 @@ func TestOnInv_KnownBlockOnlyUpdatesAvailability(t *testing.T) {
 
 	known := f.node(t, 3)
 
-	msgs, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeBlock, known.Hash))
+	msgs, txHashes, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeBlock, known.Hash))
 	require.NoError(t, err)
 	require.Empty(t, msgs, "a block we already have a header for needs no getheaders")
+	require.Empty(t, txHashes)
 
 	require.NotNil(t, peer.State.pindexBestKnownBlock)
 	require.Equal(t, int32(3), peer.State.pindexBestKnownBlock.Height)
@@ -822,19 +824,20 @@ func TestOnInv_DoesNotRequestTheSameBlockTwice(t *testing.T) {
 
 	unknown := chainhash.Hash{0xAB}
 
-	msgs, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeBlock, unknown, unknown, unknown))
+	msgs, txHashes, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeBlock, unknown, unknown, unknown))
 	require.NoError(t, err)
 	require.Len(t, msgs, 1, "a hash repeated inside one inv message draws one getheaders")
+	require.Empty(t, txHashes)
 }
 
-func TestOnInv_TxInvsAreCountedOnly(t *testing.T) {
+func TestOnInv_CollectsTxHashesForKafka(t *testing.T) {
 	f := newDownloadFixture(t, 3)
 	peer := fullNodePeer("1.2.3.4:8333")
 
-	msgs, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeTx, chainhash.Hash{0x01}, chainhash.Hash{0x02}))
+	msgs, txHashes, err := f.bd.OnInv(peer, invMsg(t, wire.InvTypeTx, chainhash.Hash{0x01}, chainhash.Hash{0x02}))
 	require.NoError(t, err)
-	require.Empty(t, msgs, "the tx path is Phase 3")
-	require.Equal(t, uint64(2), f.bd.TxInvsReceived())
+	require.Empty(t, msgs, "a tx inv never draws a getheaders")
+	require.Equal(t, []chainhash.Hash{{0x01}, {0x02}}, txHashes, "collected in order, for the caller to produce to Kafka (Task 16)")
 
 	require.Equal(t, chainhash.Hash{}, peer.State.hashLastUnknownBlock, "a tx inv must not touch block availability")
 	require.Nil(t, peer.State.pindexBestKnownBlock)
@@ -854,10 +857,11 @@ func TestOnInv_UnsupportedInvTypeIsAProtocolViolation(t *testing.T) {
 			f := newDownloadFixture(t, 3)
 			peer := fullNodePeer("1.2.3.4:8333")
 
-			msgs, err := f.bd.OnInv(peer, invMsg(t, tc.typ, chainhash.Hash{0x01}))
+			msgs, txHashes, err := f.bd.OnInv(peer, invMsg(t, tc.typ, chainhash.Hash{0x01}))
 			require.Error(t, err)
 			require.ErrorIs(t, err, ErrProtocolViolation)
 			require.Empty(t, msgs)
+			require.Empty(t, txHashes)
 		})
 	}
 }

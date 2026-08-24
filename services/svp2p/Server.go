@@ -124,6 +124,23 @@ type Server struct {
 	// only before Start runs (Init/New alone).
 	txAnnouncer *txAnnouncer
 
+	// legacyInvProducer is Task 16's tx-inv round trip's PRODUCE leg
+	// (bridge/kafka.go LegacyInvProducer): built before startSync, so
+	// startSync's SyncConfig has it ready as protocol.SyncConfig.
+	// TxInvProducer, the same ordering reason txAnnouncer is built before
+	// startSync. nil when settings.Kafka.LegacyInvConfig is unset — tx invs
+	// from the wire are then simply not produced to Kafka (Produce/Stop are
+	// both nil-receiver safe, so Stop can still call it unconditionally).
+	legacyInvProducer *bridge.LegacyInvProducer
+
+	// legacyInvConsumer is Task 16's tx-inv round trip's CONSUME leg
+	// (bridge.StartLegacyInvConsumer). A PLAIN listener, like
+	// blocksFinalConsumer — not controlled, see that function's own doc
+	// comment for why. nil when settings.Kafka.LegacyInvConfig is unset.
+	// Closed from Stop's own defer (fix round 2, Important 1), not inline
+	// like blocksFinalConsumer: see that defer's doc comment for why.
+	legacyInvConsumer kafka.KafkaConsumerGroupI
+
 	headerIndexMu sync.RWMutex
 	headerIndex   *protocol.HeaderIndex
 
@@ -243,6 +260,17 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return canRelayTx(ctx, s.blockchainClient, s.logger)
 	})
 
+	// legacyInvProducer is built here for the identical reason: startSync's
+	// SyncConfig.TxInvProducer needs it ready, and it costs nothing extra to
+	// build unconditionally — Produce/Stop are both nil-receiver safe when
+	// the topic is unconfigured.
+	legacyInvProducer, err := bridge.StartLegacyInvProducer(ctx, s.logger, s.settings)
+	if err != nil {
+		return errors.New(errors.ERR_SERVICE_NOT_STARTED, "svp2p: failed to start legacy inv Kafka producer", err)
+	}
+
+	s.legacyInvProducer = legacyInvProducer
+
 	if err := s.startSync(ctx); err != nil {
 		if errors.IsContextError(err) {
 			s.logger.Infof("[svp2p] shutting down during header index hydration")
@@ -294,6 +322,21 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// peer-sourced tx ingestor (Task 14) share the one announcer instance.
 	bridge.StartTxMetaConsumer(ctx, s.logger, s.settings, s.blockchainClient, s.txAnnouncer.put)
 
+	// The tx-inv round trip's CONSUME leg (Task 16), started the same way
+	// and after the same manager readiness point as blocks-final above:
+	// PeerManager.InvFromKafka needs a live peer registry to answer into.
+	// A PLAIN listener, like blocks-final, not controlled (see
+	// bridge.StartLegacyInvConsumer's own doc comment for why): the RUNNING
+	// gate is applied per-message inside it, not by pausing the consumer.
+	// s.legacyInvProducer above is the PRODUCE leg this consumer's own
+	// round trip closes.
+	legacyInvConsumer, err := bridge.StartLegacyInvConsumer(ctx, s.logger, s.settings, s.blockchainClient, s.manager.InvFromKafka)
+	if err != nil {
+		return errors.New(errors.ERR_SERVICE_NOT_STARTED, "svp2p: failed to start legacy inv Kafka consumer", err)
+	}
+
+	s.legacyInvConsumer = legacyInvConsumer
+
 	apiKey := s.settings.GRPCAdminAPIKey
 	if apiKey == "" {
 		key := make([]byte, 32)
@@ -335,18 +378,26 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 // a ctx parameter to respect; this task does not build that, only names
 // where a reader of the shutdown path would look for it.
 func (s *Server) Stop(_ context.Context) error {
-	// admission and stoppableBridge are released via defer, not inline
-	// below, so an early return from blocksFinalConsumer.Close or
-	// manager.Stop still releases their background goroutines rather than
-	// leaking them (fix round 2, Minor 3): both own a goroutine that only
-	// their own Stop call releases (admission's failure-map eviction loop;
-	// stoppableBridge's orphan-pool TTL ticker and eviction worker), and
-	// leaking either on an error path is strictly worse than the small
+	// admission, stoppableBridge, the legacy-inv consumer and the legacy-inv
+	// producer are ALL released via defer, not inline below, so an early
+	// return from blocksFinalConsumer.Close or manager.Stop still releases
+	// every one of them rather than leaking (fix round 2, Minor 3, extended
+	// by fix round 2's Important 1): each owns something that only its own
+	// Stop/Close call releases (admission's failure-map eviction loop;
+	// stoppableBridge's orphan-pool TTL ticker and eviction worker; the
+	// legacy-inv consumer's Kafka subscription; the legacy-inv producer's
+	// DC11 flush), and leaking — or, for the DC11 flush, silently dropping
+	// announcements — on an error path is strictly worse than the small
 	// ordering risk of releasing them without every peer goroutine having
-	// joined first — which is itself only possible on this same abnormal,
-	// something-already-failed path, since the ordinary success path still
-	// runs this defer after the manager.Stop() call below has already
-	// completed, preserving the original ordering exactly.
+	// joined first. That risk is real only on this same abnormal,
+	// something-already-failed path: on the ordinary success path this
+	// defer still runs after manager.Stop() below has already completed,
+	// preserving every ordering constraint exactly (no new RelayBlock/
+	// InvFromKafka call starts against a torn-down registry; the DC11 flush
+	// runs after every Produce caller has joined). The risk that DOES
+	// remain on the abnormal path — Produce racing the flush — is recovered
+	// in bridge.LegacyInvProducer.Produce itself (fix round 2, Important 1);
+	// see that method's own doc comment.
 	defer func() {
 		if s.admission != nil {
 			s.admission.Stop()
@@ -356,6 +407,32 @@ func (s *Server) Stop(_ context.Context) error {
 		if s.stoppableBridge != nil {
 			s.stoppableBridge.Stop()
 			s.stoppableBridge = nil
+		}
+
+		// The producer is flushed BEFORE the consumer is closed, deliberately.
+		// This ordering only buys anything on the ABNORMAL path — an early
+		// return above, where manager.Stop() never ran: there the peer
+		// registry is still live, so a tx inv still sitting in the producer's
+		// channel can be flushed, consumed, and answered with a getdata.
+		// On the ordinary path this defer runs AFTER manager.Stop() has
+		// returned — a defer fires at function exit, so it follows every
+		// statement in the body — and the registry is therefore ALREADY torn
+		// down: a flushed inv lands on the departed-peer path, which is
+		// harmless and is what txinv_shutdown_test.go asserts. Reversing the
+		// order would flush into a topic nothing is listening to on either
+		// path.
+		if err := s.legacyInvProducer.Stop(); err != nil {
+			s.logger.Errorf("[svp2p] failed to stop legacy inv Kafka producer during shutdown: %v", err)
+		}
+
+		s.legacyInvProducer = nil
+
+		if s.legacyInvConsumer != nil {
+			if err := s.legacyInvConsumer.Close(); err != nil {
+				s.logger.Errorf("[svp2p] failed to close legacy inv Kafka consumer during shutdown: %v", err)
+			}
+
+			s.legacyInvConsumer = nil
 		}
 	}()
 
@@ -399,13 +476,15 @@ func (s *Server) Stop(_ context.Context) error {
 
 	// Peers are joined next: PeerManager.Stop waits for every peer goroutine,
 	// and a peer may still be running an ingest that goes through Admission
-	// or the bridge's orphan pool. Releasing either's background goroutine
-	// before those callers are gone would pull the failure map, or the pool,
-	// out from under a live ingest — which is why both releases live in the
-	// defer above rather than here: on the ordinary (no error) path the
-	// defer still runs after this call returns, preserving that ordering
-	// exactly; it only fires ahead of a joined manager on the abnormal path
-	// where manager.Stop itself never got the chance to run.
+	// or the bridge's orphan pool, or a produce call into the legacy-inv
+	// topic. Releasing any of those background resources before their
+	// callers are gone would pull the failure map, the pool, the consumer's
+	// subscription, or the producer's flush out from under a live caller —
+	// which is why all four releases live in the defer above rather than
+	// here: on the ordinary (no error) path the defer still runs after this
+	// call returns, preserving that ordering exactly; it only fires ahead of
+	// a joined manager on the abnormal path where manager.Stop itself never
+	// got the chance to run.
 	if s.manager != nil {
 		if err := s.manager.Stop(); err != nil {
 			return err
@@ -463,11 +542,22 @@ func (s *Server) startSync(ctx context.Context) error {
 		txIngestorI = &txIngestor{bridge: ing.bridge, announce: s.txAnnouncer.put}
 	}
 
+	// Task 16's tx-inv round trip PRODUCE seam: s.legacyInvProducer is
+	// *bridge.LegacyInvProducer, built (possibly nil, an unconfigured topic)
+	// before this method ran (Start's own doc comment). Nil-checked the same
+	// way as ingestor/fetcher/txIngestorI above — a typed nil in an
+	// interface is not nil.
+	var txInvProducer protocol.TxInvProducer
+	if s.legacyInvProducer != nil {
+		txInvProducer = s.legacyInvProducer
+	}
+
 	if err := s.manager.ConfigureSync(protocol.SyncConfig{
 		Index:                            s.HeaderIndex(),
 		Ingestor:                         ingestor,
 		Fetcher:                          fetcher,
 		TxIngestor:                       txIngestorI,
+		TxInvProducer:                    txInvProducer,
 		AllowSyncCandidateFromLocalPeers: s.settings.Legacy.AllowSyncCandidateFromLocalPeers,
 		TickInterval:                     s.syncTick,
 		MaxLastBlockTime:                 s.maxLastBlockTime,

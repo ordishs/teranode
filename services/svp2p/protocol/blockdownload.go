@@ -6,6 +6,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
 )
 
 // BlockDownloadWindow mirrors validation.h DEFAULT_BLOCK_DOWNLOAD_WINDOW
@@ -265,11 +266,17 @@ type BlockDownloader struct {
 	// strictly more work, so any change of this hash is an advance.
 	lastTipHash chainhash.Hash
 
-	// txInvsReceived counts tx inventory announcements. Decision 1 defers the
-	// whole tx path to Phase 3, so Phase 2 counts and logs them and does
-	// nothing else. Guarded by the caller's sync-state mutex like every other
-	// field here, so it needs no atomic.
-	txInvsReceived uint64
+	// requestedTxns is the node-wide half of the tx-inv round trip's dedup
+	// (Task 16, manager.go:2338-2352's `sm.requestedTxns`): a tx hash lands
+	// here the moment a getdata for it goes out to ANY peer, for
+	// requestedTxnsTTL (10s, matching legacy exactly), so a second inv for
+	// the same hash from a DIFFERENT peer inside that window is not
+	// requested again either. This replaces Decision 1's txInvsReceived
+	// counter — Phase 2's stand-in for the tx path Phase 3 now builds — which
+	// is removed along with its accessor; see RequestTxs and TestOnInv_*
+	// for what proves tx invs are actually seen now that the counter is
+	// gone. Stopped by Stop, called once from PeerManager.Stop.
+	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 
 	// maxLastBlockTime is the rotation window CheckStall measures against. It
 	// is an instance field rather than the MaxLastBlockTime constant used
@@ -320,6 +327,7 @@ func NewBlockDownloader(idx *HeaderIndex, hs *HeaderSync) (*BlockDownloader, err
 		inFlight:         make(map[chainhash.Hash][]inFlightHolder),
 		haveData:         make(map[chainhash.Hash]int32),
 		retryAfter:       make(map[chainhash.Hash]deferredBlock),
+		requestedTxns:    expiringmap.New[chainhash.Hash, struct{}](requestedTxnsTTL),
 		lastTipHash:      tipHash,
 		maxLastBlockTime: MaxLastBlockTime,
 
@@ -926,11 +934,18 @@ func (bd *BlockDownloader) BlockNotDelivered(peer *SyncPeer, hash chainhash.Hash
 // Requires the caller to hold PeerManager's sync-state mutex.
 func (bd *BlockDownloader) BlocksInFlight() int { return len(bd.inFlight) }
 
-// TxInvsReceived reports how many tx inventory announcements have arrived.
-// Decision 1 defers the tx path to Phase 3; this is the counter that stands in
-// for it until then. Requires the caller to hold PeerManager's sync-state
-// mutex: the counter is deliberately not atomic, like every other field here.
-func (bd *BlockDownloader) TxInvsReceived() uint64 { return bd.txInvsReceived }
+// Stop releases requestedTxns' background TTL-eviction goroutine
+// (expiringmap.New starts one whenever expiry != 0). Called once from
+// PeerManager.Stop, after every peer goroutine has already joined
+// (m.wg.Wait()) — the same "join producers before releasing what they used"
+// ordering Server.go documents for admission and the orphan pool.
+func (bd *BlockDownloader) Stop() {
+	if bd == nil || bd.requestedTxns == nil {
+		return
+	}
+
+	bd.requestedTxns.Stop()
+}
 
 // PeerDisconnected is BlockDownloadTracker::ClearPeer, the block-download half
 // of net_processing.cpp FinalizeNode: everything the peer was downloading goes
@@ -943,6 +958,22 @@ func (bd *BlockDownloader) PeerDisconnected(peer *SyncPeer) {
 // clearPeer releases every block in flight from peer and resets its download
 // bookkeeping. It is also legacy netsync manager.go clearRequestedState, which
 // the sync-peer rotation runs before choosing another peer.
+//
+// Reached on TWO different occasions, not one — this matters for anything
+// added here (fix round 2, Important 3/4): the actual disconnect
+// (PeerDisconnected, called once from PeerManager.peerGone, "the single
+// release point for a peer that goes away") AND a rotation, where the peer
+// stays connected (CheckStall's own call at this file's rotate branch;
+// PeerManager's own pre-admission-timeout rotate at manager.go:1107;
+// peerGone's own doc comment: "A rotation must NOT come here"). An earlier
+// version of this method also stopped peer.State.requestedTxns' TTL
+// goroutine here, reasoning it mirrored legacy's DonePeer-only
+// state.requestedTxns.Stop() (netsync/manager.go:1140) — wrong, because
+// THIS method also fires on a rotation, where the peer keeps announcing
+// txs into that same map for the rest of the connection. That call was
+// removed; requestedTxns' TTL goroutine is owned and stopped by
+// PeerManager.peerGone instead, the one method that only ever runs on an
+// actual disconnect.
 func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
 	if peer == nil {
 		return
@@ -986,22 +1017,31 @@ func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
 // get the headers for first, we now only provide a getheaders response here.
 // When we receive the headers, we will then ask for the blocks we need."
 //
-// Tx invs are counted and nothing else — Decision 1 defers the tx path to
-// Phase 3.
+// Tx invs are collected, not counted: this is the PRODUCE half of Task 16's
+// tx-inv round trip over LegacyInvConfig (legacy QueueInv,
+// netsync/manager.go:2958-3011, which splits an inbound inv into its block
+// and tx halves and writes only the tx half to Kafka). The returned hashes
+// are handed to a Kafka producer by the caller (PeerManager.Inv), never
+// produced here: this method performs no I/O, matching every other machine
+// in this package (spec §4.3). Decision 1's txInvsReceived counter — Phase
+// 2's stand-in for this path — is gone; RequestTxs and the tx-inv round
+// trip's own tests are what now proves a tx inv is actually seen.
 //
 // On error the message list is nil, never partial. C++ scores the bad entry and
 // carries on through the rest of the batch, but it is setting fDisconnect while
 // it does so; here the error means the caller must drop the peer, and messages
 // queued for a peer we are about to drop are not worth sending. Availability
 // updates made for the entries already processed do stand — they are state, not
-// output, and they were valid when they were made.
-func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Message, error) {
+// output, and they were valid when they were made. The same discipline applies
+// to the collected tx hashes: discarded on error, for the same reason.
+func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Message, []chainhash.Hash, error) {
 	if peer == nil || peer.State == nil || msg == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var (
 		msgs      []wire.Message
+		txHashes  []chainhash.Hash
 		requested map[chainhash.Hash]struct{}
 	)
 
@@ -1044,21 +1084,136 @@ func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Messa
 			msgs = append(msgs, bd.getHeadersFor(inv.Hash))
 
 		case wire.InvTypeTx:
-			// net_processing.cpp: "got txn inv: %s %s txnsrc peer=%d". Phase 2
-			// stops here (Decision 1).
-			bd.txInvsReceived++
+			// net_processing.cpp: "got txn inv: %s %s txnsrc peer=%d". Collected
+			// for the caller to produce to Kafka (legacy QueueInv splits and
+			// writes the WHOLE tx half of the inv, duplicates included — no
+			// per-message dedup on the produce side, matching that exactly; the
+			// consume side (RequestTxs) is where dedup actually happens).
+			txHashes = append(txHashes, inv.Hash)
 
 		default:
 			// net_processing.cpp: "Got invalid inv type %d from peer=%d" →
 			// pfrom->fDisconnect = true. C++ finishes the loop first; there is
 			// nothing worth doing for a peer we are about to drop, so this
 			// returns straight away and discards what it had queued.
-			return nil, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+			return nil, nil, errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
 				"svp2p: unsupported inv type %d", uint32(inv.Type), ErrProtocolViolation)
 		}
 	}
 
-	return msgs, nil
+	return msgs, txHashes, nil
+}
+
+// RequestTxs is the CONSUME half of Task 16's tx-inv round trip: legacy
+// processInvMsg's InvTypeTx branch plus the getdata-build loop that follows
+// it (netsync/manager.go:2338-2352, :2365-2408), replayed here for tx hashes
+// that arrived back off the LegacyInvConfig topic rather than directly off
+// the wire — OnInv above is the PRODUCE half that put them there.
+//
+// Two suppressions apply, and they are kept independent (controller
+// addendum H3): headers-first mode ignores every inv while we are
+// downloading headers up to a checkpoint ("Ignore inventory when we're in
+// headers-first mode", manager.go:2373-2376) — a different reason from, and
+// checked separately from, the RUNNING gate the caller (bridge/kafka.go's
+// handleLegacyInvMessage) already applied before this method is ever
+// reached: legacy's own processInvMsg tests processInvs (RUNNING) FIRST,
+// returning immediately — before peer.AddKnownInventory even runs — for a
+// tx type when it fails (manager.go:2365-2370, "if !processInvs { return
+// }"); it tests headersFirstMode SECOND, AFTER AddKnownInventory
+// (manager.go:2372-2376). This method starts from "RUNNING already
+// verified" (the caller's gate), so its own knownTxs marking below stands
+// in for AddKnownInventory and correctly runs before its own
+// headers-first check — same relative order, one gate already resolved by
+// the caller.
+//
+// rejected is protocol.TxIngestor.Rejected — legacy's own
+// "skip the transaction if it has already been rejected" (manager.go:2400).
+// nil (no TxIngestor wired) is treated as "nothing is rejected", the same
+// permissive default nil canRelay gets elsewhere in this port.
+//
+// Dedup checks BOTH maps (fix round 2, Minor 1 correction: legacy itself
+// only ever READS the node-wide sm.requestedTxns, manager.go:2340 — it
+// WRITES both maps, manager.go:2346-2347, but state.requestedTxns is never
+// read anywhere in legacy; this port's extra per-peer READ is a harmless
+// superset, not a fidelity claim, and the brief asked for both maps'
+// dedup regardless): the node-wide requestedTxns on bd, so a second peer's
+// inv for a hash already requested from anyone doesn't draw a second
+// getdata, and this peer's own requestedTxns, so a second inv for the same
+// hash from the SAME peer doesn't either. A hash that passes both is
+// marked in both before moving on to the next, exactly as legacy sets
+// sm.requestedTxns and state.requestedTxns together (manager.go:2346-2347).
+//
+// NOT checked here, and disclosed rather than silently omitted (fix round
+// 2, Important 2): legacy's own haveInventory gate (manager.go:2380,
+// wired to a UTXO-store lookup — "this transaction exists in the utxo
+// store, which means it has been processed completely at our end") has no
+// counterpart in this method. protocol carries no UTXO-store seam (spec
+// §4.4), so a tx announcement for something we already hold still draws a
+// getdata and a redundant full download here, where legacy would skip it.
+// Booked as a residual against a future UTXO-aware seam, not built in this
+// task.
+//
+// Requires PeerManager.syncMu, like every other BlockDownloader method that
+// reads or writes peer.State or bd's own fields.
+func (bd *BlockDownloader) RequestTxs(peer *SyncPeer, hashes []chainhash.Hash, rejected func(chainhash.Hash) bool) *wire.MsgGetData {
+	if peer == nil || peer.State == nil || len(hashes) == 0 {
+		return nil
+	}
+
+	// peer.AddKnownInventory(iv) — legacy's own ordering (manager.go:2365-
+	// 2376): this runs UNCONDITIONALLY once the RUNNING gate has already
+	// passed (the caller, bridge/kafka.go, never reaches this method
+	// otherwise), and it runs BEFORE the headers-first check below, not
+	// after. That order is load-bearing, not incidental: during
+	// headers-first sync we still learn that this peer already has these
+	// txs (so the tx announcement relay, relay.go selectTxRelayTargets,
+	// never re-offers them back), even though no getdata goes out for them
+	// yet. Marking after the headers-first return would silently lose that
+	// fact for exactly the hashes this suppression is about. This is the
+	// tx-side counterpart of Inv's own unconditional knownBlocks.mark
+	// (manager.go:800-806) — the "peer told us about a hash first" half of
+	// syncPeer.State.knownTxs, which until this task had only the
+	// "we already relayed it" half (RelayTxs); see that field's own doc
+	// comment.
+	for _, hash := range hashes {
+		peer.State.knownTxs.mark(hash)
+	}
+
+	if bd.hs != nil && bd.hs.IsHeadersFirstMode() {
+		return nil
+	}
+
+	var gdmsg *wire.MsgGetData
+
+	for _, hash := range hashes {
+		if rejected != nil && rejected(hash) {
+			continue
+		}
+
+		if _, exists := bd.requestedTxns.Get(hash); exists {
+			continue
+		}
+
+		if _, exists := peer.State.requestedTxns.Get(hash); exists {
+			continue
+		}
+
+		if gdmsg == nil {
+			gdmsg = wire.NewMsgGetData()
+		}
+
+		if err := gdmsg.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &hash)); err != nil {
+			// A getdata is capped at wire.MaxInvPerMsg (50,000); unreachable in
+			// practice against one inv batch, kept for the same reason as the
+			// other AddInvVect error sites in this file.
+			continue
+		}
+
+		bd.requestedTxns.Set(hash, struct{}{})
+		peer.State.requestedTxns.Set(hash, struct{}{})
+	}
+
+	return gdmsg
 }
 
 // getHeadersFor builds the inv-answering getheaders: a locator from our best

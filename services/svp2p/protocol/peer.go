@@ -128,13 +128,30 @@ type TxIngestor interface {
 	Ingest(ctx context.Context, msg *wire.MsgTx, peerAddr string) TxIngestOutcome
 
 	// Rejected reports whether hash is in the ingest-side rejected-tx set
-	// (bridge.Bridge.TxRejected). This is Task 16's seam: the inv handler's
-	// "already rejected, skip the getdata" suppression
-	// (services/legacy/netsync/manager.go:2400) is made reachable through
-	// this method but is not called from anywhere in this package today —
-	// BlockDownloader.OnInv's InvTypeTx case stops at Decision 1 (Phase 2)
-	// and Task 16 is who extends it.
+	// (bridge.Bridge.TxRejected). This is Task 16's seam, now wired: the inv
+	// handler's "already rejected, skip the getdata" suppression
+	// (services/legacy/netsync/manager.go:2400) is reached from
+	// PeerManager.Inv/InvFromKafka via BlockDownloader.RequestTxs.
 	Rejected(hash chainhash.Hash) bool
+}
+
+// TxInvProducer is this package's whole view of the tx-inv round trip's
+// Kafka producer (Task 16, legacy QueueInv's Kafka half,
+// netsync/manager.go:2958-3011): the PRODUCE-side counterpart to TxIngestor
+// above, and declared here for the identical spec §4.4 reason — the
+// producer itself lives in bridge/kafka.go, which this package must never
+// import, so PeerManager reaches it through this locally-declared interface
+// instead, composed with the concrete Kafka producer in the svp2p package
+// (services/svp2p/Server.go), the same shape BlockIngestor, BlockTxFetcher
+// and TxIngestor already use for their own cross-package seams.
+type TxInvProducer interface {
+	// Produce hands hashes (a batch of tx invs a peer just announced) off to
+	// the LegacyInvConfig Kafka topic, tagged with peerAddr so the consumer
+	// side (bridge/kafka.go, PeerManager.InvFromKafka) can answer the same
+	// peer back. Called with no lock held — PeerManager.Inv collects under
+	// syncMu and calls this only after releasing it (spec §4.3's no-blocking-
+	// call-under-a-lock contract; a Kafka produce can block).
+	Produce(peerAddr string, hashes []chainhash.Hash)
 }
 
 // TxIngestOutcome is what one Ingest call reports. Unlike IngestOutcome

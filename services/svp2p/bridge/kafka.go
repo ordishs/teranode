@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"google.golang.org/protobuf/proto"
@@ -343,6 +344,299 @@ func handleTxMetaMessage(logger ulogger.Logger, msg *kafka.KafkaMessage, onTx Tx
 
 		onTx(e.hash, txMeta.Fee, txMeta.SizeInBytes)
 	}
+
+	return nil
+}
+
+// InvHandler is called once per decoded legacy-inv Kafka message that
+// carries at least one tx entry AND passed the RUNNING gate: the peer
+// address the original inv came from, and every tx hash it announced.
+// Declared with primitive parameters rather than a protocol type, for the
+// same spec §4.4 reason as BlockFinalHandler/TxMetaHandler above.
+type InvHandler func(peerAddr string, hashes []chainhash.Hash)
+
+// StartLegacyInvConsumer wires the legacy-inv Kafka topic
+// (settings.Kafka.LegacyInvConfig) to onInv — the CONSUME half of Task 16's
+// tx-inv round trip; StartLegacyInvProducer below is the PRODUCE half.
+// legacy's own kafkaINVListener (netsync/manager.go:3417-3441) decodes the
+// identical KafkaInvTopicMessage and calls handleInvMsg directly;
+// handleLegacyInvMessage below is this port's counterpart.
+//
+// This is a PLAIN listener (kafka.NewKafkaConsumerGroupFromURL, like
+// StartBlocksFinalConsumer), NOT a controlled one — read this paragraph
+// before changing that, because an earlier version of this function got it
+// wrong. legacy's own INV listener IS built through
+// kafka.StartKafkaControlledListener (manager.go:3350-3352), but its
+// control channel is `blockListenersCh` (manager.go:3355-3358), fed
+// `blockEnabled := true` UNCONDITIONALLY by the poller — the identical
+// "always true" gate StartBlocksFinalConsumer's own doc comment already
+// describes as dead machinery. legacy's tx RUNNING gate
+// (`pollTxRunningGate`'s equivalent poll, manager.go:3316-3321) feeds a
+// DIFFERENT channel, `txListenersCh`, which only the TXMETA listener is
+// registered on. So legacy's INV listener never pauses; the RUNNING check
+// for tx invs is applied per-message, inside handleInvMsg/processInvMsg
+// (manager.go:2270-2280, :2365-2370), by handleLegacyInvMessage below.
+// Gating the LISTENER instead (an earlier version of this port did, citing
+// "pause without dropping announcements") behaves differently on resume: a
+// paused listener replays a backlog of now-stale invs for peers that may
+// already be gone, where legacy's always-on-listener-plus-per-message-drop
+// resumes with a clean slate — the better behavior as well as the faithful
+// one, since a stale inv is worthless and the departed-peer drop
+// (PeerManager.InvFromKafka) already does that job one layer down anyway.
+// "The ingestion-pause mechanism, carried unchanged" (spec §7) describes
+// WHY this round trip exists — so tx ingestion can pause without
+// announcements being lost — not a directive to gate this consumer.
+//
+// Headers-first suppression is a SEPARATE gate, checked separately, inside
+// BlockDownloader.RequestTxs on the other side of onInv (protocol
+// package's own state) — see that method's doc comment for the ordering
+// relative to peer.AddKnownInventory that legacy's source makes load-
+// bearing, which handleLegacyInvMessage's RUNNING check below is the other
+// half of (RUNNING is tested BEFORE AddKnownInventory in legacy;
+// headers-first is tested AFTER it).
+//
+// A nil LegacyInvConfig means the topic is not configured, matching
+// legacy's own `if legacyInvConfigURL != nil` gate (netsync/manager.go:
+// 3330): no consumer is started, and no getdata is ever built by this
+// path. Returns (nil, nil) in that case, like StartBlocksFinalConsumer.
+//
+// The returned consumer's lifecycle is the caller's, exactly like
+// StartBlocksFinalConsumer's own doc comment describes: Start already
+// begins consuming, tied to ctx, and the caller must Close it during Stop
+// ahead of tearing down the peer registry.
+func StartLegacyInvConsumer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, onInv InvHandler) (kafka.KafkaConsumerGroupI, error) {
+	configURL := tSettings.Kafka.LegacyInvConfig
+	if configURL == nil {
+		logger.Infof("[svp2p] legacy inv round trip disabled: kafka_legacyInvConfig is not set")
+		return nil, nil
+	}
+
+	groupID := "inv.legacy." + tSettings.ClientName
+
+	consumer, err := kafka.NewKafkaConsumerGroupFromURL(logger, configURL, groupID, true, &tSettings.Kafka)
+	if err != nil {
+		return nil, err
+	}
+
+	consumer.Start(ctx, func(msg *kafka.KafkaMessage) error {
+		return handleLegacyInvMessage(ctx, logger, blockchainClient, msg, onInv)
+	})
+
+	return consumer, nil
+}
+
+// handleLegacyInvMessage decodes one legacy-inv message, applies the
+// RUNNING gate, and calls onInv with every InvType_Tx entry's hash that
+// survived — mirroring legacy's own newInvFromKafkaMessage
+// (netsync/inv_msg.go:104-137) for the decode, and handleInvMsg's own
+// processInvs computation (manager.go:2270-2280, done once per inv
+// message, reused for every entry in it) for the gate. The peer lookup
+// legacy does at this same site is NOT done here: it happens on the
+// protocol-package side of onInv (PeerManager.InvFromKafka), since this
+// package has no peer registry to look one up in (spec §4.4).
+//
+// Order matters and mirrors legacy's own (manager.go processInvMsg,
+// :2365-2376): decode and filter first (a message that carries nothing
+// answerable is never worth an FSM call), THEN the RUNNING gate — checked
+// BEFORE onInv is called at all, so a not-RUNNING message never reaches
+// peer.AddKnownInventory's equivalent (RequestTxs' own knownTxs marking,
+// protocol package) either, exactly as legacy's own
+// "if !processInvs { return }" returns before AddKnownInventory ever runs
+// for a tx type. Fails closed on an FSM read error, matching legacy's own
+// `processInvs` default (initialized false, only set true on a successful
+// RUNNING read) and canRelayTx's documented "fails closed" discipline
+// elsewhere in this port.
+//
+// Non-tx entries (block invs never travel this topic in this port — block
+// invs keep their in-process path, task scope fence) are filtered out
+// rather than erroring, the same defensive discipline as every other
+// decode in this file. A hash that fails to parse is logged and skipped;
+// the rest of the message still reaches onInv, matching
+// handleTxMetaMessage's own per-entry (not whole-message) failure
+// handling. onInv is not called at all when no tx entry survives, or when
+// the RUNNING gate is closed.
+func handleLegacyInvMessage(ctx context.Context, logger ulogger.Logger, blockchainClient blockchain.ClientI, msg *kafka.KafkaMessage, onInv InvHandler) error {
+	var invMsg kafkamessage.KafkaInvTopicMessage
+	if err := proto.Unmarshal(msg.Value, &invMsg); err != nil {
+		logger.Errorf("[svp2p] failed to unmarshal legacy inv message, skipping: %v", err)
+		return nil
+	}
+
+	var hashes []chainhash.Hash
+
+	for _, inv := range invMsg.Inv {
+		if inv.Type != kafkamessage.InvType_Tx {
+			continue
+		}
+
+		hash, err := chainhash.NewHashFromStr(inv.Hash)
+		if err != nil {
+			logger.Errorf("[svp2p] legacy inv message from peer %s carries an unparseable tx hash %q, skipping entry: %v", invMsg.PeerAddress, inv.Hash, err)
+			continue
+		}
+
+		hashes = append(hashes, *hash)
+	}
+
+	if len(hashes) == 0 {
+		return nil
+	}
+
+	running := false
+
+	if blockchainClient != nil {
+		r, err := blockchainClient.IsFSMCurrentState(ctx, blockchain.FSMStateRUNNING)
+		if err == nil {
+			running = r
+		}
+	}
+
+	if !running {
+		logger.Debugf("[svp2p] ignoring legacy inv message from peer %s: not in running state", invMsg.PeerAddress)
+		return nil
+	}
+
+	onInv(invMsg.PeerAddress, hashes)
+
+	return nil
+}
+
+// legacyInvProducerChannelSize matches legacy's own legacyKafkaInvCh buffer
+// (netsync/manager.go:3337, "make(chan *kafka.Message, 10_000)").
+const legacyInvProducerChannelSize = 10_000
+
+// LegacyInvProducer is the PRODUCE half of Task 16's tx-inv round trip:
+// legacy QueueInv's Kafka write (netsync/manager.go:2958-3011), relocated
+// behind a Produce method protocol.TxInvProducer is satisfied by directly
+// (services/svp2p/Server.go composes it into protocol.SyncConfig with no
+// adapter needed, the same way BlocksFinalConsumer's onFinal is
+// s.manager.RelayBlock).
+type LegacyInvProducer struct {
+	logger   ulogger.Logger
+	ch       chan *kafka.Message
+	producer kafka.KafkaAsyncProducerI
+}
+
+// StartLegacyInvProducer builds the legacy-inv Kafka producer, matching
+// legacy's own construction (netsync/manager.go:3335-3350): an async
+// producer over a buffered channel, started on its own goroutine tied to
+// ctx. A nil LegacyInvConfig returns (nil, nil), matching every other
+// unconfigured-topic case in this file — no producer is built, and
+// LegacyInvProducer.Produce/Stop are both nil-receiver safe so a caller
+// that always calls them unconditionally (Server.go) needs no extra nil
+// check of its own.
+func StartLegacyInvProducer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings) (*LegacyInvProducer, error) {
+	configURL := tSettings.Kafka.LegacyInvConfig
+	if configURL == nil {
+		logger.Infof("[svp2p] legacy inv round trip disabled: kafka_legacyInvConfig is not set")
+		return nil, nil
+	}
+
+	ch := make(chan *kafka.Message, legacyInvProducerChannelSize)
+
+	producer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, configURL, &tSettings.Kafka)
+	if err != nil {
+		return nil, err
+	}
+
+	go producer.Start(ctx, ch)
+
+	return &LegacyInvProducer{logger: logger, ch: ch, producer: producer}, nil
+}
+
+// Produce marshals hashes as a KafkaInvTopicMessage tagged with peerAddr and
+// sends it to the legacy-inv topic, mirroring legacy's own QueueInv
+// (netsync/manager.go:2989-3004): a plain, blocking channel send — no
+// select/default drop — because the channel's own backpressure IS the
+// pause mechanism (this method's own doc note on StartLegacyInvConsumer):
+// a stalled Kafka producer slows the peer's own read loop rather than
+// silently losing an announcement. Safe to call on a nil *LegacyInvProducer
+// (an unconfigured topic): a no-op, matching StartLegacyInvConsumer's own
+// unconfigured-topic silence.
+//
+// Called by PeerManager.Inv only AFTER releasing syncMu (protocol.
+// TxInvProducer's own doc comment) — never while any lock in this package's
+// caller is held, satisfying spec §4.3's no-blocking-call-under-a-lock rule
+// for the blocking send this method performs.
+//
+// Recovers "send on closed channel" (fix round 2, Important 1): Stop's own
+// doc comment used to claim this could never race a live Produce call,
+// reasoning Server.Stop always ran Stop() after PeerManager.Stop() had
+// joined every peer goroutine. Fixing Important 1 — the DC11 flush being
+// skipped on an early-return shutdown path — moved Stop() into a defer
+// that CAN now fire before manager.Stop() has joined every peer, reopening
+// exactly the race legacy's own sendDuringShutdown protects against at
+// this identical seam (netsync/manager.go:2937-2949, "Inv delivery runs on
+// peer read-loop goroutines... but the channels they target are torn down
+// by a different goroutine during shutdown"). Recovering here, rather than
+// re-establishing the ordering guarantee, is the same trade Server.Stop's
+// own defer already makes for admission/stoppableBridge: releasing early
+// on an abnormal, something-already-failed path beats leaking or crashing.
+func (p *LegacyInvProducer) Produce(peerAddr string, hashes []chainhash.Hash) {
+	if p == nil || len(hashes) == 0 {
+		return
+	}
+
+	msg := &kafkamessage.KafkaInvTopicMessage{PeerAddress: peerAddr}
+	for _, h := range hashes {
+		msg.Inv = append(msg.Inv, &kafkamessage.Inv{Type: kafkamessage.InvType_Tx, Hash: h.String()})
+	}
+
+	value, err := proto.Marshal(msg)
+	if err != nil {
+		p.logger.Errorf("[svp2p] failed to marshal legacy inv message for peer %s, skipping: %v", peerAddr, err)
+		return
+	}
+
+	sendToLegacyInvChannel(p.ch, &kafka.Message{Value: value})
+}
+
+// sendToLegacyInvChannel is legacy's own sendDuringShutdown
+// (netsync/manager.go:2937-2949), generalized to nothing legacy-specific:
+// a plain blocking send that recovers "send on closed channel" rather than
+// crashing the process, because a flag check and a channel send are not
+// atomic against a concurrent close. Dropping one produce during shutdown
+// is safe — an inv is advisory, and this port's whole reason for this
+// round trip's existence is that a dropped announcement gets re-sent by
+// the peer (or a later connection) on its own.
+func sendToLegacyInvChannel(ch chan *kafka.Message, msg *kafka.Message) {
+	defer func() {
+		_ = recover()
+	}()
+
+	ch <- msg
+}
+
+// Stop flushes the producer synchronously — the DC11 note (netsync/
+// manager.go:3080-3091, "stop the legacy INV async producer so its final
+// flush runs during shutdown. Safe here ... Stop() has no caller ctx to
+// honour ..., so it is raced against an internal timeout: a wedged broker
+// flush can't block shutdown"). Carried here identically, via the same
+// kafka.StopProducerCtx helper and util.DefaultBatcherDrainTimeout bound
+// legacy's own DC11 call uses. Safe on a nil *LegacyInvProducer.
+//
+// Server.Stop calls this from a defer (fix round 2, Important 1: an
+// earlier version called it inline at the very end, which an early return
+// from any of blocksFinalConsumer.Close/legacyInvConsumer.Close/
+// manager.Stop skipped entirely — silently dropping the flush on exactly
+// the failure path where dropping announcements matters most). On the
+// ordinary success path the defer still runs after PeerManager.Stop() has
+// already joined every peer goroutine, preserving the original ordering
+// exactly. On an abnormal path it can now fire BEFORE that join completes,
+// which reopens a real send-after-close race against Produce — see
+// Produce's own doc comment for why that is now recovered rather than
+// re-establishing the ordering guarantee (the same early-release-over-
+// leaking trade Server.Stop's defer already makes for admission/
+// stoppableBridge).
+func (p *LegacyInvProducer) Stop() error {
+	if p == nil {
+		return nil
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), util.DefaultBatcherDrainTimeout)
+	defer cancel()
+
+	kafka.StopProducerCtx(stopCtx, p.logger, "legacy INV", p.producer)
 
 	return nil
 }

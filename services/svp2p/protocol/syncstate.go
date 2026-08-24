@@ -1,9 +1,20 @@
 package protocol
 
 import (
+	"time"
+
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
 )
+
+// requestedTxnsTTL mirrors legacy's own per-peer requestedTxns construction
+// (netsync/manager.go:990, "allow the node 10 seconds to respond to the tx
+// request") — the same TTL BlockDownloader's global requestedTxns uses
+// (blockdownload.go), so a tx this peer was asked for is only ever
+// remembered as "already requested" for 10 seconds, matching legacy on
+// both the per-peer and the node-wide map.
+const requestedTxnsTTL = 10 * time.Second
 
 // peerSyncState is the net_processing.cpp CNodeState port: per-peer sync
 // bookkeeping consumed by headers-first sync (Task 5) and block download
@@ -183,20 +194,30 @@ type peerSyncState struct {
 	// that a tx-scale cap would blow through in seconds. See knownTxCap's
 	// own doc comment for the E3 sizing argument.
 	//
-	// Unlike knownBlocks — which is also fed by inbound peer signals (Inv,
-	// BlockDone: whichever peer told us about a hash first gets it marked
-	// before any relay for that hash runs) — this set has only ONE writer
-	// today: RelayTxs marks a hash for every peer it actually sends an inv
-	// to. There is no peer-originated tx-inv path yet in this port (Task
-	// 16's LegacyInvConfig round trip, out of this task's scope per the
-	// plan's scope fence) to feed the "peer already told us they have it"
-	// half the way updateBlockAvailability does for blocks. So this set
-	// answers only "did WE already relay this tx to this peer", not "does
-	// this peer already have it" — still exactly what stops the txmeta
-	// path (which has no peer-of-origin to exclude in the first place, only
-	// a Kafka source) from re-announcing the same hash to the same peer
-	// across two separate batcher flushes more than a dedup-window apart.
+	// Like knownBlocks, this set now has TWO writers (Task 16 added the
+	// second): RelayTxs marks a hash for every peer it actually sends an
+	// inv to (the "did WE already relay this tx to this peer" half), and
+	// BlockDownloader.RequestTxs marks it for the peer that just announced
+	// the hash back to us over the tx-inv round trip (the "peer already
+	// told us they have it" half) — legacy's own peer.AddKnownInventory for
+	// tx invs (netsync/manager.go:2371, run unconditionally once the
+	// RUNNING gate has passed, BEFORE the headers-first check; see
+	// RequestTxs' own doc comment for why that order matters). Before Task
+	// 16 there was no peer-originated tx-inv path in this port at all, so
+	// this set answered only the first half; it now answers both, the same
+	// two-writer shape knownBlocks already had via Inv/BlockDone and
+	// RelayBlock.
 	knownTxs *knownBlockSet
+
+	// requestedTxns is this peer's half of the tx-inv round trip's dedup
+	// (Task 16, manager.go:2340-2347's `state.requestedTxns`, the per-peer
+	// twin of BlockDownloader.requestedTxns below): a tx hash lands here the
+	// moment a getdata for it goes out to THIS peer, so a second inv for the
+	// same hash from the same peer inside the TTL window is not requested
+	// again. Stopped on disconnect (blockdownload.go clearPeer), mirroring
+	// legacy's own state.requestedTxns.Stop() at DonePeer
+	// (netsync/manager.go:1140).
+	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 }
 
 // newPeerSyncState returns a zero-value peerSyncState: no best known block,
@@ -204,8 +225,9 @@ type peerSyncState struct {
 // stalling. This mirrors a freshly default-constructed CNodeState entry.
 func newPeerSyncState() *peerSyncState {
 	return &peerSyncState{
-		knownBlocks: newKnownBlockSet(knownBlockCap),
-		knownTxs:    newKnownBlockSet(knownTxCap),
+		knownBlocks:   newKnownBlockSet(knownBlockCap),
+		knownTxs:      newKnownBlockSet(knownTxCap),
+		requestedTxns: expiringmap.New[chainhash.Hash, struct{}](requestedTxnsTTL),
 	}
 }
 
