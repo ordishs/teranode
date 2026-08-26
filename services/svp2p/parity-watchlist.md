@@ -35,6 +35,14 @@ receive path, so no unit test can settle it.
 - **Pass:** no honest SVNode peer reaches the error. If one does, the policy is
   wrong and Task 5 owns the fix.
 
+
+**Verdict 2026-08-26 (parity harness, `services/svp2p/parity`, `TestParity_HeadersReplayIsDropped`):**
+both implementations drop the replaying peer — legacy for "block header that does
+not properly connect to the chain", svp2p through `ErrHeadersNoProgress` — after
+asking twice. The honest case (an inv-drawn duplicate reply mid-round) is pinned
+by `TestParity_HonestDuplicateReplyMidRoundStaysConnected` after fix 79f0870ba.
+Whether a real SVNode ever replays a batch remains a question for a recorded peer.
+
 ## 2. Sync-peer election order
 
 **headersync.go `PeerEstablished` note.**
@@ -105,6 +113,29 @@ Note two known structural differences, neither a defect:
   blocks must add the flag in the same change, or this port will start banning
   peers for innocently relayed compact blocks.**
 
+
+**Verdict 2026-08-26 (`TestParity_MisbehaviourScores`, one peer per row, both
+services):**
+
+| Row | svp2p | legacy | SVNode |
+|---|---|---|---|
+| multiple-version | 1, keeps | 0, keeps (ignores) | 1, keeps |
+| missing-version | 1, keeps | disconnects | 1, keeps |
+| unconnected-headers ×10 | 20, keeps | disconnects ("unrequested headers") | 20, keeps |
+| non-continuous headers | 20, keeps | disconnects ("unrequested headers") | 20, keeps |
+| invalid block BODY (2nd coinbase) | **0, keeps — GAP** | disconnects | 100, bans |
+| headers > 2000 | connection fails (go-wire decode) | keeps, swallows | 20, keeps |
+| addr > 1000 | connection fails (go-wire decode) | keeps, swallows | 20, keeps |
+
+svp2p matches SVNode on the four scored rows; legacy is harsher. The two decoder
+rows cannot reach either scorer: go-wire refuses the payload (svp2p fails the
+connection at `transport/conn.go`, legacy's read loop drops it silently). The
+invalid-body row is a gap: the error reaches the bridge as TX_ERROR, outside
+PeerFault's block-describing allow-list (Task 20), so the peer is neither scored
+nor dropped — ledger carried residual 15. Also found while building the rig:
+legacy rejects and BANS any peer whose user agent lacks "Bitcoin SV"/"BSV"
+(`peer_server.go:617`); svp2p has no such fence — scenario 12 below.
+
 ## 5. Multi-peer download distribution
 
 **Tasks 3-7, 6b.**
@@ -124,6 +155,20 @@ Watch specifically for the download-timeout livelock the ledger carries: at the
 default steady-state window a 4 GB block needs 6.7 MB/s from ONE peer, and the
 per-peer grant is zero exactly then. Racing covers most of it, but not with a
 single useful peer, and not when every holder stalls at the cap.
+
+
+**Verdict 2026-08-26 (`TestParity_MultiPeerDistribution`, 200 × 200 KB blocks,
+fast/slow/silent peers, per-block budget 1 % = 6 s):** svp2p reaches the tip,
+drops the silent peer on the carried per-block clock (79f0870ba) and is redialed
+by `legacy_connect_peers`; legacy downloads from its single sync peer only.
+Distribution is real (both serving peers carry blocks) but so is the cost: svp2p
+served **1,316 blocks for a 200-block chain** (~5.6×) because a block arriving
+before its parent is refused pre-admission, discarded and fetched again — the
+ledger's carried residual 1, measured at "twice" on 36 blocks in Task 21 and at
+five times here under a slow in-process ingest. Wall clock: legacy 40 s–2m40s
+(depends on which peer its height-ranked election picks first; the silent one
+costs a 180 s rotation), svp2p 51–67 s. The row pins the multiplier as a KNOWN
+GAP; the rule-derived bound a fix must meet is in the test.
 
 ---
 
@@ -213,3 +258,15 @@ against — only SVNode.
 
 - **Observe:** how many peers each received addr is forwarded to, against SVNode
   on the same input.
+
+### 12. User-agent fence
+
+Legacy rejects and bans (24 h) any peer whose user agent contains neither
+"Bitcoin SV" nor "BSV" (`services/legacy/peer_server.go:617`, "Only BSV
+Blockchain clients are supported"). svp2p accepts any agent; SVNode has no such
+fence either. Found 2026-08-26 when the harness's scripted peer, announcing
+`/svp2p-scripted-peer:1.0/`, was banned by the legacy leg and accepted by svp2p.
+
+- **Observe:** which agents connect to each over a testnet session.
+- **Pass:** an owner decision — carry legacy's fence into svp2p, or drop it at
+  cutover as a Teranode-only policy with no SVNode counterpart.
