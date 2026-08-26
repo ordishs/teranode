@@ -27,6 +27,12 @@ type Observation struct {
 	Disconnected map[string]string
 	// Scores is, per peer address, the node's misbehaviour total for that peer.
 	Scores map[string]int
+	// GetHeadersIn is the total getheaders every peer received from the node.
+	// Reported and available to scenarios; not compared.
+	GetHeadersIn int
+	// Notes are free-text facts a scenario wants in the report (for instance the
+	// disconnect reason each side logged). Reported, never compared.
+	Notes map[string]string
 	// WallClock is how long Drive took. Reported, never compared.
 	WallClock time.Duration
 }
@@ -149,10 +155,12 @@ func WriteReport(t *testing.T, name string, legacy, svp2p Observation, res Resul
 	fmt.Fprintf(&b, "| field | legacy | svp2p |\n|---|---|---|\n")
 	fmt.Fprintf(&b, "| BlocksAccepted | %d | %d |\n", legacy.BlocksAccepted, svp2p.BlocksAccepted)
 	fmt.Fprintf(&b, "| WallClock | %s | %s |\n", legacy.WallClock.Round(time.Millisecond), svp2p.WallClock.Round(time.Millisecond))
+	fmt.Fprintf(&b, "| GetHeadersIn | %d | %d |\n", legacy.GetHeadersIn, svp2p.GetHeadersIn)
 	fmt.Fprintf(&b, "| Requests | %v | %v |\n", legacy.Requests, svp2p.Requests)
 	fmt.Fprintf(&b, "| Served | %v | %v |\n", legacy.Served, svp2p.Served)
 	fmt.Fprintf(&b, "| Disconnected | %v | %v |\n", legacy.Disconnected, svp2p.Disconnected)
-	fmt.Fprintf(&b, "| Scores | %v | %v |\n\n", legacy.Scores, svp2p.Scores)
+	fmt.Fprintf(&b, "| Scores | %v | %v |\n", legacy.Scores, svp2p.Scores)
+	fmt.Fprintf(&b, "| Notes | %v | %v |\n\n", legacy.Notes, svp2p.Notes)
 
 	fmt.Fprintf(&b, "## Diffs (%d)\n\n", len(res.Diffs))
 	for _, d := range res.Diffs {

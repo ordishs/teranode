@@ -128,6 +128,7 @@ func ObserveDefault(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedP
 	for i, p := range peers {
 		name := peerName(i)
 		o.Requests[name] = p.RequestedCount()
+		o.GetHeadersIn += p.Transcript.Count(svp2ptest.In, "getheaders")
 		o.Served[name] = p.ServedBlocks()
 
 		if who := p.Transcript.ClosedBy(); who != "" {

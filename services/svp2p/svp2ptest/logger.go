@@ -66,3 +66,27 @@ func (l *RecordingLogger) Contains(substr string) bool {
 // accepts (valid proof of work under the regtest limit, BIP34 coinbase, merkle
 // root = the coinbase txid, which is what a single-transaction block's root is).
 // ---------------------------------------------------------------------------
+
+// Lines returns a copy of every line recorded so far.
+func (l *RecordingLogger) Lines() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	out := make([]string, len(l.lines))
+	copy(out, l.lines)
+
+	return out
+}
+
+// Matching returns the recorded lines that contain substr.
+func (l *RecordingLogger) Matching(substr string) []string {
+	var out []string
+
+	for _, line := range l.Lines() {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+
+	return out
+}
