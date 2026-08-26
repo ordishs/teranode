@@ -196,6 +196,16 @@ func (s *Server) SetSyncClocks(tick, maxLastBlockTime time.Duration) {
 	s.maxLastBlockTime = maxLastBlockTime
 }
 
+// ConnectedCount is the number of peers connected to this server; 0 before
+// Start. Test support for the parity harness.
+func (s *Server) ConnectedCount() int {
+	if s.manager == nil {
+		return 0
+	}
+
+	return int(s.manager.ConnectedCount())
+}
+
 // PeerScores is PeerManager.PeerScores for the peers this server holds; nil
 // before Start. Test support for the parity harness.
 func (s *Server) PeerScores() map[string]int {

@@ -26,6 +26,9 @@ type Scenario struct {
 	Tweaks []func(impl Impl, chain *svp2ptest.FixtureChain, s *settings.Settings)
 	// Peers builds the peer set for one leg. Index i is reported as "peer<i>".
 	Peers func(t *testing.T, chain *svp2ptest.FixtureChain, net wire.BitcoinNet) []*svp2ptest.ScriptedPeer
+	// Connect picks which peers the node dials (legacy_connect_peers); nil
+	// means all of them. Peers left out are expected to Dial the node in Drive.
+	Connect func(peers []*svp2ptest.ScriptedPeer) []string
 	// Drive runs the scenario against a started node.
 	Drive func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer)
 	// Observe reads the externally visible facts; ObserveDefault covers most.
@@ -79,9 +82,14 @@ func runLeg(t *testing.T, s Scenario, impl Impl) (Observation, []*svp2ptest.Tran
 
 	peers := s.Peers(t, chain, tSettings.ChainCfgParams.Net)
 
-	addrs := make([]string, len(peers))
-	for i, p := range peers {
-		addrs[i] = p.Addr
+	var addrs []string
+
+	if s.Connect != nil {
+		addrs = s.Connect(peers)
+	} else {
+		for _, p := range peers {
+			addrs = append(addrs, p.Addr)
+		}
 	}
 
 	n := newNode(t, impl, addrs, func(dst *settings.Settings) {

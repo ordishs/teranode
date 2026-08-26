@@ -23,6 +23,7 @@ import (
 	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // Impl names the service under test.
@@ -251,4 +252,21 @@ func (n *nodeUnderTest) WaitFor(t *testing.T, cond func() bool, timeout time.Dur
 
 	n.Logger.Dump(t)
 	t.Fatalf("%s (height now %d)", what, n.BestHeight(t))
+}
+
+// ConnectedCount is how many peers the node currently holds.
+func (n *nodeUnderTest) ConnectedCount(t *testing.T) int {
+	t.Helper()
+
+	switch svc := n.svc.(type) {
+	case *svp2p.Server:
+		return svc.ConnectedCount()
+	case *legacy.Server:
+		resp, err := svc.GetPeerCount(context.Background(), &emptypb.Empty{})
+		require.NoError(t, err)
+
+		return int(resp.Count)
+	}
+
+	return 0
 }
