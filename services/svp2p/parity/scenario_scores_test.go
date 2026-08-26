@@ -17,6 +17,11 @@ import (
 // scoreRow is one line of parity-watchlist scenario 4: a peer that commits one
 // offence, the svp2p total the table predicts, and whether the peer must go.
 type scoreRow struct {
+	// afterSync is sent by Drive once the node has the whole chain, so no
+	// getheaders of the node's own is outstanding: legacy treats headers that
+	// arrive while one is as solicited, which made the header rows racy when
+	// they were pushed at handshake time.
+	afterSync  func(chain *svp2ptest.FixtureChain) []wire.Message
 	name       string
 	script     func(chain *svp2ptest.FixtureChain) svp2ptest.Script
 	svp2pScore int
@@ -116,18 +121,20 @@ func scoreRows() []scoreRow {
 			}},
 		{name: "unconnected-headers-x10", svp2pScore: 20, legacyDrops: true,
 			accepted: svnodeKeeps("Misbehaving(20, \"too-many-unconnected-headers\"); legacy drops any unrequested headers"),
-			script: func(chain *svp2ptest.FixtureChain) svp2ptest.Script {
+			script:   func(*svp2ptest.FixtureChain) svp2ptest.Script { return svp2ptest.Script{} },
+			afterSync: func(chain *svp2ptest.FixtureChain) []wire.Message {
 				msgs := make([]wire.Message, 0, 10)
 				for i := 0; i < 10; i++ {
 					msgs = append(msgs, headersMsg(unconnected(chain, byte(i))))
 				}
 
-				return svp2ptest.Script{OnConnect: msgs}
+				return msgs
 			}},
 		{name: "non-continuous-headers", svp2pScore: 20, legacyDrops: true,
 			accepted: svnodeKeeps("Misbehaving(20, \"disconnected headers\"); legacy drops any unrequested headers"),
-			script: func(chain *svp2ptest.FixtureChain) svp2ptest.Script {
-				return svp2ptest.Script{OnConnect: []wire.Message{headersMsg(chain.Headers[0], chain.Headers[2])}}
+			script:   func(*svp2ptest.FixtureChain) svp2ptest.Script { return svp2ptest.Script{} },
+			afterSync: func(chain *svp2ptest.FixtureChain) []wire.Message {
+				return []wire.Message{headersMsg(chain.Headers[0], chain.Headers[2])}
 			}},
 		// A block whose BODY is invalid — a second coinbase under the requested
 		// header. The bridge's createTxMap judges it as a block failure
@@ -187,6 +194,14 @@ func TestParity_MisbehaviourScores(t *testing.T) {
 				},
 				Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
 					sampler := n.sampleScores()
+
+					if row.afterSync != nil {
+						n.WaitForHeight(t, 5, 30*time.Second)
+
+						for _, m := range row.afterSync(peers[0].Chain) {
+							peers[0].Send(m)
+						}
+					}
 
 					// Enough for the handshake, the offence and any reaction; a
 					// dropped peer ends the wait early.
