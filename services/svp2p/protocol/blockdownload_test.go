@@ -2635,3 +2635,86 @@ func TestStallAction_DisconnectReasonNamesTheRule(t *testing.T) {
 	require.NotEqual(t, StallActionDisconnect, StallActionDisconnectTimeout)
 	require.NotEqual(t, StallActionDisconnect.String(), StallActionDisconnectTimeout.String())
 }
+
+// TestOnInv_RoundOwnerDoesNotAnswerABlockInvWithGetHeaders pins the fix for a
+// live testnet disconnect (Task 27, 2026-08-26): a block announced by inv while
+// a headers-first round runs drew a second, overlapping getheaders to the peer
+// driving the round. The peer answered both from the same locator with the
+// same 2000 headers, and the second reply failed the no-progress terminator
+// (acceptHeaders), disconnecting an honest sync peer. SVNode has no round and
+// no terminator, so the duplicate is harmless there; here the round owner's own
+// chain of requests reaches the announced block, so the inv answer is redundant
+// for that one peer. Availability is still recorded.
+func TestOnInv_RoundOwnerDoesNotAnswerABlockInvWithGetHeaders(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+
+	owner := fullNodePeer("1.2.3.4:8333")
+	require.Len(t, f.hs.PeerEstablished(owner), 1)
+	require.True(t, owner.State.fSyncStarted)
+	require.True(t, f.hs.IsHeadersFirstMode())
+
+	unknown := chainhash.Hash{0xAB}
+
+	msgs, txHashes, err := f.bd.OnInv(owner, invMsg(t, wire.InvTypeBlock, unknown))
+	require.NoError(t, err)
+	require.Empty(t, msgs, "the round owner's own getheaders chain will reach the block")
+	require.Empty(t, txHashes)
+	require.Equal(t, unknown, owner.State.hashLastUnknownBlock, "availability is still recorded")
+
+	other := fullNodePeer("5.6.7.8:8333")
+
+	msgs, _, err = f.bd.OnInv(other, invMsg(t, wire.InvTypeBlock, unknown))
+	require.NoError(t, err)
+	require.Len(t, msgs, 1, "a peer that does not own the round is answered as before")
+}
+
+// TestCheckStall_RotationDoesNotForgiveTheFrontBlockClock pins the fix for the
+// second Task 27 finding: near the tip a block-withholding peer was re-admitted
+// as a sync peer and rotated every 180 seconds for ever, because rotation's
+// clearPeer zeroed nDownloadingSince and the next re-hand started the
+// per-block timeout from scratch. SVNode never clears that clock short of a
+// disconnect. A rotated peer that is handed blocks again therefore inherits the
+// clock of the request it never answered, so the unconditional timeout
+// accumulates across rotations and eventually disconnects it.
+func TestCheckStall_RotationDoesNotForgiveTheFrontBlockClock(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := f.syncingPeer(t, "1.2.3.4:8333")
+	require.Equal(t, testNow, peer.State.nDownloadingSince)
+
+	rotated := testNow + micros(MaxLastBlockTime) + 1
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
+	require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, rotated))
+	require.Empty(t, peer.State.vBlocksInFlight)
+
+	rehanded := rotated + micros(time.Second)
+	best := f.node(t, 3)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, best, rehanded))
+	require.Equal(t, testNow, peer.State.nDownloadingSince, "the re-hand inherits the unanswered request's clock")
+
+	// Ten minutes after the ORIGINAL request the timeout fires, although only
+	// seven minutes have passed since the re-hand.
+	require.Equal(t, StallActionDisconnectTimeout, f.bd.CheckStall(peer, noIngest, testNow+micros(10*time.Minute)+1))
+}
+
+// TestBlockReceived_ClearsTheCarriedClock: a rotated peer that then DELIVERS
+// has paid its debt; the next batch it is handed starts a fresh clock.
+func TestBlockReceived_ClearsTheCarriedClock(t *testing.T) {
+	f := newDownloadFixture(t, 3)
+	peer := f.syncingPeer(t, "1.2.3.4:8333")
+
+	rotated := testNow + micros(MaxLastBlockTime) + 1
+	require.Equal(t, StallActionNone, f.bd.CheckStall(peer, noIngest, testNow))
+	require.Equal(t, StallActionRotateSyncPeer, f.bd.CheckStall(peer, noIngest, rotated))
+
+	rehanded := rotated + micros(time.Second)
+	best := f.node(t, 3)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, best, rehanded))
+	require.Equal(t, testNow, peer.State.nDownloadingSince)
+
+	delivered := rehanded + micros(time.Second)
+	require.True(t, f.bd.BlockReceived(peer, best.Hash, delivered))
+
+	again := delivered + micros(time.Second)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 2), again))
+	require.Equal(t, again, peer.State.nDownloadingSince, "a delivery clears the carried clock")
+}

@@ -86,6 +86,16 @@ type peerSyncState struct {
 	// queue, so it always measures the block at the head.
 	nDownloadingSince int64
 
+	// nCarriedDownloadingSince holds the nDownloadingSince a sync-peer rotation
+	// cleared while blocks were still owed. SVNode never zeroes the clock short
+	// of a disconnect; legacy rotation (clearRequestedState) does, and on a
+	// re-hand that let a block-withholding peer restart the per-block timeout
+	// every rotation for ever (Task 27 finding 2, 2026-08-26). The next
+	// MarkBlockAsInFlight that opens a batch inherits this clock instead of the
+	// current time; a delivery (BlockReceived) clears it, because a peer that
+	// delivers has paid the debt.
+	nCarriedDownloadingSince int64
+
 	// fSyncStarted mirrors CNodeState::fSyncStarted: whether we've started
 	// headers synchronization with this peer. Populated and consumed by
 	// headers-first sync (Task 5); not touched here.

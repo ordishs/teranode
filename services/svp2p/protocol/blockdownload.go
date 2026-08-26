@@ -835,6 +835,13 @@ func (bd *BlockDownloader) MarkBlockAsInFlight(peer *SyncPeer, block HeaderNode,
 		// block_download_tracker.cpp:46-50: "We're starting a block download
 		// (batch) from this peer."
 		peer.State.nDownloadingSince = nowMicros
+
+		// A rotation does not forgive the clock of a request the peer never
+		// answered: see peerSyncState.nCarriedDownloadingSince.
+		if peer.State.nCarriedDownloadingSince != 0 {
+			peer.State.nDownloadingSince = peer.State.nCarriedDownloadingSince
+			peer.State.nCarriedDownloadingSince = 0
+		}
 	}
 
 	return true
@@ -912,6 +919,9 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash,
 				// already held cannot lengthen the next block's window.
 				state.nDownloadingSince = nowMicros
 			}
+
+			// The peer delivered, so the debt a rotation carried is paid.
+			state.nCarriedDownloadingSince = 0
 
 			state.vBlocksInFlight = append(state.vBlocksInFlight[:i], state.vBlocksInFlight[i+1:]...)
 
@@ -1136,6 +1146,18 @@ func (bd *BlockDownloader) OnInv(peer *SyncPeer, msg *wire.MsgInv) ([]wire.Messa
 			}
 
 			if bd.IsInFlight(inv.Hash) {
+				continue
+			}
+
+			// The peer driving a headers-first round already has a getheaders
+			// chain in flight that will reach this block. Answering the inv
+			// as well duplicates that request; the peer answers both from the
+			// same locator with the same batch, and the second reply fails the
+			// round's no-progress terminator (acceptHeaders) — an honest sync
+			// peer disconnected on every block announced mid-round (Task 27
+			// finding 1, 2026-08-26). SVNode has no round and no terminator,
+			// so it can afford the duplicate; this port cannot.
+			if bd.hs != nil && bd.hs.IsHeadersFirstMode() && peer.State.fSyncStarted {
 				continue
 			}
 
@@ -1557,9 +1579,16 @@ func (bd *BlockDownloader) CheckStall(peer *SyncPeer, ingest IngestSnapshot, now
 
 	// legacy netsync handleCheckSyncPeer: "sync peer %s is stalled due to %s,
 	// updating sync peer" → clearRequestedState then updateSyncPeer.
+	// Carry the front block's clock across the release. Without this, a peer
+	// that withholds blocks near the tip is re-admitted by the sweep, re-handed
+	// blocks and rotated again every maxLastBlockTime, and the per-block
+	// timeout below never accumulates (Task 27 finding 2, 2026-08-26).
+	carried := state.nDownloadingSince
+
 	bd.clearPeer(peer)
 	bd.hs.SyncPeerTimedOut(peer)
 
+	state.nCarriedDownloadingSince = carried
 	state.nLastProgressTime = nowMicros
 
 	return StallActionRotateSyncPeer
