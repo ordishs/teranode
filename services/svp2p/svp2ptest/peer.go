@@ -198,6 +198,7 @@ type ScriptedPeer struct {
 	closed    bool
 	served    int
 	conns_    int
+	dialled   map[net.Conn]bool
 	requested map[chainhash.Hash]int
 }
 
@@ -227,6 +228,7 @@ func NewScriptedPeer(t *testing.T, chain *FixtureChain, netMagic wire.BitcoinNet
 		Script:     script,
 		Transcript: &Transcript{},
 		t:          t,
+		dialled:    make(map[net.Conn]bool),
 		requested:  make(map[chainhash.Hash]int),
 	}
 
@@ -276,6 +278,40 @@ func (p *ScriptedPeer) acceptLoop(ln net.Listener) {
 
 		go p.serve(conn)
 	}
+}
+
+// Dial connects to the node as an INBOUND peer (from the node's point of view)
+// and serves the connection with the same script. The peer keeps its
+// reserved Addr for reporting; the node sees an ephemeral source port.
+func (p *ScriptedPeer) Dial(nodeAddr string) error {
+	conn, err := net.Dial("tcp", nodeAddr)
+	if err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	p.conns = append(p.conns, conn)
+	p.conns_++
+	p.dialled[conn] = true
+	p.mu.Unlock()
+
+	// An inbound peer speaks first.
+	local := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, wire.SFNodeNetwork)
+	version := wire.NewMsgVersion(local, local, uint64(time.Now().UnixNano()), int32(len(p.Chain.Headers))) //nolint:gosec // fixture height is small
+	version.UserAgent = "/Bitcoin SV:1.0.16/"
+	version.Services = wire.SFNodeNetwork
+
+	if p.Script.Version != nil {
+		p.Script.Version(version)
+	}
+
+	if err := p.write(conn, version); err != nil {
+		return err
+	}
+
+	go p.serve(conn)
+
+	return nil
 }
 
 // Close ends every connection and stops listening.
@@ -402,6 +438,20 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 
 		switch m := msg.(type) {
 		case *wire.MsgVersion:
+			p.mu.Lock()
+			weDialled := p.dialled[conn]
+			p.mu.Unlock()
+
+			if weDialled {
+				// We dialled this connection and already sent our version:
+				// answer the node's version with a verack and carry on.
+				if !p.writeAll(conn, append([]wire.Message{wire.NewMsgVerAck()}, p.Script.OnConnect...)) {
+					return
+				}
+
+				continue
+			}
+
 			version := wire.NewMsgVersion(local, remote, uint64(time.Now().UnixNano()), int32(len(p.Chain.Headers))) //nolint:gosec // fixture height is small
 			version.UserAgent = "/Bitcoin SV:1.0.16/"
 			version.Services = wire.SFNodeNetwork

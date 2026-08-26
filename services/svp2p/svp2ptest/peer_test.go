@@ -266,3 +266,27 @@ func TestScriptedPeer_BeforeVersionIsSentAheadOfTheVersion(t *testing.T) {
 	require.Equal(t, "ping", first.Command(), "the scripted message precedes the peer's version")
 	require.Equal(t, "version", c.read(3*time.Second).Command())
 }
+
+// TestScriptedPeer_DialActsAsAnInboundPeer: the peer connects to a listener,
+// sends its version first, and answers the listener's version with a verack.
+func TestScriptedPeer_DialActsAsAnInboundPeer(t *testing.T) {
+	peer, _ := newTestPeer(t, 3, Script{})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	require.NoError(t, peer.Dial(ln.Addr().String()))
+
+	conn, err := ln.Accept()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	c := &rawClient{t: t, conn: conn, net: peer.Net}
+	require.Equal(t, "version", c.read(3*time.Second).Command(), "an inbound peer speaks first")
+
+	me := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, 0)
+	c.write(wire.NewMsgVersion(me, me, 1, 0))
+	require.Equal(t, "verack", c.read(3*time.Second).Command())
+	require.Equal(t, 1, peer.Connections())
+}

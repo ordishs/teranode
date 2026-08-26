@@ -49,6 +49,8 @@ type nodeUnderTest struct {
 	Impl     Impl
 	Logger   *svp2ptest.RecordingLogger
 	Settings *settings.Settings
+	// PeerListen is the node's P2P listen address, for inbound scripted peers.
+	PeerListen string
 
 	blockchainStore blockchain_store.Store
 	svc             service
@@ -56,6 +58,8 @@ type nodeUnderTest struct {
 
 	// scores is filled by a scenario's Drive from a scoreSampler, for Observe.
 	scores map[string]int
+	// notes is filled by a scenario's Drive for Observe.
+	notes map[string]string
 }
 
 var nodeCounter atomic.Uint64
@@ -80,7 +84,10 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Context = fmt.Sprintf("%s-parity-%s-%d", tSettings.Context, impl, nodeCounter.Add(1))
-	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
+	// A fixed loopback port rather than :0, so scripted peers can DIAL the node
+	// (inbound peers are what addr relay and self-advertisement act on).
+	peerListen := svp2ptest.FreePort(t)
+	tSettings.Legacy.ListenAddresses = []string{peerListen}
 	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.Legacy.ConnectPeers = connectPeers
@@ -186,7 +193,7 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 		t.Fatalf("%s did not become ready", impl)
 	}
 
-	n := &nodeUnderTest{Impl: impl, Logger: logger, Settings: tSettings, blockchainStore: blockchainStore, svc: svc, cancel: cancel}
+	n := &nodeUnderTest{Impl: impl, Logger: logger, Settings: tSettings, PeerListen: peerListen, blockchainStore: blockchainStore, svc: svc, cancel: cancel}
 
 	t.Cleanup(n.Stop)
 
