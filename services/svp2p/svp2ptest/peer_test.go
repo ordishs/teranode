@@ -221,3 +221,23 @@ func TestScriptedPeer_ServeLimitScript(t *testing.T) {
 	require.Equal(t, 2, peer.ServedBlocks())
 	require.Equal(t, 4, peer.RequestedCount())
 }
+
+// Legacy netsync on a chain without checkpoints (regtest) syncs by getblocks →
+// inv → getdata, so the peer must answer getblocks with the block inventory
+// after the locator, capped at MaxBlocksPerMsg.
+func TestScriptedPeer_HonestGetBlocksAnswersInv(t *testing.T) {
+	peer, chain := newTestPeer(t, 12, Script{})
+	c := dialScripted(t, peer)
+
+	m := wire.NewMsgGetBlocks(&chainhash.Hash{})
+	m.ProtocolVersion = wire.ProtocolVersion
+	locator := chain.Headers[2].BlockHash() // height 3
+	require.NoError(t, m.AddBlockLocatorHash(&locator))
+	c.write(m)
+
+	inv := c.readUntil("inv", 3*time.Second).(*wire.MsgInv)
+	require.Len(t, inv.InvList, 9, "heights 4..12")
+	require.Equal(t, wire.InvTypeBlock, inv.InvList[0].Type)
+	require.Equal(t, chain.Headers[3].BlockHash(), inv.InvList[0].Hash)
+	require.Equal(t, chain.Tip(), inv.InvList[8].Hash)
+}

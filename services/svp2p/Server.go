@@ -187,6 +187,15 @@ func NewWithDeps(logger ulogger.Logger, tSettings *settings.Settings, blockchain
 	return srv
 }
 
+// SetSyncClocks narrows the sync tick and the sync-peer rotation window. It is
+// test support for the parity harness and the integration tests, which need
+// the 180 second rotation and the one second tick brought down to what a test
+// can wait for; the daemon never calls it. Zero keeps the default for either.
+func (s *Server) SetSyncClocks(tick, maxLastBlockTime time.Duration) {
+	s.syncTick = tick
+	s.maxLastBlockTime = maxLastBlockTime
+}
+
 func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	if checkLiveness {
 		return http.StatusOK, "OK", nil

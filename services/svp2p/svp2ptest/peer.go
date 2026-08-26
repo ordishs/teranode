@@ -98,6 +98,10 @@ type Script struct {
 	// OnGetData answers a getdata. The default serves every known block.
 	// Returning nil sends nothing, which is how a peer withholds blocks.
 	OnGetData func(p *ScriptedPeer, m *wire.MsgGetData) []wire.Message
+	// OnGetBlocks answers a getblocks. The default sends the inv of blocks
+	// after the locator, which is how legacy netsync syncs a chain without
+	// checkpoints (regtest).
+	OnGetBlocks func(p *ScriptedPeer, m *wire.MsgGetBlocks) []wire.Message
 	// OnGetAddr answers a getaddr. The default sends nothing.
 	OnGetAddr func(p *ScriptedPeer, m *wire.MsgGetAddr) []wire.Message
 	// WriteDelay is waited before each outbound message; nil means none.
@@ -356,7 +360,7 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 		switch m := msg.(type) {
 		case *wire.MsgVersion:
 			version := wire.NewMsgVersion(local, remote, uint64(time.Now().UnixNano()), int32(len(p.Chain.Headers))) //nolint:gosec // fixture height is small
-			version.UserAgent = "/svp2p-scripted-peer:1.0/"
+			version.UserAgent = "/Bitcoin SV:1.0.16/"
 			version.Services = wire.SFNodeNetwork
 
 			if p.Script.Version != nil {
@@ -400,6 +404,18 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 				out = p.Script.OnGetData(p, m)
 			} else {
 				out = p.blocksFor(m)
+			}
+
+			if !p.writeAll(conn, out) {
+				return
+			}
+
+		case *wire.MsgGetBlocks:
+			var out []wire.Message
+			if p.Script.OnGetBlocks != nil {
+				out = p.Script.OnGetBlocks(p, m)
+			} else {
+				out = []wire.Message{p.InvFor(m)}
 			}
 
 			if !p.writeAll(conn, out) {
@@ -463,4 +479,39 @@ func (p *ScriptedPeer) HeadersFor(msg *wire.MsgGetHeaders) *wire.MsgHeaders {
 	}
 
 	return headers
+}
+
+// InvFor is the honest getblocks answer: the inventory of up to MaxBlocksPerMsg
+// blocks after the first locator hash the chain knows, stopping at HashStop.
+func (p *ScriptedPeer) InvFor(msg *wire.MsgGetBlocks) *wire.MsgInv {
+	start := int32(0)
+
+	for _, hash := range msg.BlockLocatorHashes {
+		if hash == nil {
+			continue
+		}
+
+		if height, known := p.Chain.Heights[*hash]; known {
+			start = height
+			break
+		}
+	}
+
+	inv := wire.NewMsgInv()
+
+	for i := start; i < int32(len(p.Chain.Headers)); i++ { //nolint:gosec // fixture height is small
+		if len(inv.InvList) == wire.MaxBlocksPerMsg {
+			break
+		}
+
+		hash := p.Chain.Headers[i].BlockHash()
+
+		_ = inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash))
+
+		if msg.HashStop != (chainhash.Hash{}) && hash == msg.HashStop {
+			break
+		}
+	}
+
+	return inv
 }
