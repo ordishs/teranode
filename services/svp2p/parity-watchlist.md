@@ -58,6 +58,14 @@ cannot show how often that holds against real peers.
 - **Pass:** election quality is no worse than legacy's ranking over the corpus.
   Upgrade to a ranking only if the harness shows poor picks; do not pre-empt it.
 
+
+**Verdict 2026-08-26 (`TestParity_SyncPeerElectionOrder`, peers claiming 10/200/50
+over a 60-block chain):** legacy downloads all 60 blocks from the peer it ranked
+tallest and nothing from the others; svp2p asks whichever candidate the sweep
+meets first and then spreads the window over every useful peer (16/26/18). Both
+reach the tip in ~12 s. Election quality is moot for svp2p's download because
+download does not follow election; no ranking needed.
+
 ## 3. Unrequested-headers policy score
 
 **Task 11 (9be584555).**
@@ -71,6 +79,15 @@ too high fragments connectivity against honest peers that batch differently.
 - **Observe:** accumulated misbehavior score per honest peer over a full IBD.
 - **Pass:** no honest peer reaches `banScoreThreshold` (100). Any honest peer
   that does means the value is wrong.
+
+
+**Verdict 2026-08-26 (`TestParity_UnsolicitedHeadersScore`):** the non-elected
+peer pushes one unsolicited 2000-header batch and five announcement-sized
+batches while the round runs. svp2p keeps the peer with a score ≤ 20 (on this
+rig the push landed after the 2040-header round had already closed, so the
+observed score was 0; the 20 for a bulk batch mid-round is pinned by the unit
+tests); legacy disconnects the peer for "unrequested headers". No honest shape
+approaches the threshold.
 
 ## 4. Ban and misbehavior score parity across every handler
 
@@ -136,6 +153,12 @@ nor dropped — ledger carried residual 15. Also found while building the rig:
 legacy rejects and BANS any peer whose user agent lacks "Bitcoin SV"/"BSV"
 (`peer_server.go:617`); svp2p has no such fence — scenario 12 below.
 
+
+**Update 2026-08-26 (later the same day):** the invalid-body gap is CLOSED —
+`createTxMap` now judges a missing or second coinbase as a block failure before
+any transaction reaches the validator (91673dd66), and the row asserts svp2p's
+DoS(100) and disconnect.
+
 ## 5. Multi-peer download distribution
 
 **Tasks 3-7, 6b.**
@@ -170,6 +193,12 @@ five times here under a slow in-process ingest. Wall clock: legacy 40 s–2m40s
 costs a 180 s rotation), svp2p 51–67 s. The row pins the multiplier as a KNOWN
 GAP; the rule-derived bound a fix must meet is in the test.
 
+**Update 2026-08-26 (later the same day): CLOSED.** Orphan-block retention
+(648f05a8a) spools a block that arrives before its parent into the TempStore and
+ingests it when the parent lands; duplicate fetches on this scenario fell from
+1,116 to **0**, svp2p 43 s beside legacy's 40 s. The row now asserts the
+rule-derived bound.
+
 ---
 
 ## Phase 3 divergences worth observing at the same time
@@ -192,6 +221,12 @@ headers per message as fast as we serve them.
   or later. Note Task 10 added a raw send lane to `transport.Conn`; check whether
   queue depth is now cheap to read.
 
+
+**Verdict 2026-08-26 (`TestParity_GetHeadersFlood`, 300 getheaders in a burst):**
+both answer all 300, keep the connection, and show no heap growth (GC-adjusted
+delta negative on both). No flood guard needed at this rate; the send-queue depth
+SVNode measures is still not exposed.
+
 ### 7. No unsolicited self-advertisement
 
 SVNode advertises its local address to outbound peers unprompted
@@ -200,6 +235,11 @@ This port advertises only inside a `getaddr` reply, which is legacy's shape. A
 node that never self-advertises is less discoverable.
 
 - **Observe:** how many peers learn our address over a session, versus SVNode.
+
+
+**Verdict 2026-08-26 (`TestParity_NoUnsolicitedSelfAdvertisement`):** over 8 s
+after handshake with no getaddr, legacy sent 0 addr, svp2p sent 0 addr; SVNode
+would send its own address once. Documented divergence, both sides alike.
 
 ### 8. Cold-start bootstrap
 
@@ -214,6 +254,11 @@ peer.
 - **Pass:** this is expected to FAIL today. It is an owner decision, not a bug —
   record the behavior so the decision is made on evidence.
 
+
+**Verdict 2026-08-26 (`TestParity_ColdStartBootstrap`):** with no configured
+peers both sides hold 0 connections after 10 s (regtest legacy has no seeds
+either). Expected FAIL, recorded; the owner decision stands.
+
 ### 9. Blocks at and over the 4 GiB envelope
 
 A block a basic message header cannot declare is answered `notfound`
@@ -224,6 +269,11 @@ so never has this branch.
 - **Script:** a peer requesting a block above the envelope.
 - **Observe:** `notfound` plus the log line, and that the connection survives.
 - **Pass:** interop gap confirmed and bounded, not a crash or a stall.
+
+
+**Verdict 2026-08-26: NOT ADJUDICABLE IN-PROCESS.** The `notfound` branch fires
+on a block whose declared size exceeds the basic envelope, which needs a real
+block above 4 GiB in the node's store. Needs a fat-block rig; carried.
 
 ### 10. Inv-driven getheaders amplification
 
@@ -249,6 +299,13 @@ test, is the right place to judge it.
   together with scenario 6 — that one guards what a peer can make us SERVE, this
   one guards what a peer can make us ASK.
 
+
+**Verdict 2026-08-26 (`TestParity_InvGetHeadersAmplification`, 500 fabricated
+hashes):** svp2p drew exactly 500 getheaders (SVNode-identical); legacy drew 0
+getheaders and instead sent a block GETDATA per hash (520 block requests) — the
+bsvd shape. Neither side dropped the peer. Amplification is bounded by
+`MaxInvPerMsg` on both; recorded, no change.
+
 ### 11. Addr forwarding widths
 
 Task 18 ported `RelayAddress` (`net_processing.cpp:998-1041`) including the
@@ -258,6 +315,14 @@ against — only SVNode.
 
 - **Observe:** how many peers each received addr is forwarded to, against SVNode
   on the same input.
+
+
+**Verdict 2026-08-26 (`TestParity_AddrForwardingWidths`):** an outbound peer
+announces one fresh routable address; svp2p forwards it to **2** of the inbound
+peers (the reachable width, net_processing.cpp:1000), legacy to 0. Note the
+gate: svp2p accepts an unrequested addr from an INBOUND peer only when it is
+that peer's own address (addrrelay.go processAddrEntries), so the sender must be
+outbound to exercise forwarding.
 
 ### 12. User-agent fence
 
@@ -270,3 +335,7 @@ fence either. Found 2026-08-26 when the harness's scripted peer, announcing
 - **Observe:** which agents connect to each over a testnet session.
 - **Pass:** an owner decision — carry legacy's fence into svp2p, or drop it at
   cutover as a Teranode-only policy with no SVNode counterpart.
+
+**Verdict 2026-08-26 (`TestParity_UserAgentFence`):** legacy rejects and bans a
+peer announcing `/scriptpeer:0.1/`; svp2p accepts it and syncs from it. Pinned;
+owner decision at cutover.
