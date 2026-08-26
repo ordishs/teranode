@@ -1,36 +1,22 @@
 package svp2p
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"net"
 	"net/url"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
-	"github.com/bsv-blockchain/go-wire"
-	"github.com/bsv-blockchain/teranode/model"
-	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
-	"github.com/bsv-blockchain/teranode/services/blockvalidation"
-	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
+	"github.com/bsv-blockchain/teranode/services/svp2p/svp2ptest"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
-	"github.com/bsv-blockchain/teranode/stores/blob"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
-	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
-	"github.com/bsv-blockchain/teranode/ulogger"
-	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
@@ -39,428 +25,8 @@ import (
 // Loggers
 // ---------------------------------------------------------------------------
 
-// recordingLogger keeps every formatted Warnf and Infof line so a test can
-// assert on a decision the production code already logs, without adding any
-// new production surface. It is the same technique protocol/manager_test.go
-// uses for the self-connection disconnect reason.
-type recordingLogger struct {
-	ulogger.TestLogger
-
-	mu    sync.Mutex
-	lines []string
-}
-
-func (l *recordingLogger) record(format string, args ...interface{}) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.lines = append(l.lines, fmt.Sprintf(format, args...))
-}
-
-func (l *recordingLogger) Warnf(format string, args ...interface{}) { l.record(format, args...) }
-
-func (l *recordingLogger) Infof(format string, args ...interface{}) { l.record(format, args...) }
-
-func (l *recordingLogger) Errorf(format string, args ...interface{}) { l.record(format, args...) }
-
-func (l *recordingLogger) Debugf(format string, args ...interface{}) { l.record(format, args...) }
-
-// dump prints what the node logged, so a failing leg is diagnosable from the
-// test output alone.
-func (l *recordingLogger) dump(t *testing.T) {
-	t.Helper()
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	for _, line := range l.lines {
-		t.Log(line)
-	}
-}
-
-func (l *recordingLogger) contains(substr string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	for _, line := range l.lines {
-		if strings.Contains(line, substr) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// ---------------------------------------------------------------------------
-// Chain fixture: a run of regtest coinbase-only blocks the real pipeline
-// accepts (valid proof of work under the regtest limit, BIP34 coinbase, merkle
-// root = the coinbase txid, which is what a single-transaction block's root is).
-// ---------------------------------------------------------------------------
-
-type fixtureChain struct {
-	headers []*wire.BlockHeader // headers[i] is at height i+1
-	blocks  map[chainhash.Hash]*wire.MsgBlock
-	heights map[chainhash.Hash]int32 // includes genesis at height 0
-}
-
-func (c *fixtureChain) tip() chainhash.Hash { return c.headers[len(c.headers)-1].BlockHash() }
-
-func buildFixtureChain(t *testing.T, tSettings *settings.Settings, count int) *fixtureChain {
-	t.Helper()
-
-	privKey, err := bec.NewPrivateKey()
-	require.NoError(t, err)
-
-	address, err := bscript.NewAddressFromPublicKey(privKey.PubKey(), true)
-	require.NoError(t, err)
-
-	genesis := tSettings.ChainCfgParams.GenesisBlock.Header
-	genesisHash := genesis.BlockHash()
-
-	chain := &fixtureChain{
-		blocks:  make(map[chainhash.Hash]*wire.MsgBlock, count),
-		heights: map[chainhash.Hash]int32{genesisHash: 0},
-	}
-
-	bits, err := model.NewNBitFromString(fmt.Sprintf("%08x", genesis.Bits))
-	require.NoError(t, err)
-
-	prevHash := genesisHash
-	// Headers are spaced ten minutes apart, and a block more than two hours in
-	// the future is rejected. Starting the run far enough back that its LAST
-	// header still lands in the past keeps that rule out of the way however
-	// long the fixture chain is.
-	baseTime := time.Now().Add(-time.Duration(count+2) * 10 * time.Minute).Unix()
-
-	for i := 0; i < count; i++ {
-		height := uint32(i + 1) //nolint:gosec // test heights are small
-
-		coinbase, cbErr := model.CreateCoinbase(height, 50e8, "svp2p sync test", []string{address.AddressString})
-		require.NoError(t, cbErr)
-
-		merkleRoot := coinbase.TxIDChainHash()
-		prev := prevHash
-
-		modelHeader := &model.BlockHeader{
-			Version:        0x20000000,
-			HashPrevBlock:  &prev,
-			HashMerkleRoot: merkleRoot,
-			Timestamp:      uint32(baseTime + int64(i)*600), //nolint:gosec // test timestamps are in range
-			Bits:           *bits,
-		}
-
-		for {
-			ok, _, _ := modelHeader.HasMetTargetDifficulty()
-			if ok {
-				break
-			}
-
-			modelHeader.Nonce++
-		}
-
-		wireHeader := &wire.BlockHeader{}
-		require.NoError(t, wireHeader.Deserialize(bytes.NewReader(modelHeader.Bytes())))
-
-		coinbaseWire := wire.NewMsgTx(1)
-		require.NoError(t, coinbaseWire.Deserialize(bytes.NewReader(coinbase.Bytes())))
-
-		block := wire.NewMsgBlock(wireHeader)
-		require.NoError(t, block.AddTransaction(coinbaseWire))
-
-		hash := wireHeader.BlockHash()
-		require.Equal(t, *modelHeader.Hash(), hash, "the wire header must round-trip the mined model header")
-
-		chain.headers = append(chain.headers, wireHeader)
-		chain.blocks[hash] = block
-		chain.heights[hash] = int32(height) //nolint:gosec // test heights are small
-
-		prevHash = hash
-	}
-
-	return chain
-}
-
-// ---------------------------------------------------------------------------
-// Scripted serving peer: raw go-wire over TCP. It listens, so the svp2p server
-// reaches it through Legacy.ConnectPeers exactly as it reaches a real node.
-// ---------------------------------------------------------------------------
-
-type scriptedServingPeer struct {
-	t     *testing.T
-	chain *fixtureChain
-	net   wire.BitcoinNet
-	addr  string
-
-	mu         sync.Mutex
-	ln         net.Listener
-	conns      []net.Conn
-	served     int
-	serveLimit int // negative means "serve everything"
-	closed     bool
-
-	// requested is every block hash this peer has been asked for, whether or
-	// not it answered. It is what lets a leg see a parallel fetch: the same
-	// hash asked of two peers is the race, and no log line is needed to
-	// observe it.
-	requested map[chainhash.Hash]int
-}
-
-// newScriptedServingPeer reserves an address and, when listen is true, starts
-// serving on it immediately. A peer created with listen false holds the
-// address only; Listen starts it later, which is how the stall test brings a
-// second peer up after the first has already stalled.
-func newScriptedServingPeer(t *testing.T, chain *fixtureChain, netMagic wire.BitcoinNet, serveLimit int, listen bool) *scriptedServingPeer {
-	t.Helper()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	addr := ln.Addr().String()
-
-	p := &scriptedServingPeer{
-		t:          t,
-		chain:      chain,
-		net:        netMagic,
-		addr:       addr,
-		serveLimit: serveLimit,
-		requested:  make(map[chainhash.Hash]int),
-	}
-
-	require.NoError(t, ln.Close())
-
-	if listen {
-		p.Listen()
-	}
-
-	t.Cleanup(p.Close)
-
-	return p
-}
-
-func (p *scriptedServingPeer) Listen() {
-	p.t.Helper()
-
-	ln, err := net.Listen("tcp", p.addr)
-	require.NoError(p.t, err)
-
-	p.mu.Lock()
-	p.ln = ln
-	p.mu.Unlock()
-
-	go p.acceptLoop(ln)
-}
-
-func (p *scriptedServingPeer) acceptLoop(ln net.Listener) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			_ = conn.Close()
-
-			return
-		}
-
-		p.conns = append(p.conns, conn)
-		p.mu.Unlock()
-
-		go p.serve(conn)
-	}
-}
-
-// Close stops the listener and drops every connection, which is how the test
-// makes a stalling peer go away for good.
-func (p *scriptedServingPeer) Close() {
-	p.mu.Lock()
-
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-
-	p.closed = true
-	ln := p.ln
-	conns := p.conns
-	p.conns = nil
-	p.ln = nil
-	p.mu.Unlock()
-
-	if ln != nil {
-		_ = ln.Close()
-	}
-
-	for _, conn := range conns {
-		_ = conn.Close()
-	}
-}
-
-// wasRequested reports whether this peer has been asked for hash.
-func (p *scriptedServingPeer) wasRequested(hash chainhash.Hash) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.requested[hash] > 0
-}
-
-// requestedCount reports how many distinct blocks this peer has been asked for.
-func (p *scriptedServingPeer) requestedCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return len(p.requested)
-}
-
-// recordRequest notes that this peer was asked for hash.
-func (p *scriptedServingPeer) recordRequest(hash chainhash.Hash) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.requested[hash]++
-}
-
-func (p *scriptedServingPeer) servedCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.served
-}
-
-// claimServe reports whether this peer will answer one more getdata entry.
-func (p *scriptedServingPeer) claimServe() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.serveLimit >= 0 && p.served >= p.serveLimit {
-		return false
-	}
-
-	p.served++
-
-	return true
-}
-
-func (p *scriptedServingPeer) write(conn net.Conn, msg wire.Message) error {
-	_, err := wire.WriteMessageWithEncodingN(conn, msg, wire.ProtocolVersion, p.net, wire.BaseEncoding)
-	return err
-}
-
-func (p *scriptedServingPeer) serve(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
-
-	local := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, wire.SFNodeNetwork)
-	remote := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, wire.SFNodeNetwork)
-
-	for {
-		_, msg, _, err := wire.ReadMessageWithEncodingN(conn, wire.ProtocolVersion, p.net, wire.BaseEncoding)
-		if err != nil {
-			return
-		}
-
-		switch m := msg.(type) {
-		case *wire.MsgVersion:
-			// The inbound side answers with its own version, then verack and
-			// protoconf, which is the order net_processing.cpp uses.
-			version := wire.NewMsgVersion(local, remote, uint64(time.Now().UnixNano()), int32(len(p.chain.headers))) //nolint:gosec // fixture height is small
-			version.UserAgent = "/svp2p-scripted-peer:1.0/"
-			version.Services = wire.SFNodeNetwork
-
-			if p.write(conn, version) != nil {
-				return
-			}
-
-			if p.write(conn, wire.NewMsgVerAck()) != nil {
-				return
-			}
-
-			if p.write(conn, wire.NewMsgProtoconf(wire.DefaultMaxRecvPayloadLength, true)) != nil {
-				return
-			}
-
-		case *wire.MsgPing:
-			if p.write(conn, wire.NewMsgPong(m.Nonce)) != nil {
-				return
-			}
-
-		case *wire.MsgGetHeaders:
-			if p.write(conn, p.headersFor(m)) != nil {
-				return
-			}
-
-		case *wire.MsgGetData:
-			for _, inv := range m.InvList {
-				if inv == nil || inv.Type != wire.InvTypeBlock {
-					continue
-				}
-
-				block, known := p.chain.blocks[inv.Hash]
-				if !known {
-					continue
-				}
-
-				// Recorded before the serve limit is consulted: being ASKED is
-				// the event a race is visible in, and a peer that never answers
-				// must still show what it was asked for.
-				p.recordRequest(inv.Hash)
-
-				if !p.claimServe() {
-					// The stall: the peer keeps the connection up and simply
-					// stops answering for the blocks it was asked for.
-					continue
-				}
-
-				if p.write(conn, block) != nil {
-					return
-				}
-			}
-		}
-	}
-}
-
-// headersFor answers a getheaders from the first locator hash this peer knows,
-// which is the same rule a real node applies.
-func (p *scriptedServingPeer) headersFor(msg *wire.MsgGetHeaders) *wire.MsgHeaders {
-	start := int32(0)
-
-	for _, hash := range msg.BlockLocatorHashes {
-		if hash == nil {
-			continue
-		}
-
-		if height, known := p.chain.heights[*hash]; known {
-			start = height
-			break
-		}
-	}
-
-	headers := wire.NewMsgHeaders()
-
-	for i := start; i < int32(len(p.chain.headers)); i++ {
-		if len(headers.Headers) == wire.MaxBlockHeadersPerMsg {
-			break
-		}
-
-		header := p.chain.headers[i]
-
-		_ = headers.AddBlockHeader(header)
-
-		if msg.HashStop != (chainhash.Hash{}) && header.BlockHash() == msg.HashStop {
-			break
-		}
-	}
-
-	return headers
-}
-
-// ---------------------------------------------------------------------------
-// Harness: a real svp2p Server with the real ingestion pipeline behind it.
-// ---------------------------------------------------------------------------
-
 type syncHarness struct {
-	logger          *recordingLogger
+	logger          *svp2ptest.RecordingLogger
 	blockchainStore blockchain_store.Store
 	server          *Server
 }
@@ -481,20 +47,20 @@ func newSyncHarness(t *testing.T, name string, connectPeers []string, maxLastBlo
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	logger := &recordingLogger{}
+	logger := &svp2ptest.RecordingLogger{}
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Context = fmt.Sprintf("%s-svp2psync-%s-%d", tSettings.Context, name, syncHarnessCounter.Add(1))
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.Legacy.ConnectPeers = connectPeers
 	tSettings.GRPCAdminAPIKey = "test-admin-key"
-	tSettings.BlockAssembly.GRPCListenAddress = freePort(t)
+	tSettings.BlockAssembly.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.BlockAssembly.GRPCAddress = tSettings.BlockAssembly.GRPCListenAddress
-	tSettings.SubtreeValidation.GRPCListenAddress = freePort(t)
+	tSettings.SubtreeValidation.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.SubtreeValidation.GRPCAddress = tSettings.SubtreeValidation.GRPCListenAddress
-	tSettings.BlockValidation.GRPCListenAddress = freePort(t)
+	tSettings.BlockValidation.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.BlockValidation.GRPCAddress = tSettings.BlockValidation.GRPCListenAddress
 
 	// blockchain.LocalClient answers SetBlockSubtreesSet straight from the
@@ -532,15 +98,15 @@ func newSyncHarness(t *testing.T, name string, connectPeers []string, maxLastBlo
 	// here for real, in process, on their own loopback ports — the same
 	// constructors and clients daemon_services.go uses. Nothing about the
 	// pipeline is stubbed: what is removed is the network between processes.
-	blockAssemblyClient := startBlockAssembly(ctx, t, logger, tSettings, txStore, subtreeStore, utxoStore, blockchainClient)
+	blockAssemblyClient := svp2ptest.StartBlockAssembly(ctx, t, logger, tSettings, txStore, subtreeStore, utxoStore, blockchainClient)
 
 	validatorClient, err := validator.New(ctx, logger, tSettings, utxoStore, nil, nil, nil, blockAssemblyClient, blockchainClient)
 	require.NoError(t, err)
 
-	subtreeValidationClient := startSubtreeValidation(ctx, t, tSettings.Context, logger, tSettings, subtreeStore,
+	subtreeValidationClient := svp2ptest.StartSubtreeValidation(ctx, t, tSettings.Context, logger, tSettings, subtreeStore,
 		txStore, utxoStore, validatorClient, blockchainClient)
 
-	blockValidationClient := startBlockValidation(ctx, t, tSettings.Context, logger, tSettings, subtreeStore, txStore,
+	blockValidationClient := svp2ptest.StartBlockValidation(ctx, t, tSettings.Context, logger, tSettings, subtreeStore, txStore,
 		utxoStore, validatorClient, blockchainClient, blockAssemblyClient)
 
 	server := NewWithDeps(logger, tSettings, blockchainClient, Deps{
@@ -597,7 +163,7 @@ func (h *syncHarness) waitForHeight(t *testing.T, height uint32, timeout time.Du
 
 	_, got := h.bestBlock(t)
 
-	h.logger.dump(t)
+	h.logger.Dump(t)
 	t.Fatalf("%s: the blockchain store reached height %d, wanted %d", what, got, height)
 }
 
@@ -615,7 +181,7 @@ func (h *syncHarness) waitFor(t *testing.T, cond func() bool, timeout time.Durat
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	h.logger.dump(t)
+	h.logger.Dump(t)
 	t.Fatal(what)
 }
 
@@ -641,116 +207,6 @@ func (h *syncHarness) bestBlock(t *testing.T) (chainhash.Hash, uint32) {
 // gRPC port. Deps.BlockAssembly is a *blockassembly.Client, so the ingestion
 // path's WaitForBlockAssemblyReady gate can only be satisfied honestly by a
 // service that actually answers GetBlockAssemblyState.
-func startBlockAssembly(ctx context.Context, t *testing.T, logger ulogger.Logger, tSettings *settings.Settings,
-	txStore, subtreeStore blob.Store, utxoStore utxo.Store, blockchainClient blockchain.ClientI) *blockassembly.Client {
-	t.Helper()
-
-	ba := blockassembly.New(logger, tSettings, txStore, utxoStore, subtreeStore, blockchainClient)
-	require.NoError(t, ba.Init(ctx))
-
-	readyCh := make(chan struct{})
-
-	go func() { _ = ba.Start(ctx, readyCh) }()
-
-	select {
-	case <-readyCh:
-	case <-time.After(30 * time.Second):
-		t.Fatal("block assembly did not become ready")
-	}
-
-	client, err := blockassembly.NewClient(ctx, logger, tSettings)
-	require.NoError(t, err)
-
-	return client
-}
-
-// inMemoryConsumer builds a real KafkaConsumerGroup over the in-memory broker,
-// which is what the repo's testing rules ask for instead of a Kafka mock.
-func inMemoryConsumer(t *testing.T, logger ulogger.Logger, topic, group string) *kafka.KafkaConsumerGroup {
-	t.Helper()
-
-	consumer, err := kafka.NewKafkaConsumerGroup(kafka.KafkaConsumerConfig{
-		Logger:          logger,
-		URL:             &url.URL{Scheme: "memory", Host: "svp2p-sync-test", Path: "/" + topic},
-		Topic:           topic,
-		Partitions:      1,
-		ConsumerGroupID: group,
-	})
-	require.NoError(t, err)
-
-	return consumer
-}
-
-// startSubtreeValidation runs the real subtree validation service in-process
-// and returns the real gRPC client for it, which is what Deps.SubtreeValidation
-// carries in the daemon.
-func startSubtreeValidation(ctx context.Context, t *testing.T, name string, logger ulogger.Logger,
-	tSettings *settings.Settings, subtreeStore, txStore blob.Store, utxoStore utxo.Store,
-	validatorClient validator.Interface, blockchainClient blockchain.ClientI) subtreevalidation.Interface {
-	t.Helper()
-
-	server, err := subtreevalidation.New(ctx, logger, tSettings, subtreeStore, txStore, utxoStore, validatorClient,
-		blockchainClient,
-		inMemoryConsumer(t, logger, "subtree-"+name, "svp2p-sync-subtree-"+name),
-		inMemoryConsumer(t, logger, "txmeta-"+name, "svp2p-sync-txmeta-"+name),
-		nil, nil)
-	require.NoError(t, err)
-	require.NoError(t, server.Init(ctx))
-
-	readyCh := make(chan struct{})
-
-	go func() { _ = server.Start(ctx, readyCh) }()
-
-	waitReady(t, readyCh, "subtree validation")
-
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
-
-	client, err := subtreevalidation.NewClient(ctx, logger, tSettings, "svp2p-sync-test")
-	require.NoError(t, err)
-
-	return client
-}
-
-// startBlockValidation runs the real block validation service in-process and
-// returns the real gRPC client for it. It must start after subtree validation:
-// blockvalidation Server.Init dials that service.
-func startBlockValidation(ctx context.Context, t *testing.T, name string, logger ulogger.Logger,
-	tSettings *settings.Settings, subtreeStore, txStore blob.Store, utxoStore utxo.Store,
-	validatorClient validator.Interface, blockchainClient blockchain.ClientI,
-	blockAssemblyClient *blockassembly.Client) blockvalidation.Interface {
-	t.Helper()
-
-	server := blockvalidation.New(logger, tSettings, subtreeStore, txStore, utxoStore, validatorClient,
-		blockchainClient, inMemoryConsumer(t, logger, "blocks-"+name, "svp2p-sync-blocks-"+name),
-		blockAssemblyClient, nil)
-	require.NoError(t, server.Init(ctx))
-
-	readyCh := make(chan struct{})
-
-	go func() { _ = server.Start(ctx, readyCh) }()
-
-	waitReady(t, readyCh, "block validation")
-
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
-
-	client, err := blockvalidation.NewClient(ctx, logger, tSettings, "svp2p-sync-test")
-	require.NoError(t, err)
-
-	return client
-}
-
-func waitReady(t *testing.T, readyCh <-chan struct{}, what string) {
-	t.Helper()
-
-	select {
-	case <-readyCh:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("%s did not become ready", what)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Tests
 // ---------------------------------------------------------------------------
 
 const syncTestChainLength = 20
@@ -765,18 +221,18 @@ func TestIntegrationHeadersFirstSyncFromScriptedPeer(t *testing.T) {
 		"the chain must be longer than one getdata batch, or the second scheduling round is never exercised")
 
 	tSettings := test.CreateBaseTestSettings(t)
-	chain := buildFixtureChain(t, tSettings, syncTestChainLength)
+	chain := svp2ptest.BuildFixtureChain(t, tSettings, syncTestChainLength)
 
-	peer := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, true)
+	peer := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.Script{}, true)
 
-	h := newSyncHarness(t, "happy", []string{peer.addr}, 0)
+	h := newSyncHarness(t, "happy", []string{peer.Addr}, 0)
 	h.start(t)
 
 	h.waitForHeight(t, uint32(syncTestChainLength), 60*time.Second, "headers-first sync")
 
 	hash, height := h.bestBlock(t)
 	require.Equal(t, uint32(syncTestChainLength), height)
-	require.Equal(t, chain.tip(), hash, "the node's best block must be the scripted chain's tip")
+	require.Equal(t, chain.Tip(), hash, "the node's best block must be the scripted chain's tip")
 }
 
 // TestIntegrationSyncPeerRotationRecoversFromAStalledPeer covers the
@@ -793,16 +249,16 @@ func TestIntegrationHeadersFirstSyncFromScriptedPeer(t *testing.T) {
 // rather than left to inference.
 func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
-	chain := buildFixtureChain(t, tSettings, syncTestChainLength)
+	chain := svp2ptest.BuildFixtureChain(t, tSettings, syncTestChainLength)
 
-	stalled := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, syncTestChainLength/2, true)
-	replacement := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, false)
+	stalled := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.ServeLimit(syncTestChainLength/2), true)
+	replacement := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.Script{}, false)
 
-	h := newSyncHarness(t, "stall", []string{stalled.addr, replacement.addr}, 3*time.Second)
+	h := newSyncHarness(t, "stall", []string{stalled.Addr, replacement.Addr}, 3*time.Second)
 	h.start(t)
 
 	// The stalling peer delivers its half first, and then nothing.
-	h.waitFor(t, func() bool { return stalled.servedCount() == syncTestChainLength/2 },
+	h.waitFor(t, func() bool { return stalled.ServedBlocks() == syncTestChainLength/2 },
 		60*time.Second, "the stalling peer never delivered its half of the chain")
 
 	h.waitFor(t, func() bool {
@@ -816,9 +272,9 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	// whole formatted line rather than two loose substrings is what keeps the
 	// other rotation log (the pre-admission timeout in BlockDone) and any
 	// unrelated peer-teardown line from satisfying it between them.
-	wantRotation := fmt.Sprintf("rotating the sync peer %s: no sync progress", stalled.addr)
+	wantRotation := fmt.Sprintf("rotating the sync peer %s: no sync progress", stalled.Addr)
 
-	h.waitFor(t, func() bool { return h.logger.contains(wantRotation) },
+	h.waitFor(t, func() bool { return h.logger.Contains(wantRotation) },
 		60*time.Second, "the sync peer was never rotated for making no progress")
 
 	// The rotation releases the sync slot and the peer's downloads without
@@ -837,7 +293,7 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	// and there is nobody to race to. That is exactly the case the rotation and
 	// the download timeout are the fallbacks for, and this leg is where the
 	// rotation half of it is covered.
-	require.Zero(t, replacement.requestedCount(),
+	require.Zero(t, replacement.RequestedCount(),
 		"the replacement is not up yet, so no block can have been raced to it")
 
 	// The stalling peer then goes away, which is what releases the blocks it
@@ -855,8 +311,8 @@ func TestIntegrationSyncPeerRotationRecoversFromAStalledPeer(t *testing.T) {
 	h.waitForHeight(t, uint32(syncTestChainLength), 120*time.Second, "sync after the replacement peer connected")
 
 	hash, _ := h.bestBlock(t)
-	require.Equal(t, chain.tip(), hash)
-	require.Positive(t, replacement.servedCount(), "the replacement peer must have served the rest of the chain")
+	require.Equal(t, chain.Tip(), hash)
+	require.Positive(t, replacement.ServedBlocks(), "the replacement peer must have served the rest of the chain")
 }
 
 // twoPeerChainLength is longer than one getdata batch on purpose: a peer may
@@ -878,12 +334,12 @@ const twoPeerChainLength = 2*protocol.MaxBlocksInTransitPerPeer + 4
 // stalled block was raced.
 func TestIntegrationBlockDownloadSpreadsAcrossTwoPeers(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
-	chain := buildFixtureChain(t, tSettings, twoPeerChainLength)
+	chain := svp2ptest.BuildFixtureChain(t, tSettings, twoPeerChainLength)
 
-	first := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, true)
-	second := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, true)
+	first := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.Script{}, true)
+	second := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.Script{}, true)
 
-	h := newSyncHarness(t, "spread", []string{first.addr, second.addr}, 0, func(s *settings.Settings) {
+	h := newSyncHarness(t, "spread", []string{first.Addr, second.Addr}, 0, func(s *settings.Settings) {
 		s.Legacy.BlockDownloadSlowFetchTimeout = time.Hour
 	})
 	h.start(t)
@@ -892,22 +348,22 @@ func TestIntegrationBlockDownloadSpreadsAcrossTwoPeers(t *testing.T) {
 
 	hash, height := h.bestBlock(t)
 	require.Equal(t, uint32(twoPeerChainLength), height)
-	require.Equal(t, chain.tip(), hash)
+	require.Equal(t, chain.Tip(), hash)
 
-	require.Positive(t, first.requestedCount(), "the first peer must have been asked for blocks")
-	require.Positive(t, second.requestedCount(), "the second peer must have been asked for blocks")
-	require.Positive(t, first.servedCount())
-	require.Positive(t, second.servedCount())
+	require.Positive(t, first.RequestedCount(), "the first peer must have been asked for blocks")
+	require.Positive(t, second.RequestedCount(), "the second peer must have been asked for blocks")
+	require.Positive(t, first.ServedBlocks())
+	require.Positive(t, second.ServedBlocks())
 
 	// Every block of the chain was fetched from one peer or the other, and both
 	// contributed. That union is the distribution claim; which peer got which
 	// slice is the scheduler's business and not fixed.
 	fetched := make(map[chainhash.Hash]struct{}, twoPeerChainLength)
 
-	for _, header := range chain.headers {
+	for _, header := range chain.Headers {
 		hash := header.BlockHash()
 
-		if first.wasRequested(hash) || second.wasRequested(hash) {
+		if first.Requested(hash) || second.Requested(hash) {
 			fetched[hash] = struct{}{}
 		}
 	}
@@ -932,10 +388,10 @@ func TestIntegrationBlockDownloadSpreadsAcrossTwoPeers(t *testing.T) {
 	// discarding them, which is orphan-block retention and a different piece of
 	// work. On mainnet these are gigabyte blocks, so it is worth having: the
 	// residual is one wasted transfer per out-of-order arrival.
-	served := first.servedCount() + second.servedCount()
+	served := first.ServedBlocks() + second.ServedBlocks()
 
 	t.Logf("block serves for a %d-block chain: first=%d second=%d total=%d",
-		twoPeerChainLength, first.servedCount(), second.servedCount(), served)
+		twoPeerChainLength, first.ServedBlocks(), second.ServedBlocks(), served)
 
 	require.LessOrEqual(t, served, 2*twoPeerChainLength,
 		"a parent-missing block must be re-fetched once at most, not once per tick")
@@ -964,13 +420,13 @@ const raceChainLength = 6
 // blocks parked on the peer that will not serve them.
 func TestIntegrationRacesABlockAwayFromASilentPeer(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
-	chain := buildFixtureChain(t, tSettings, raceChainLength)
+	chain := svp2ptest.BuildFixtureChain(t, tSettings, raceChainLength)
 
 	// serveLimit 0: it answers version, ping and getheaders, and never a block.
-	silent := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, 0, true)
-	rescuer := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, -1, false)
+	silent := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.ServeLimit(0), true)
+	rescuer := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.Script{}, false)
 
-	h := newSyncHarness(t, "race", []string{silent.addr, rescuer.addr}, 0, func(s *settings.Settings) {
+	h := newSyncHarness(t, "race", []string{silent.Addr, rescuer.Addr}, 0, func(s *settings.Settings) {
 		// The fuse, shrunk from 30 seconds so the leg does not have to wait one
 		// out. Everything else keeps its production window, which is the point:
 		// the rotation (180 s) and the download timeout (10 minutes) are both
@@ -981,14 +437,14 @@ func TestIntegrationRacesABlockAwayFromASilentPeer(t *testing.T) {
 	h.start(t)
 
 	// The silent peer takes the chain and sits on it.
-	h.waitFor(t, func() bool { return silent.requestedCount() > 0 },
+	h.waitFor(t, func() bool { return silent.RequestedCount() > 0 },
 		60*time.Second, "the silent peer was never asked for a block")
 
-	require.Zero(t, silent.servedCount(), "this peer answers headers and no blocks")
+	require.Zero(t, silent.ServedBlocks(), "this peer answers headers and no blocks")
 
-	firstBlock := chain.headers[0].BlockHash()
+	firstBlock := chain.Headers[0].BlockHash()
 
-	h.waitFor(t, func() bool { return silent.wasRequested(firstBlock) },
+	h.waitFor(t, func() bool { return silent.Requested(firstBlock) },
 		60*time.Second, "the head of the chain was never requested from the silent peer")
 
 	// Only now does anyone else exist to race to.
@@ -1000,14 +456,14 @@ func TestIntegrationRacesABlockAwayFromASilentPeer(t *testing.T) {
 	h.waitForHeight(t, uint32(raceChainLength), 120*time.Second, "sync through raced block downloads")
 
 	hash, _ := h.bestBlock(t)
-	require.Equal(t, chain.tip(), hash)
+	require.Equal(t, chain.Tip(), hash)
 
 	// THE RACE ITSELF: a block the silent peer was asked for, and never served,
 	// was asked of the other peer too.
-	require.True(t, rescuer.wasRequested(firstBlock),
+	require.True(t, rescuer.Requested(firstBlock),
 		"the block the silent peer sat on must be raced to the peer that can serve it")
-	require.Positive(t, rescuer.servedCount())
-	require.Zero(t, silent.servedCount(), "the silent peer served nothing at any point")
+	require.Positive(t, rescuer.ServedBlocks())
+	require.Zero(t, silent.ServedBlocks(), "the silent peer served nothing at any point")
 
 	// What the race did NOT need. The silent peer is still connected: no
 	// disconnect, no rotation, no partial download thrown away but its own.
@@ -1024,8 +480,8 @@ func TestIntegrationRacesABlockAwayFromASilentPeer(t *testing.T) {
 func noStallDisconnect(t *testing.T, h *syncHarness, msg string) {
 	t.Helper()
 
-	require.False(t, h.logger.contains(protocol.StallActionDisconnect.DisconnectReason()), msg)
-	require.False(t, h.logger.contains(protocol.StallActionDisconnectTimeout.DisconnectReason()), msg)
+	require.False(t, h.logger.Contains(protocol.StallActionDisconnect.DisconnectReason()), msg)
+	require.False(t, h.logger.Contains(protocol.StallActionDisconnectTimeout.DisconnectReason()), msg)
 }
 
 // TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer covers what the race
@@ -1039,11 +495,11 @@ func noStallDisconnect(t *testing.T, h *syncHarness, msg string) {
 // so with a single peer that clock can never start.
 func TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
-	chain := buildFixtureChain(t, tSettings, raceChainLength)
+	chain := svp2ptest.BuildFixtureChain(t, tSettings, raceChainLength)
 
-	silent := newScriptedServingPeer(t, chain, tSettings.ChainCfgParams.Net, 0, true)
+	silent := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.ServeLimit(0), true)
 
-	h := newSyncHarness(t, "timeout", []string{silent.addr}, 0, func(s *settings.Settings) {
+	h := newSyncHarness(t, "timeout", []string{silent.Addr}, 0, func(s *settings.Settings) {
 		// One percent of the ten minute block interval is six seconds. This is
 		// the operator's dial, used here to make a ten minute rule testable
 		// rather than to change what is being tested.
@@ -1052,7 +508,7 @@ func TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer(t *testing.T) {
 	})
 	h.start(t)
 
-	h.waitFor(t, func() bool { return silent.requestedCount() > 0 },
+	h.waitFor(t, func() bool { return silent.RequestedCount() > 0 },
 		60*time.Second, "the silent peer was never asked for a block")
 
 	// The rule is named in the log now, so this pins the TIMEOUT clause
@@ -1060,12 +516,12 @@ func TestIntegrationDownloadTimeoutDisconnectsASilentSolePeer(t *testing.T) {
 	// which is what the test's own preamble above always claimed to be
 	// asserting (Task 25, phase-3 ledger residual "Distinguishing the two
 	// disconnect logs").
-	want := fmt.Sprintf("disconnecting %s: %s", silent.addr, protocol.StallActionDisconnectTimeout.DisconnectReason())
+	want := fmt.Sprintf("disconnecting %s: %s", silent.Addr, protocol.StallActionDisconnectTimeout.DisconnectReason())
 
-	h.waitFor(t, func() bool { return h.logger.contains(want) },
+	h.waitFor(t, func() bool { return h.logger.Contains(want) },
 		60*time.Second, "the silent peer was never disconnected by the download timeout")
 
-	require.Zero(t, silent.servedCount())
-	require.False(t, h.logger.contains("rotating the sync peer"),
+	require.Zero(t, silent.ServedBlocks())
+	require.False(t, h.logger.Contains("rotating the sync peer"),
 		"the rotation window is 180 seconds and must not be what fired here")
 }

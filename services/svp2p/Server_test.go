@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
+	"github.com/bsv-blockchain/teranode/services/svp2p/svp2ptest"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -46,24 +47,12 @@ func (l *warnRecordingLogger) Warnings() []string {
 	return append([]string(nil), l.warnings...)
 }
 
-func freePort(t *testing.T) string {
-	t.Helper()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
-
-	return addr
-}
-
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.GRPCAdminAPIKey = "test-admin-key"
 
@@ -222,7 +211,7 @@ func testHeaderBlock(t *testing.T, nonce uint32, previousHash *chainhash.Hash) *
 func TestServerHydratesHeaderIndexFromBlockchain(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.GRPCAdminAPIKey = "test-admin-key"
 
@@ -294,7 +283,7 @@ func TestServerHydratesHeaderIndexFromBlockchain(t *testing.T) {
 func TestServerHeaderIndexFollowsReorgAcrossPreviouslySyncedHeights(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.GRPCAdminAPIKey = "test-admin-key"
 
@@ -378,7 +367,7 @@ func TestServerHeaderIndexFollowsReorgAcrossPreviouslySyncedHeights(t *testing.T
 func TestServerHydratesHeaderIndexAcrossMultipleBatches(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.GRPCAdminAPIKey = "test-admin-key"
 
@@ -520,7 +509,7 @@ func (c *divergentBestHeaderClient) Calls() int {
 func TestServerReconcileWalkStopsAtDepthCap(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.GRPCAdminAPIKey = "test-admin-key"
 

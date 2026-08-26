@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer_api"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
+	"github.com/bsv-blockchain/teranode/services/svp2p/svp2ptest"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -28,7 +29,7 @@ func newIntegrationServer(t *testing.T, role string, connectTo []string) (*Serve
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Context = tSettings.Context + "-" + role
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.Legacy.ConnectPeers = connectTo
 	tSettings.GRPCAdminAPIKey = "test-admin-key"

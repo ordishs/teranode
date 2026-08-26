@@ -1,0 +1,114 @@
+// Package svp2ptest holds test-support code shared by the svp2p integration
+// tests and the parity harness: a fixture chain the real pipeline accepts, a
+// scripted wire-level peer, in-process starters for the Teranode services a
+// node needs, and a recording logger. It is imported by tests only.
+package svp2ptest
+
+import (
+	"bytes"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/stretchr/testify/require"
+)
+
+// ---------------------------------------------------------------------------
+// Chain fixture: a run of regtest coinbase-only blocks the real pipeline
+// accepts (valid proof of work under the regtest limit, BIP34 coinbase, merkle
+// root = the coinbase txid, which is what a single-transaction block's root is).
+// ---------------------------------------------------------------------------
+
+type FixtureChain struct {
+	Headers []*wire.BlockHeader // headers[i] is at height i+1
+	Blocks  map[chainhash.Hash]*wire.MsgBlock
+	Heights map[chainhash.Hash]int32 // includes genesis at height 0
+}
+
+func (c *FixtureChain) Tip() chainhash.Hash { return c.Headers[len(c.Headers)-1].BlockHash() }
+
+func BuildFixtureChain(t *testing.T, tSettings *settings.Settings, count int) *FixtureChain {
+	t.Helper()
+
+	privKey, err := bec.NewPrivateKey()
+	require.NoError(t, err)
+
+	address, err := bscript.NewAddressFromPublicKey(privKey.PubKey(), true)
+	require.NoError(t, err)
+
+	genesis := tSettings.ChainCfgParams.GenesisBlock.Header
+	genesisHash := genesis.BlockHash()
+
+	chain := &FixtureChain{
+		Blocks:  make(map[chainhash.Hash]*wire.MsgBlock, count),
+		Heights: map[chainhash.Hash]int32{genesisHash: 0},
+	}
+
+	bits, err := model.NewNBitFromString(fmt.Sprintf("%08x", genesis.Bits))
+	require.NoError(t, err)
+
+	prevHash := genesisHash
+	// Headers are spaced ten minutes apart, and a block more than two hours in
+	// the future is rejected. Starting the run far enough back that its LAST
+	// header still lands in the past keeps that rule out of the way however
+	// long the fixture chain is.
+	baseTime := time.Now().Add(-time.Duration(count+2) * 10 * time.Minute).Unix()
+
+	for i := 0; i < count; i++ {
+		height := uint32(i + 1) //nolint:gosec // test heights are small
+
+		coinbase, cbErr := model.CreateCoinbase(height, 50e8, "svp2p sync test", []string{address.AddressString})
+		require.NoError(t, cbErr)
+
+		merkleRoot := coinbase.TxIDChainHash()
+		prev := prevHash
+
+		modelHeader := &model.BlockHeader{
+			Version:        0x20000000,
+			HashPrevBlock:  &prev,
+			HashMerkleRoot: merkleRoot,
+			Timestamp:      uint32(baseTime + int64(i)*600), //nolint:gosec // test timestamps are in range
+			Bits:           *bits,
+		}
+
+		for {
+			ok, _, _ := modelHeader.HasMetTargetDifficulty()
+			if ok {
+				break
+			}
+
+			modelHeader.Nonce++
+		}
+
+		wireHeader := &wire.BlockHeader{}
+		require.NoError(t, wireHeader.Deserialize(bytes.NewReader(modelHeader.Bytes())))
+
+		coinbaseWire := wire.NewMsgTx(1)
+		require.NoError(t, coinbaseWire.Deserialize(bytes.NewReader(coinbase.Bytes())))
+
+		block := wire.NewMsgBlock(wireHeader)
+		require.NoError(t, block.AddTransaction(coinbaseWire))
+
+		hash := wireHeader.BlockHash()
+		require.Equal(t, *modelHeader.Hash(), hash, "the wire header must round-trip the mined model header")
+
+		chain.Headers = append(chain.Headers, wireHeader)
+		chain.Blocks[hash] = block
+		chain.Heights[hash] = int32(height) //nolint:gosec // test heights are small
+
+		prevHash = hash
+	}
+
+	return chain
+}
+
+// ---------------------------------------------------------------------------
+// Scripted serving peer: raw go-wire over TCP. It listens, so the svp2p server
+// reaches it through Legacy.ConnectPeers exactly as it reaches a real node.
+// ---------------------------------------------------------------------------

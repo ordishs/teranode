@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/svp2p/svp2ptest"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
@@ -79,7 +80,7 @@ func newShutdownFlushTestServer(t *testing.T) (*Server, *debugRecordingLogger) {
 
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.Legacy.ListenAddresses = []string{"127.0.0.1:0"}
-	tSettings.Legacy.GRPCListenAddress = freePort(t)
+	tSettings.Legacy.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.Legacy.WorkingDir = t.TempDir()
 	tSettings.GRPCAdminAPIKey = "test-admin-key"
 
