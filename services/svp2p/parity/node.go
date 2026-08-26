@@ -53,6 +53,9 @@ type nodeUnderTest struct {
 	blockchainStore blockchain_store.Store
 	svc             service
 	cancel          context.CancelFunc
+
+	// scores is filled by a scenario's Drive from a scoreSampler, for Observe.
+	scores map[string]int
 }
 
 var nodeCounter atomic.Uint64
@@ -89,6 +92,15 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 	tSettings.BlockValidation.GRPCListenAddress = svp2ptest.FreePort(t)
 	tSettings.BlockValidation.GRPCAddress = tSettings.BlockValidation.GRPCListenAddress
 	tSettings.BlockValidation.PeriodicProcessingInterval = 200 * time.Millisecond
+
+	// Fixture blocks are ~190 bytes, so no peer can ever meet a bytes-per-second
+	// sync floor; both floors are zeroed or the sync peer is rotated (svp2p) or
+	// disconnected (legacy, 2026-08-26 diagnostic: "stalled due to network
+	// speed violation") in the middle of every scenario. legacy reads its floor
+	// from gocore under legacy_config_, which an environment variable of the
+	// same name overrides (gocore config.go LookupEnv).
+	tSettings.Legacy.MinSyncPeerNetworkSpeed = 0
+	t.Setenv("legacy_config_MinSyncPeerNetworkSpeed", "0")
 
 	// legacy Server.Init refuses to start without an asset address; these
 	// scenarios never serve a block, so the address only has to parse.
@@ -224,6 +236,10 @@ func (n *nodeUnderTest) WaitFor(t *testing.T, cond func() bool, timeout time.Dur
 		}
 
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	if what == "" {
+		return // a bounded wait, not an assertion
 	}
 
 	n.Logger.Dump(t)

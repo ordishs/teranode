@@ -27,6 +27,9 @@ type Observation struct {
 	Disconnected map[string]string
 	// Scores is, per peer address, the node's misbehaviour total for that peer.
 	Scores map[string]int
+	// Connections is, per peer address, how many times the node connected.
+	// Reported, never compared: redial cadence is transport policy.
+	Connections map[string]int
 	// GetHeadersIn is the total getheaders every peer received from the node.
 	// Reported and available to scenarios; not compared.
 	GetHeadersIn int
@@ -160,6 +163,7 @@ func WriteReport(t *testing.T, name string, legacy, svp2p Observation, res Resul
 	fmt.Fprintf(&b, "| Served | %v | %v |\n", legacy.Served, svp2p.Served)
 	fmt.Fprintf(&b, "| Disconnected | %v | %v |\n", legacy.Disconnected, svp2p.Disconnected)
 	fmt.Fprintf(&b, "| Scores | %v | %v |\n", legacy.Scores, svp2p.Scores)
+	fmt.Fprintf(&b, "| Connections | %v | %v |\n", legacy.Connections, svp2p.Connections)
 	fmt.Fprintf(&b, "| Notes | %v | %v |\n\n", legacy.Notes, svp2p.Notes)
 
 	fmt.Fprintf(&b, "## Diffs (%d)\n\n", len(res.Diffs))

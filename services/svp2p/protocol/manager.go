@@ -2210,6 +2210,24 @@ func (m *PeerManager) ListenAddrs() []string {
 	return addrs
 }
 
+// PeerScores is the misbehaviour score of every peer that has completed its
+// handshake, keyed by remote address. Test support for the parity harness; the
+// daemon does not call it.
+func (m *PeerManager) PeerScores() map[string]int {
+	out := make(map[string]int)
+
+	for _, h := range m.peerHandles() {
+		if !h.established {
+			continue
+		}
+
+		info := h.peer.Info()
+		out[info.Addr] = info.MisbehaviorScore
+	}
+
+	return out
+}
+
 func (m *PeerManager) ConnectedCount() int32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()

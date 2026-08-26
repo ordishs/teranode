@@ -241,3 +241,28 @@ func TestScriptedPeer_HonestGetBlocksAnswersInv(t *testing.T) {
 	require.Equal(t, chain.Headers[3].BlockHash(), inv.InvList[0].Hash)
 	require.Equal(t, chain.Tip(), inv.InvList[8].Hash)
 }
+
+func TestRaw_EncodesPayloadVerbatimUnderItsCommand(t *testing.T) {
+	peer, _ := newTestPeer(t, 1, Script{OnConnect: []wire.Message{&Raw{Cmd: "addr", Payload: []byte{0x00}}}})
+	c := dialScripted(t, peer)
+
+	msg := c.readUntil("addr", 3*time.Second)
+	require.Equal(t, "addr", msg.Command())
+	require.Equal(t, 1, peer.Transcript.Count(Out, "addr"))
+}
+
+func TestScriptedPeer_BeforeVersionIsSentAheadOfTheVersion(t *testing.T) {
+	peer, _ := newTestPeer(t, 1, Script{BeforeVersion: []wire.Message{wire.NewMsgPing(7)}})
+
+	conn, err := net.Dial("tcp", peer.Addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	c := &rawClient{t: t, conn: conn, net: peer.Net}
+	me := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, 0)
+	c.write(wire.NewMsgVersion(me, me, 1, 0))
+
+	first := c.read(3 * time.Second)
+	require.Equal(t, "ping", first.Command(), "the scripted message precedes the peer's version")
+	require.Equal(t, "version", c.read(3*time.Second).Command())
+}

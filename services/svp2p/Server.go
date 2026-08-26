@@ -196,6 +196,16 @@ func (s *Server) SetSyncClocks(tick, maxLastBlockTime time.Duration) {
 	s.maxLastBlockTime = maxLastBlockTime
 }
 
+// PeerScores is PeerManager.PeerScores for the peers this server holds; nil
+// before Start. Test support for the parity harness.
+func (s *Server) PeerScores() map[string]int {
+	if s.manager == nil {
+		return nil
+	}
+
+	return s.manager.PeerScores()
+}
+
 func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	if checkLiveness {
 		return http.StatusOK, "OK", nil

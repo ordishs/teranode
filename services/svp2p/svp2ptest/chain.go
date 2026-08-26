@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
@@ -34,6 +35,17 @@ type FixtureChain struct {
 func (c *FixtureChain) Tip() chainhash.Hash { return c.Headers[len(c.Headers)-1].BlockHash() }
 
 func BuildFixtureChain(t *testing.T, tSettings *settings.Settings, count int) *FixtureChain {
+	t.Helper()
+
+	return BuildFixtureChainPadded(t, tSettings, count, 0)
+}
+
+// BuildFixtureChainPadded is BuildFixtureChain with padBytes of OP_RETURN data
+// on every coinbase, so a block carries real bytes. Legacy netsync rotates a
+// sync peer delivering under 51200 bytes/s for three 30-second ticks
+// (syncPeerTickerInterval, maxNetworkViolations), and no rate of 190-byte
+// blocks can satisfy that; 200 KB blocks at any live pace do.
+func BuildFixtureChainPadded(t *testing.T, tSettings *settings.Settings, count, padBytes int) *FixtureChain {
 	t.Helper()
 
 	privKey, err := bec.NewPrivateKey()
@@ -63,8 +75,20 @@ func BuildFixtureChain(t *testing.T, tSettings *settings.Settings, count int) *F
 	for i := 0; i < count; i++ {
 		height := uint32(i + 1) //nolint:gosec // test heights are small
 
-		coinbase, cbErr := model.CreateCoinbase(height, 50e8, "svp2p sync test", []string{address.AddressString})
+		// The subsidy halves every SubsidyReductionInterval blocks (150 on
+		// regtest); a coinbase that ignores that is rejected by
+		// checkBlockRewardAndFees at the first halving and the chain stalls there.
+		subsidy := uint64(50e8) >> (height / tSettings.ChainCfgParams.SubsidyReductionInterval)
+
+		coinbase, cbErr := model.CreateCoinbase(height, subsidy, "svp2p sync test", []string{address.AddressString})
 		require.NoError(t, cbErr)
+
+		if padBytes > 0 {
+			pad := &bscript.Script{}
+			require.NoError(t, pad.AppendOpcodes(bscript.OpFALSE, bscript.OpRETURN))
+			require.NoError(t, pad.AppendPushData(make([]byte, padBytes)))
+			coinbase.AddOutput(&bt.Output{Satoshis: 0, LockingScript: pad})
+		}
 
 		merkleRoot := coinbase.TxIDChainHash()
 		prev := prevHash

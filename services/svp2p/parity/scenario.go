@@ -18,6 +18,8 @@ type Scenario struct {
 	Name string
 	// Chain is the fixture chain height.
 	Chain int
+	// Pad is OP_RETURN bytes per coinbase (BuildFixtureChainPadded); 0 = none.
+	Pad int
 	// Tweaks adjust the settings of BOTH legs before the peers and the node are
 	// built. They may replace ChainCfgParams (for instance to add a checkpoint on
 	// the fixture chain); the peers are then built with the tweaked wire magic.
@@ -69,7 +71,7 @@ func runLeg(t *testing.T, s Scenario, impl Impl) (Observation, []*svp2ptest.Tran
 	t.Helper()
 
 	tSettings := test.CreateBaseTestSettings(t)
-	chain := svp2ptest.BuildFixtureChain(t, tSettings, s.Chain)
+	chain := svp2ptest.BuildFixtureChainPadded(t, tSettings, s.Chain, s.Pad)
 
 	for _, tweak := range s.Tweaks {
 		tweak(impl, chain, tSettings)
@@ -123,6 +125,7 @@ func ObserveDefault(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedP
 		Served:         make(map[string]int, len(peers)),
 		Disconnected:   make(map[string]string),
 		Scores:         make(map[string]int),
+		Connections:    make(map[string]int, len(peers)),
 	}
 
 	for i, p := range peers {
@@ -130,6 +133,7 @@ func ObserveDefault(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedP
 		o.Requests[name] = p.RequestedCount()
 		o.GetHeadersIn += p.Transcript.Count(svp2ptest.In, "getheaders")
 		o.Served[name] = p.ServedBlocks()
+		o.Connections[name] = p.Connections()
 
 		if who := p.Transcript.ClosedBy(); who != "" {
 			o.Disconnected[name] = who

@@ -1,6 +1,7 @@
 package svp2ptest
 
 import (
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -110,7 +112,36 @@ type Script struct {
 	Version func(v *wire.MsgVersion)
 	// OnConnect is sent right after the peer's verack.
 	OnConnect []wire.Message
+	// BeforeVersion is sent when the node's version arrives, BEFORE the peer's
+	// own version — the "missing-version" offence.
+	BeforeVersion []wire.Message
 }
+
+// Raw is a wire message with an arbitrary command and payload, for sending
+// what go-wire's typed messages refuse to build (an addr above MaxAddrPerMsg,
+// a headers batch above MaxBlockHeadersPerMsg).
+type Raw struct {
+	Cmd     string
+	Payload []byte
+}
+
+// Bsvdecode is unused; Raw is only ever sent.
+func (r *Raw) Bsvdecode(_ io.Reader, _ uint32, _ wire.MessageEncoding) error {
+	return errors.NewProcessingError("svp2ptest.Raw is write-only")
+}
+
+// BsvEncode writes the payload verbatim.
+func (r *Raw) BsvEncode(w io.Writer, _ uint32, _ wire.MessageEncoding) error {
+	_, err := w.Write(r.Payload)
+
+	return err
+}
+
+// Command is the wire command name.
+func (r *Raw) Command() string { return r.Cmd }
+
+// MaxPayloadLength is the payload's own length.
+func (r *Raw) MaxPayloadLength(_ uint32) uint64 { return uint64(len(r.Payload)) }
 
 // ServeLimit is the script of a peer that serves the first n blocks requested
 // of it and withholds the rest. n == 0 withholds everything.
@@ -166,7 +197,18 @@ type ScriptedPeer struct {
 	conns     []net.Conn
 	closed    bool
 	served    int
+	conns_    int
 	requested map[chainhash.Hash]int
+}
+
+// Connections is how many times the node connected to this peer. With
+// legacy_connect_peers a dropped peer is redialed, so a scenario that bounds
+// what a peer was handed must bound it per connection.
+func (p *ScriptedPeer) Connections() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.conns_
 }
 
 // NewScriptedPeer reserves a loopback address for the peer. With listen true it
@@ -229,6 +271,7 @@ func (p *ScriptedPeer) acceptLoop(ln net.Listener) {
 		}
 
 		p.conns = append(p.conns, conn)
+		p.conns_++
 		p.mu.Unlock()
 
 		go p.serve(conn)
@@ -365,6 +408,10 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 
 			if p.Script.Version != nil {
 				p.Script.Version(version)
+			}
+
+			if !p.writeAll(conn, p.Script.BeforeVersion) {
+				return
 			}
 
 			if !p.writeAll(conn, []wire.Message{version, wire.NewMsgVerAck(), wire.NewMsgProtoconf(wire.DefaultMaxRecvPayloadLength, true)}) {
