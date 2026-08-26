@@ -56,12 +56,26 @@ func TestParity_MultiPeerDistribution(t *testing.T) {
 				svp2ptest.NewScriptedPeer(t, c, net, silentScript, true),       // peer2 silent
 			}
 		},
-		Drive: func(t *testing.T, n *nodeUnderTest, _ []*svp2ptest.ScriptedPeer) {
+		Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
 			n.WaitForHeight(t, chain, 240*time.Second)
+
+			// How long the silent peer had been owing its LAST batch when the
+			// sync finished: a peer inside its per-block budget is rightly kept.
+			owing := time.Duration(0)
+			for _, e := range peers[2].Transcript.Snapshot() {
+				if e.Dir == svp2ptest.In && e.Cmd == "getdata" {
+					owing = time.Since(e.At)
+				}
+			}
+
+			n.notes = map[string]string{"silent-owing-at-end": owing.Round(time.Millisecond).String()}
 		},
 		Observe: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) Observation {
 			o := ObserveDefault(t, n, peers)
 			o.Notes = map[string]string{}
+			for k, v := range n.notes {
+				o.Notes[k] = v
+			}
 
 			for _, needle := range []string{"disconnecting", "rotating", "ingest failed", "admission", "not mined", "parent", "unrequested", "timed out", "block download timeout", "stalling"} {
 				o.Notes[needle] = fmt.Sprint(len(n.Logger.Matching(needle)))
@@ -90,9 +104,17 @@ func TestParity_MultiPeerDistribution(t *testing.T) {
 	batchesPerConn := int(budget/maxLastBlockTime) + 1
 	require.LessOrEqual(t, s.Requests["peer2"], batchesPerConn*protocol.MaxBlocksInTransitPerPeer*s.Connections["peer2"],
 		"the silent peer is handed at most %d batches per connection", batchesPerConn)
-	require.True(t, s.Disconnected["peer2"] == "node" || s.Requests["peer2"] <= protocol.MaxBlocksInTransitPerPeer,
-		"a silent peer that still owes blocks must be dropped; one that was handed a single re-homed batch may stay (requests=%d, disconnected=%q)",
-		s.Requests["peer2"], s.Disconnected["peer2"])
+	owing, err := time.ParseDuration(s.Notes["silent-owing-at-end"])
+	require.NoError(t, err)
+	// Three legitimate outcomes: dropped on the carried clock; handed only its
+	// first batch, which the rotation released so it owed nothing more (the
+	// serving peers took the rest of the window); or re-handed so late that its
+	// budget had not run out when the sync finished.
+	require.True(t, s.Disconnected["peer2"] == "node" ||
+		s.Requests["peer2"] <= protocol.MaxBlocksInTransitPerPeer ||
+		owing < budget+maxLastBlockTime,
+		"a silent peer re-handed blocks and owing them past its budget must be dropped (requests=%d, owing %s at the end, disconnected=%q)",
+		s.Requests["peer2"], owing, s.Disconnected["peer2"])
 
 	require.GreaterOrEqual(t, s.Served["peer0"]+s.Served["peer1"], chain, "every block crossed the wire from a serving peer")
 	require.Positive(t, s.Served["peer1"], "the slow peer must have been given work too")
