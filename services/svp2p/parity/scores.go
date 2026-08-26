@@ -13,14 +13,46 @@ import (
 // "Misbehaving peer 127.0.0.1:1234 (outbound, ...): reason -- ban score increased to 20".
 var legacyScoreLine = regexp.MustCompile(`Misbehaving peer (\S+) .*ban score (?:increased to|is) (\d+)`)
 
+// svp2pThresholdLine is the disconnect svp2p logs when a peer crosses the ban
+// threshold: "[svp2p] peer 127.0.0.1:1234 done: ... misbehavior threshold
+// reached (score 100)". A peer dropped this way is gone from PeerScores before
+// a sampler can see it, so the line is the record.
+var svp2pThresholdLine = regexp.MustCompile(`peer (\S+) done: .*misbehavior threshold reached \(score (\d+)\)`)
+
+// svp2pRejectedBlockLine is the other disconnect that carries a score without
+// naming it: manager.go BlockDone sets delta = scoreInvalidBlock (100, the
+// DoS(100) of validation.cpp) in the same statement that raises "block %s was
+// rejected", so the line stands for that score.
+var svp2pRejectedBlockLine = regexp.MustCompile(`peer (\S+) done: .*svp2p: block \S+ was rejected`)
+
+const svp2pInvalidBlockScore = 100
+
 // Scores is the node's current misbehaviour total per peer address. svp2p
 // exposes it; legacy only logs it, so its figure is the highest total logged.
 func (n *nodeUnderTest) Scores() map[string]int {
 	switch n.Impl {
 	case Svp2p:
+		out := make(map[string]int)
+
 		if srv, ok := n.svc.(*svp2p.Server); ok {
-			return srv.PeerScores()
+			for addr, v := range srv.PeerScores() {
+				out[addr] = v
+			}
 		}
+
+		for _, line := range n.Logger.Lines() {
+			if m := svp2pThresholdLine.FindStringSubmatch(line); m != nil {
+				if v, err := strconv.Atoi(m[2]); err == nil && v > out[m[1]] {
+					out[m[1]] = v
+				}
+			}
+
+			if m := svp2pRejectedBlockLine.FindStringSubmatch(line); m != nil && out[m[1]] < svp2pInvalidBlockScore {
+				out[m[1]] = svp2pInvalidBlockScore
+			}
+		}
+
+		return out
 	case Legacy:
 		out := make(map[string]int)
 

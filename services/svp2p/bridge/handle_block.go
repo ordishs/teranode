@@ -1887,6 +1887,22 @@ func (sm *svp2pBridge) createTxMapFromSource(ctx context.Context, sb sourceBlock
 			return nil, errors.NewProcessingError("failed to convert wire.Tx to bt.Tx", err)
 		}
 
+		// validation.cpp CheckBlock: "First transaction must be coinbase, the
+		// rest must not be" (bad-cb-missing, bad-cb-multiple), both DoS 100.
+		// Judged here, before any transaction reaches the validator: a second
+		// coinbase would otherwise surface as the validator's TX_ERROR
+		// ("coinbase transactions are not supported"), which the peer-fault
+		// classification rightly does not blame a peer for, and the peer that
+		// served the invalid body would never be scored (parity harness
+		// scenario 4, 2026-08-26).
+		if i == 0 && !tx.IsCoinbase() {
+			return nil, errors.NewBlockInvalidError("[createTxMap][%s] first transaction %s is not a coinbase", sb.hash.String(), hashCopy.String())
+		}
+
+		if i > 0 && tx.IsCoinbase() {
+			return nil, errors.NewBlockInvalidError("[createTxMap][%s] transaction %d of %d is a second coinbase", sb.hash.String(), i, sb.txCount)
+		}
+
 		// don't add the coinbase to the txMap, we cannot process it anyway
 		if !tx.IsCoinbase() {
 			tx.SetTxHash(&hashCopy)

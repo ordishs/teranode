@@ -129,18 +129,14 @@ func scoreRows() []scoreRow {
 			script: func(chain *svp2ptest.FixtureChain) svp2ptest.Script {
 				return svp2ptest.Script{OnConnect: []wire.Message{headersMsg(chain.Headers[0], chain.Headers[2])}}
 			}},
-		// KNOWN GAP, found by this harness 2026-08-26 (ledger carried residual 15):
-		// a block whose BODY is invalid (a second coinbase under the requested
-		// header) reaches the bridge as TX_ERROR, which PeerFault's allow-list of
-		// block-describing codes (Task 20) does not attribute to the peer. svp2p
-		// therefore neither scores nor disconnects; SVNode gives DoS(100)
-		// (bad-cb-multiple / bad-txns-duplicate) and legacy disconnects. The row
-		// pins today's behaviour so a fix flips it consciously.
-		{name: "invalid-block", svp2pScore: 0, dropped: false, legacyDrops: true,
-			accepted: []Divergence{
-				{Field: "Scores", Reason: "KNOWN GAP residual 15: svp2p does not score an invalid block body; SVNode DoS(100)"},
-				{Field: "Disconnected", Reason: "KNOWN GAP residual 15: legacy disconnects on the block error, svp2p keeps the peer"},
-			},
+		// A block whose BODY is invalid — a second coinbase under the requested
+		// header. The bridge's createTxMap judges it as a block failure
+		// (CheckBlock bad-cb-multiple) before any transaction reaches the
+		// validator, so the peer is blamed: svp2p DoS(100) and disconnect, as
+		// SVNode; legacy disconnects on the block error without a logged score.
+		// (Closed 2026-08-26; was ledger carried residual 15.)
+		{name: "invalid-block", svp2pScore: 100, dropped: true, legacyDrops: true,
+			accepted: []Divergence{{Field: "Scores", Reason: "legacy disconnects on the block error without a logged score; svp2p carries SVNode's DoS(100)"}},
 			script: func(chain *svp2ptest.FixtureChain) svp2ptest.Script {
 				return svp2ptest.Script{OnGetData: func(p *svp2ptest.ScriptedPeer, m *wire.MsgGetData) []wire.Message {
 					var out []wire.Message

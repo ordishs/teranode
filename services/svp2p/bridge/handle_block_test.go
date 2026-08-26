@@ -1521,3 +1521,45 @@ func TestClassifyAndCountPrewarmError(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateTxMap_RejectsABlockWithTwoCoinbases pins the CheckBlock rule
+// SVNode enforces before any transaction is validated (validation.cpp
+// CheckBlock: "bad-cb-multiple"): a block whose body carries a second coinbase
+// is invalid as a BLOCK, and the error must say so with a block-invalid code so
+// the peer that served it is blamed (parity harness scenario 4, invalid-block
+// row, 2026-08-26 — until this rule the second coinbase surfaced as a TX_ERROR
+// from the validator and the peer was never scored).
+func TestCreateTxMap_RejectsABlockWithTwoCoinbases(t *testing.T) {
+	block, err := ReadBlockFromFile("testdata/0000000000000000015594853418b4093c4be4ad8b77fec88b5400feb3268fc4.bin")
+	require.NoError(t, err)
+
+	msg := block.MsgBlock()
+	msg.Transactions = append(msg.Transactions, msg.Transactions[0])
+	bad := bsvutil.NewBlock(msg)
+
+	sm := &svp2pBridge{}
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](len(bad.Transactions()))
+
+	_, err = sm.createTxMap(context.Background(), bad, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "a second coinbase is a block-level failure: %v", err)
+	require.Contains(t, err.Error(), "coinbase")
+}
+
+// TestCreateTxMap_RejectsABlockWhoseFirstTxIsNotACoinbase is CheckBlock's
+// "bad-cb-missing".
+func TestCreateTxMap_RejectsABlockWhoseFirstTxIsNotACoinbase(t *testing.T) {
+	block, err := ReadBlockFromFile("testdata/0000000000000000015594853418b4093c4be4ad8b77fec88b5400feb3268fc4.bin")
+	require.NoError(t, err)
+
+	msg := block.MsgBlock()
+	msg.Transactions = msg.Transactions[1:]
+	bad := bsvutil.NewBlock(msg)
+
+	sm := &svp2pBridge{}
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](len(bad.Transactions()))
+
+	_, err = sm.createTxMap(context.Background(), bad, txMap)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "a missing coinbase is a block-level failure: %v", err)
+}
