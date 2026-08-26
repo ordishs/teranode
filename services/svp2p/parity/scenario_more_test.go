@@ -84,8 +84,19 @@ func TestParity_SyncPeerElectionOrder(t *testing.T) {
 
 	require.Equal(t, uint32(chain), obs[Legacy].BlocksAccepted)
 	require.Equal(t, uint32(chain), obs[Svp2p].BlocksAccepted)
-	require.Equal(t, chain, obs[Legacy].Requests["peer1"], "legacy downloads everything from the peer it ranked tallest")
-	require.Zero(t, obs[Legacy].Requests["peer0"]+obs[Legacy].Requests["peer2"], "legacy never schedules blocks from the other candidates")
+	// Legacy ranks by claimed height among the candidates PRESENT when startSync
+	// runs — often only the first peer to complete its handshake — so which peer
+	// it picks varies run to run; what is fixed is that it downloads the whole
+	// chain from that one peer and nothing from the others.
+	legacyServing := 0
+	for _, name := range []string{"peer0", "peer1", "peer2"} {
+		if obs[Legacy].Requests[name] > 0 {
+			legacyServing++
+			require.Equal(t, chain, obs[Legacy].Requests[name], "legacy downloads the whole chain from its single sync peer")
+		}
+	}
+
+	require.Equal(t, 1, legacyServing, "legacy schedules blocks from exactly one peer")
 	require.Positive(t, obs[Svp2p].Requests["peer0"]+obs[Svp2p].Requests["peer2"], "svp2p spreads the window over every useful peer regardless of election")
 	t.Logf("election: legacy asked %s first (%s), svp2p asked %s first (%s)",
 		obs[Legacy].Notes["first-asked"], obs[Legacy].WallClock.Round(time.Millisecond),

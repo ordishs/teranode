@@ -60,11 +60,15 @@ cannot show how often that holds against real peers.
 
 
 **Verdict 2026-08-26 (`TestParity_SyncPeerElectionOrder`, peers claiming 10/200/50
-over a 60-block chain):** legacy downloads all 60 blocks from the peer it ranked
-tallest and nothing from the others; svp2p asks whichever candidate the sweep
-meets first and then spreads the window over every useful peer (16/26/18). Both
-reach the tip in ~12 s. Election quality is moot for svp2p's download because
-download does not follow election; no ranking needed.
+over a 60-block chain):** legacy ranks by claimed height only among the
+candidates present when `startSync` runs — often just the first peer to finish
+its handshake — so across three runs it elected peer1, peer2 and peer1, and each
+time downloaded all 60 blocks from that one peer and nothing from the others.
+svp2p asks whichever candidate the sweep meets first and then spreads the window
+over every useful peer (16/26/18). Both reach the tip in ~12 s. Election quality
+is moot for svp2p's download because download does not follow election; no
+ranking needed. (This assertion was the one intermittent parity failure seen
+under -race; it assumed legacy always picks the tallest.)
 
 ## 3. Unrequested-headers policy score
 
