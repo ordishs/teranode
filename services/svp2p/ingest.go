@@ -26,6 +26,10 @@ type blockIngestor struct {
 	logger    ulogger.Logger
 	bridge    bridge.Bridge
 	admission *bridge.Admission
+
+	// retained spools blocks that arrive before their parent; nil disables
+	// retention and such a block is refused as before (see orphanBlocks).
+	retained *orphanBlocks
 }
 
 var _ protocol.BlockIngestor = (*blockIngestor)(nil)
@@ -100,6 +104,16 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 		// block back instead. TransientLocal stays set alongside it, because
 		// this IS our own fault and the delivering peer's stall clock must still
 		// be refreshed.
+		if b.retained != nil && b.retained.fits(hash, req.SizeBytes) {
+			if err := b.retained.Retain(ctx, req); err != nil {
+				b.logger.Warnf("[svp2p] block %s could not be retained, refusing it instead: %v", hash, err)
+			} else {
+				b.logger.Debugf("[svp2p] block %s retained: its parent %s is not in our chain yet", hash, req.Header.PrevBlock)
+
+				return protocol.IngestOutcome{Retained: true}
+			}
+		}
+
 		return protocol.IngestOutcome{
 			Err: b.release(req.TxReader, errors.NewServiceUnavailableError(
 				"[svp2p] block %s cannot be admitted yet: its parent %s is not in our chain", hash, req.Header.PrevBlock)),
@@ -142,6 +156,10 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 		// Only a fault of the block ITSELF is the peer's: a block that fails
 		// validation, or a payload that fails to decode.
 		return protocol.IngestOutcome{Err: err, PeerFault: true}
+	}
+
+	if b.retained != nil {
+		b.retained.Replay(ctx, hash, b.Ingest)
 	}
 
 	b.admission.ClearFailure(hash)

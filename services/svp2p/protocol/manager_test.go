@@ -2601,3 +2601,45 @@ func TestConfigureSync_CarriesTheSyncPeerRateFloor(t *testing.T) {
 			"0 is legacy's disable value (netsync/manager.go:266) and must survive the plumbing")
 	})
 }
+
+// TestBlockDone_RetainedCountsAsReceived: a block the ingestor spooled because
+// its parent has not landed (IngestOutcome.Retained) is a completed download —
+// it leaves the in-flight set, is recorded as held data, and is neither
+// deferred for a retry nor scored. Before orphan retention such a block was
+// refused and re-fetched once its parent landed (phase-3 ledger residual 1).
+func TestBlockDone_RetainedCountsAsReceived(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 2, 7)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	for _, h := range chain {
+		_, err = idx.AddHeader(h)
+		require.NoError(t, err)
+	}
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+
+	block, ok := idx.Lookup(chain[1].BlockHash())
+	require.True(t, ok)
+
+	peer := NewSyncPeer("1.1.1.1:8333", wire.SFNodeNetwork, newPeerSyncState())
+
+	m.syncMu.Lock()
+	require.True(t, m.blockDownloader.MarkBlockAsInFlight(peer, block, testNow))
+	m.syncMu.Unlock()
+
+	delta, err := m.BlockDone(peer, block.Hash, IngestOutcome{Retained: true})
+	require.NoError(t, err)
+	require.Zero(t, delta, "retention is our own doing; the peer earns no score")
+
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	require.False(t, m.blockDownloader.IsInFlight(block.Hash), "a retained block is no longer owed by anyone")
+	_, held := m.blockDownloader.haveData[block.Hash]
+	require.True(t, held, "a retained block counts as data we hold, so the walk never asks for it again")
+	_, deferred := m.blockDownloader.retryAfter[block.Hash]
+	require.False(t, deferred, "a retained block is not parked for a retry")
+}

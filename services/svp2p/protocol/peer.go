@@ -106,6 +106,12 @@ type IngestOutcome struct {
 	// lands — see ParentMissingRetryDelay.
 	ParentMissing bool
 
+	// Retained reports that the block arrived before its parent and was
+	// spooled by the ingestor instead of refused: the download is complete and
+	// must not be re-requested; the block is ingested from the spool when its
+	// parent lands. Mutually exclusive with ParentMissing.
+	Retained bool
+
 	// TransientLocal reports a local storage or service fault, including the
 	// admission backoff skip. Admission.SkipForBackoff's caller contract: the
 	// delivering peer did its job, so refresh its stall clock and never

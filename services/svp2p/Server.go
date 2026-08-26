@@ -690,11 +690,17 @@ func (s *Server) newBlockIngestor() (*blockIngestor, error) {
 	// than silently degrading Stop into a no-op.
 	s.stoppableBridge = br
 
-	return &blockIngestor{
+	ing := &blockIngestor{
 		logger:    s.logger,
 		bridge:    br,
 		admission: s.admission,
-	}, nil
+	}
+
+	if s.admission.Enabled() {
+		ing.retained = newOrphanBlocks(s.logger, s.deps.TempStore, s.admission.BudgetBytes())
+	}
+
+	return ing, nil
 }
 
 // stoppableBridge is the narrow slice of *svp2pBridge Server.Stop needs:

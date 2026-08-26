@@ -1472,6 +1472,13 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 	case outcome.Err == nil:
 		m.blockDownloader.BlockReceived(syncPeer, hash, now)
 
+	case outcome.Retained:
+		// The bytes are spooled by the ingestor (orphanBlocks); for the
+		// scheduler this download is complete and must not be re-requested.
+		m.blockDownloader.BlockReceived(syncPeer, hash, now)
+
+		m.logger.Debugf("[svp2p] block %s retained until its parent lands", hash)
+
 	case outcome.ParentMissing:
 		// The block is wanted and the peer delivered it; our own chain is just
 		// not ready for it. Release the claim, hold the block back from the next

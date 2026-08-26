@@ -13,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/svp2p/bridge"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
+	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
@@ -35,13 +36,29 @@ type stubBridge struct {
 	preAdmitErr   error
 	preAdmitBlock chan struct{}
 	preAdmitCalls int
+
+	// preAdmitFor overrides preAdmit for the named block hashes.
+	preAdmitFor map[chainhash.Hash]bridge.PreAdmitResult
+	// ingested records every IngestBlock call: header hash and the bytes read.
+	ingested []ingestedBlock
 }
 
-func (s *stubBridge) PreAdmit(ctx context.Context, _ *wire.BlockHeader) (bridge.PreAdmitResult, error) {
+type ingestedBlock struct {
+	hash    chainhash.Hash
+	txCount uint64
+	payload []byte
+	peer    string
+}
+
+func (s *stubBridge) PreAdmit(ctx context.Context, header *wire.BlockHeader) (bridge.PreAdmitResult, error) {
 	s.mu.Lock()
 	s.preAdmitCalls++
 	block := s.preAdmitBlock
 	result, err := s.preAdmit, s.preAdmitErr
+
+	if override, ok := s.preAdmitFor[header.BlockHash()]; ok {
+		result = override
+	}
 	s.mu.Unlock()
 
 	if block != nil {
@@ -55,18 +72,27 @@ func (s *stubBridge) PreAdmit(ctx context.Context, _ *wire.BlockHeader) (bridge.
 	return result, err
 }
 
-func (s *stubBridge) IngestBlock(_ context.Context, _ *wire.BlockHeader, _ uint64, txReader io.Reader, _ string) error {
+func (s *stubBridge) IngestBlock(_ context.Context, header *wire.BlockHeader, txCount uint64, txReader io.Reader, peer string) error {
+	payload, _ := io.ReadAll(txReader)
+
 	s.mu.Lock()
 	s.calls++
 	err := s.err
+	s.ingested = append(s.ingested, ingestedBlock{hash: header.BlockHash(), txCount: txCount, payload: payload, peer: peer})
 	s.mu.Unlock()
 
-	// The real IngestBlock releases the stream on every exit path.
 	if closer, ok := txReader.(io.Closer); ok {
 		_ = closer.Close()
 	}
 
 	return err
+}
+
+func (s *stubBridge) ingestedBlocks() []ingestedBlock {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]ingestedBlock(nil), s.ingested...)
 }
 
 func (s *stubBridge) HeaderEvents() <-chan bridge.HeaderEvent { return nil }
@@ -465,4 +491,88 @@ func TestBlockIngestorClassifiesPipelineRejects(t *testing.T) {
 			require.Equal(t, 1, br.callCount())
 		})
 	}
+}
+
+// retainingIngestor is newTestIngestor with orphan-block retention over an
+// in-memory temp store and the given byte budget.
+func retainingIngestor(t *testing.T, br bridge.Bridge, budget int64) (*blockIngestor, *bridge.Admission) {
+	t.Helper()
+
+	ingestor, admission := newTestIngestor(t, br)
+	ingestor.retained = newOrphanBlocks(ulogger.TestLogger{}, blobmemory.New(), budget)
+
+	return ingestor, admission
+}
+
+// TestBlockIngestorRetainsAnOrphanAndReplaysItWhenTheParentLands closes the
+// phase-3 ledger's carried residual 1: a block that arrives before its parent
+// used to be refused and its bytes discarded, so it crossed the wire again
+// once the parent landed — measured at about five times over by the parity
+// harness on a three-peer download (2026-08-26). SVNode keeps the block. Now
+// the bytes are spooled into the temp store, the download counts as received,
+// and the block is ingested from the spool the moment its parent is in.
+func TestBlockIngestorRetainsAnOrphanAndReplaysItWhenTheParentLands(t *testing.T) {
+	parent := testIngestHeader()
+	parentHash := parent.BlockHash()
+	child := wire.NewBlockHeader(1, &parentHash, &chainhash.Hash{0x01}, 0x207fffff, 2)
+	childHash := child.BlockHash()
+
+	br := &stubBridge{preAdmitFor: map[chainhash.Hash]bridge.PreAdmitResult{childHash: {ParentMissing: true}}}
+	ingestor, admission := retainingIngestor(t, br, 1<<20)
+
+	body := []byte("child block transactions")
+	stream := &countingStream{Reader: bytes.NewReader(body)}
+
+	outcome := ingestor.Ingest(context.Background(), testIngestRequest(child, stream))
+
+	require.NoError(t, outcome.Err, "a retained orphan is a completed download")
+	require.True(t, outcome.Retained)
+	require.False(t, outcome.ParentMissing, "the scheduler must not defer or re-request a retained block")
+	require.False(t, outcome.TransientLocal)
+	require.Zero(t, br.callCount(), "the orphan must not run the pipeline before its parent")
+	require.Equal(t, 1, stream.closeCount())
+	require.Equal(t, 1, ingestor.retained.Len())
+	require.Equal(t, int64(len(body)), ingestor.retained.Bytes())
+
+	// The parent lands: the child is ingested from the spool, with the bytes
+	// the peer sent, attributed to the peer that sent them.
+	br.mu.Lock()
+	br.preAdmitFor[childHash] = bridge.PreAdmitResult{}
+	br.mu.Unlock()
+
+	parentStream := &countingStream{Reader: bytes.NewReader([]byte("parent"))}
+	outcome = ingestor.Ingest(context.Background(), testIngestRequest(parent, parentStream))
+	require.NoError(t, outcome.Err)
+
+	ingestor.retained.Wait()
+
+	got := br.ingestedBlocks()
+	require.Len(t, got, 2)
+	require.Equal(t, parentHash, got[0].hash)
+	require.Equal(t, childHash, got[1].hash)
+	require.Equal(t, body, got[1].payload, "the replay must carry the bytes the peer sent")
+	require.Equal(t, uint64(1), got[1].txCount)
+	require.Equal(t, "127.0.0.1:8333", got[1].peer)
+	require.Zero(t, ingestor.retained.Len(), "a replayed block leaves the spool")
+	require.Equal(t, int64(0), admission.Waiters())
+}
+
+// TestBlockIngestorHoldsBackAnOrphanOverTheRetentionBudget keeps today's
+// behaviour when the spool is full: refuse, release, let the scheduler defer.
+func TestBlockIngestorHoldsBackAnOrphanOverTheRetentionBudget(t *testing.T) {
+	br := &stubBridge{preAdmit: bridge.PreAdmitResult{ParentMissing: true}}
+	ingestor, _ := retainingIngestor(t, br, 8)
+
+	stream := &countingStream{Reader: bytes.NewReader(nil)}
+	req := testIngestRequest(testIngestHeader(), stream)
+	req.SizeBytes = 1024
+
+	outcome := ingestor.Ingest(context.Background(), req)
+
+	require.Error(t, outcome.Err)
+	require.True(t, outcome.ParentMissing)
+	require.True(t, outcome.TransientLocal)
+	require.False(t, outcome.Retained)
+	require.Equal(t, 1, stream.closeCount())
+	require.Zero(t, ingestor.retained.Len())
 }
