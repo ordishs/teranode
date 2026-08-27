@@ -25,7 +25,7 @@ import (
 // A silently-zero field here would be the safe direction (banning stays on), but
 // it would make the switch a no-op for svp2p with no signal at all.
 func TestDisableBanning_LoaderReadsKey(t *testing.T) {
-	const key = "legacy_config_DisableBanning"
+	const key = "legacy_disableBanning"
 
 	ctx := gocore.Config().GetContext()
 

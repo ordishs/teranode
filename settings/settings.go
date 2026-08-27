@@ -722,24 +722,14 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// `legacy_config_MinSyncPeerNetworkSpeed` through its reflective
 			// loader (config.go:773 over config.go:154). Setting one does
 			// nothing to the other, and cutover must reconcile the two.
-			MinSyncPeerNetworkSpeed: getUint64("legacy_minSyncPeerNetworkSpeed", 51200, alternativeContext...),
-			// NOT a new Phase 3 settings key: `legacy_config_DisableBanning`
-			// is the key the legacy service already honors as the bsvd
-			// `--nobanning` switch. Legacy reads it through the reflective
-			// `legacy_config_<Field>` loader (services/legacy/config.go:773
-			// setConfigValuesFromSettings, over config.go:155's
-			// DisableBanning field), which needs no typed accessor. This
-			// typed field exists so svp2p can honor the SAME operator switch
-			// without reaching into gocore config itself; the default matches
-			// legacy's zero value, so behavior is unchanged on both sides.
-			//
-			// CUTOVER ITEM: `legacy_config_*` is legacy's own reflection
-			// namespace, and the legacy service is DELETED at cutover (spec
-			// §10 item 6). This key dies with the service it belongs to, so
-			// the cutover change must rename it to an svp2p-owned key and
-			// migrate any operator who set it. Do not let svp2p inherit a
-			// key whose namespace no longer exists.
-			DisableBanning: getBool("legacy_config_DisableBanning", false, alternativeContext...),
+			MinSyncPeerNetworkSpeed: getUint64WithFallback("legacy_minSyncPeerNetworkSpeed", "legacy_config_MinSyncPeerNetworkSpeed", 51200, alternativeContext...),
+			// `legacy_disableBanning` is svp2p's own key for the bsvd --nobanning
+			// switch. The legacy service reads `legacy_config_DisableBanning`
+			// through its reflective loader (services/legacy/config.go
+			// setConfigValuesFromSettings), a namespace deleted with that
+			// service at cutover (spec §10 item 6). Until then an operator who set
+			// only the old key keeps the behaviour, with a deprecation warning.
+			DisableBanning: getBoolWithFallback("legacy_disableBanning", "legacy_config_DisableBanning", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
