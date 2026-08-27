@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -39,6 +40,9 @@ type orphanValidateFunc func(ctx context.Context, tx *bt.Tx) (*meta.Data, error)
 type orphanEntry struct {
 	tx      *bt.Tx
 	parents map[chainhash.Hash]struct{}
+
+	// addedAt feeds orphan_time when the entry is released.
+	addedAt time.Time
 }
 
 // ReleasedOrphan is one orphan the release walk promoted to accepted, in
@@ -322,6 +326,8 @@ func (p *orphanPool) finalValidate(entry *orphanEntry) {
 // does that today; this is a standing constraint for anything added here
 // later, not a description of a bug that exists now.
 func (p *orphanPool) onEvict(hash chainhash.Hash, entry *orphanEntry) bool {
+	prometheusSvp2pBridgeOrphans.Dec()
+
 	select {
 	case p.evictions <- entry:
 	default:
@@ -354,7 +360,10 @@ func (p *orphanPool) add(tx *bt.Tx) {
 	p.m.Set(hash, &orphanEntry{
 		tx:      tx,
 		parents: parents,
+		addedAt: time.Now(),
 	})
+
+	prometheusSvp2pBridgeOrphans.Inc()
 }
 
 // release runs legacy's processOrphanTransactions
@@ -416,6 +425,11 @@ func (p *orphanPool) add(tx *bt.Tx) {
 // entry, since by the time an entry is popped it has already been removed
 // here.
 func (p *orphanPool) release(ctx context.Context, root chainhash.Hash) []ReleasedOrphan {
+	start := time.Now()
+	defer func() {
+		prometheusSvp2pBridgeProcessOrphanTransactions.Observe(float64(time.Since(start).Microseconds()) / 1_000_000)
+	}()
+
 	var released []ReleasedOrphan
 
 	queue := []chainhash.Hash{root}
@@ -458,6 +472,8 @@ func (p *orphanPool) release(ctx context.Context, root chainhash.Hash) []Release
 					// it discarded the map key when it built orphanTxs
 					// from Items() (`for _, orphanTx := range orphanTxs`).
 					p.m.Delete(hash)
+					prometheusSvp2pBridgeOrphans.Dec()
+
 					continue
 				}
 
@@ -484,6 +500,8 @@ func (p *orphanPool) release(ctx context.Context, root chainhash.Hash) []Release
 			// being deferred to this hash's own turn at the top of the
 			// loop.
 			p.m.Delete(hash)
+			prometheusSvp2pBridgeOrphans.Dec()
+			prometheusSvp2pBridgeOrphanTime.Observe(float64(time.Since(entry.addedAt).Microseconds()) / 1_000_000)
 
 			released = append(released, ReleasedOrphan{
 				TxHash: hash,

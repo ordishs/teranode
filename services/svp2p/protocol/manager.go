@@ -808,7 +808,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 		Conn:         conn,
 		Logger:       m.logger,
 		IdleTimeout:  m.tSettings.Legacy.PeerIdleTimeout,
-		PingInterval: pingInterval,
+		PingInterval: effectivePingInterval(m.tSettings.Legacy.PeerIdleTimeout, pingInterval),
 		BanThreshold: banScoreThreshold,
 		// The legacy `--nobanning` switch, read from the same setting the
 		// legacy service reads it from (see PeerConfig.DisableBanning).
@@ -2378,4 +2378,18 @@ func netAddressOf(addr net.Addr) *wire.NetAddress {
 	}
 
 	return wire.NewNetAddress(tcpAddr, 0)
+}
+
+// effectivePingInterval fits the ping cadence to the idle window it keeps
+// alive. SVNode's PING_INTERVAL (2 min) sits under a TIMEOUT_INTERVAL of 20
+// min (net.h), a tenfold margin; svp2p's window is legacy_peerIdleTimeout,
+// 125 s by default, which would leave a pong 5 s to arrive. When the window is
+// shorter than two cadences the cadence is halved, so a pong always has at
+// least half the window; otherwise SVNode's own cadence is kept.
+func effectivePingInterval(idle, ping time.Duration) time.Duration {
+	if idle > 0 && idle < 2*ping {
+		return idle / 2
+	}
+
+	return ping
 }

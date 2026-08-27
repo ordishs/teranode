@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -99,6 +100,11 @@ type IngestTxResult struct {
 // own block height (the same comment legacy carries verbatim at
 // manager.go:1242).
 func (sm *svp2pBridge) IngestTx(ctx context.Context, txBytes []byte, peerAddr string) (IngestTxResult, error) {
+	start := time.Now()
+	defer func() {
+		prometheusSvp2pBridgeHandleTxMsg.Observe(float64(time.Since(start).Microseconds()) / 1_000_000)
+	}()
+
 	btTx, err := bt.NewTxFromBytes(txBytes)
 	if err != nil {
 		return IngestTxResult{}, errors.NewProcessingError("[IngestTx] failed to create transaction from bytes", err)
@@ -113,7 +119,9 @@ func (sm *svp2pBridge) IngestTx(ctx context.Context, txBytes []byte, peerAddr st
 
 	// passing in block height 0, which will default to utxo store block
 	// height in validator (manager.go:1242, carried verbatim).
+	validateStart := time.Now()
 	txMeta, err := sm.validationClient.Validate(ctx, btTx, 0)
+	prometheusSvp2pBridgeHandleTxMsgValidate.Observe(float64(time.Since(validateStart).Microseconds()) / 1_000_000)
 
 	// Not carried here (review round 1, Minor 7): immediately after
 	// Validate, and REGARDLESS of its outcome (err nil or not — the check

@@ -72,6 +72,15 @@ var (
 	// package already registers other metrics here for this reason.
 	prometheusSvp2pBridgeOrphanEvictionQueueDrops prometheus.Counter
 
+	// The five tx-side netsync metrics Phase 2 dropped and Phase 3 gave
+	// consumers again (see the RESIDUAL note above): IngestTx and the orphan
+	// pool observe them under this package's subsystem.
+	prometheusSvp2pBridgeHandleTxMsg               prometheus.Histogram
+	prometheusSvp2pBridgeHandleTxMsgValidate       prometheus.Histogram
+	prometheusSvp2pBridgeProcessOrphanTransactions prometheus.Histogram
+	prometheusSvp2pBridgeOrphans                   prometheus.Gauge
+	prometheusSvp2pBridgeOrphanTime                prometheus.Histogram
+
 	prometheusMetricsInitOnce sync.Once
 )
 
@@ -211,4 +220,48 @@ func _initPrometheusMetrics() {
 		Help:      "Number of orphan final-validation attempts dropped because the eviction hand-off queue was full",
 	})
 	prometheus.MustRegister(prometheusSvp2pBridgeOrphanEvictionQueueDrops)
+	prometheusSvp2pBridgeHandleTxMsg = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "teranode",
+		Subsystem: "svp2p_bridge",
+		Name:      "handle_tx_msg",
+		Help:      "The time taken to ingest a tx message from a peer",
+		Buckets:   util.MetricsBucketsMilliSeconds,
+	})
+	prometheus.MustRegister(prometheusSvp2pBridgeHandleTxMsg)
+
+	prometheusSvp2pBridgeHandleTxMsgValidate = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "teranode",
+		Subsystem: "svp2p_bridge",
+		Name:      "handle_tx_msg_validate",
+		Help:      "The time taken by the validator for a tx message from a peer",
+		Buckets:   util.MetricsBucketsMilliSeconds,
+	})
+	prometheus.MustRegister(prometheusSvp2pBridgeHandleTxMsgValidate)
+
+	prometheusSvp2pBridgeProcessOrphanTransactions = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "teranode",
+		Subsystem: "svp2p_bridge",
+		Name:      "process_orphan_transactions",
+		Help:      "The time taken to release orphan transactions after a parent is accepted",
+		Buckets:   util.MetricsBucketsMilliSeconds,
+	})
+	prometheus.MustRegister(prometheusSvp2pBridgeProcessOrphanTransactions)
+
+	prometheusSvp2pBridgeOrphans = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "teranode",
+		Subsystem: "svp2p_bridge",
+		Name:      "orphans",
+		Help:      "The number of orphan transactions in the pool",
+	})
+	prometheus.MustRegister(prometheusSvp2pBridgeOrphans)
+
+	prometheusSvp2pBridgeOrphanTime = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "teranode",
+		Subsystem: "svp2p_bridge",
+		Name:      "orphan_time",
+		Help:      "The time an orphan transaction waited in the pool before it was released",
+		Buckets:   util.MetricsBucketsSeconds,
+	})
+	prometheus.MustRegister(prometheusSvp2pBridgeOrphanTime)
+
 }

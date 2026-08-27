@@ -780,7 +780,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			WriteBufferSize:          getInt("grpc_write_buffer_size", 0, alternativeContext...),
 			KeepaliveTime:            getInt("grpc_keepalive_time_seconds", 30, alternativeContext...),
 			KeepaliveTimeout:         getInt("grpc_keepalive_timeout_seconds", 20, alternativeContext...),
-			ServerMinPingTime:        getInt("grpc_server_min_ping_time_seconds", 30, alternativeContext...),
+			ServerMinPingTime:        getInt("grpc_server_min_ping_time_seconds", 20, alternativeContext...), // strictly below grpc_keepalive_time_seconds: equal values race at the boundary and the server answers GOAWAY too_many_pings
 			PermitWithoutStream:      getBool("grpc_permit_without_stream", true, alternativeContext...),
 			MaxConnectionIdleSeconds: getInt("grpc_max_connection_idle_seconds", 300, alternativeContext...),
 		},
