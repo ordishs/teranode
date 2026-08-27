@@ -12,10 +12,11 @@ import (
 )
 
 // TestParity_ColdStartBootstrap — watch-list scenario 8. No configured peers
-// and an empty address table: neither side has anyone to dial. svp2p carries
-// no DNS seeds, fixed seeds or feelers (Task 19), and regtest legacy has no
-// seeds either, so both sit at zero. Recorded, not judged: it is the owner
-// decision the watch-list names.
+// and an empty address table. svp2p now carries SVNode's DNS seeding and
+// fixed-seed fallback (protocol/seeds.go), but regtest declares neither a DNS
+// seed nor a fixed seed, and legacy has no regtest seeds either, so both sit at
+// zero here. The bootstrap itself is pinned in protocol/seeds_test.go with an
+// injected resolver; this row records that nothing dials out on regtest.
 func TestParity_ColdStartBootstrap(t *testing.T) {
 	obs, _ := RunParity(t, Scenario{
 		Name:  "cold-start-bootstrap",
@@ -34,7 +35,7 @@ func TestParity_ColdStartBootstrap(t *testing.T) {
 		},
 	})
 
-	require.Equal(t, "0", obs[Svp2p].Notes["connected-after-10s"], "svp2p cannot bootstrap outbound without legacy_connect_peers or a warm peers.json (Task 19 residuals 13-15)")
+	require.Equal(t, "0", obs[Svp2p].Notes["connected-after-10s"], "regtest has no DNS or fixed seeds, so an empty table must stay empty and nothing may dial out")
 	t.Logf("cold start: legacy connected %s, svp2p connected %s", obs[Legacy].Notes["connected-after-10s"], obs[Svp2p].Notes["connected-after-10s"])
 }
 

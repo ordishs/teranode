@@ -265,21 +265,36 @@ type PeerManager struct {
 	// bypassed.
 	dialTCP func(addr string) (net.Conn, error)
 
+	// dnsLookup, dnsSeedDelay, fixedSeedGrace and fixedSeeds are the seams of
+	// seeds.go: the resolver, ThreadDNSAddressSeed's opening sleep, the
+	// fixed-seed grace period and the fixed-seed table. Fields so tests can
+	// drive the bootstrap without the network or a minute of wall clock.
+	dnsLookup       dnsLookupFunc
+	dnsSeedDelay    time.Duration
+	fixedSeedGrace  time.Duration
+	fixedSeeds      func() []Address
+	fixedSeedsAdded bool
+
 	quit chan struct{}
 	wg   sync.WaitGroup
 }
 
 func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList *BanList) *PeerManager {
 	m := &PeerManager{
-		logger:        logger,
-		tSettings:     tSettings,
-		banList:       banList,
-		peers:         make(map[*Peer]*SyncPeer),
-		outboundDials: make(map[string]struct{}),
-		quit:          make(chan struct{}),
-		syncTick:      defaultSyncTick,
-		outboundTick:  defaultOpenConnectionsTick,
+		logger:         logger,
+		tSettings:      tSettings,
+		banList:        banList,
+		peers:          make(map[*Peer]*SyncPeer),
+		outboundDials:  make(map[string]struct{}),
+		quit:           make(chan struct{}),
+		syncTick:       defaultSyncTick,
+		outboundTick:   defaultOpenConnectionsTick,
+		dnsLookup:      defaultDNSLookup,
+		dnsSeedDelay:   defaultDNSSeedDelay,
+		fixedSeedGrace: defaultFixedSeedGrace,
 	}
+
+	m.fixedSeeds = m.defaultFixedSeeds
 
 	m.dialTCP = func(addr string) (net.Conn, error) {
 		return net.DialTimeout("tcp", addr, dialTimeout)
@@ -632,6 +647,18 @@ func (m *PeerManager) Start(ctx context.Context, listenAddresses []string) error
 			defer m.wg.Done()
 			m.openConnectionsLoop(ctx, addrMan, target)
 		}()
+
+		// net.cpp CConnman::Start: threadDNSAddressSeed unless -dnsseed=0;
+		// init.cpp soft-sets -dnsseed=0 when -connect is given, which the
+		// enclosing ConnectPeers test already reproduces.
+		if !m.tSettings.Legacy.DisableDNSSeed {
+			m.wg.Add(1)
+
+			go func() {
+				defer m.wg.Done()
+				m.runDNSSeeding(ctx, addrMan)
+			}()
+		}
 	}
 
 	if m.SyncEnabled() {

@@ -729,6 +729,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// setConfigValuesFromSettings), a namespace deleted with that
 			// service at cutover (spec §10 item 6). Until then an operator who set
 			// only the old key keeps the behaviour, with a deprecation warning.
+			DisableDNSSeed: getBoolWithFallback("legacy_disableDNSSeed", "legacy_config_DisableDNSSeed", false, alternativeContext...),
 			DisableBanning: getBoolWithFallback("legacy_disableBanning", "legacy_config_DisableBanning", false, alternativeContext...),
 		},
 		Propagation: PropagationSettings{

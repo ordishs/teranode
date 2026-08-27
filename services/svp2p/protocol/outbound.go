@@ -17,11 +17,10 @@ import (
 // (net.cpp:1817-1836) returns without ever reaching the loop below, which is
 // why legacy_connect_peers stays dominant when it is set.
 //
-// DNS seeds are deliberately NOT here (SVNode's ThreadDNSAddressSeed,
-// net.cpp:1622): out of scope for this task. Neither is the fixed-seed
-// fallback the loop reaches when the table is empty (net.cpp:1842-1855), nor
-// feeler connections (net.cpp:1897-1918), nor one-shots (ProcessOneShot,
-// net.cpp:1801), nor addnode slots (net.cpp:2050-2090). Each is listed in the
+// DNS seeds (SVNode's ThreadDNSAddressSeed) and the fixed-seed fallback the
+// loop reaches when the table is empty live in seeds.go. Still not carried:
+// feeler connections (net.cpp:1897-1918), one-shots (ProcessOneShot,
+// net.cpp:1801) and addnode slots (net.cpp:2050-2090). Each is listed in the
 // task's residual ledger rather than half-built.
 //
 // LOCKING (the package contract, restated because this file adds a caller of
@@ -166,6 +165,9 @@ func (m *PeerManager) outboundSlotsSnapshot() outboundSlots {
 // loop (net.cpp:1838-1991). Started by Start only when there is an address
 // table to read, a positive target, and no legacy_connect_peers list.
 func (m *PeerManager) openConnectionsLoop(ctx context.Context, addrMan *AddrMan, target int) {
+	// nStart (net.cpp:1841), for the fixed-seed grace period.
+	started := time.Now()
+
 	for {
 		// The sleep is at the TOP of the C++ loop too (net.cpp:1846), which
 		// is what keeps a node from hammering the table on startup.
@@ -176,6 +178,10 @@ func (m *PeerManager) openConnectionsLoop(ctx context.Context, addrMan *AddrMan,
 		case <-ctx.Done():
 			return
 		}
+
+		// net.cpp:1855-1866: fixed seeds once the table has stayed empty for
+		// a minute — "DNS doesn't seem to be available".
+		m.addFixedSeedsIfStarved(addrMan, started)
 
 		slots := m.outboundSlotsSnapshot()
 

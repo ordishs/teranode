@@ -105,3 +105,20 @@ func TestMinSyncPeerNetworkSpeed_NewKeyWinsOverLegacyConfigKey(t *testing.T) {
 	require.Equal(t, uint64(12345), s.Legacy.MinSyncPeerNetworkSpeed)
 	require.NotContains(t, out, "legacy_config_MinSyncPeerNetworkSpeed")
 }
+
+// legacy_disableDNSSeed is the bsvd --nodnsseed switch for svp2p; the legacy
+// service spells it legacy_config_DisableDNSSeed.
+func TestDisableDNSSeed_LoaderReadsKeyAndFallback(t *testing.T) {
+	require.False(t, NewSettings().Legacy.DisableDNSSeed, "DNS seeding is on by default")
+
+	setForTest(t, "legacy_config_DisableDNSSeed", "true")
+
+	var s *Settings
+
+	out := captureStderr(t, func() { s = NewSettings() })
+	require.True(t, s.Legacy.DisableDNSSeed)
+	require.Contains(t, out, "legacy_disableDNSSeed")
+
+	setForTest(t, "legacy_disableDNSSeed", "false")
+	require.False(t, NewSettings().Legacy.DisableDNSSeed, "the new key wins")
+}

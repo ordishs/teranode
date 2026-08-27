@@ -1281,6 +1281,15 @@ func (p *Peer) Established() <-chan struct{} { return p.established }
 // takes syncMu (the package lock order is peer lock then manager lock).
 func (p *Peer) Inbound() bool { return p.cfg.Handshake.Inbound }
 
+// Services is the peer's advertised nServices from its version message, zero
+// before the handshake has delivered one. Takes the peer lock like Info.
+func (p *Peer) Services() wire.ServiceFlag {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.hs.PeerInfo().Services
+}
+
 func (p *Peer) Disconnect(reason string) {
 	_ = p.disconnect(errors.New(errors.ERR_ERROR, "svp2p: disconnected: %s", reason))
 }

@@ -263,6 +263,15 @@ peer.
 peers both sides hold 0 connections after 10 s (regtest legacy has no seeds
 either). Expected FAIL, recorded; the owner decision stands.
 
+**Owner decision 2026-08-27: add DNS seeds.** svp2p now carries
+ThreadDNSAddressSeed (query the chain's DNS seeds when the table is empty or
+fewer than two full-node peers are up, after SVNode's 11 s wait) and the
+fixed-seed fallback (SVNode's `pnSeed6_*` tables, added once the table has
+stayed empty for 60 s) in `protocol/seeds.go`; `legacy_disableDNSSeed` is the
+--nodnsseed switch. Regtest has neither kind of seed, so this in-process row
+still reads 0/0 and now asserts exactly that; the bootstrap itself is pinned in
+`protocol/seeds_test.go` with an injected resolver. Scenario CLOSED.
+
 ### 9. Blocks at and over the 4 GiB envelope
 
 A block a basic message header cannot declare is answered `notfound`
@@ -343,3 +352,8 @@ fence either. Found 2026-08-26 when the harness's scripted peer, announcing
 **Verdict 2026-08-26 (`TestParity_UserAgentFence`):** legacy rejects and bans a
 peer announcing `/scriptpeer:0.1/`; svp2p accepts it and syncs from it. Pinned;
 owner decision at cutover.
+
+**Owner decision 2026-08-27: DROP the fence.** svp2p follows SVNode and accepts
+any user agent; legacy's ban is a Teranode-only policy with no SVNode
+counterpart and ends with the legacy service at cutover. Recorded as a
+deliberate behaviour change in the Phase 3 PR. Scenario CLOSED.
