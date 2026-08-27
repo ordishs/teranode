@@ -92,7 +92,7 @@ func (b *svp2pBridge) FetchBlock(ctx context.Context, hash *chainhash.Hash) (io.
 
 	url := fmt.Sprintf("%s/%s/%s?wire=1", b.settings.Asset.HTTPAddress, legacyBlockWirePath, hash.String())
 
-	body, err := util.DoHTTPRequestBodyReader(ctx, url)
+	body, err := util.DoTrustedHTTPRequestBodyReader(ctx, url)
 	if err != nil {
 		// The asset service answering 404 for a block the blockchain service
 		// knows about means the body is not retained here. util's HTTP helper

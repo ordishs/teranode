@@ -106,8 +106,10 @@ func TestFetchBlock_StreamsBodyAndReportsDeclaredLength(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	util.SetSSRFProtection(false)
-	t.Cleanup(func() { util.SetSSRFProtection(true) })
+	// Deliberately WITH SSRF protection on: asset_httpAddress is operator
+	// configuration and defaults to loopback, so FetchBlock must not go through
+	// the peer-facing dial policy (ledger residual 14).
+	util.SetSSRFProtection(true)
 
 	b, mockBC, _ := newFetchBridge(ctx, t, srv.URL)
 	mockBC.On("GetBlockHeader", mock.Anything, &wantHash).
