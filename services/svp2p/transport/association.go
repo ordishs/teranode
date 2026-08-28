@@ -16,7 +16,7 @@ import (
 var ErrAssociationClosed = errors.New(errors.ERR_ERROR, "svp2p: association closed")
 
 // ErrStreamExists reports a second stream of a type the association already
-// holds. association.cpp:149-152 MoveStream throws in the same case: one
+// holds. association.cpp:137-160 MoveStream throws in the same case: one
 // stream per type is the invariant, and a peer that asks twice is misbehaving.
 var ErrStreamExists = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: stream type already attached")
 
@@ -40,6 +40,7 @@ type Association struct {
 	streams map[wire.StreamType]*Conn
 	policy  StreamPolicy
 	closed  bool
+	started bool
 
 	pver atomic.Uint32
 
@@ -53,7 +54,6 @@ type Association struct {
 	err   error
 
 	closeOnce sync.Once
-	startOnce sync.Once
 	wg        sync.WaitGroup
 
 	ctx context.Context
@@ -121,43 +121,51 @@ func (a *Association) HasStream(t wire.StreamType) bool {
 	return ok
 }
 
-// Start runs the GENERAL stream. Every other stream is started by Attach, so
-// a stream that arrives after Start is serviced the same way.
+// Start runs every stream the association holds, GENERAL and any stream
+// attached before this call, all of them on the caller's context. A stream
+// attached AFTER this call is started by Attach instead. Nothing runs on a
+// context the caller did not supply, so cancellation always reaches every
+// stream.
 func (a *Association) Start(ctx context.Context) {
-	started := false
+	a.mu.Lock()
 
-	a.startOnce.Do(func() { started = true })
-
-	if !started {
+	if a.started || a.closed {
+		a.mu.Unlock()
 		return
 	}
 
-	a.mu.Lock()
-
+	a.started = true
 	a.ctx = ctx
-	general := a.streams[wire.StreamTypeGeneral]
-	closed := a.closed
 
-	if !closed {
-		a.wg.Add(2)
+	pending := make([]*Conn, 0, len(a.streams))
+	for _, c := range a.streams {
+		pending = append(pending, c)
 	}
+
+	a.wg.Add(2 * len(pending))
 
 	a.mu.Unlock()
 
-	if closed {
-		return
+	pver := a.pver.Load()
+
+	for _, c := range pending {
+		c.SetProtocolVersion(pver)
+		c.Start(ctx)
+		a.forward(c)
+
+		go a.watch(c)
 	}
-
-	general.Start(ctx)
-	a.forward(general)
-
-	go a.watch(general)
 }
 
 // Attach adopts a further stream. The stream must carry a type the association
-// does not already hold (association.cpp:149-152); anything else is refused
+// does not already hold (association.cpp:137-160); anything else is refused
 // and the rejected Conn is closed here, because the caller has handed over
 // ownership of the socket by calling this.
+//
+// Attaching BEFORE Start is allowed and is how a stream negotiated during the
+// handshake is registered. Such a stream is stored but NOT started here: Start
+// starts it with the caller's context, because starting it now would bind it
+// to a context the caller never chose and cancellation would never reach it.
 func (a *Association) Attach(c *Conn) error {
 	a.mu.Lock()
 
@@ -178,6 +186,13 @@ func (a *Association) Attach(c *Conn) error {
 	}
 
 	a.streams[t] = c
+
+	if !a.started {
+		a.mu.Unlock()
+
+		return nil
+	}
+
 	ctx := a.ctx
 
 	// Under mu, so that fail cannot snapshot this stream and then reach

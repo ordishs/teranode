@@ -20,6 +20,11 @@ import (
 // matches errors.Is by code, and callers distinguish this condition.
 var ErrSendQueueFull = errors.New(errors.ERR_THRESHOLD_EXCEEDED, "svp2p: send queue full")
 
+// ErrConnClosed is what Err reports when the connection was shut down locally
+// rather than by a fault. A close that follows a real failure keeps the
+// failure: quitOnce records the first cause only.
+var ErrConnClosed = errors.New(errors.ERR_ERROR, "svp2p: connection closed locally")
+
 type Config struct {
 	Net             wire.BitcoinNet
 	ProtocolVersion uint32
@@ -495,6 +500,15 @@ func (c *Conn) BytesSent() uint64 { return c.sent.Load() }
 func (c *Conn) BytesReceived() uint64 { return c.received.Load() }
 
 func (c *Conn) fail(err error) {
+	c.markFailed(err)
+
+	_ = c.closeNC()
+}
+
+// markFailed records the FIRST cause and releases everything parked on quit.
+// Later calls keep the first cause, so a local close after a fault does not
+// overwrite the fault.
+func (c *Conn) markFailed(err error) {
 	c.quitOnce.Do(func() {
 		c.errMu.Lock()
 		c.err = err
@@ -502,13 +516,19 @@ func (c *Conn) fail(err error) {
 
 		close(c.quit)
 	})
-
-	_ = c.closeNC()
 }
 
-// Close shuts the socket; the reader's resulting error cascades through
-// fail, which closes quit and releases the writer.
-func (c *Conn) Close() error { return c.closeNC() }
+// Close shuts the connection down locally. It trips quit as well as the
+// socket, because closing the socket alone does NOT release a read loop parked
+// on a full inbound channel: that select waits on quit, not on the socket, so
+// a consumer that has stopped draining would leave the reader parked for ever
+// and Done would never close. Err reports ErrConnClosed unless a fault was
+// recorded first.
+func (c *Conn) Close() error {
+	c.markFailed(ErrConnClosed)
+
+	return c.closeNC()
+}
 
 func (c *Conn) closeNC() error {
 	var err error

@@ -382,3 +382,121 @@ func TestAssociation_StreamTypeDefaultsToGeneral(t *testing.T) {
 
 	require.Equal(t, wire.StreamTypeGeneral, c.StreamType())
 }
+
+// A local close must release a read loop parked on a full inbound channel.
+// That select waits on the Conn's quit channel, never on the socket, so
+// closing the socket alone would leave the reader parked and Done would never
+// close — while the association reported a clean teardown.
+func TestAssociation_CloseReleasesAReaderParkedOnAFullInbound(t *testing.T) {
+	local, remote := net.Pipe()
+
+	defer func() { _ = remote.Close() }()
+
+	cfg := testConfig()
+	cfg.RecvQueueLen = 1
+
+	general := New(local, cfg)
+
+	a := NewAssociation(general, []byte{0x06})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a.Start(ctx)
+
+	// Nothing ever reads a.Inbound here. The far side keeps writing until the
+	// pipe goes away, which backs up the merged channel, then the Conn's own
+	// inbound channel, and finally parks the read loop mid-send.
+	go func() {
+		for {
+			_, err := wire.WriteMessageWithEncodingN(remote, wire.NewMsgPing(9), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		return len(a.inbound) == cap(a.inbound) && len(general.inbound) == cap(general.inbound)
+	}, 5*time.Second, 10*time.Millisecond, "the inbound channels never filled, so no reader was parked")
+
+	require.NoError(t, a.Close())
+
+	select {
+	case <-general.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the parked read loop was never released")
+	}
+
+	select {
+	case <-a.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the association did not tear down")
+	}
+
+	require.ErrorIs(t, general.Err(), ErrConnClosed)
+	require.Error(t, a.Err())
+}
+
+// A stream attached before Start must be started BY Start, on the caller's
+// context, so that cancellation reaches it. Starting it at Attach time would
+// bind it to a context the caller never supplied.
+func TestAssociation_AttachBeforeStartRunsOnTheCallersContext(t *testing.T) {
+	general, _ := pipeConn(t, wire.StreamTypeGeneral, wire.ProtocolVersion)
+
+	a := NewAssociation(general, []byte{0x07})
+
+	data1, data1Remote := pipeConn(t, wire.StreamTypeData1, wire.ProtocolVersion)
+	require.NoError(t, a.Attach(data1))
+	require.True(t, a.HasStream(wire.StreamTypeData1))
+
+	// net.Pipe is unbuffered, so this write completes only once something
+	// reads the other end. Nothing may read it until Start runs.
+	writeErr := make(chan error, 1)
+
+	go func() {
+		_, err := wire.WriteMessageWithEncodingN(data1Remote, wire.NewMsgPong(11), wire.ProtocolVersion, wire.MainNet, wire.BaseEncoding)
+		writeErr <- err
+	}()
+
+	select {
+	case <-writeErr:
+		t.Fatal("the pre-attached stream was reading before Start")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a.Start(ctx)
+
+	select {
+	case err := <-writeErr:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not start the pre-attached stream")
+	}
+
+	select {
+	case msg, open := <-a.Inbound():
+		require.True(t, open)
+		require.Equal(t, wire.CmdPong, msg.Command())
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pre-attached stream's message never reached the merged channel")
+	}
+
+	cancel()
+
+	for name, ch := range map[string]<-chan struct{}{
+		"association": a.Done(),
+		"general":     general.Done(),
+		"data1":       data1.Done(),
+	} {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("cancelling the context did not close %s", name)
+		}
+	}
+
+	require.Error(t, a.Err())
+}
