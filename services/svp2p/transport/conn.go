@@ -34,6 +34,21 @@ type Config struct {
 	// node's excessive block size limit, so this bounds an extended frame the
 	// same as it bounds a basic one.
 	MaxBlockPayload uint64
+
+	// StreamType is the association stream this connection carries. Zero means
+	// GENERAL: association.cpp:43 gives the first socket of an association the
+	// GENERAL type, and every other type is opened later.
+	StreamType wire.StreamType
+}
+
+// StreamType reports which association stream this connection carries. An
+// unset Config.StreamType reads as GENERAL (association.cpp:43).
+func (c *Conn) StreamType() wire.StreamType {
+	if c.cfg.StreamType == wire.StreamTypeUnknown {
+		return wire.StreamTypeGeneral
+	}
+
+	return c.cfg.StreamType
 }
 
 // maxBlockPayload returns the configured block payload ceiling, or the
@@ -83,6 +98,7 @@ type Conn struct {
 	err           error
 	quitOnce      sync.Once
 	closeOnce     sync.Once
+	startOnce     sync.Once
 }
 
 func New(nc net.Conn, cfg Config) *Conn {
@@ -104,7 +120,21 @@ func New(nc net.Conn, cfg Config) *Conn {
 	return c
 }
 
+// Start launches the reader and the writer. startOnce is the single owner of
+// done: whichever of Start and closeNC claims it takes responsibility for
+// closing done, so a connection that is closed before it ever ran still
+// reports Done, and one that is started reports Done only once both loops have
+// left. An Association needs the first case, because it closes a stream it
+// refuses to attach and that stream was never started.
 func (c *Conn) Start(ctx context.Context) {
+	started := false
+
+	c.startOnce.Do(func() { started = true })
+
+	if !started {
+		return
+	}
+
 	var wg sync.WaitGroup
 
 	wg.Add(2)
@@ -490,6 +520,8 @@ func (c *Conn) closeNC() error {
 		// socket, so it needs the close signalled explicitly.
 		close(c.sockClosed)
 	})
+
+	c.startOnce.Do(func() { close(c.done) })
 
 	return err
 }
