@@ -38,9 +38,10 @@ const extendedBlockSettleTimeout = 2 * time.Minute
 // whole payload twice over — NewRawBlockMessage reads the asset body into one
 // []byte (services/legacy/raw_block_message.go:28, io.ReadAll) and go-wire's
 // WriteMessageWithEncodingN encodes that into a bytes.Buffer
-// (message.go:351-353) — so a 4 GiB + 1 block costs upwards of 16 GB of live
-// heap before go-wire drops the frame at message.go:385. Under -race the cost
-// is far higher: this scenario was run with both legs on 2026-08-28 and the
+// (message.go:351-353).
+//
+// Measured on 2026-08-28, both legs, WITHOUT the race detector: 94.8 GB
+// maximum resident set size. With -race the first attempt never finished — the
 // test binary was killed by the OS at 62.8 GB maximum resident set size, 762 s
 // in, still inside the legacy leg.
 //

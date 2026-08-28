@@ -222,7 +222,7 @@ type FrameHeader struct {
 // (protocol.cpp:220-237: command "extmsg", length 0xffffffff, zero checksum,
 // then the real command and a 64 bit length).
 //
-// go-wire cannot read that extension: readMessageHeader (message.go:245,
+// go-wire cannot read that extension: readMessageHeader (message.go:246,
 // v1.2.11) reads MessageHeaderSize = 24 bytes into a buffer and then parses the
 // extension out of that SAME 24 byte buffer, which is already exhausted. The
 // error is discarded, so an extmsg frame comes back with an empty command and a
@@ -487,8 +487,10 @@ func (p *ScriptedPeer) Conns() []net.Conn {
 }
 
 // protoconf is the peer's protocol configuration announcement. The stream
-// policies it carries are the ones the node picks its preferred policy from
-// (net.cpp:904-921 SetSupportedStreamPolicies).
+// policies it carries are the ones the node intersects with its own
+// (net.cpp:904-923 CNode::SetSupportedStreamPolicies) before picking the first
+// of its prioritised list that is in common
+// (net.cpp:945-963 CNode::GetPreferredStreamPolicyName).
 func (p *ScriptedPeer) protoconf() *wire.MsgProtoconf {
 	policies := p.Script.StreamPolicies
 	if policies == nil {
@@ -523,15 +525,52 @@ func (p *ScriptedPeer) Close() {
 	}
 }
 
-// Send writes msg to every live connection.
+// Send writes msg to every live GENERAL connection, skipping any connection
+// this peer has acked a DATA1 createstream on.
+//
+// A DATA1 stream is not a second peer. It is one more socket of the SAME
+// association, and SVNode never originates unsolicited traffic on it: the send
+// router (stream_policy.cpp:161-184 BlockPriorityStreamPolicy::PushMessage)
+// puts a message on DATA1 only when IsHighPriorityMsg says so
+// (stream_policy.cpp:25-31), and everything else takes GENERAL. Writing a
+// scripted message to both sockets would deliver it to the node TWICE, and the
+// node would answer, or score, twice — which is exactly what happened to
+// TestParity_GetHeadersFlood, TestParity_InvGetHeadersAmplification and
+// TestParity_MisbehaviourScores once Tasks 9/10 gave the node a second
+// connection: every count doubled.
+//
+// A scenario that deliberately wants a message on the DATA1 socket addresses
+// it by hand with Write.
 func (p *ScriptedPeer) Send(msg wire.Message) {
-	p.mu.Lock()
-	conns := append([]net.Conn(nil), p.conns...)
-	p.mu.Unlock()
-
-	for _, c := range conns {
+	for _, c := range p.generalConns() {
 		_ = p.write(c, msg)
 	}
+}
+
+// generalConns copies the live connections that are NOT a recorded DATA1
+// stream. A connection whose createstream this peer has not acked is GENERAL
+// by definition, which keeps a single-connection peer behaving exactly as it
+// did before multistreams existed.
+func (p *ScriptedPeer) generalConns() []net.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	data1 := make(map[net.Conn]struct{}, len(p.data1Conns))
+	for _, c := range p.data1Conns {
+		data1[c] = struct{}{}
+	}
+
+	out := make([]net.Conn, 0, len(p.conns))
+
+	for _, c := range p.conns {
+		if _, isData1 := data1[c]; isData1 {
+			continue
+		}
+
+		out = append(out, c)
+	}
+
+	return out
 }
 
 // Requested reports whether the node ever asked this peer for the block.

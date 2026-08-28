@@ -290,3 +290,62 @@ func TestScriptedPeer_DialActsAsAnInboundPeer(t *testing.T) {
 	require.Equal(t, "verack", c.read(3*time.Second).Command())
 	require.Equal(t, 1, peer.Connections())
 }
+
+// TestScriptedPeer_SendSkipsTheData1Stream pins the rule Send follows once an
+// association holds two sockets: unsolicited scripted traffic goes out on
+// GENERAL only.
+//
+// SVNode's send router puts a message on DATA1 only when IsHighPriorityMsg
+// says so (stream_policy.cpp:25-31, used by
+// BlockPriorityStreamPolicy::PushMessage at :161-184); everything else takes
+// GENERAL. Before this rule Send wrote to EVERY live connection, so a scenario
+// that sent one inv delivered it to the node twice and every count the
+// scenario made came back doubled.
+//
+// Both sockets are driven the way the node drives them: a version on the
+// first, a DATA1 createstream on the second, which is what makes the peer
+// record it (association.cpp:137-160 MoveStream).
+func TestScriptedPeer_SendSkipsTheData1Stream(t *testing.T) {
+	peer, chain := newTestPeer(t, 3, Script{})
+
+	general := dialScripted(t, peer)
+
+	associationID := []byte{0x01, 0x02, 0x03, 0x04}
+
+	data1, err := net.Dial("tcp", peer.Addr)
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = data1.Close() })
+
+	data1Client := &rawClient{t: t, conn: data1, net: peer.Net}
+	data1Client.write(wire.NewMsgCreateStream(associationID, wire.StreamTypeData1, wire.BlockPriorityStreamPolicy))
+
+	ack, ok := data1Client.readUntil(wire.CmdStreamAck, 5*time.Second).(*wire.MsgStreamAck)
+	require.True(t, ok, "the peer must ack a DATA1 createstream")
+	require.Equal(t, wire.StreamTypeData1, ack.StreamType)
+
+	// The ack is what records the socket as DATA1, so only now is Send's rule
+	// under test at all.
+	inv := wire.NewMsgInv()
+	tip := chain.Tip()
+	require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &tip)))
+
+	peer.Send(inv)
+
+	got := general.readUntil(wire.CmdInv, 5*time.Second)
+	require.Equal(t, wire.CmdInv, got.Command(), "the GENERAL socket must receive the sent message")
+
+	// Nothing may arrive on DATA1. A read deadline is the only way to assert an
+	// absence on a socket, so the window is explicit.
+	require.NoError(t, data1.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+
+	_, _, readErr := wire.ReadMessage(data1, wire.ProtocolVersion, peer.Net)
+	require.Error(t, readErr, "nothing may be sent unsolicited on the DATA1 stream")
+
+	var netErr net.Error
+	require.ErrorAs(t, readErr, &netErr)
+	require.True(t, netErr.Timeout(), "the DATA1 read must end in a timeout, not in a message or a closed socket: %v", readErr)
+
+	// The transcript agrees: exactly one inv went out, on the GENERAL socket.
+	require.Equal(t, 1, peer.Transcript.Count(Out, wire.CmdInv), "Send must write the message once, not once per socket")
+}

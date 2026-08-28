@@ -296,6 +296,13 @@ type assetBody struct {
 // pushBlockMsg (services/legacy/peer_server.go:2277). A hash it was not given
 // is answered 404, which is the status FetchBlock folds into
 // errors.ErrBlockNotFound.
+//
+// One stub serves BOTH legs of a scenario, and the per-hash maps are never
+// cleared between them. That is safe only because runLeg builds a FRESH
+// FixtureChain per leg from a fresh random key (svp2ptest.BuildFixtureChainPadded),
+// so the two legs register and count under different block hashes. A scenario
+// that ever gives both legs the same tip hash must reset these maps between
+// legs, or Completed will report the first leg's fetch to the second.
 type assetStub struct {
 	srv *httptest.Server
 
@@ -374,6 +381,16 @@ func (a *assetStub) handle(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 
 	if !known {
+		http.NotFound(w, r)
+
+		return
+	}
+
+	// A declared length below the header it is supposed to start with is a
+	// broken registration, not a body: served, it would underflow the
+	// remaining count below into a near-infinite write loop. Answered 404, so
+	// the scenario fails on the node's notfound rather than on a hung stub.
+	if body.Length < uint64(len(body.Header)) {
 		http.NotFound(w, r)
 
 		return

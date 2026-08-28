@@ -303,11 +303,21 @@ race detector off): it fetches the whole body, sends the peer nothing, and drops
 the peer.** The transcript shows the `getdata` arriving and no reply of any kind
 — no `block`, no `notfound` — and the node then closing the connection
 (`Disconnected[peer0]=node`, `still-connected: 0`) after 2 m 1 s. The asset stub
-recorded one completed body write, so legacy did read all 4 GiB + 1. It is then
-dropped inside go-wire: `WriteMessageWithEncodingN` returns `(0, nil)` for a
-payload above `math.MaxUint32` (`message.go:385`), which legacy's `OnGetData`
-reads as success, so no `notfound` is queued either
-(`services/legacy/peer_server.go:1663-1680`).
+recorded one completed body write, so legacy did read all 4 GiB + 1.
+
+Two INDEPENDENT facts produce that silence. They are not a chain: the second
+happens after the first has already decided the answer.
+
+1. **No `notfound` is ever considered.** `pushBlockMsg` ends at
+   `sp.QueueMessageWithEncoding` (`services/legacy/peer_server.go:2323`) and
+   returns nil — success means QUEUED, not sent. The getdata loop adds a
+   `notfound` entry only for a non-nil return
+   (`services/legacy/peer_server.go:1663-1680`), so the decision is made and
+   closed before any writer runs.
+2. **The frame is then dropped by go-wire's writer.**
+   `WriteMessageWithEncodingN` returns `(0, nil)` for a payload above
+   `math.MaxUint32` (`message.go:385`) — no bytes, no error. That happens later,
+   on the out handler goroutine, where nothing inspects the result.
 
 The cost of that path is why the legacy leg is opt-in. legacy materialises the
 payload twice over — `NewRawBlockMessage` reads the asset body into one
@@ -394,10 +404,13 @@ deliberate behaviour change in the Phase 3 PR. Scenario CLOSED.
 **Tasks 8, 9, 10 (Phase 4).** Both implementations now negotiate the
 BlockPriority stream policy and open a second connection for the DATA1 stream,
 in both directions: each accepts an inbound `createstream` and moves that socket
-into an existing association (`net.cpp:3188-3240` `CConnman::MoveStream`), and
+into an existing association (`net.cpp:3188-3245` `CConnman::MoveStream`), and
 each dials a second connection out and sends `createstream` once the handshake
-has agreed BlockPriority (`net.cpp:948-965` `SetSupportedStreamPolicies`).
-Blocks then travel on DATA1 (`stream_policy.cpp:187-195`).
+has agreed BlockPriority — the peer's advertised policy list is intersected with
+ours in `net.cpp:904-923` `CNode::SetSupportedStreamPolicies`, and the first of
+our prioritised list that is in common is picked in `net.cpp:945-963`
+`CNode::GetPreferredStreamPolicyName`. Blocks then travel on DATA1
+(`stream_policy.cpp:25-31`, `IsHighPriorityMsg`).
 
 Nothing here is left for the harness to judge — both directions are pinned by
 in-process tests over real sockets, so this row records the state rather than
@@ -429,19 +442,38 @@ accepts. Both directions pinned; no divergence to watch.
 ### 14. `headers` routing under BlockPriority
 
 **Task 9 (Phase 4).** The two stacks put `headers` on different streams of a
-BlockPriority association.
+BlockPriority association, and reading the SVNode source settled which one is
+right — the opposite way round from what this row first recorded.
 
 - legacy routes `block`, `headers`, `ping` and `pong` to DATA1
   (`services/legacy/peer/stream_policy.go:27`).
-- svp2p routes `block`, `ping` and `pong` to DATA1 and leaves `headers` on
-  GENERAL (`services/svp2p/transport/policy.go:42`), which is SVNode's own set
-  (`stream_policy.cpp:187-195`).
+- svp2p routes `block`, `ping` and `pong` to DATA1 and leaves `headers` and
+  `getheaders` on GENERAL (`services/svp2p/transport/policy.go:42`).
 
-This is not peer-visible in any way a parity scenario can score. Both streams
-belong to one association, a peer reads both, and neither the message nor its
-order changes — only which socket carries it. A peer that counted `headers` per
-socket would see the difference, and no real peer does.
+**SVNode sends `headers` on DATA1.** Its send router is
+`BlockPriorityStreamPolicy::PushMessage` (`stream_policy.cpp:161-184`), which
+picks DATA1 whenever `IsHighPriorityMsg` says so (`stream_policy.cpp:25-31`).
+That predicate is `ping`, `pong`, or `IsBlockMsg`, and `IsBlockMsg`
+(`stream_policy.cpp:11-22`) is a WIDE set: `block`, `cmpctblock`, `blocktxn`,
+`getblocktxn`, **`headers`**, **`getheaders`**, `hdrsen`, `gethdrsen`, plus any
+message whose payload type is BLOCK.
 
-**Recorded 2026-08-28:** svp2p follows SVNode, legacy does not. Deliberate, not
-peer-visible, no action. If legacy is ever the reference for a cutover
-comparison, expect its `headers` on the DATA1 socket and svp2p's on GENERAL.
+`BlockPriorityStreamPolicy::GetStreamTypeForMessage` (`stream_policy.cpp:187-195`),
+the three-value `BLOCK`/`PING`/`OTHER` function svp2p's `policy.go` was written
+against, is NOT the send router. Its only caller is
+`Association::GetAverageBandwidth` (`association.cpp:215-226`), which asks "which
+stream carries this class of message" for the bandwidth statistic behind
+`net_processing.cpp:107` and `:5697`. Nothing routes a send through it.
+
+So on this row **legacy matches SVNode and svp2p diverges** — the reverse of the
+first reading. The divergence is narrow: only which socket of one association
+carries `headers`/`getheaders`. A peer reads both sockets, and neither the
+message nor its order changes, so no parity scenario can score it. It is
+visible to a peer that measures per-stream bandwidth, which is exactly what
+SVNode's own stall detection does on its side of the link.
+
+**Recorded 2026-08-28:** svp2p leaves `headers` on GENERAL; SVNode and legacy
+put it on DATA1. Not fixed here — `policy.go` is Task 9's and changing the
+routing set is a behaviour change, not a record correction. Carried as an open
+item for Task 9: widen `blockPriorityStreamPolicy.StreamFor` to `IsBlockMsg`'s
+set, or record a deliberate reason not to.
