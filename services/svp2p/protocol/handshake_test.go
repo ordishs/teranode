@@ -241,7 +241,7 @@ func TestNoSendHeadersForOldPeer(t *testing.T) {
 // net_processing.cpp PushNodeVersion: the association ID rides in version
 // when multistreams are on. Outbound only — inbound answers with the peer's.
 func TestHandshake_OutboundVersionCarriesOurAssociationID(t *testing.T) {
-	id := []byte{0x00, 1, 2, 3}
+	id := testAssociationID(1)
 	cfg := outboundConfig()
 	cfg.AssociationID = id
 	h := NewHandshake(cfg)
@@ -316,17 +316,17 @@ func versionIn(t *testing.T, msgs []wire.Message) *wire.MsgVersion {
 	return nil
 }
 
-// net_processing.cpp:1750-1757 ProcessVersionMessage stores the dialer's
-// association ID on the accepting node (SetAssociationID at :1756), and
-// net_processing.cpp:1798-1799 then answers with PushNodeVersion, which reads
-// that same ID back off the node (net_processing.cpp:143-147). The accepting
+// net_processing.cpp:1758-1776 ProcessVersionMessage stores the dialer's
+// association ID on the accepting node (SetAssociationID at :1775), and
+// net_processing.cpp:1816-1818 then answers with PushNodeVersion, which reads
+// that same ID back off the node (net_processing.cpp:142-146). The accepting
 // side therefore echoes the ID the dialer named.
 func TestHandshake_InboundVersionEchoesTheirAssociationID(t *testing.T) {
 	cfg := outboundConfig()
 	cfg.Inbound = true
 	h := NewHandshake(cfg)
 
-	id := []byte{0x00, 4, 5, 6}
+	id := testAssociationID(2)
 	their := remoteVersion(1234)
 	their.AssociationID = id
 
@@ -335,7 +335,7 @@ func TestHandshake_InboundVersionEchoesTheirAssociationID(t *testing.T) {
 	require.Equal(t, id, versionIn(t, reply).AssociationID)
 }
 
-// net_processing.cpp:1741: the received ID is only stored when
+// net_processing.cpp:1760: the received ID is only stored when
 // config.GetMultistreamsEnabled() is true, so a node with multistreams off
 // echoes nothing and never gets a second stream.
 func TestHandshake_InboundEchoesNothingWithoutBlockPriority(t *testing.T) {
@@ -345,14 +345,14 @@ func TestHandshake_InboundEchoesNothingWithoutBlockPriority(t *testing.T) {
 	h := NewHandshake(cfg)
 
 	their := remoteVersion(1234)
-	their.AssociationID = []byte{0x00, 4, 5, 6}
+	their.AssociationID = testAssociationID(2)
 
 	reply, err := h.OnMessage(their)
 	require.NoError(t, err)
 	require.Empty(t, versionIn(t, reply).AssociationID)
 }
 
-// net_processing.cpp:143-146: PushNodeVersion sends an empty ID when the node
+// net_processing.cpp:142-146: PushNodeVersion sends an empty ID when the node
 // has none, which for an inbound peer means the dialer named none either.
 func TestHandshake_InboundNamesNoAssociationWhenTheyNameNone(t *testing.T) {
 	cfg := outboundConfig()
@@ -360,6 +360,83 @@ func TestHandshake_InboundNamesNoAssociationWhenTheyNameNone(t *testing.T) {
 	h := NewHandshake(cfg)
 
 	reply, err := h.OnMessage(remoteVersion(1234))
+	require.NoError(t, err)
+	require.Empty(t, versionIn(t, reply).AssociationID)
+}
+
+// testAssociationID is a well-formed 17-byte UUID association ID
+// (association_id.h:34): the IDType::UUID tag, then 16 body bytes. tag makes
+// one test's ID distinguishable from another's.
+func testAssociationID(tag byte) []byte {
+	id := make([]byte, 17)
+	for i := 1; i < len(id); i++ {
+		id[i] = tag
+	}
+
+	return id
+}
+
+// association_id.cpp:10-32 AssociationID::Make throws on any type byte other
+// than IDType::UUID, and association_id.cpp:43-53 UUIDAssociationID throws
+// unless the body is exactly 16 bytes. Either throw reaches the catch at
+// net_processing.cpp:1796-1801, which rejects and disconnects.
+func TestHandshake_MalformedAssociationIDDisconnects(t *testing.T) {
+	tests := []struct {
+		name string
+		id   []byte
+	}{
+		{name: "unsupported type byte", id: append([]byte{0x01}, make([]byte, 16)...)},
+		{name: "body one byte short", id: append([]byte{0x00}, make([]byte, 15)...)},
+		{name: "body one byte long", id: append([]byte{0x00}, make([]byte, 17)...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := outboundConfig()
+			cfg.Inbound = true
+			h := NewHandshake(cfg)
+
+			their := remoteVersion(1234)
+			their.AssociationID = tt.id
+
+			_, err := h.OnMessage(their)
+			require.ErrorIs(t, err, ErrMalformedAssociationID)
+			require.ErrorIs(t, err, ErrProtocolViolation)
+		})
+	}
+}
+
+// association_id.cpp:12 and :31: Make returns a null pointer, not a throw, for
+// fewer than two bytes, and net_processing.cpp:1778-1781 answers a null ID
+// with ClearAssociationID. Such a peer stays connected and gets no echo.
+func TestHandshake_NullAssociationIDIsNotAViolation(t *testing.T) {
+	for _, id := range [][]byte{{}, {0x00}} {
+		cfg := outboundConfig()
+		cfg.Inbound = true
+		h := NewHandshake(cfg)
+
+		their := remoteVersion(1234)
+		their.AssociationID = id
+
+		reply, err := h.OnMessage(their)
+		require.NoError(t, err)
+		require.Empty(t, versionIn(t, reply).AssociationID)
+	}
+}
+
+// net_processing.cpp:1760: the whole decode, Make included, is gated on
+// GetMultistreamsEnabled, so a node with multistreams off never inspects the
+// ID and never disconnects over one.
+func TestHandshake_MalformedAssociationIDIgnoredWithoutBlockPriority(t *testing.T) {
+	cfg := outboundConfig()
+	cfg.Inbound = true
+	cfg.AllowBlockPriority = false
+	h := NewHandshake(cfg)
+
+	their := remoteVersion(1234)
+	their.AssociationID = []byte{0x07, 1, 2, 3}
+
+	reply, err := h.OnMessage(their)
 	require.NoError(t, err)
 	require.Empty(t, versionIn(t, reply).AssociationID)
 }

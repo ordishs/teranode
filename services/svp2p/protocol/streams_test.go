@@ -153,7 +153,7 @@ func establishAssociation(t *testing.T, m *PeerManager, id []byte) *scriptedPeer
 func TestInbound_CreateStreamAttachesAndAcksOnNewStream(t *testing.T) {
 	m := startedManager(t)
 
-	id := []byte{0x00, 9, 9, 9, 9}
+	id := testAssociationID(9)
 	_ = establishAssociation(t, m, id)
 
 	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
@@ -180,7 +180,7 @@ func TestInbound_CreateStreamAttachesAndAcksOnNewStream(t *testing.T) {
 func TestInbound_CreateStreamFromOtherIPIsBanned(t *testing.T) {
 	m := startedManager(t)
 
-	id := []byte{0x00, 8, 8, 8, 8}
+	id := testAssociationID(8)
 	_ = establishAssociation(t, m, id)
 
 	otherHost, raw := dialFromOtherIP(t, m)
@@ -240,7 +240,7 @@ func dialFromOtherIP(t *testing.T, m *PeerManager) (string, net.Conn) {
 func TestInbound_CreateStreamSetupFailures(t *testing.T) {
 	m := startedManager(t)
 
-	id := []byte{0x00, 7, 7, 7, 7}
+	id := testAssociationID(7)
 	_ = establishAssociation(t, m, id)
 
 	// The duplicate case needs a DATA1 stream already in place, so attach one
@@ -260,7 +260,7 @@ func TestInbound_CreateStreamSetupFailures(t *testing.T) {
 	}{
 		{
 			name:   "unknown association id",
-			msg:    &wire.MsgCreateStream{AssociationID: []byte{0x00, 1, 2, 3}, StreamType: wire.StreamTypeData1, StreamPolicyName: wire.BlockPriorityStreamPolicy},
+			msg:    &wire.MsgCreateStream{AssociationID: testAssociationID(11), StreamType: wire.StreamTypeData1, StreamPolicyName: wire.BlockPriorityStreamPolicy},
 			reason: reasonNoSuchNode,
 		},
 		{
@@ -313,7 +313,7 @@ func TestInbound_UnsolicitedStreamAckIsRejected(t *testing.T) {
 	m := startedManager(t)
 
 	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
-	writeMsg(t, raw, &wire.MsgStreamAck{AssociationID: []byte{0x00, 5, 5, 5}, StreamType: wire.StreamTypeData1})
+	writeMsg(t, raw, &wire.MsgStreamAck{AssociationID: testAssociationID(5), StreamType: wire.StreamTypeData1})
 
 	rej, ok := readMsg(t, raw, 5*time.Second).(*wire.MsgReject)
 	require.True(t, ok, "an unsolicited streamack must be rejected")
@@ -340,7 +340,7 @@ func TestInbound_OtherFirstMessageDisconnects(t *testing.T) {
 func TestInbound_CreateStreamRefusedWhenBlockPriorityOff(t *testing.T) {
 	m := startedManagerWith(t, func(s *settings.Settings) { s.Legacy.AllowBlockPriority = false }, nil)
 
-	id := []byte{0x00, 6, 6, 6, 6}
+	id := testAssociationID(6)
 	_ = establishAssociation(t, m, id)
 
 	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
@@ -374,7 +374,7 @@ func TestInbound_SilentConnectionTimesOut(t *testing.T) {
 func TestInbound_AssociationUnregistersOnDisconnect(t *testing.T) {
 	m := startedManager(t)
 
-	id := []byte{0x00, 4, 4, 4, 4}
+	id := testAssociationID(4)
 	far := establishAssociation(t, m, id)
 
 	require.NoError(t, far.nc.Close())
@@ -734,7 +734,7 @@ func TestOutbound_StreamDialIsAbandonedOnStop(t *testing.T) {
 	}
 }
 
-// net_processing.cpp:1750-1757 then :1798-1799: a peer that dials this node
+// net_processing.cpp:1758-1776 then :1816-1818: a peer that dials this node
 // and names an association must get that same name back in the node's version
 // reply, or it never sends createstream and the association never gets a
 // DATA1 stream.
@@ -744,7 +744,7 @@ func TestInbound_VersionReplyEchoesTheDialersAssociationID(t *testing.T) {
 	far := dialScripted(t, nodeAddr(t, m, "127.0.0.1"))
 	t.Cleanup(func() { _ = far.nc.Close() })
 
-	id := []byte{0x00, 7, 7, 7, 7}
+	id := testAssociationID(7)
 	version := remoteVersion(4321)
 	version.AssociationID = id
 
@@ -761,7 +761,7 @@ func TestInbound_VersionReplyEchoesTheDialersAssociationID(t *testing.T) {
 	require.Equal(t, id, ours.AssociationID, "the accepting side must echo the dialer's association ID")
 }
 
-// net_processing.cpp:1741: with multistreams off the accepting side stores no
+// net_processing.cpp:1760: with multistreams off the accepting side stores no
 // ID, so its version reply names no association.
 func TestInbound_NoEchoWhenBlockPriorityOff(t *testing.T) {
 	m := startedManagerWith(t, func(s *settings.Settings) { s.Legacy.AllowBlockPriority = false }, nil)
@@ -770,7 +770,7 @@ func TestInbound_NoEchoWhenBlockPriorityOff(t *testing.T) {
 	t.Cleanup(func() { _ = far.nc.Close() })
 
 	version := remoteVersion(4321)
-	version.AssociationID = []byte{0x00, 6, 6, 6, 6}
+	version.AssociationID = testAssociationID(6)
 
 	far.write(t, version)
 

@@ -37,11 +37,36 @@ var (
 	// streamack arriving on a connection that already has a version is
 	// invalid — REJECT_NONSTANDARD, then disconnect.
 	ErrStreamMessageAfterVersion = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: stream setup message after version", ErrProtocolViolation)
+
+	// ErrMalformedAssociationID mirrors the "Badly formatted association ID"
+	// throw in net_processing.cpp:1784-1789, which the catch at
+	// net_processing.cpp:1796-1801 turns into a reject and a disconnect.
+	ErrMalformedAssociationID = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: malformed association id", ErrProtocolViolation)
 )
 
 // associationIDTypeUUID is IDType::UUID (association_id.h:34): byte 0 of an
 // association ID identifies its format; UUID is 16 random bytes after it.
 const associationIDTypeUUID = 0x00
+
+// associationIDLength is the whole of a UUID association ID on the wire: the
+// type byte plus the 16 bytes of the UUID itself.
+const associationIDLength = 17
+
+// validAssociationID reports whether AssociationID::Make would accept these
+// bytes. association_id.cpp:16-28 throws on any type byte other than
+// IDType::UUID, and association_id.cpp:43-53 UUIDAssociationID throws unless
+// the body is exactly the 16 bytes of a UUID.
+func validAssociationID(id []byte) bool {
+	return len(id) == associationIDLength && id[0] == associationIDTypeUUID
+}
+
+// nullAssociationID reports the case association_id.cpp:12 and :31 answer with
+// a null pointer rather than a throw: fewer than two bytes. The peer supports
+// streams but has turned them off, and net_processing.cpp:1778-1781 clears the
+// ID instead of disconnecting.
+func nullAssociationID(id []byte) bool {
+	return len(id) < 2
+}
 
 // generateAssociationID builds a fresh 17-byte association ID: a 1-byte
 // IDType::UUID tag followed by 16 random bytes (association_id.h:34,
@@ -141,18 +166,20 @@ func (h *Handshake) ourVersion() *wire.MsgVersion {
 }
 
 // associationIDForVersion is the association ID our version message carries.
-// net_processing.cpp:143-147 PushNodeVersion reads it off the node itself, so
+// net_processing.cpp:142-146 PushNodeVersion reads it off the node itself, so
 // which ID that is depends on how the connection started:
 //
 //   - Outbound: net_processing.cpp:209-211 creates the ID before the version
 //     goes out, and the manager hands it over as cfg.AssociationID.
-//   - Inbound: net_processing.cpp:1756 SetAssociationID stores the DIALER's ID
+//   - Inbound: net_processing.cpp:1775 SetAssociationID stores the DIALER's ID
 //     on the node while the version is being processed, and the reply at
-//     net_processing.cpp:1798-1799 then carries that same ID back. An inbound
+//     net_processing.cpp:1816-1818 then carries that same ID back. An inbound
 //     peer that gets no echo clears its own ID and never sends createstream.
 //
 // Both sides are gated on config.GetMultistreamsEnabled()
-// (net_processing.cpp:209 and :1741), which is AllowBlockPriority here.
+// (net_processing.cpp:209 and :1760), which is AllowBlockPriority here.
+// onVersion has already refused any ID Make would have thrown on, so what is
+// stored here is either well formed or empty.
 func (h *Handshake) associationIDForVersion() []byte {
 	if !h.cfg.Inbound {
 		return h.cfg.AssociationID
@@ -239,12 +266,28 @@ func (h *Handshake) onVersion(m *wire.MsgVersion) ([]wire.Message, error) {
 		return nil, ErrObsoleteVersion
 	}
 
+	// net_processing.cpp:1758-1776: the peer's association ID is decoded, and
+	// AssociationID::Make throws on anything malformed. The whole block sits
+	// under config.GetMultistreamsEnabled() (net_processing.cpp:1760), so a
+	// node with multistreams off never inspects the ID at all.
+	associationID := m.AssociationID
+
+	if h.cfg.AllowBlockPriority {
+		switch {
+		case nullAssociationID(associationID):
+			// net_processing.cpp:1778-1781 ClearAssociationID.
+			associationID = nil
+		case !validAssociationID(associationID):
+			return nil, ErrMalformedAssociationID
+		}
+	}
+
 	h.versionRecvd = true
 	h.info.Services = m.Services
 	h.info.UserAgent = m.UserAgent
 	h.info.StartingHeight = m.LastBlock
 	h.info.DisableRelayTx = m.DisableRelayTx
-	h.info.AssociationID = m.AssociationID
+	h.info.AssociationID = associationID
 	h.info.AdvertisedVersion = uint32(m.ProtocolVersion) //nolint:gosec // checked >= MinPeerProtoVersion above
 	h.info.NegotiatedVersion = min(wire.ProtocolVersion, h.info.AdvertisedVersion)
 

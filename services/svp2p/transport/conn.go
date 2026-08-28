@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // ErrSendQueueFull carries its own code because the teranode errors package
@@ -39,6 +40,11 @@ type Config struct {
 	// node's excessive block size limit, so this bounds an extended frame the
 	// same as it bounds a basic one.
 	MaxBlockPayload uint64
+
+	// Logger receives the transport's own debug lines. It is optional: nil
+	// turns that logging off, which is what a test building a Conn directly
+	// wants.
+	Logger ulogger.Logger
 
 	// StreamType is the association stream this connection carries. Zero means
 	// GENERAL: association.cpp:43 gives the first socket of an association the
@@ -80,6 +86,16 @@ func (c *Conn) StreamType() wire.StreamType {
 	}
 
 	return c.cfg.StreamType
+}
+
+// debugf writes one line when the caller supplied a logger, and nothing when
+// it did not.
+func (c *Conn) debugf(format string, args ...interface{}) {
+	if c.cfg.Logger == nil {
+		return
+	}
+
+	c.cfg.Logger.Debugf(format, args...)
 }
 
 // MaxBlockPayload returns the configured block payload ceiling, or the
@@ -220,6 +236,8 @@ func (c *Conn) readLoop() {
 				c.fail(ErrExtendedNonBlock)
 				return
 			}
+
+			c.debugf("[svp2p] extended block frame from %s: %d bytes", c.RemoteAddr(), hdr.length)
 		}
 
 		// Detect "block" before any payload byte is materialized, and hand

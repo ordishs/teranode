@@ -8,11 +8,14 @@ import (
 	"io"
 	"math"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -296,4 +299,103 @@ func TestWriteBlock_ExtendedWriteFailureWrapsCleanly(t *testing.T) {
 	err := <-bs.done
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), "%!", "the wrapped error must render, not an unmatched verb")
+}
+
+// recordingLogger keeps the Debugf lines a Conn writes, so a test can assert
+// on them. Every other level goes to the embedded TestLogger.
+type recordingLogger struct {
+	ulogger.TestLogger
+
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *recordingLogger) Debugf(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *recordingLogger) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// The live regtest run found the extended-header path completely silent, which
+// left no way to tell an extended frame from a basic one in a log. Accepting
+// one now writes a single debug line naming the peer and the declared length.
+func TestReadLoop_ExtendedBlockIsLogged(t *testing.T) {
+	logger := &recordingLogger{}
+
+	a, b := net.Pipe()
+	defer a.Close()
+
+	c := New(b, Config{Net: wire.MainNet, ProtocolVersion: 70016, SendBudgetBytes: 1 << 20, RecvQueueLen: 4, WriteTimeout: time.Second, MaxBlockPayload: 8 << 30, Logger: logger})
+	c.Start(context.Background())
+
+	defer c.Close()
+
+	length := uint64(math.MaxUint32) + 1
+
+	go func() {
+		_, _ = a.Write(extBlockFrameHeader(wire.MainNet, length))
+		_, _ = io.CopyN(a, zeroReader{}, 200)
+		_ = a.Close()
+	}()
+
+	select {
+	case bs := <-c.InboundBlocks():
+		_ = bs.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("no block stream delivered")
+	}
+
+	require.True(t, logger.contains("extended block frame"), "an accepted extended frame must be logged: %v", logger.lines)
+	require.True(t, logger.contains(fmt.Sprintf("%d bytes", length)), "the log line must name the declared length: %v", logger.lines)
+}
+
+// A basic block header is the ordinary case and must stay silent, or every
+// block on a busy node writes a line.
+func TestReadLoop_BasicBlockIsNotLoggedAsExtended(t *testing.T) {
+	logger := &recordingLogger{}
+
+	a, b := net.Pipe()
+	defer a.Close()
+
+	c := New(b, Config{Net: wire.MainNet, ProtocolVersion: 70016, SendBudgetBytes: 1 << 20, RecvQueueLen: 4, WriteTimeout: time.Second, MaxBlockPayload: 8 << 30, Logger: logger})
+	c.Start(context.Background())
+
+	defer c.Close()
+
+	const length = 200
+
+	go func() {
+		var hdr [wire.MessageHeaderSize]byte
+
+		binary.LittleEndian.PutUint32(hdr[0:4], uint32(wire.MainNet))
+		copy(hdr[4:4+wire.CommandSize], wire.CmdBlock)
+		binary.LittleEndian.PutUint32(hdr[16:20], length)
+
+		_, _ = a.Write(hdr[:])
+		_, _ = io.CopyN(a, zeroReader{}, length)
+		_ = a.Close()
+	}()
+
+	select {
+	case bs := <-c.InboundBlocks():
+		_ = bs.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("no block stream delivered")
+	}
+
+	require.False(t, logger.contains("extended block frame"), "a basic frame must not be logged as extended: %v", logger.lines)
 }

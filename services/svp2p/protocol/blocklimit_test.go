@@ -42,7 +42,7 @@ func TestInbound_StreamsCarryTheConfiguredBlockPayloadCap(t *testing.T) {
 		s.Policy = &settings.PolicySettings{ExcessiveBlockSize: excessive}
 	}, nil)
 
-	id := []byte{0x00, 3, 3, 3, 3}
+	id := testAssociationID(3)
 	_ = establishAssociation(t, m, id)
 
 	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))

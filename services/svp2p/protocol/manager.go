@@ -871,6 +871,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 		RecvQueueLen:    recvQueueLen,
 		WriteTimeout:    writeTimeout,
 		MaxBlockPayload: m.maxBlockPayload,
+		Logger:          m.logger,
 		StreamType:      wire.StreamTypeGeneral,
 		Prefix:          first,
 	})
