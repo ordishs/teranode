@@ -24,6 +24,57 @@ func honestPeers(n int) func(*testing.T, *svp2ptest.FixtureChain, wire.BitcoinNe
 	}
 }
 
+// waitForQuiet blocks until peer's inbound count of cmd stops changing for
+// quiet, so a sampled "before" count does not land mid-burst of the node's
+// own startup traffic (e.g. its headers-first sync tail). Fails the test if
+// the count never settles within max.
+func waitForQuiet(t *testing.T, peer *svp2ptest.ScriptedPeer, cmd string, quiet, max time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(max)
+	last := peer.Transcript.Count(svp2ptest.In, cmd)
+	lastChange := time.Now()
+
+	for {
+		time.Sleep(50 * time.Millisecond)
+
+		cur := peer.Transcript.Count(svp2ptest.In, cmd)
+		if cur != last {
+			last, lastChange = cur, time.Now()
+		}
+
+		if time.Since(lastChange) >= quiet {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("%s count never went quiet for %s within %s (stuck at %d)", cmd, quiet, max, last)
+		}
+	}
+}
+
+// countStoppedGetHeaders counts inbound getheaders carrying a non-zero
+// HashStop: the shape OnInv builds for each fabricated inv (hashStop = that
+// entry's own hash), never the zero-HashStop getheaders the node's own
+// sync-peer sweep can also send while a peer stays near tip. Sampling on
+// this filter, rather than on the raw command count, keeps the amplification
+// count exact regardless of when a sweep round lands inside the wait.
+func countStoppedGetHeaders(peer *svp2ptest.ScriptedPeer) int {
+	n := 0
+
+	for _, e := range peer.Transcript.Snapshot() {
+		if e.Dir != svp2ptest.In || e.Cmd != "getheaders" {
+			continue
+		}
+
+		if gh, ok := e.Msg.(*wire.MsgGetHeaders); ok && gh.HashStop != (chainhash.Hash{}) {
+			n++
+		}
+	}
+
+	return n
+}
+
 // firstAsked returns the index of the peer whose transcript holds the earliest
 // inbound getheaders, and -1 if none was asked.
 func firstAsked(peers []*svp2ptest.ScriptedPeer) int {
@@ -241,8 +292,9 @@ func TestParity_InvGetHeadersAmplification(t *testing.T) {
 		Peers: honestPeers(1),
 		Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
 			n.WaitForHeight(t, chain, 60*time.Second)
+			waitForQuiet(t, peers[0], "getheaders", 1500*time.Millisecond, 15*time.Second)
 
-			before := peers[0].Transcript.Count(svp2ptest.In, "getheaders")
+			before := countStoppedGetHeaders(peers[0])
 
 			inv := wire.NewMsgInv()
 			for i := 0; i < fabricated; i++ {
@@ -254,7 +306,7 @@ func TestParity_InvGetHeadersAmplification(t *testing.T) {
 
 			time.Sleep(3 * time.Second)
 
-			n.notes = map[string]string{"getheaders-drawn": fmt.Sprint(peers[0].Transcript.Count(svp2ptest.In, "getheaders") - before)}
+			n.notes = map[string]string{"getheaders-drawn": fmt.Sprint(countStoppedGetHeaders(peers[0]) - before)}
 		},
 		Observe: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) Observation {
 			o := ObserveDefault(t, n, peers)
