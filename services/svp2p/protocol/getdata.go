@@ -53,10 +53,10 @@ const (
 	// well have.
 	serveFailed
 
-	// serveUnframeable is the >4 GiB block: we hold it and cannot put it in a
-	// basic message header (OPEN QUESTION 5). It is answered with notfound like
-	// serveAbsent, and kept distinct from it because the cause, the log line
-	// and the fix are different — this one goes away with Phase 4's extmsg.
+	// serveUnframeable is the >4 GiB block for a peer below 70016, the
+	// extended-header floor — SVNode's GetMaxPayloadLength(version) has the
+	// same floor. It is answered with notfound like serveAbsent, and kept
+	// distinct from it because the cause and the log line are different.
 	serveUnframeable
 )
 
@@ -336,27 +336,29 @@ func (p *Peer) serveBlock(ctx context.Context, inv *wire.InvVect) serveOutcome {
 
 	// OPEN QUESTION 5, decided from the declared length before a single
 	// payload byte is read: a block a basic message header cannot declare is
-	// refused with notfound until Phase 4 brings the extended header.
+	// framed with the extended header (transport.Conn.SendBlock) for a peer
+	// that negotiated transport.ExtendedPayloadVersion, and refused with
+	// notfound for one that has not.
 	//
-	// This has no SVNode counterpart at all: SVNode frames a payload this large
-	// with an extended header (protocol.cpp:220-237), so it never faces "I hold
-	// this but cannot frame it" and has no branch to copy here. The owner closed
-	// OQ5 as notfound-plus-warn. It reaches the peer the same way an absent
-	// block does, but stays a distinct outcome because this one is a temporary
-	// limitation of ours, not a statement about what we hold.
+	// SVNode frames a payload this large with an extended header for every
+	// peer (protocol.cpp:220-237) and has no version floor of its own beyond
+	// CMessageHeader::GetMaxPayloadLength(version), which is exactly this
+	// check. Below that floor, the owner closed OQ5 as notfound-plus-warn: it
+	// reaches the peer the same way an absent block does, but stays a
+	// distinct outcome because this one is a temporary limitation of that
+	// peer's negotiated version, not a statement about what we hold.
 	//
 	// Cost of deciding it here rather than before the fetch: FetchBlock reports
 	// the declared length and issues the HTTP request in the same call, so this
-	// closes an opened-but-unread body — one request, zero bytes read, in a
-	// case no block on any BSV network can reach today. Reading the length
-	// without a body needs a size-only method on BlockTxFetcher; the booked
-	// follow-up that stores the payload hash at ingest removes the need for
-	// either.
-	if length > transport.MaxBlockFrameBytes {
+	// closes an opened-but-unread body — one request, zero bytes read — for a
+	// peer below the floor. Reading the length without a body needs a
+	// size-only method on BlockTxFetcher; the booked follow-up that stores the
+	// payload hash at ingest removes the need for either.
+	if length > transport.MaxBlockFrameBytes && p.negotiatedVersion() < transport.ExtendedPayloadVersion {
 		_ = body.Close()
 
-		p.cfg.Logger.Warnf("[svp2p] refusing to serve block %s to %s: %d bytes exceeds the %d byte message header limit, extended headers are not implemented",
-			inv.Hash, p.cfg.Conn.RemoteAddr(), length, transport.MaxBlockFrameBytes)
+		p.cfg.Logger.Warnf("[svp2p] block %s is %d bytes and %s negotiated version %d, below the extended-header floor; answering notfound",
+			inv.Hash, length, p.cfg.Conn.RemoteAddr(), p.negotiatedVersion())
 
 		return serveUnframeable
 	}

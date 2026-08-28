@@ -3,7 +3,9 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/svp2p/transport"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -194,6 +197,48 @@ func newServingTestPeerWithIdle(t *testing.T, f *serveFixture, fetch *stubFetche
 	t.Helper()
 
 	p, far := newTestPeer(t, idle, time.Hour)
+
+	sp := NewSyncPeer("127.0.0.1:8333", 0, newPeerSyncState())
+
+	p.cfg.Sync = &servingDispatcher{srv: f.srv, sp: sp, activeTip: f.tip(t)}
+	p.cfg.SyncPeer = sp
+	p.cfg.Fetcher = fetch
+
+	return p, far, sp
+}
+
+// newServingTestPeerWithConnVersion is newServingTestPeer with the transport
+// connection's OWN initial protocol version pinned to connVersion, instead of
+// wire.ProtocolVersion. Production always constructs the Conn at our own
+// wire.ProtocolVersion (manager.go:753), which already sits at
+// transport.ExtendedPayloadVersion — so a test built on that default cannot
+// tell "the handshake wired the negotiated version onto the Conn" apart from
+// "the Conn's untouched construction default happened to be high enough".
+// Pinning connVersion below the extended floor here makes an extended send
+// succeed ONLY if something moves the Conn's version up after the handshake.
+func newServingTestPeerWithConnVersion(t *testing.T, f *serveFixture, fetch *stubFetcher, connVersion uint32) (*Peer, *scriptedPeer, *SyncPeer) {
+	t.Helper()
+
+	a, b := net.Pipe()
+	conn := transport.New(a, transport.Config{
+		Net: wire.MainNet, ProtocolVersion: connVersion,
+		SendBudgetBytes: 1 << 20, RecvQueueLen: 32, WriteTimeout: 5 * time.Second,
+	})
+
+	cfg := PeerConfig{
+		Handshake: HandshakeConfig{
+			Inbound: false, Nonce: 7777, UserAgent: "/teranode-svp2p:0.1.0/",
+			StartingHeight: 0, MaxRecvPayloadLength: wire.DefaultMaxRecvPayloadLength,
+			AllowBlockPriority: true,
+			LocalAddr:          wire.NewNetAddressIPPort(nil, 8333, 0),
+			RemoteAddr:         wire.NewNetAddressIPPort(nil, 8333, 0),
+		},
+		Conn: conn, Logger: ulogger.TestLogger{},
+		IdleTimeout: time.Hour, PingInterval: time.Hour, BanThreshold: 100,
+	}
+
+	p := NewPeer(cfg)
+	far := &scriptedPeer{nc: b}
 
 	sp := NewSyncPeer("127.0.0.1:8333", 0, newPeerSyncState())
 
@@ -394,12 +439,16 @@ func TestServeGetData_ContinueInvFollowsTheBlock(t *testing.T) {
 	require.Equal(t, f.tip(t).Hash, inv.InvList[0].Hash)
 }
 
-// TestServeGetData_BlockAboveTheFramingLimit is the OPEN QUESTION 5 answer,
-// and the ONE case where a block enters a notfound. It is a deliberate
-// divergence, not an instance of the missing-block rule: SVNode frames a
-// payload this large with an extended header (protocol.cpp:220-237) and so has
-// no branch to copy. Nothing of the block reaches the socket.
-func TestServeGetData_BlockAboveTheFramingLimit(t *testing.T) {
+// TestServeGetData_BlockAboveTheFramingLimit_OldPeer is the OPEN QUESTION 5
+// answer for a peer that never negotiated the extended header, and the ONE
+// case left where a block enters a notfound. It is a deliberate divergence,
+// not an instance of the missing-block rule: SVNode frames a payload this
+// large with an extended header for any peer (protocol.cpp:220-237), but this
+// service only extends it to a peer whose negotiated version reaches
+// EXTENDED_PAYLOAD_VERSION (version.h:51) — SVNode's own
+// CMessageHeader::GetMaxPayloadLength(version) draws the same floor. Nothing
+// of the block reaches the socket.
+func TestServeGetData_BlockAboveTheFramingLimit_OldPeer(t *testing.T) {
 	f := newServeFixture(t, 3)
 	fetch := newStubFetcher()
 
@@ -415,7 +464,7 @@ func TestServeGetData_BlockAboveTheFramingLimit(t *testing.T) {
 
 	go func() { _ = p.Run(ctx) }()
 
-	completeHandshake(t, far)
+	completeHandshakeWithProtocolVersion(t, far, int32(transport.ExtendedPayloadVersion-1)) //nolint:gosec // fixed test constant, fits int32
 
 	far.write(t, getDataFor(wire.NewInvVect(wire.InvTypeBlock, &blockHash)))
 
@@ -425,6 +474,69 @@ func TestServeGetData_BlockAboveTheFramingLimit(t *testing.T) {
 	require.Equal(t, blockHash, nf.InvList[0].Hash)
 
 	require.Equal(t, 1, fetch.opens(blockHash), "the refusal must not pay for a second read")
+}
+
+// TestServeGetData_BlockAboveTheFramingLimit_ExtendedPeer is the OPEN
+// QUESTION 5 answer's mirror: a peer that negotiated
+// transport.ExtendedPayloadVersion gets the block framed with the extended
+// header instead of notfound.
+//
+// The Conn under test is built at a version BELOW the extended floor
+// (newServingTestPeerWithConnVersion), so the extended frame below can only
+// appear on the wire if completing the handshake pushed the negotiated
+// version onto the Conn — proving peer.go's post-handshake
+// SetProtocolVersion call, not merely getdata.go's own version check.
+//
+// The payload itself is never streamed: MaxBlockFrameBytes+1 declared bytes
+// is over 4 GiB, and proving the frame started is exactly what "a SendBlock
+// happened" needs. Only the 44 byte extended header (extheader.go) is read
+// off the wire; the connection is then torn down without draining the body
+// SendBlock is still trying to write.
+func TestServeGetData_BlockAboveTheFramingLimit_ExtendedPeer(t *testing.T) {
+	f := newServeFixture(t, 3)
+	fetch := newStubFetcher()
+
+	blk, raw := testWireBlock(t, 0x60, 1)
+	blockHash := blk.BlockHash()
+	fetch.blocks[blockHash] = raw
+	fetch.declared[blockHash] = transport.MaxBlockFrameBytes + 1
+
+	p, far, _ := newServingTestPeerWithConnVersion(t, f, fetch, transport.ExtendedPayloadVersion-1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = p.Run(ctx) }()
+
+	completeHandshake(t, far)
+
+	far.write(t, getDataFor(wire.NewInvVect(wire.InvTypeBlock, &blockHash)))
+
+	require.NoError(t, far.nc.SetReadDeadline(time.Now().Add(5*time.Second)))
+
+	hdr := make([]byte, wire.MessageHeaderSize+wire.CommandSize+8)
+	_, err := io.ReadFull(far.nc, hdr)
+	require.NoError(t, err, "the extended header must reach the wire")
+
+	require.Equal(t, uint32(wire.MainNet), binary.LittleEndian.Uint32(hdr[0:4]), "network magic")
+	require.Equal(t, wire.CmdExtMsg, cmdString(hdr[4:16]), "extmsg marker command")
+	require.Equal(t, uint32(0xffffffff), binary.LittleEndian.Uint32(hdr[16:20]), "basic length field pinned to the reserved marker")
+	require.Equal(t, [4]byte{}, [4]byte(hdr[20:24]), "the extended path carries a zero checksum")
+	require.Equal(t, wire.CmdBlock, cmdString(hdr[24:36]), "the real command in the extension")
+	require.Equal(t, transport.MaxBlockFrameBytes+1, binary.LittleEndian.Uint64(hdr[36:44]), "the declared payload length")
+
+	require.NoError(t, far.nc.Close())
+}
+
+// cmdString trims a fixed-width, NUL-padded wire command field down to its
+// text, the same convention go-wire's own header reader applies.
+func cmdString(field []byte) string {
+	i := bytes.IndexByte(field, 0)
+	if i < 0 {
+		i = len(field)
+	}
+
+	return string(field[:i])
 }
 
 // TestServeGetData_LookupFailureIsNotNotFound is the B4 split. A store that

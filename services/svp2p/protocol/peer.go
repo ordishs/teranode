@@ -667,6 +667,15 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 
 	if est {
 		p.estOnce.Do(func() {
+			// The Conn is constructed at OUR OWN wire.ProtocolVersion
+			// (manager.go:753), which is always >= any peer's, so its pver
+			// never reflects what was actually negotiated until this call
+			// moves it down. Without it, transport.Conn.SendBlock's own
+			// version gate (conn_send_stream.go) stays permanently at our
+			// ceiling and never refuses a peer that negotiated lower — the
+			// only real gate would then be getdata.go's own check.
+			p.cfg.Conn.SetProtocolVersion(info.NegotiatedVersion)
+
 			close(p.established)
 
 			firstEstablished = true
@@ -1288,6 +1297,16 @@ func (p *Peer) Services() wire.ServiceFlag {
 	defer p.mu.Unlock()
 
 	return p.hs.PeerInfo().Services
+}
+
+// negotiatedVersion is the version.h:51 EXTENDED_PAYLOAD_VERSION comparand:
+// min(our wire.ProtocolVersion, the peer's advertised version), zero before
+// the handshake has delivered one. Takes the peer lock like Services.
+func (p *Peer) negotiatedVersion() uint32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.hs.PeerInfo().NegotiatedVersion
 }
 
 func (p *Peer) Disconnect(reason string) {

@@ -414,8 +414,21 @@ func TestTxPayloadBytes(t *testing.T) {
 func completeHandshake(t *testing.T, far *scriptedPeer) {
 	t.Helper()
 
+	completeHandshakeWithProtocolVersion(t, far, int32(wire.ProtocolVersion)) //nolint:gosec // fixed protocol constant, fits int32
+}
+
+// completeHandshakeWithProtocolVersion runs the same handshake as
+// completeHandshake, but with the remote peer advertising protocolVersion
+// instead of our own wire.ProtocolVersion — the lever a test needs to land
+// the negotiated version on either side of transport.ExtendedPayloadVersion
+// (handshake.go:170, NegotiatedVersion = min(wire.ProtocolVersion, advertised)).
+func completeHandshakeWithProtocolVersion(t *testing.T, far *scriptedPeer, protocolVersion int32) {
+	t.Helper()
+
 	require.IsType(t, &wire.MsgVersion{}, far.read(t))
-	far.write(t, remoteVersion(1234))
+	v := remoteVersion(1234)
+	v.ProtocolVersion = protocolVersion
+	far.write(t, v)
 	require.IsType(t, &wire.MsgVerAck{}, far.read(t))
 	require.IsType(t, &wire.MsgProtoconf{}, far.read(t))
 	far.write(t, wire.NewMsgVerAck())
