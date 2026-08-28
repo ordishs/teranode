@@ -26,6 +26,24 @@ type Config struct {
 	SendBudgetBytes int
 	RecvQueueLen    int
 	WriteTimeout    time.Duration
+
+	// MaxBlockPayload bounds an inbound block payload, basic or extended. Zero
+	// defers to wire.MaxBlockPayload() (the process-wide -excessiveblocksize).
+	// protocol.cpp GetMaxPayloadLength: the extended header only lifts the
+	// basic header's uint32 ceiling — it does not exempt the payload from the
+	// node's excessive block size limit, so this bounds an extended frame the
+	// same as it bounds a basic one.
+	MaxBlockPayload uint64
+}
+
+// maxBlockPayload returns the configured block payload ceiling, or the
+// process-wide default when the connection did not set one.
+func (c *Conn) maxBlockPayload() uint64 {
+	if c.cfg.MaxBlockPayload != 0 {
+		return c.cfg.MaxBlockPayload
+	}
+
+	return wire.MaxBlockPayload()
 }
 
 // queuedMsg is one entry on a send lane. Exactly one of msg and block is set:
@@ -122,10 +140,26 @@ func (c *Conn) readLoop() {
 			return
 		}
 
+		if hdr.extended {
+			// version.h:51 EXTENDED_PAYLOAD_VERSION: only a 70016 peer may frame this.
+			if c.pver.Load() < ExtendedPayloadVersion {
+				c.fail(ErrExtendedVersion)
+				return
+			}
+
+			if hdr.command != wire.CmdBlock {
+				// net_processing.cpp:3306: non-block payloads are bounded by
+				// maxRecvPayloadLength; nothing but a block is ever this big.
+				if hdr.length > uint64(wire.DefaultMaxRecvPayloadLength) {
+					c.fail(ErrExtendedTooLarge)
+					return
+				}
+			}
+		}
+
 		// Detect "block" before any payload byte is materialized, and hand
-		// the socket to the consumer as a stream. An extmsg-wrapped block
-		// carries the outer "extmsg" command, so it takes the buffered path
-		// below; extended headers are deferred per the phase plan.
+		// the socket to the consumer as a stream, whether the header is basic
+		// or extended: hdr.command already carries the real command either way.
 		if hdr.command == wire.CmdBlock {
 			if err := c.readBlock(hdr); err != nil {
 				c.fail(err)
@@ -136,8 +170,15 @@ func (c *Conn) readLoop() {
 		}
 
 		// Every other command keeps go-wire's framing path, checksum
-		// verification included: replay the header bytes we already took.
-		r := io.MultiReader(bytes.NewReader(hdr.raw[:]), c.nc)
+		// verification included: replay the header bytes we already took. An
+		// extended header also replays its extension bytes, which go-wire's
+		// ReadMessageWithEncodingN already parses (message.go:270).
+		var r io.Reader
+		if hdr.extended {
+			r = io.MultiReader(bytes.NewReader(hdr.raw[:]), bytes.NewReader(hdr.ext[:]), c.nc)
+		} else {
+			r = io.MultiReader(bytes.NewReader(hdr.raw[:]), c.nc)
+		}
 
 		total, msg, _, err := wire.ReadMessageWithEncodingN(r, c.pver.Load(), c.cfg.Net, wire.BaseEncoding)
 
@@ -169,10 +210,10 @@ func (c *Conn) readBlock(hdr wireHeader) error {
 		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE, "svp2p: block message from other network [%v]", hdr.magic)
 	}
 
-	length := uint64(hdr.length)
-	if length > wire.MaxBlockPayload() {
+	length := hdr.length
+	if maxPayload := c.maxBlockPayload(); length > maxPayload {
 		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
-			"svp2p: block payload of %d bytes exceeds the %d byte maximum", length, wire.MaxBlockPayload())
+			"svp2p: block payload of %d bytes exceeds the %d byte maximum", length, maxPayload)
 	}
 
 	bs, err := newBlockStream(c.nc, length, c.pver.Load())

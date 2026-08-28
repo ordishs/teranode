@@ -21,17 +21,26 @@ var ErrBlockStreamClosed = errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: block
 const minTxPayloadBytes = 10
 
 // wireHeader is the 24 byte message header, kept raw so a non-block message
-// can be replayed into go-wire's own framing path unchanged.
+// can be replayed into go-wire's own framing path unchanged. An extended
+// header (protocol.cpp:220-237) additionally carries ext, the 20 extension
+// bytes read past the basic header, also kept raw for replay.
 type wireHeader struct {
-	raw     [wire.MessageHeaderSize]byte
-	magic   wire.BitcoinNet
-	command string
-	length  uint32
+	raw      [wire.MessageHeaderSize]byte
+	magic    wire.BitcoinNet
+	command  string
+	length   uint64
+	checksum [4]byte
+	extended bool
+	ext      [wire.CommandSize + 8]byte
 }
 
 // readWireHeader reads one message header. It deliberately stops before the
 // payload so the read loop can pick the streaming path for "block" before any
 // payload byte is materialized.
+//
+// protocol.cpp:257-263 CMessageHeader::Read: the header is extended when the
+// COMMAND is "extmsg" and the basic length field carries the 0xffffffff
+// marker; the real command and a 64-bit length follow in the extension.
 func readWireHeader(r io.Reader) (int, wireHeader, error) {
 	var h wireHeader
 
@@ -42,10 +51,27 @@ func readWireHeader(r io.Reader) (int, wireHeader, error) {
 
 	h.magic = wire.BitcoinNet(binary.LittleEndian.Uint32(h.raw[0:4]))
 	h.command = string(bytes.TrimRight(h.raw[4:4+wire.CommandSize], "\x00"))
-	h.length = binary.LittleEndian.Uint32(h.raw[16:20])
+	basicLen := binary.LittleEndian.Uint32(h.raw[16:20])
+	copy(h.checksum[:], h.raw[20:24])
+	h.length = uint64(basicLen)
 
-	// Bytes 20:24 hold the payload checksum. The streaming path skips it; see
-	// the rationale on BlockStream.
+	if h.command == wire.CmdExtMsg && basicLen == extLengthMarker {
+		m, err := io.ReadFull(r, h.ext[:])
+		n += m
+
+		if err != nil {
+			if err == io.EOF { //nolint:errorlint // io.ReadFull never wraps io.EOF
+				err = io.ErrUnexpectedEOF
+			}
+
+			return n, h, err
+		}
+
+		h.extended = true
+		h.command = string(bytes.TrimRight(h.ext[:wire.CommandSize], "\x00"))
+		h.length = binary.LittleEndian.Uint64(h.ext[wire.CommandSize:])
+	}
+
 	return n, h, nil
 }
 
