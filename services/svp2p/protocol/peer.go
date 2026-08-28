@@ -274,7 +274,7 @@ type addrDispatcher interface {
 
 type PeerConfig struct {
 	Handshake    HandshakeConfig
-	Conn         *transport.Conn
+	Conn         transport.PeerConn
 	Logger       ulogger.Logger
 	IdleTimeout  time.Duration
 	PingInterval time.Duration
