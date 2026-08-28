@@ -1,8 +1,11 @@
 package svp2ptest
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"testing"
@@ -189,6 +192,83 @@ func (r *Raw) Command() string { return r.Cmd }
 // MaxPayloadLength is the payload's own length.
 func (r *Raw) MaxPayloadLength(_ uint32) uint64 { return uint64(len(r.Payload)) }
 
+// ExtendedFrame is one extmsg-framed message this peer received: the command
+// the extension header named, the payload length it declared, and how many
+// payload bytes actually arrived. The payload itself is discarded as it is
+// counted, so a peer can measure a multi-gigabyte block without holding it.
+type ExtendedFrame struct {
+	Command  string
+	Declared uint64
+	Received uint64
+}
+
+// extendedHeaderBytes is the whole extended header: the 24 byte basic header
+// plus the 12 byte real command and the 64 bit length SVNode appends
+// (protocol.cpp:220-237).
+const extendedHeaderBytes = wire.MessageHeaderSize + wire.CommandSize + 8
+
+// FrameHeader is one wire message header read off a socket, before any payload
+// byte. Raw holds the bytes consumed, so a caller that decides not to handle
+// the message itself can replay them into go-wire's own reader.
+type FrameHeader struct {
+	Command  string
+	Length   uint64
+	Extended bool
+	Raw      []byte
+}
+
+// ReadFrameHeader reads one message header from r, including the 20 byte
+// extension SVNode appends when a payload cannot fit a uint32 length
+// (protocol.cpp:220-237: command "extmsg", length 0xffffffff, zero checksum,
+// then the real command and a 64 bit length).
+//
+// go-wire cannot read that extension: readMessageHeader (message.go:245,
+// v1.2.11) reads MessageHeaderSize = 24 bytes into a buffer and then parses the
+// extension out of that SAME 24 byte buffer, which is already exhausted. The
+// error is discarded, so an extmsg frame comes back with an empty command and a
+// zero extended length, and the payload is left on the socket. This reads the
+// header by hand instead. It is deliberately transport-free: svp2ptest stands
+// in for a peer, so it must not share the code under test.
+func ReadFrameHeader(r io.Reader) (FrameHeader, error) {
+	// Sized for the extension from the start: a basic header keeps the slice
+	// at its own length, and an extended one appends into the spare capacity
+	// rather than reallocating.
+	raw := make([]byte, wire.MessageHeaderSize, extendedHeaderBytes)
+
+	if _, err := io.ReadFull(r, raw); err != nil {
+		return FrameHeader{}, err
+	}
+
+	hdr := FrameHeader{
+		Command: trimCommand(raw[4 : 4+wire.CommandSize]),
+		Length:  uint64(binary.LittleEndian.Uint32(raw[16:20])),
+		Raw:     raw,
+	}
+
+	// The three conditions together are go-wire's own extmsg test
+	// (message.go:270) and SVNode's frame: any one of them alone would
+	// misread an ordinary message.
+	if hdr.Command != wire.CmdExtMsg || hdr.Length != math.MaxUint32 || !bytes.Equal(raw[20:24], []byte{0, 0, 0, 0}) {
+		return hdr, nil
+	}
+
+	ext := make([]byte, extendedHeaderBytes-wire.MessageHeaderSize)
+
+	if _, err := io.ReadFull(r, ext); err != nil {
+		return FrameHeader{}, err
+	}
+
+	hdr.Command = trimCommand(ext[:wire.CommandSize])
+	hdr.Length = binary.LittleEndian.Uint64(ext[wire.CommandSize:])
+	hdr.Extended = true
+	hdr.Raw = append(raw, ext...)
+
+	return hdr, nil
+}
+
+// trimCommand reads a zero padded command field.
+func trimCommand(b []byte) string { return string(bytes.TrimRight(b, "\x00")) }
+
 // ServeLimit is the script of a peer that serves the first n blocks requested
 // of it and withholds the rest. n == 0 withholds everything.
 func ServeLimit(n int) Script {
@@ -248,6 +328,7 @@ type ScriptedPeer struct {
 	requested   map[chainhash.Hash]int
 	assocOfConn map[net.Conn]string
 	data1Conns  map[string]net.Conn
+	extFrames   []ExtendedFrame
 }
 
 // Connections is how many times the node connected to this peer. With
@@ -474,6 +555,15 @@ func (p *ScriptedPeer) RequestedCount() int {
 	return n
 }
 
+// ExtendedFrames copies the extmsg-framed messages this peer received, in
+// arrival order.
+func (p *ScriptedPeer) ExtendedFrames() []ExtendedFrame {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return append([]ExtendedFrame(nil), p.extFrames...)
+}
+
 // ServedBlocks is the number of block messages this peer sent.
 func (p *ScriptedPeer) ServedBlocks() int {
 	p.mu.Lock()
@@ -606,6 +696,41 @@ func (p *ScriptedPeer) writeGetDataReply(conn net.Conn, msgs []wire.Message) boo
 	return true
 }
 
+// noteClosed records that the connection ended, attributing it to the node
+// unless this peer is the side that shut down.
+func (p *ScriptedPeer) noteClosed() {
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+
+	if !closed {
+		p.Transcript.setClosedBy("node")
+	}
+}
+
+// drainExtendedFrame counts an extmsg payload straight into io.Discard and
+// records what the header declared beside what actually arrived. It reports
+// whether the connection is still byte aligned: a short payload leaves the
+// socket mid-message and the serve loop must give up on it.
+//
+// A block is also added to the Transcript, so a scenario can assert on it with
+// the same Count/FirstOn vocabulary it uses for every other message. The value
+// carried is an empty wire.MsgBlock: the payload was never decoded, and a
+// scenario that wants the byte counts reads ExtendedFrames.
+func (p *ScriptedPeer) drainExtendedFrame(conn net.Conn, hdr FrameHeader) bool {
+	n, err := io.Copy(io.Discard, io.LimitReader(conn, int64(hdr.Length))) //nolint:gosec // an extended length above MaxInt64 cannot be framed
+
+	p.mu.Lock()
+	p.extFrames = append(p.extFrames, ExtendedFrame{Command: hdr.Command, Declared: hdr.Length, Received: uint64(n)}) //nolint:gosec // io.Copy never returns a negative count
+	p.mu.Unlock()
+
+	if hdr.Command == wire.CmdBlock {
+		p.Transcript.add(conn, In, &wire.MsgBlock{})
+	}
+
+	return err == nil && uint64(n) == hdr.Length //nolint:gosec // io.Copy never returns a negative count
+}
+
 func (p *ScriptedPeer) serve(conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
@@ -616,15 +741,33 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 	remote := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, wire.SFNodeNetwork)
 
 	for {
-		_, msg, _, err := wire.ReadMessageWithEncodingN(conn, wire.ProtocolVersion, p.Net, wire.BaseEncoding)
+		// The header is read by hand first so an extmsg frame is recognised
+		// before go-wire is asked for anything: go-wire misparses that header
+		// (ReadFrameHeader) and, for a block above the 4 GiB envelope, would
+		// try to buffer the whole payload. An extended block is counted and
+		// discarded instead; every other frame is replayed into go-wire
+		// unchanged, header bytes and all.
+		hdr, err := ReadFrameHeader(conn)
 		if err != nil {
-			p.mu.Lock()
-			closed := p.closed
-			p.mu.Unlock()
+			p.noteClosed()
 
-			if !closed {
-				p.Transcript.setClosedBy("node")
+			return
+		}
+
+		if hdr.Extended {
+			if !p.drainExtendedFrame(conn, hdr) {
+				p.noteClosed()
+
+				return
 			}
+
+			continue
+		}
+
+		_, msg, _, err := wire.ReadMessageWithEncodingN(io.MultiReader(bytes.NewReader(hdr.Raw), conn),
+			wire.ProtocolVersion, p.Net, wire.BaseEncoding)
+		if err != nil {
+			p.noteClosed()
 
 			return
 		}

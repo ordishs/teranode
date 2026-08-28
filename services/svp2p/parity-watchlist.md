@@ -288,6 +288,37 @@ so never has this branch.
 on a block whose declared size exceeds the basic envelope, which needs a real
 block above 4 GiB in the node's store. Needs a fat-block rig; carried.
 
+**Verdict 2026-08-28 (`TestParity_ExtendedBlockServing`, Phase 4): svp2p frames
+4 GiB + 1 with the extended header and the peer receives every byte.** A peer
+that negotiated 70016 asks for a block the node declares at 4,294,967,297 bytes.
+svp2p writes SVNode's extmsg header (`protocol.cpp:220-237`, command "extmsg",
+length `0xffffffff`, zero checksum, then command "block" and a 64 bit length) and
+streams the payload: the peer counted 4,294,967,297 bytes against a declared
+4,294,967,297, sent no `notfound`, and the connection survived. Scenario wall
+clock 4.6 s, peak resident set 1.6 GB — the body is never materialised on either
+side.
+
+**Legacy, observed the same day on the same scenario (`PARITY_FAT_BLOCK_LEGACY=1`,
+race detector off): it fetches the whole body, sends the peer nothing, and drops
+the peer.** The transcript shows the `getdata` arriving and no reply of any kind
+— no `block`, no `notfound` — and the node then closing the connection
+(`Disconnected[peer0]=node`, `still-connected: 0`) after 2 m 1 s. The asset stub
+recorded one completed body write, so legacy did read all 4 GiB + 1. It is then
+dropped inside go-wire: `WriteMessageWithEncodingN` returns `(0, nil)` for a
+payload above `math.MaxUint32` (`message.go:385`), which legacy's `OnGetData`
+reads as success, so no `notfound` is queued either
+(`services/legacy/peer_server.go:1663-1680`).
+
+The cost of that path is why the legacy leg is opt-in. legacy materialises the
+payload twice over — `NewRawBlockMessage` reads the asset body into one
+`[]byte` (`services/legacy/raw_block_message.go:28`, `io.ReadAll`) and go-wire
+encodes that into a `bytes.Buffer` (`message.go:351-353`) — measured at **94.8 GB
+maximum resident set size** without the race detector. With `-race` and both
+legs the test binary was killed by the OS at 62.8 GB, 762 s in, still inside the
+legacy leg. The default leg set is therefore svp2p alone, which keeps the
+package inside `make test`; the row's assertions are on svp2p, as a verdict on
+this port should be. **Scenario CLOSED.**
+
 ### 10. Inv-driven getheaders amplification
 
 **Task 25 (59dc6310c), the opposite direction to scenario 6.**
@@ -357,3 +388,60 @@ owner decision at cutover.
 any user agent; legacy's ban is a Teranode-only policy with no SVNode
 counterpart and ends with the legacy service at cutover. Recorded as a
 deliberate behaviour change in the Phase 3 PR. Scenario CLOSED.
+
+### 13. BlockPriority stream negotiation
+
+**Tasks 8, 9, 10 (Phase 4).** Both implementations now negotiate the
+BlockPriority stream policy and open a second connection for the DATA1 stream,
+in both directions: each accepts an inbound `createstream` and moves that socket
+into an existing association (`net.cpp:3188-3240` `CConnman::MoveStream`), and
+each dials a second connection out and sends `createstream` once the handshake
+has agreed BlockPriority (`net.cpp:948-965` `SetSupportedStreamPolicies`).
+Blocks then travel on DATA1 (`stream_policy.cpp:187-195`).
+
+Nothing here is left for the harness to judge — both directions are pinned by
+in-process tests over real sockets, so this row records the state rather than
+asking a question of it.
+
+- **svp2p, inbound:** `TestInbound_CreateStreamAttachesAndAcksOnNewStream`,
+  `TestInbound_CreateStreamFromOtherIPIsBanned`,
+  `TestInbound_CreateStreamRefusedWhenBlockPriorityOff`,
+  `TestInbound_UnsolicitedStreamAckIsRejected`,
+  `TestInbound_AssociationUnregistersOnDisconnect`
+  (`services/svp2p/protocol/streams_test.go`).
+- **svp2p, outbound:** `TestOutbound_OpensData1AfterBlockPriorityHandshake`,
+  `TestOutbound_NoData1WithoutBlockPriority`,
+  `TestOutbound_NoStreamsWhenBlockPriorityOff`,
+  `TestOutbound_Data1DialFailureIsNotFatal`,
+  `TestOutbound_SilentStreamAckDoesNotStallTheQueue`
+  (same file).
+- **Both stacks together:** `TestIntegrationTwoServersOpenADataStream`
+  (`services/svp2p/multistream_integration_test.go`) and
+  `TestIntegrationBlocksTravelOnData1`
+  (`services/svp2p/sync_integration_test.go`).
+- **legacy:** the same two directions ship in `services/legacy/peer`, and the
+  cross-stack e2e set (`TestMultistream*` in `test/e2e/daemon/ready`) covers
+  legacy against SVNode.
+
+**Recorded 2026-08-28:** svp2p initiates and accepts; legacy initiates and
+accepts. Both directions pinned; no divergence to watch.
+
+### 14. `headers` routing under BlockPriority
+
+**Task 9 (Phase 4).** The two stacks put `headers` on different streams of a
+BlockPriority association.
+
+- legacy routes `block`, `headers`, `ping` and `pong` to DATA1
+  (`services/legacy/peer/stream_policy.go:27`).
+- svp2p routes `block`, `ping` and `pong` to DATA1 and leaves `headers` on
+  GENERAL (`services/svp2p/transport/policy.go:42`), which is SVNode's own set
+  (`stream_policy.cpp:187-195`).
+
+This is not peer-visible in any way a parity scenario can score. Both streams
+belong to one association, a peer reads both, and neither the message nor its
+order changes — only which socket carries it. A peer that counted `headers` per
+socket would see the difference, and no real peer does.
+
+**Recorded 2026-08-28:** svp2p follows SVNode, legacy does not. Deliberate, not
+peer-visible, no action. If legacy is ever the reference for a cutover
+comparison, expect its `headers` on the DATA1 socket and svp2p's on GENERAL.

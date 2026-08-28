@@ -6,11 +6,16 @@ package parity
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy"
 	"github.com/bsv-blockchain/teranode/services/p2p"
@@ -269,4 +274,139 @@ func (n *nodeUnderTest) ConnectedCount(t *testing.T) int {
 	}
 
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Asset service stub
+// ---------------------------------------------------------------------------
+
+// assetBody is one block the stub will serve: the real 80 byte header followed
+// by filler out to Length. The filler is never materialised — Length is a
+// number, and the handler streams a reused zero chunk until it has written that
+// many bytes — so a scenario can declare a body far larger than this process
+// could hold.
+type assetBody struct {
+	Header []byte
+	Length uint64
+}
+
+// assetStub stands in for the asset service's block_legacy?wire=1 route, the
+// one route BOTH implementations read a block body from: svp2p through
+// bridge.FetchBlock (services/svp2p/bridge/fetch.go) and legacy through
+// pushBlockMsg (services/legacy/peer_server.go:2277). A hash it was not given
+// is answered 404, which is the status FetchBlock folds into
+// errors.ErrBlockNotFound.
+type assetStub struct {
+	srv *httptest.Server
+
+	mu        sync.Mutex
+	bodies    map[chainhash.Hash]assetBody
+	completed map[chainhash.Hash]int
+}
+
+// assetChunkBytes is the filler chunk the handler reuses. One mebibyte keeps
+// the write count on a 4 GiB body near four thousand rather than half a
+// million, without holding anything worth counting.
+const assetChunkBytes = 1 << 20
+
+// startAssetStub starts the stub on loopback and stops it with the test.
+func startAssetStub(t *testing.T) *assetStub {
+	t.Helper()
+
+	a := &assetStub{
+		bodies:    make(map[chainhash.Hash]assetBody),
+		completed: make(map[chainhash.Hash]int),
+	}
+
+	a.srv = httptest.NewServer(http.HandlerFunc(a.handle))
+
+	t.Cleanup(a.srv.Close)
+
+	return a
+}
+
+// URL is what Asset.HTTPAddress must be set to.
+func (a *assetStub) URL() string { return a.srv.URL }
+
+// Register makes the stub serve length bytes for hash: header first, filler
+// after. Registering the same hash twice is idempotent, which is what lets a
+// scenario call it from a Tweaks hook that runs once per leg.
+func (a *assetStub) Register(hash chainhash.Hash, header []byte, length uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.bodies[hash] = assetBody{Header: header, Length: length}
+}
+
+// Completed is how many times the stub has written a whole body for hash. It is
+// the signal a scenario waits on when the node under test answers a fat block
+// with silence: the fetch finishing is observable, the silence that follows is
+// not.
+func (a *assetStub) Completed(hash chainhash.Hash) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.completed[hash]
+}
+
+func (a *assetStub) handle(w http.ResponseWriter, r *http.Request) {
+	// Matched as a suffix rather than a whole path: Asset.HTTPAddress carries
+	// a base path in production ("…/api/v1"), and this stub is given whatever
+	// the scenario set, so the route may sit under a prefix.
+	const route = "/block_legacy/"
+
+	idx := strings.LastIndex(r.URL.Path, route)
+	if idx < 0 || r.URL.Query().Get("wire") != "1" {
+		http.NotFound(w, r)
+
+		return
+	}
+
+	hash, err := chainhash.NewHashFromStr(r.URL.Path[idx+len(route):])
+	if err != nil {
+		http.NotFound(w, r)
+
+		return
+	}
+
+	a.mu.Lock()
+	body, known := a.bodies[*hash]
+	a.mu.Unlock()
+
+	if !known {
+		http.NotFound(w, r)
+
+		return
+	}
+
+	// No Content-Length: block_legacy is one of the asset service's streaming
+	// routes and does not carry one either (services/asset/httpimpl/stream.go:83),
+	// which is why FetchBlock reads the declared length from the blockchain
+	// store instead of from the response.
+	w.WriteHeader(http.StatusOK)
+
+	written, err := w.Write(body.Header)
+	if err != nil {
+		return
+	}
+
+	remaining := body.Length - uint64(written) //nolint:gosec // the handler is only ever given a length above the header
+	chunk := make([]byte, assetChunkBytes)
+
+	for remaining > 0 {
+		n := uint64(len(chunk))
+		if n > remaining {
+			n = remaining
+		}
+
+		if _, err := w.Write(chunk[:n]); err != nil {
+			return
+		}
+
+		remaining -= n
+	}
+
+	a.mu.Lock()
+	a.completed[*hash]++
+	a.mu.Unlock()
 }
