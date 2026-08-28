@@ -441,39 +441,42 @@ accepts. Both directions pinned; no divergence to watch.
 
 ### 14. `headers` routing under BlockPriority
 
-**Task 9 (Phase 4).** The two stacks put `headers` on different streams of a
-BlockPriority association, and reading the SVNode source settled which one is
-right — the opposite way round from what this row first recorded.
+**Task 9 (Phase 4), corrected and FIXED 2026-08-28.** This row first recorded
+that svp2p matched SVNode by leaving `headers` on GENERAL. Reading the SVNode
+source showed the opposite, and the port has been changed.
 
-- legacy routes `block`, `headers`, `ping` and `pong` to DATA1
-  (`services/legacy/peer/stream_policy.go:27`).
-- svp2p routes `block`, `ping` and `pong` to DATA1 and leaves `headers` and
-  `getheaders` on GENERAL (`services/svp2p/transport/policy.go:42`).
-
-**SVNode sends `headers` on DATA1.** Its send router is
-`BlockPriorityStreamPolicy::PushMessage` (`stream_policy.cpp:161-184`), which
-picks DATA1 whenever `IsHighPriorityMsg` says so (`stream_policy.cpp:25-31`).
-That predicate is `ping`, `pong`, or `IsBlockMsg`, and `IsBlockMsg`
-(`stream_policy.cpp:11-22`) is a WIDE set: `block`, `cmpctblock`, `blocktxn`,
-`getblocktxn`, **`headers`**, **`getheaders`**, `hdrsen`, `gethdrsen`, plus any
-message whose payload type is BLOCK.
+**SVNode's send router** is `BlockPriorityStreamPolicy::PushMessage`
+(`stream_policy.cpp:161-184`): when the caller has not named a stream, DATA1 is
+taken whenever `IsHighPriorityMsg` holds (`stream_policy.cpp:25-31`), GENERAL
+otherwise. `IsHighPriorityMsg` is `ping`, `pong`, or `IsBlockMsg`, and
+`IsBlockMsg` (`stream_policy.cpp:11-22`) is a WIDE set: `block`, `cmpctblock`,
+`blocktxn`, `getblocktxn`, **`headers`**, **`getheaders`**, `hdrsen`,
+`gethdrsen`, plus any message whose payload type is BLOCK.
 
 `BlockPriorityStreamPolicy::GetStreamTypeForMessage` (`stream_policy.cpp:187-195`),
-the three-value `BLOCK`/`PING`/`OTHER` function svp2p's `policy.go` was written
-against, is NOT the send router. Its only caller is
-`Association::GetAverageBandwidth` (`association.cpp:215-226`), which asks "which
-stream carries this class of message" for the bandwidth statistic behind
-`net_processing.cpp:107` and `:5697`. Nothing routes a send through it.
+the three-value `BLOCK`/`PING`/`OTHER` function svp2p's `transport/policy.go`
+was first written against, is NOT the router. Its only caller is
+`Association::GetAverageBandwidth` (`association.cpp:222`), which asks which
+stream carries a CLASS of message so it can read that stream's bandwidth meter —
+the statistic behind `net_processing.cpp:107` and `:5697`.
 
-So on this row **legacy matches SVNode and svp2p diverges** — the reverse of the
-first reading. The divergence is narrow: only which socket of one association
-carries `headers`/`getheaders`. A peer reads both sockets, and neither the
-message nor its order changes, so no parity scenario can score it. It is
-visible to a peer that measures per-stream bandwidth, which is exactly what
-SVNode's own stall detection does on its side of the link.
+**svp2p now matches SVNode.** `blockPriorityStreamPolicy.StreamFor`
+(`services/svp2p/transport/policy.go`) routes exactly the `IsHighPriorityMsg`
+set to DATA1 and everything else to GENERAL, pinned command by command in
+`TestStreamPolicy_Routing`. The payload-type arm of `IsBlockMsg` has no
+counterpart: it exists for SVNode's sender-side tag on a pre-serialised body,
+and this transport frames a block through `SendBlock`.
 
-**Recorded 2026-08-28:** svp2p leaves `headers` on GENERAL; SVNode and legacy
-put it on DATA1. Not fixed here — `policy.go` is Task 9's and changing the
-routing set is a behaviour change, not a record correction. Carried as an open
-item for Task 9: widen `blockPriorityStreamPolicy.StreamFor` to `IsBlockMsg`'s
-set, or record a deliberate reason not to.
+**Legacy is now the divergence, and it is narrower than it looks.** legacy
+routes `block`, `headers`, `ping` and `pong` to DATA1
+(`services/legacy/peer/stream_policy.go:27`) and leaves `getheaders`,
+`cmpctblock`, `blocktxn`, `getblocktxn`, `hdrsen` and `gethdrsen` on GENERAL,
+where SVNode puts all six on DATA1. Of those, `getheaders` is the only one
+legacy actually sends.
+
+**Recorded 2026-08-28:** not peer-visible in any way a parity scenario can
+score — both sockets belong to one association, a peer reads both, and neither
+the message nor its order changes, only which socket carries it. It is visible
+to a peer that measures per-stream bandwidth, which is what SVNode's own stall
+detection does on its side of the link. No action for legacy: its narrower set
+ends with the legacy service at cutover. Scenario CLOSED.
