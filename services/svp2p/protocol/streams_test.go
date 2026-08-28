@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"encoding/binary"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/svp2p/svp2ptest"
+	"github.com/bsv-blockchain/teranode/services/svp2p/transport"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -400,19 +402,23 @@ func associationCount(m *PeerManager) int {
 	return len(m.associations)
 }
 
-// writeRawHeader hand-frames a 24-byte message header with no payload behind
-// it, so a test can present framing the typed messages cannot build.
-func writeRawHeader(t *testing.T, nc net.Conn, command string, length uint32) {
-	t.Helper()
-
+// rawHeader hand-frames a 24-byte message header with no payload behind it, so
+// a test can present framing the typed messages cannot build.
+func rawHeader(command string, length uint32) []byte {
 	hdr := make([]byte, wire.MessageHeaderSize)
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(wire.MainNet))
 	copy(hdr[4:4+wire.CommandSize], command)
 	binary.LittleEndian.PutUint32(hdr[16:20], length)
 
+	return hdr
+}
+
+func writeRawHeader(t *testing.T, nc net.Conn, command string, length uint32) {
+	t.Helper()
+
 	require.NoError(t, nc.SetWriteDeadline(time.Now().Add(5*time.Second)))
 
-	_, err := nc.Write(hdr)
+	_, err := nc.Write(rawHeader(command, length))
 	require.NoError(t, err)
 }
 
@@ -892,4 +898,66 @@ func TestInbound_AssociationNotRegisteredWhenBlockPriorityOff(t *testing.T) {
 
 	require.Never(t, func() bool { return associationCount(m) != 0 }, 2*time.Second, 100*time.Millisecond,
 		"an unvalidated association ID must not be registered with multistreams off")
+}
+
+// go-wire's (*MsgReject).MaxPayloadLength is the whole message payload
+// maximum, which it derives from the excessive block size global, so it is no
+// bound at all on the answer to a createstream this node sent. A reject header
+// declaring 1 MiB is refused on the header alone.
+func TestOutbound_RejectAnsweringCreateStreamIsBoundedByAFixedSize(t *testing.T) {
+	m := startedManager(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// What the far side sees after it sends the header ALONE. io.EOF means the
+	// node decided on the header and closed, so it never asked for the 1 MiB
+	// payload that header promised.
+	farRead := make(chan error, 1)
+
+	go func() {
+		far, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			farRead <- acceptErr
+
+			return
+		}
+
+		defer func() { _ = far.Close() }()
+
+		if _, writeErr := far.Write(rawHeader(wire.CmdReject, 1<<20)); writeErr != nil {
+			farRead <- writeErr
+
+			return
+		}
+
+		_ = far.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+		// Drain what the node sent (its createstream) until the socket ends. A
+		// clean end says the node gave up on the reject header; a timeout
+		// would say it was still waiting for the payload that header declared.
+		_, copyErr := io.Copy(io.Discard, far)
+		farRead <- copyErr
+	}()
+
+	nc, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+
+	policy, ok := transport.PolicyForName(wire.BlockPriorityStreamPolicy)
+	require.True(t, ok)
+
+	start := time.Now()
+
+	_, err = m.requestStream(context.Background(), nc, testAssociationID(1), policy)
+
+	// openNewStreamConnection closes the socket on every failure; do the same
+	// here, so the far side reaches the EOF it is waiting on.
+	require.NoError(t, nc.Close())
+
+	require.ErrorIs(t, err, ErrFirstMessageTooLong)
+	require.Less(t, time.Since(start), streamAckTimeout, "the header alone must decide it, with no wait on a payload")
+
+	require.NoError(t, <-farRead, "the node must close without asking for the payload it was promised")
 }

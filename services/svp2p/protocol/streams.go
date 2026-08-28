@@ -53,23 +53,56 @@ var (
 	ErrFirstMessageCommand = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: illegal first message command")
 )
 
+// maxRejectFirstMessageBytes bounds a reject read off a socket that carries no
+// Conn yet. go-wire's own (*MsgReject).MaxPayloadLength is maxMessagePayload(),
+// which it derives from the excessive block size global, so it is no bound at
+// all here: it would let a 24 byte header ask this node for tens of MiB.
+//
+// A reject is small by construction. SVNode truncates the reason to
+// validation.h:155 MAX_REJECT_MESSAGE_LENGTH (111) before sending, and reads it
+// back under the same limit (net_processing.cpp:1486 LIMITED_STRING). The whole
+// message is then the command varstr (1 + 12), the reject code (1), the reason
+// varstr (1 + 111) and an optional 32 byte hash: 158 bytes. 256 leaves room for
+// a peer that frames it less tightly and is still nothing to allocate.
+const maxRejectFirstMessageBytes = uint64(256)
+
+// recvCapped holds a per-message maximum at or below what this node advertises
+// it will ever receive (net_processing.cpp:3306 maxRecvPayloadLength). go-wire
+// derives several of its maxima from mutable globals, so without this cap a
+// wire.SetLimits call elsewhere in the node could silently widen what an
+// unauthenticated connection may make this node allocate.
+func recvCapped(n uint64) uint64 {
+	if n > uint64(wire.DefaultMaxRecvPayloadLength) {
+		return uint64(wire.DefaultMaxRecvPayloadLength)
+	}
+
+	return n
+}
+
 // inboundFirstLimits bounds the payload of every command
 // net_processing.cpp:4708-4715 accepts before a version, each by its OWN
 // maximum rather than by the 2 MiB receive ceiling. The command is read out of
 // the header before anything allocates, so one unauthenticated connection can
 // never make this node reserve more than the largest of these.
-var inboundFirstLimits = map[string]uint64{
-	wire.CmdVersion:      (&wire.MsgVersion{}).MaxPayloadLength(wire.ProtocolVersion),
-	wire.CmdCreateStream: (&wire.MsgCreateStream{}).MaxPayloadLength(wire.ProtocolVersion),
-	wire.CmdStreamAck:    (&wire.MsgStreamAck{}).MaxPayloadLength(wire.ProtocolVersion),
+//
+// Built on each call, never frozen at init: go-wire's maxima read globals that
+// this node sets at startup, so a value captured once could be stale.
+func inboundFirstLimits() map[string]uint64 {
+	return map[string]uint64{
+		wire.CmdVersion:      recvCapped((&wire.MsgVersion{}).MaxPayloadLength(wire.ProtocolVersion)),
+		wire.CmdCreateStream: recvCapped((&wire.MsgCreateStream{}).MaxPayloadLength(wire.ProtocolVersion)),
+		wire.CmdStreamAck:    recvCapped((&wire.MsgStreamAck{}).MaxPayloadLength(wire.ProtocolVersion)),
+	}
 }
 
 // streamAckLimits bounds the answer to a createstream this node sent: the
 // streamack that confirms it, or the reject that refuses it
 // (net_processing.cpp:1577-1584).
-var streamAckLimits = map[string]uint64{
-	wire.CmdStreamAck: (&wire.MsgStreamAck{}).MaxPayloadLength(wire.ProtocolVersion),
-	wire.CmdReject:    (&wire.MsgReject{}).MaxPayloadLength(wire.ProtocolVersion),
+func streamAckLimits() map[string]uint64 {
+	return map[string]uint64{
+		wire.CmdStreamAck: recvCapped((&wire.MsgStreamAck{}).MaxPayloadLength(wire.ProtocolVersion)),
+		wire.CmdReject:    maxRejectFirstMessageBytes,
+	}
 }
 
 // The reject reason a stream-setup failure puts ON THE WIRE. SVNode sends
@@ -147,7 +180,7 @@ func (m *PeerManager) classifyInbound(ctx context.Context, nc net.Conn) {
 		}
 	}()
 
-	msg, raw, err := readFirstMessage(nc, magic, m.firstMessageTimeout, inboundFirstLimits)
+	msg, raw, err := readFirstMessage(nc, magic, m.firstMessageTimeout, inboundFirstLimits())
 
 	close(read)
 
@@ -723,7 +756,7 @@ func (m *PeerManager) requestStream(ctx context.Context, nc net.Conn, id []byte,
 		}
 	}()
 
-	msg, _, err := readFirstMessage(nc, magic, streamAckTimeout, streamAckLimits)
+	msg, _, err := readFirstMessage(nc, magic, streamAckTimeout, streamAckLimits())
 
 	close(read)
 

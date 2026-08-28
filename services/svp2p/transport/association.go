@@ -97,11 +97,15 @@ func (a *Association) ID() []byte {
 // SetID records the association ID an inbound peer named in its version
 // message (net_processing.cpp:1775 SetAssociationID). An outbound association
 // is built with the ID we generated and never reaches this.
+//
+// The bytes are copied, for the reason ID copies them back out: this ID comes
+// off the wire, and the association must not share a backing array with
+// whatever decoded it.
 func (a *Association) SetID(id []byte) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.id = id
+	a.id = bytes.Clone(id)
 }
 
 func (a *Association) SetPolicy(p StreamPolicy) {
