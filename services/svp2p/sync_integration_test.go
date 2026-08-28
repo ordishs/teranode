@@ -472,6 +472,64 @@ func TestIntegrationRacesABlockAwayFromASilentPeer(t *testing.T) {
 	noStallDisconnect(t, h, "the recovery here is the race, not the stall or timeout disconnect")
 }
 
+// TestIntegrationBlocksTravelOnData1 is the phase-4 exit for block delivery: a
+// node that negotiates BlockPriority with its peer and opens DATA1
+// (protocol/streams.go setupStreams, Task 9) must actually pull its blocks
+// down that stream, not merely open it. The scripted peer here acks the
+// node's createstream and, from then on, answers every getdata's block
+// replies on the connection that ack went out on
+// (svp2ptest.ScriptedPeer.writeGetDataReply) — the same routing SVNode's own
+// BlockPriority policy performs (stream_policy.cpp:187-195).
+func TestIntegrationBlocksTravelOnData1(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	chain := svp2ptest.BuildFixtureChain(t, tSettings, syncTestChainLength)
+
+	require.True(t, tSettings.Legacy.AllowBlockPriority, "legacy_allowBlockPriority must default on for DATA1 to be requested")
+
+	peer := svp2ptest.NewScriptedPeer(t, chain, tSettings.ChainCfgParams.Net, svp2ptest.Script{}, true)
+
+	h := newSyncHarness(t, "data1", []string{peer.Addr}, 0)
+	h.start(t)
+
+	h.waitForHeight(t, uint32(syncTestChainLength), 60*time.Second, "sync over DATA1")
+
+	hash, height := h.bestBlock(t)
+	require.Equal(t, uint32(syncTestChainLength), height)
+	require.Equal(t, chain.Tip(), hash)
+
+	ack, ok := peer.Transcript.FirstOn(svp2ptest.Out, "streamack")
+	require.True(t, ok, "the peer must have acked the node's createstream")
+
+	conns := peer.Conns()
+	require.Len(t, conns, 2, "the node must open exactly two connections to this peer: GENERAL then DATA1")
+
+	generalConn, data1Conn := conns[0], conns[1]
+
+	// Blocks may legitimately have been served on GENERAL before DATA1
+	// attached (the association's own handshake is not instantaneous), so
+	// only entries after the streamack count against GENERAL.
+	blocksOnGeneralAfterAck := 0
+	blocksOnData1 := 0
+
+	for _, e := range peer.Transcript.Snapshot() {
+		if e.Dir != svp2ptest.Out || e.Cmd != "block" {
+			continue
+		}
+
+		switch e.Conn {
+		case data1Conn:
+			blocksOnData1++
+		case generalConn:
+			if e.At.After(ack.At) {
+				blocksOnGeneralAfterAck++
+			}
+		}
+	}
+
+	require.Positive(t, blocksOnData1, "at least one block must have travelled on the DATA1 connection")
+	require.Zero(t, blocksOnGeneralAfterAck, "no block may travel on GENERAL once DATA1 has attached")
+}
+
 // noStallDisconnect asserts that NEITHER DetectStalling clause disconnected
 // anyone. Both reasons have to be named: Task 25 split the single shared log
 // line "stalling block download" into one text per rule, so a check for either
