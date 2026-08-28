@@ -27,9 +27,12 @@ const (
 
 // Entry is one message in a Transcript. Conn is the connection it travelled
 // on, so a multi-stream scenario can tell the association's GENERAL stream
-// from its DATA1 stream.
+// from its DATA1 stream. Seq is the entry's position in transcript order,
+// assigned under Transcript.mu — the ordering a scenario should compare on,
+// since At is wall-clock time and two entries can tie on a coarse clock.
 type Entry struct {
 	At   time.Time
+	Seq  int
 	Dir  Direction
 	Cmd  string
 	Msg  wire.Message
@@ -48,7 +51,8 @@ func (tr *Transcript) add(conn net.Conn, dir Direction, msg wire.Message) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 
-	tr.entries = append(tr.entries, Entry{At: time.Now(), Dir: dir, Cmd: msg.Command(), Msg: msg, Conn: conn})
+	seq := len(tr.entries)
+	tr.entries = append(tr.entries, Entry{At: time.Now(), Seq: seq, Dir: dir, Cmd: msg.Command(), Msg: msg, Conn: conn})
 }
 
 // Count returns how many entries travelled in dir with the given command.
@@ -528,6 +532,24 @@ func (p *ScriptedPeer) data1ConnFor(conn net.Conn) (net.Conn, bool) {
 	return dc, ok
 }
 
+// forgetConn drops conn from the association-routing tables when its serve
+// loop exits, whichever role it held: a GENERAL connection's own entry in
+// assocOfConn, or a DATA1 connection's entry in data1Conns. Without this a
+// long-lived or reused ScriptedPeer would grow both maps by one entry per
+// connection for the rest of the test.
+func (p *ScriptedPeer) forgetConn(conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.assocOfConn, conn)
+
+	for id, dc := range p.data1Conns {
+		if dc == conn {
+			delete(p.data1Conns, id)
+		}
+	}
+}
+
 func (p *ScriptedPeer) write(conn net.Conn, msg wire.Message) error {
 	if p.Script.WriteDelay != nil {
 		if d := p.Script.WriteDelay(msg, int(msg.MaxPayloadLength(wire.ProtocolVersion))); d > 0 { //nolint:gosec // bounded by the wire limit
@@ -585,7 +607,10 @@ func (p *ScriptedPeer) writeGetDataReply(conn net.Conn, msgs []wire.Message) boo
 }
 
 func (p *ScriptedPeer) serve(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		_ = conn.Close()
+		p.forgetConn(conn)
+	}()
 
 	local := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, wire.SFNodeNetwork)
 	remote := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, wire.SFNodeNetwork)

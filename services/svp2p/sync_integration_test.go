@@ -507,7 +507,10 @@ func TestIntegrationBlocksTravelOnData1(t *testing.T) {
 
 	// Blocks may legitimately have been served on GENERAL before DATA1
 	// attached (the association's own handshake is not instantaneous), so
-	// only entries after the streamack count against GENERAL.
+	// only entries after the streamack count against GENERAL. Ordering is
+	// compared by Seq, the entry's position in transcript order, rather than
+	// by wall-clock time: a coarse clock can tie two entries and turn a real
+	// ordering violation into a false negative under At.After.
 	blocksOnGeneralAfterAck := 0
 	blocksOnData1 := 0
 
@@ -520,7 +523,7 @@ func TestIntegrationBlocksTravelOnData1(t *testing.T) {
 		case data1Conn:
 			blocksOnData1++
 		case generalConn:
-			if e.At.After(ack.At) {
+			if e.Seq > ack.Seq {
 				blocksOnGeneralAfterAck++
 			}
 		}
