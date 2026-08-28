@@ -25,9 +25,12 @@ var (
 	// sends an extended message header.
 	ErrExtendedVersion = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended message from a peer below protocol version 70016")
 
-	// ErrExtendedTooLarge is returned when an extended non-block message
-	// exceeds the advertised receive limit.
-	ErrExtendedTooLarge = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended non-block message exceeds the advertised receive limit")
+	// ErrExtendedNonBlock is returned when a peer frames a non-block message
+	// with the extended header. protocol.cpp:220-237 only frames a payload
+	// this way once it exceeds uint32 max, and any such payload already
+	// exceeds our advertised maxRecvPayloadLength (net_processing.cpp:3306),
+	// so no non-block message ever legitimately arrives extended.
+	ErrExtendedNonBlock = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended header on a non-block message")
 )
 
 // extBlockFrameHeader is the 44-byte extended header for a block payload.

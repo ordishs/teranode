@@ -102,22 +102,36 @@ func TestReadLoop_ExtendedFromOldPeerDisconnects(t *testing.T) {
 	require.ErrorIs(t, c.Err(), ErrExtendedVersion)
 }
 
-// An extended NON-block message is bounded by the advertised receive limit.
-func TestReadLoop_ExtendedNonBlockOverLimitDisconnects(t *testing.T) {
-	a, b := net.Pipe()
-	defer a.Close()
+// protocol.cpp:220-237 only frames a payload extended once it exceeds uint32
+// max, so a non-block message is never legitimately framed this way — every
+// extended non-block header is refused, whatever length it declares.
+func TestReadLoop_ExtendedNonBlockDisconnects(t *testing.T) {
+	cases := []struct {
+		name   string
+		length uint64
+	}{
+		{name: "over the advertised receive limit", length: uint64(math.MaxUint32) + 1},
+		{name: "a small declared length", length: 100},
+	}
 
-	c := New(b, Config{Net: wire.MainNet, ProtocolVersion: 70016, SendBudgetBytes: 1 << 20, RecvQueueLen: 4, WriteTimeout: time.Second})
-	c.Start(context.Background())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := net.Pipe()
+			defer a.Close()
 
-	hdr := extBlockFrameHeader(wire.MainNet, uint64(math.MaxUint32)+1)
-	copy(hdr[24:36], make([]byte, 12))
-	copy(hdr[24:36], wire.CmdInv)
+			c := New(b, Config{Net: wire.MainNet, ProtocolVersion: 70016, SendBudgetBytes: 1 << 20, RecvQueueLen: 4, WriteTimeout: time.Second})
+			c.Start(context.Background())
 
-	go func() { _, _ = a.Write(hdr) }()
+			hdr := extBlockFrameHeader(wire.MainNet, tc.length)
+			copy(hdr[24:24+wire.CommandSize], make([]byte, wire.CommandSize))
+			copy(hdr[24:24+wire.CommandSize], wire.CmdInv)
 
-	<-c.Done()
-	require.ErrorIs(t, c.Err(), ErrExtendedTooLarge)
+			go func() { _, _ = a.Write(hdr) }()
+
+			<-c.Done()
+			require.ErrorIs(t, c.Err(), ErrExtendedNonBlock)
+		})
+	}
 }
 
 type zeroReader struct{}

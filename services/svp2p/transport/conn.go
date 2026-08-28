@@ -147,13 +147,13 @@ func (c *Conn) readLoop() {
 				return
 			}
 
+			// protocol.cpp:220-237 only frames a payload extended once it
+			// exceeds uint32 max, and any such payload already exceeds our
+			// advertised maxRecvPayloadLength (net_processing.cpp:3306), so a
+			// non-block message is never legitimately framed this way.
 			if hdr.command != wire.CmdBlock {
-				// net_processing.cpp:3306: non-block payloads are bounded by
-				// maxRecvPayloadLength; nothing but a block is ever this big.
-				if hdr.length > uint64(wire.DefaultMaxRecvPayloadLength) {
-					c.fail(ErrExtendedTooLarge)
-					return
-				}
+				c.fail(ErrExtendedNonBlock)
+				return
 			}
 		}
 
@@ -170,15 +170,11 @@ func (c *Conn) readLoop() {
 		}
 
 		// Every other command keeps go-wire's framing path, checksum
-		// verification included: replay the header bytes we already took. An
-		// extended header also replays its extension bytes, which go-wire's
-		// ReadMessageWithEncodingN already parses (message.go:270).
-		var r io.Reader
-		if hdr.extended {
-			r = io.MultiReader(bytes.NewReader(hdr.raw[:]), bytes.NewReader(hdr.ext[:]), c.nc)
-		} else {
-			r = io.MultiReader(bytes.NewReader(hdr.raw[:]), c.nc)
-		}
+		// verification included: replay the header bytes we already took.
+		// This is reached only by basic frames — an extended non-block
+		// header is refused above — so the 24-byte header accounting below
+		// stays correct.
+		r := io.MultiReader(bytes.NewReader(hdr.raw[:]), c.nc)
 
 		total, msg, _, err := wire.ReadMessageWithEncodingN(r, c.pver.Load(), c.cfg.Net, wire.BaseEncoding)
 
