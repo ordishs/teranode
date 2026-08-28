@@ -115,6 +115,10 @@ type Script struct {
 	// BeforeVersion is sent when the node's version arrives, BEFORE the peer's
 	// own version — the "missing-version" offence.
 	BeforeVersion []wire.Message
+	// OnCreateStream answers the node's createstream on a second connection.
+	// The default acks it on the same connection, which is what
+	// net_processing.cpp:1569-1571 does.
+	OnCreateStream func(p *ScriptedPeer, conn net.Conn, m *wire.MsgCreateStream) []wire.Message
 }
 
 // Raw is a wire message with an arbitrary command and payload, for sending
@@ -312,6 +316,39 @@ func (p *ScriptedPeer) Dial(nodeAddr string) error {
 	go p.serve(conn)
 
 	return nil
+}
+
+// DialRaw opens a bare TCP connection to the node and sends nothing. The
+// connection is tracked so Close ends it, but no serve loop runs on it: the
+// caller drives it message by message with Write and ReadOne.
+func (p *ScriptedPeer) DialRaw(nodeAddr string) (net.Conn, error) {
+	conn, err := net.Dial("tcp", nodeAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	p.conns = append(p.conns, conn)
+	p.mu.Unlock()
+
+	return conn, nil
+}
+
+// Write sends one message on conn and records it in the Transcript.
+func (p *ScriptedPeer) Write(conn net.Conn, msg wire.Message) error {
+	return p.write(conn, msg)
+}
+
+// ReadOne reads a single message off conn within timeout.
+func ReadOne(t *testing.T, conn net.Conn, netMagic wire.BitcoinNet, timeout time.Duration) wire.Message {
+	t.Helper()
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(timeout)))
+
+	_, msg, _, err := wire.ReadMessageWithEncodingN(conn, wire.ProtocolVersion, netMagic, wire.BaseEncoding)
+	require.NoError(t, err)
+
+	return msg
 }
 
 // Close ends every connection and stops listening.
@@ -513,6 +550,18 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 				out = p.Script.OnGetBlocks(p, m)
 			} else {
 				out = []wire.Message{p.InvFor(m)}
+			}
+
+			if !p.writeAll(conn, out) {
+				return
+			}
+
+		case *wire.MsgCreateStream:
+			var out []wire.Message
+			if p.Script.OnCreateStream != nil {
+				out = p.Script.OnCreateStream(p, conn, m)
+			} else {
+				out = []wire.Message{wire.NewMsgStreamAck(m.AssociationID, m.StreamType)}
 			}
 
 			if !p.writeAll(conn, out) {

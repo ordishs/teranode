@@ -84,7 +84,22 @@ func NewAssociation(general *Conn, id []byte) *Association {
 	return a
 }
 
-func (a *Association) ID() []byte { return a.id }
+func (a *Association) ID() []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.id
+}
+
+// SetID records the association ID an inbound peer named in its version
+// message (net_processing.cpp:1775 SetAssociationID). An outbound association
+// is built with the ID we generated and never reaches this.
+func (a *Association) SetID(id []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.id = id
+}
 
 func (a *Association) SetPolicy(p StreamPolicy) {
 	a.mu.Lock()

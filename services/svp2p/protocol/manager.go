@@ -201,6 +201,18 @@ type PeerManager struct {
 	nonces    []uint64
 	started   bool
 
+	// associations indexes every established peer's association by its ID, so
+	// a createstream naming one can find it (net.cpp:3192-3202 walks vNodes
+	// for the same lookup). Guarded by mu, keyed by string(id). An entry
+	// appears when the peer's handshake completes and goes when its runPeer
+	// returns.
+	associations map[string]*transport.Association
+
+	// firstMessageTimeout bounds how long a fresh inbound connection may stay
+	// silent before it names itself. A field rather than the constant so a
+	// test can shorten it.
+	firstMessageTimeout time.Duration
+
 	// syncMu is this package's cs_main: ONE mutex over the whole sync-state
 	// graph — HeaderSync, BlockDownloader, every peerSyncState, activeTip,
 	// and every WRITE to headerIndex. Those machines are all caller-locked by
@@ -285,6 +297,7 @@ func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList
 		tSettings:      tSettings,
 		banList:        banList,
 		peers:          make(map[*Peer]*SyncPeer),
+		associations:   make(map[string]*transport.Association),
 		outboundDials:  make(map[string]struct{}),
 		quit:           make(chan struct{}),
 		syncTick:       defaultSyncTick,
@@ -292,6 +305,8 @@ func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList
 		dnsLookup:      defaultDNSLookup,
 		dnsSeedDelay:   defaultDNSSeedDelay,
 		fixedSeedGrace: defaultFixedSeedGrace,
+
+		firstMessageTimeout: defaultFirstMessageTimeout,
 	}
 
 	m.fixedSeeds = m.defaultFixedSeeds
@@ -702,7 +717,9 @@ func (m *PeerManager) acceptLoop(ctx context.Context, ln net.Listener) {
 		go func() {
 			defer m.wg.Done()
 
-			_ = m.runPeer(ctx, nc, true)
+			// net_processing.cpp:4708-4715: the first message decides whether
+			// this is a peer or a further stream of one we already have.
+			m.classifyInbound(ctx, nc)
 		}()
 	}
 }
@@ -718,7 +735,7 @@ func (m *PeerManager) dialLoop(ctx context.Context, addr string) {
 
 		nc, err := m.dialTCP(addr)
 		if err == nil {
-			runErr := m.runPeer(ctx, nc, false)
+			runErr := m.runPeer(ctx, nc, false, nil)
 
 			// net.cpp: never redial a peer that proved to be ourselves.
 			if errors.Is(runErr, ErrSelfConnection) {
@@ -747,14 +764,37 @@ func (m *PeerManager) dialLoop(ctx context.Context, addr string) {
 	}
 }
 
-func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) error {
-	conn := transport.New(nc, transport.Config{
+// runPeer drives one connection's whole life. first carries the bytes the
+// inbound classifier already took off the socket, which the general stream
+// replays before it reads any further (transport.Config.Prefix); it is nil for
+// an outbound connection, which nothing has read from yet.
+func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, first []byte) error {
+	general := transport.New(nc, transport.Config{
 		Net:             m.tSettings.ChainCfgParams.Net,
 		ProtocolVersion: wire.ProtocolVersion,
 		SendBudgetBytes: sendBudgetBytes,
 		RecvQueueLen:    recvQueueLen,
 		WriteTimeout:    writeTimeout,
+		StreamType:      wire.StreamTypeGeneral,
+		Prefix:          first,
 	})
+
+	// net_processing.cpp:210 CreateAssociationID: the side that dials names
+	// the association and advertises the name in its version message. An
+	// inbound peer names its own, which the handshake learns from that
+	// message (net_processing.cpp:1775) and the watcher below registers.
+	var ourAssociationID []byte
+
+	if !inbound {
+		id, err := generateAssociationID()
+		if err != nil {
+			m.logger.Warnf("[svp2p] running %s without multistreams: %v", nc.RemoteAddr(), err)
+		} else {
+			ourAssociationID = id
+		}
+	}
+
+	assoc := transport.NewAssociation(general, ourAssociationID)
 
 	syncPeer := NewSyncPeer(nc.RemoteAddr().String(), 0, newPeerSyncState())
 
@@ -801,11 +841,12 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 			StartingHeight:       m.startingHeight(),
 			MaxRecvPayloadLength: wire.DefaultMaxRecvPayloadLength,
 			AllowBlockPriority:   m.tSettings.Legacy.AllowBlockPriority,
+			AssociationID:        ourAssociationID,
 			LocalAddr:            netAddressOf(nc.LocalAddr()),
 			RemoteAddr:           netAddressOf(nc.RemoteAddr()),
 			CheckIncomingNonce:   m.hasSentNonce,
 		},
-		Conn:         conn,
+		Conn:         assoc,
 		Logger:       m.logger,
 		IdleTimeout:  m.tSettings.Legacy.PeerIdleTimeout,
 		PingInterval: effectivePingInterval(m.tSettings.Legacy.PeerIdleTimeout, pingInterval),
@@ -829,7 +870,46 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool) er
 	m.peers[peer] = syncPeer
 	m.mu.Unlock()
 
+	// The association only becomes reachable by ID once the handshake is
+	// done, because an inbound peer's ID arrives in its version message. This
+	// watcher leaves on either outcome, so an association that dies before it
+	// establishes leaks nothing.
+	var watch sync.WaitGroup
+
+	watch.Add(1)
+
+	go func() {
+		defer watch.Done()
+
+		select {
+		case <-peer.Established():
+		case <-assoc.Done():
+			return
+		}
+
+		id := ourAssociationID
+		if inbound {
+			id = peer.Info().AssociationID
+		}
+
+		if len(id) == 0 {
+			return
+		}
+
+		assoc.SetID(id)
+		m.registerAssociation(assoc)
+	}()
+
 	err := peer.Run(ctx)
+
+	// Peer.Run always ends through disconnect, which closes the association;
+	// this is the belt for the brace, and it is what releases the watcher
+	// above when the handshake never completed.
+	_ = assoc.Close()
+
+	watch.Wait()
+
+	m.unregisterAssociation(assoc)
 
 	m.mu.Lock()
 	delete(m.peers, peer)

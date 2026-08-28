@@ -347,6 +347,11 @@ type PeerSnapshot struct {
 	LastRecv         time.Time
 	MisbehaviorScore int
 
+	// AssociationID is the ID this connection's association is known by: the
+	// one the peer named in its version message on an inbound connection, and
+	// the one we generated on an outbound one.
+	AssociationID []byte
+
 	// TxDropped counts inbound txs this peer had refused entry to txMsgCh
 	// because it was already full (queueTx) — sustained loss that would
 	// otherwise be invisible in production (review round 1, Minor 5). Not
@@ -1334,6 +1339,7 @@ func (p *Peer) Info() PeerSnapshot {
 		ConnectedAt:      p.connectedAt,
 		LastRecv:         p.lastRecv,
 		MisbehaviorScore: p.hs.MisbehaviorScore(),
+		AssociationID:    info.AssociationID,
 		TxDropped:        p.txDropped.Load(),
 	}
 }

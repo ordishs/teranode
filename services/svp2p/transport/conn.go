@@ -44,6 +44,32 @@ type Config struct {
 	// GENERAL: association.cpp:43 gives the first socket of an association the
 	// GENERAL type, and every other type is opened later.
 	StreamType wire.StreamType
+
+	// Prefix is bytes already taken off the socket that the read loop must
+	// still see. The inbound classifier reads the first message off the raw
+	// socket to decide whether the connection is a peer or a new stream
+	// (net_processing.cpp:4708-4715), so a connection that turns out to be a
+	// peer hands those bytes back here rather than losing them.
+	Prefix []byte
+}
+
+// prefixConn replays bytes the caller already consumed before delegating to
+// the real socket. Only the read loop reads, so the cursor needs no lock.
+type prefixConn struct {
+	net.Conn
+
+	prefix []byte
+}
+
+func (p *prefixConn) Read(b []byte) (int, error) {
+	if len(p.prefix) > 0 {
+		n := copy(b, p.prefix)
+		p.prefix = p.prefix[n:]
+
+		return n, nil
+	}
+
+	return p.Conn.Read(b)
 }
 
 // StreamType reports which association stream this connection carries. An
@@ -107,6 +133,10 @@ type Conn struct {
 }
 
 func New(nc net.Conn, cfg Config) *Conn {
+	if len(cfg.Prefix) > 0 {
+		nc = &prefixConn{Conn: nc, prefix: cfg.Prefix}
+	}
+
 	c := &Conn{
 		nc:      nc,
 		cfg:     cfg,

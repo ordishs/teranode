@@ -335,7 +335,7 @@ func (m *PeerManager) openNetworkConnection(ctx context.Context, addrMan *AddrMa
 		// The address is marked Good once the handshake completes, not here:
 		// that is ProcessVersionMessage's own order (net_processing.cpp:1872),
 		// and GetAddrRequest is where this port keeps that block.
-		_ = m.runPeer(ctx, nc, false)
+		_ = m.runPeer(ctx, nc, false, nil)
 	}()
 }
 
