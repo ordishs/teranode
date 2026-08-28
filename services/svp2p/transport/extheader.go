@@ -26,10 +26,12 @@ var (
 	ErrExtendedVersion = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended message from a peer below protocol version 70016")
 
 	// ErrExtendedNonBlock is returned when a peer frames a non-block message
-	// with the extended header. protocol.cpp:220-237 only frames a payload
-	// this way once it exceeds uint32 max, and any such payload already
-	// exceeds our advertised maxRecvPayloadLength (net_processing.cpp:3306),
-	// so no non-block message ever legitimately arrives extended.
+	// with the extended header. This is a DEVIATION: protocol.cpp:262-266
+	// keys the extended header on the command alone and would read such a
+	// frame. protocol.cpp:220-237 only WRITES one for a payload above uint32
+	// max, and any such payload already exceeds our advertised
+	// maxRecvPayloadLength (net_processing.cpp:3306), so no non-block message
+	// ever legitimately arrives extended and refusing it costs no honest peer.
 	ErrExtendedNonBlock = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended header on a non-block message")
 )
 

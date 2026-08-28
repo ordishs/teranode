@@ -337,11 +337,20 @@ func TestInbound_OtherFirstMessageDisconnects(t *testing.T) {
 }
 
 // With multistreams off a createstream is refused with REJECT_STREAM_SETUP.
+// The peer establishes with an association ID and is NOT registered under it
+// (net_processing.cpp:209-211), so the refusal has to come from the setting
+// itself rather than from the missing association.
 func TestInbound_CreateStreamRefusedWhenBlockPriorityOff(t *testing.T) {
 	m := startedManagerWith(t, func(s *settings.Settings) { s.Legacy.AllowBlockPriority = false }, nil)
 
 	id := testAssociationID(6)
-	_ = establishAssociation(t, m, id)
+
+	far := dialScripted(t, nodeAddr(t, m, "127.0.0.1"))
+	t.Cleanup(func() { _ = far.nc.Close() })
+
+	far.completeOutboundHandshakeWithAssociationID(t, id)
+
+	require.Eventually(t, func() bool { return establishedCount(m) == 1 }, 10*time.Second, 50*time.Millisecond)
 
 	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
 	writeMsg(t, raw, &wire.MsgCreateStream{
@@ -356,7 +365,7 @@ func TestInbound_CreateStreamRefusedWhenBlockPriorityOff(t *testing.T) {
 	require.Equal(t, reasonMultistreamsOff, rej.Reason)
 
 	requireEOF(t, raw, 5*time.Second)
-	require.False(t, m.associationByID(id).HasStream(wire.StreamTypeData1))
+	require.Equal(t, 0, associationCount(m))
 }
 
 // A husk that sends nothing is dropped at the first-message timeout.
@@ -810,4 +819,77 @@ func TestManager_LogsEveryAcceptedConnection(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return logger.contains("inbound") && logger.contains(far.nc.LocalAddr().String())
 	}, 5*time.Second, 20*time.Millisecond, "an accepted peer must be logged with its address and direction")
+}
+
+// go-wire's per-message MaxPayloadLength, not the 2 MiB receive ceiling, is
+// what bounds the first message. A header that declares more than its own
+// command can ever carry is refused before anything allocates the payload it
+// promises: the test writes the header alone, so a node that read the payload
+// would sit on the socket until the first-message timeout instead of closing.
+func TestInbound_FirstMessageIsBoundedByItsCommand(t *testing.T) {
+	m := startedManager(t)
+
+	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
+	writeRawHeader(t, raw, wire.CmdVersion, 1<<20)
+
+	requireEOF(t, raw, 5*time.Second)
+	require.Equal(t, 0, len(m.peerHandles()))
+	require.Equal(t, 0, associationCount(m))
+}
+
+// net_processing.cpp:4708-4715 takes version, createstream and streamack
+// before anything else, so every other command is refused on the header alone
+// however small the payload it declares.
+func TestInbound_UnknownFirstCommandRefusedOnItsHeader(t *testing.T) {
+	m := startedManager(t)
+
+	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
+	writeRawHeader(t, raw, wire.CmdBlock, 64)
+
+	requireEOF(t, raw, 5*time.Second)
+	require.Equal(t, 0, len(m.peerHandles()))
+}
+
+// net.cpp:3218-3232 reaches the different-IP ban BEFORE net.cpp:3233-3236
+// looks the stream policy up, so a createstream that is wrong on both counts
+// is banned rather than merely refused.
+func TestInbound_CreateStreamFromOtherIPWithBogusPolicyIsBanned(t *testing.T) {
+	m := startedManager(t)
+
+	id := testAssociationID(3)
+	_ = establishAssociation(t, m, id)
+
+	otherHost, raw := dialFromOtherIP(t, m)
+
+	writeMsg(t, raw, &wire.MsgCreateStream{
+		AssociationID:    id,
+		StreamType:       wire.StreamTypeData1,
+		StreamPolicyName: "Nope",
+	})
+
+	rej, ok := readMsg(t, raw, 5*time.Second).(*wire.MsgReject)
+	require.True(t, ok, "a refused createstream must be rejected before the disconnect")
+	require.Equal(t, rejectStreamSetup, rej.Code)
+	require.Equal(t, reasonOtherAddress, rej.Reason)
+
+	requireEOF(t, raw, 5*time.Second)
+
+	require.True(t, m.banList.IsBanned(otherHost), "the different IP outranks the bogus policy")
+}
+
+// net_processing.cpp:209-211 creates an association ID only when multistreams
+// are enabled. With them off the ID an inbound peer echoes is unvalidated peer
+// bytes, so it must never become a registry key.
+func TestInbound_AssociationNotRegisteredWhenBlockPriorityOff(t *testing.T) {
+	m := startedManagerWith(t, func(s *settings.Settings) { s.Legacy.AllowBlockPriority = false }, nil)
+
+	far := dialScripted(t, nodeAddr(t, m, "127.0.0.1"))
+	t.Cleanup(func() { _ = far.nc.Close() })
+
+	far.completeOutboundHandshakeWithAssociationID(t, testAssociationID(2))
+
+	require.Eventually(t, func() bool { return establishedCount(m) == 1 }, 10*time.Second, 50*time.Millisecond)
+
+	require.Never(t, func() bool { return associationCount(m) != 0 }, 2*time.Second, 100*time.Millisecond,
+		"an unvalidated association ID must not be registered with multistreams off")
 }

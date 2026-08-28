@@ -187,6 +187,14 @@ func (nopCloser) Close() error { return nil }
 func TestSendBlock_RoundTripsAcrossTheExtendedBoundary(t *testing.T) {
 	for _, length := range []uint64{MaxBlockFrameBytes, MaxBlockFrameBytes + 1, MaxBlockFrameBytes + 2} {
 		t.Run(fmt.Sprintf("%d", length), func(t *testing.T) {
+			// The first two lengths each stream about 4 GiB through a loopback
+			// socket, which is the whole cost of this test. They confirm where
+			// the basic path ends; the third is the extended path itself and
+			// always runs.
+			if testing.Short() && length <= MaxBlockFrameBytes+1 {
+				t.Skip("4 GiB basic-path round trip, skipped under -short")
+			}
+
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			require.NoError(t, err)
 			defer ln.Close()
@@ -398,4 +406,30 @@ func TestReadLoop_BasicBlockIsNotLoggedAsExtended(t *testing.T) {
 	}
 
 	require.False(t, logger.contains("extended block frame"), "a basic frame must not be logged as extended: %v", logger.lines)
+}
+
+// TestWriteBlock_BasicWriteFailureWrapsCleanly is the basic-path analogue of
+// TestWriteBlock_ExtendedWriteFailureWrapsCleanly. The two paths report the
+// same misalignment with the same wrapped cause, so the same rendering rule
+// applies to both.
+func TestWriteBlock_BasicWriteFailureWrapsCleanly(t *testing.T) {
+	nc := &failAfterConn{after: wire.MessageHeaderSize + 5}
+	c := &Conn{nc: nc, cfg: Config{Net: wire.MainNet}}
+
+	length := uint64(1 << 20)
+	bs := &blockSend{
+		ctx: context.Background(),
+		req: BlockSendRequest{
+			Length: length,
+			Open:   func(context.Context) (io.ReadCloser, error) { return nopCloser{&countingReader{left: length}}, nil },
+		},
+		done: make(chan error, 1),
+	}
+
+	ok := c.writeBlock(bs)
+	require.False(t, ok, "a body write that ends early must fail the connection")
+
+	err := <-bs.done
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "%!", "the wrapped error must render, not an unmatched verb")
 }

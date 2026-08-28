@@ -351,7 +351,7 @@ func (c *Conn) writeBlock(bs *blockSend) (ok bool) {
 	// waiting mid-message and every later frame on this socket is garbage.
 	// io.CopyN reports io.EOF for a body that ended early.
 	bs.done <- errors.New(errors.ERR_ERROR,
-		"svp2p: block send wrote %d of %d declared payload bytes, connection is no longer byte aligned: %v", copied, bs.req.Length, err)
+		"svp2p: block send wrote %d of %d declared payload bytes, connection is no longer byte aligned", copied, bs.req.Length, err)
 
 	return false
 }

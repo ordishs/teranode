@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"sync"
@@ -84,11 +85,13 @@ func NewAssociation(general *Conn, id []byte) *Association {
 	return a
 }
 
+// ID is a copy: the caller keys a registry on it and must not be able to
+// mutate the association's own bytes through the slice it is handed.
 func (a *Association) ID() []byte {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	return a.id
+	return bytes.Clone(a.id)
 }
 
 // SetID records the association ID an inbound peer named in its version
@@ -231,12 +234,17 @@ func (a *Association) Attach(c *Conn) error {
 	// wg.Wait before these forwarders are counted.
 	a.wg.Add(2)
 
-	a.mu.Unlock()
-
 	// The version the association negotiated, applied before the stream reads
 	// or writes a byte: an extended block frame on DATA1 is refused unless
 	// this stream also knows the peer is at ExtendedPayloadVersion.
+	//
+	// Read AND applied inside the same critical section that put the stream in
+	// the map, so a concurrent SetProtocolVersion either misses the stream and
+	// is ordered before this store, or sees it and is ordered after. Both are
+	// non-blocking atomic stores, so mu stays a leaf lock.
 	c.SetProtocolVersion(a.pver.Load())
+
+	a.mu.Unlock()
 
 	c.Start(ctx)
 	a.forward(c)

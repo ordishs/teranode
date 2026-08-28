@@ -72,6 +72,12 @@ func (p *prefixConn) Read(b []byte) (int, error) {
 		n := copy(b, p.prefix)
 		p.prefix = p.prefix[n:]
 
+		// A slice of length zero still pins the whole backing array, and the
+		// prefix is a full first message. Drop the reference once it is spent.
+		if len(p.prefix) == 0 {
+			p.prefix = nil
+		}
+
 		return n, nil
 	}
 
@@ -228,10 +234,13 @@ func (c *Conn) readLoop() {
 				return
 			}
 
-			// protocol.cpp:220-237 only frames a payload extended once it
-			// exceeds uint32 max, and any such payload already exceeds our
-			// advertised maxRecvPayloadLength (net_processing.cpp:3306), so a
-			// non-block message is never legitimately framed this way.
+			// A DEVIATION, not a port: protocol.cpp:262-266 keys the extended
+			// header on the COMMAND alone and would read such a frame whatever
+			// it carries. protocol.cpp:220-237 only WRITES one for a payload
+			// above uint32 max, and any such payload already exceeds our
+			// advertised maxRecvPayloadLength (net_processing.cpp:3306), so no
+			// honest peer sends a non-block message this way and refusing is
+			// the safer half of the difference.
 			if hdr.command != wire.CmdBlock {
 				c.fail(ErrExtendedNonBlock)
 				return

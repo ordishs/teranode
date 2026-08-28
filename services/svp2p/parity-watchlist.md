@@ -305,6 +305,10 @@ the peer.** The transcript shows the `getdata` arriving and no reply of any kind
 (`Disconnected[peer0]=node`, `still-connected: 0`) after 2 m 1 s. The asset stub
 recorded one completed body write, so legacy did read all 4 GiB + 1.
 
+That legacy observation is OPT-IN: it runs only with `PARITY_FAT_BLOCK_LEGACY=1`
+set, and CI never sets it, so nothing re-checks this comparison on a later
+change to legacy.
+
 Two INDEPENDENT facts produce that silence. They are not a chain: the second
 happens after the first has already decided the answer.
 

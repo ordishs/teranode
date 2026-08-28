@@ -45,9 +45,32 @@ var (
 	ErrFirstMessageExtended = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended header as the first message")
 
 	// ErrFirstMessageTooLong reports a first message that declares more
-	// payload than we ever advertise we will receive.
+	// payload than its own command can ever carry.
 	ErrFirstMessageTooLong = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: first message payload too long")
+
+	// ErrFirstMessageCommand reports a first message whose command is not one
+	// of the few legal on a connection that has said nothing yet.
+	ErrFirstMessageCommand = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: illegal first message command")
 )
+
+// inboundFirstLimits bounds the payload of every command
+// net_processing.cpp:4708-4715 accepts before a version, each by its OWN
+// maximum rather than by the 2 MiB receive ceiling. The command is read out of
+// the header before anything allocates, so one unauthenticated connection can
+// never make this node reserve more than the largest of these.
+var inboundFirstLimits = map[string]uint64{
+	wire.CmdVersion:      (&wire.MsgVersion{}).MaxPayloadLength(wire.ProtocolVersion),
+	wire.CmdCreateStream: (&wire.MsgCreateStream{}).MaxPayloadLength(wire.ProtocolVersion),
+	wire.CmdStreamAck:    (&wire.MsgStreamAck{}).MaxPayloadLength(wire.ProtocolVersion),
+}
+
+// streamAckLimits bounds the answer to a createstream this node sent: the
+// streamack that confirms it, or the reject that refuses it
+// (net_processing.cpp:1577-1584).
+var streamAckLimits = map[string]uint64{
+	wire.CmdStreamAck: (&wire.MsgStreamAck{}).MaxPayloadLength(wire.ProtocolVersion),
+	wire.CmdReject:    (&wire.MsgReject{}).MaxPayloadLength(wire.ProtocolVersion),
+}
 
 // The reject reason a stream-setup failure puts ON THE WIRE. SVNode sends
 // what its own exception carried (net_processing.cpp:1580 e.what()), so the
@@ -124,7 +147,7 @@ func (m *PeerManager) classifyInbound(ctx context.Context, nc net.Conn) {
 		}
 	}()
 
-	msg, raw, err := readFirstMessage(nc, magic, m.firstMessageTimeout)
+	msg, raw, err := readFirstMessage(nc, magic, m.firstMessageTimeout, inboundFirstLimits)
 
 	close(read)
 
@@ -178,7 +201,12 @@ func (m *PeerManager) writeAndClose(nc net.Conn, msg wire.Message) {
 // readFirstMessage takes exactly one message off the socket and returns it
 // together with the raw header and payload bytes, so a connection that turns
 // out to be a peer can replay them into its transport.
-func readFirstMessage(nc net.Conn, magic wire.BitcoinNet, timeout time.Duration) (wire.Message, []byte, error) {
+//
+// limits names every command legal here and the largest payload each may
+// declare. Both are checked on the 24 byte header, BEFORE the payload buffer
+// is allocated: the caller holds a connection that has authenticated nothing,
+// so the declared length must never decide the size of an allocation.
+func readFirstMessage(nc net.Conn, magic wire.BitcoinNet, timeout time.Duration, limits map[string]uint64) (wire.Message, []byte, error) {
 	if err := nc.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, nil, errors.New(errors.ERR_NETWORK_ERROR, "svp2p: cannot set first message deadline", err)
 	}
@@ -195,7 +223,14 @@ func readFirstMessage(nc net.Conn, magic wire.BitcoinNet, timeout time.Duration)
 		return nil, nil, ErrFirstMessageExtended
 	}
 
-	if length > wire.DefaultMaxRecvPayloadLength {
+	command := string(bytes.TrimRight(raw[4:4+wire.CommandSize], "\x00"))
+
+	limit, legal := limits[command]
+	if !legal {
+		return nil, nil, ErrFirstMessageCommand
+	}
+
+	if uint64(length) > limit {
 		return nil, nil, ErrFirstMessageTooLong
 	}
 
@@ -245,20 +280,6 @@ func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 			errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: unsupported stream type %d", cs.StreamType))
 	}
 
-	// net.cpp:3233-3236: an empty policy name leaves the association's
-	// current policy alone; a named one must exist.
-	var policy transport.StreamPolicy
-
-	if cs.StreamPolicyName != "" {
-		found, ok := transport.PolicyForName(cs.StreamPolicyName)
-		if !ok {
-			return streamSetupFailure(reasonUnknownPolicy,
-				errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: unknown stream policy %q", cs.StreamPolicyName))
-		}
-
-		policy = found
-	}
-
 	a := m.associationByID(cs.AssociationID)
 	if a == nil {
 		return streamSetupFailure(reasonNoSuchNode,
@@ -278,6 +299,23 @@ func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 
 		return streamSetupFailure(reasonOtherAddress,
 			errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: attempt to move stream between peers with different IPs: %s != %s", from, to))
+	}
+
+	// net.cpp:3233-3236: an empty policy name leaves the association's
+	// current policy alone; a named one must exist. SVNode reaches
+	// ReplaceStreamPolicy only here, AFTER the lookup at net.cpp:3192-3208 and
+	// after the different-IP ban at net.cpp:3218-3232, so a createstream that
+	// is wrong on both counts is banned rather than merely refused.
+	var policy transport.StreamPolicy
+
+	if cs.StreamPolicyName != "" {
+		found, ok := transport.PolicyForName(cs.StreamPolicyName)
+		if !ok {
+			return streamSetupFailure(reasonUnknownPolicy,
+				errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: unknown stream policy %q", cs.StreamPolicyName))
+		}
+
+		policy = found
 	}
 
 	// association.cpp:150-153, checked before the socket becomes a stream:
@@ -685,7 +723,7 @@ func (m *PeerManager) requestStream(ctx context.Context, nc net.Conn, id []byte,
 		}
 	}()
 
-	msg, _, err := readFirstMessage(nc, magic, streamAckTimeout)
+	msg, _, err := readFirstMessage(nc, magic, streamAckTimeout, streamAckLimits)
 
 	close(read)
 

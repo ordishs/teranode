@@ -988,7 +988,16 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 		}
 
 		id := ourAssociationID
+
 		if inbound {
+			// net_processing.cpp:209-211 creates an association ID only when
+			// multistreams are enabled. With them off there is nothing this
+			// node ever asked for, so the ID an inbound peer echoes is
+			// unvalidated peer bytes and must not become a registry key.
+			if !m.tSettings.Legacy.AllowBlockPriority {
+				return
+			}
+
 			id = peer.Info().AssociationID
 		}
 

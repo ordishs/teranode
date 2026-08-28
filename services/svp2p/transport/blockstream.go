@@ -38,9 +38,13 @@ type wireHeader struct {
 // payload so the read loop can pick the streaming path for "block" before any
 // payload byte is materialized.
 //
-// protocol.cpp:257-263 CMessageHeader::Read: the header is extended when the
-// COMMAND is "extmsg" and the basic length field carries the 0xffffffff
-// marker; the real command and a 64-bit length follow in the extension.
+// protocol.cpp:262-266 CMessageHeader::Read keys the extended header on the
+// COMMAND alone; the 0xffffffff marker is what the writer emits alongside it
+// (protocol.cpp:222-228). Requiring BOTH here is a deliberate narrowing: a
+// frame that names "extmsg" without the marker is not something SVNode ever
+// writes, and reading the extension off such a header would let a peer choose
+// how many bytes this node consumes. The real command and a 64-bit length
+// follow in the extension.
 func readWireHeader(r io.Reader) (int, wireHeader, error) {
 	var h wireHeader
 
