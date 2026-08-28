@@ -237,3 +237,66 @@ func TestNoSendHeadersForOldPeer(t *testing.T) {
 	require.Empty(t, reply)
 	require.True(t, h.Established())
 }
+
+// net_processing.cpp PushNodeVersion: the association ID rides in version
+// when multistreams are on. Outbound only — inbound answers with the peer's.
+func TestHandshake_OutboundVersionCarriesOurAssociationID(t *testing.T) {
+	id := []byte{0x00, 1, 2, 3}
+	cfg := outboundConfig()
+	cfg.AssociationID = id
+	h := NewHandshake(cfg)
+
+	msgs := h.Initial()
+	require.Len(t, msgs, 1)
+	v, ok := msgs[0].(*wire.MsgVersion)
+	require.True(t, ok)
+	require.Equal(t, id, v.AssociationID)
+}
+
+// establishedInboundHandshake drives an inbound Handshake through
+// version+verack so it is fully established, for tests that only care about
+// post-handshake behaviour.
+func establishedInboundHandshake(t *testing.T) *Handshake {
+	t.Helper()
+
+	cfg := outboundConfig()
+	cfg.Inbound = true
+	h := NewHandshake(cfg)
+
+	_, err := h.OnMessage(remoteVersion(1234))
+	require.NoError(t, err)
+
+	_, err = h.OnMessage(wire.NewMsgVerAck())
+	require.NoError(t, err)
+	require.True(t, h.Established())
+
+	return h
+}
+
+// net_processing.cpp:1521-1528 / :1598-1604: createstream or streamack on a
+// connection that already saw version → reject REJECT_NONSTANDARD, disconnect.
+func TestHandshake_StreamMessagesAfterVersionAreRejected(t *testing.T) {
+	for _, msg := range []wire.Message{&wire.MsgCreateStream{}, &wire.MsgStreamAck{}} {
+		h := establishedInboundHandshake(t)
+
+		replies, err := h.OnMessage(msg)
+		require.ErrorIs(t, err, ErrStreamMessageAfterVersion)
+		require.Len(t, replies, 1)
+		rej, ok := replies[0].(*wire.MsgReject)
+		require.True(t, ok)
+		require.Equal(t, wire.RejectNonstandard, rej.Code)
+	}
+}
+
+// association_id.h:34: 17 bytes, byte 0 = IDType::UUID (0x00), then 16
+// random bytes.
+func TestGenerateAssociationID(t *testing.T) {
+	id, err := generateAssociationID()
+	require.NoError(t, err)
+	require.Len(t, id, 17)
+	require.Equal(t, byte(0x00), id[0])
+
+	other, err := generateAssociationID()
+	require.NoError(t, err)
+	require.NotEqual(t, id, other)
+}

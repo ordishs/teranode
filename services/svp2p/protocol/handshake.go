@@ -4,6 +4,8 @@
 package protocol
 
 import (
+	"crypto/rand"
+
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 )
@@ -29,7 +31,32 @@ var (
 	ErrSelfConnection    = errors.New(errors.ERR_NETWORK_CONNECTION_REFUSED, "svp2p: connected to self")
 	ErrObsoleteVersion   = errors.New(errors.ERR_NETWORK_INVALID_RESPONSE, "svp2p: peer protocol version obsolete")
 	ErrProtocolViolation = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: protocol violation")
+
+	// ErrStreamMessageAfterVersion mirrors net_processing.cpp
+	// ProcessCreateStreamMessage / ProcessStreamAckMessage: createstream or
+	// streamack arriving on a connection that already has a version is
+	// invalid — REJECT_NONSTANDARD, then disconnect.
+	ErrStreamMessageAfterVersion = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: stream setup message after version", ErrProtocolViolation)
 )
+
+// associationIDTypeUUID is IDType::UUID (association_id.h:34): byte 0 of an
+// association ID identifies its format; UUID is 16 random bytes after it.
+const associationIDTypeUUID = 0x00
+
+// generateAssociationID builds a fresh 17-byte association ID: a 1-byte
+// IDType::UUID tag followed by 16 random bytes (association_id.h:34,
+// legacy peer/association.go:190). A crypto/rand read error is returned to
+// the caller, who logs it and runs the connection without multistreams.
+func generateAssociationID() ([]byte, error) {
+	id := make([]byte, 17)
+	id[0] = associationIDTypeUUID
+
+	if _, err := rand.Read(id[1:]); err != nil {
+		return nil, errors.New(errors.ERR_UNKNOWN, "svp2p: failed to generate association id", err)
+	}
+
+	return id, nil
+}
 
 type HandshakeConfig struct {
 	Inbound              bool
@@ -40,6 +67,11 @@ type HandshakeConfig struct {
 	AllowBlockPriority   bool
 	LocalAddr            *wire.NetAddress
 	RemoteAddr           *wire.NetAddress
+
+	// AssociationID rides in our version message when non-nil
+	// (net_processing.cpp PushNodeVersion). Outbound only in effect: the
+	// manager sets it only for outbound peers.
+	AssociationID []byte
 
 	// CheckIncomingNonce mirrors net.cpp CConnman::CheckIncomingNonce: true
 	// if this node itself sent the given nonce on one of its own
@@ -96,6 +128,7 @@ func (h *Handshake) Initial() []wire.Message {
 func (h *Handshake) ourVersion() *wire.MsgVersion {
 	msg := wire.NewMsgVersion(h.cfg.LocalAddr, h.cfg.RemoteAddr, h.cfg.Nonce, h.cfg.StartingHeight)
 	msg.UserAgent = h.cfg.UserAgent
+	msg.AssociationID = h.cfg.AssociationID
 
 	return msg
 }
@@ -103,6 +136,20 @@ func (h *Handshake) ourVersion() *wire.MsgVersion {
 func (h *Handshake) OnMessage(msg wire.Message) ([]wire.Message, error) {
 	if m, ok := msg.(*wire.MsgVersion); ok {
 		return h.onVersion(m)
+	}
+
+	// net_processing.cpp ProcessCreateStreamMessage:1521-1528 /
+	// ProcessStreamAckMessage:1598-1604: a connection that already has a
+	// version can't also set up a stream — REJECT_NONSTANDARD, disconnect.
+	switch m := msg.(type) {
+	case *wire.MsgCreateStream:
+		if h.versionRecvd {
+			return []wire.Message{wire.NewMsgReject(m.Command(), wire.RejectNonstandard, "Invalid createstream scenario")}, ErrStreamMessageAfterVersion
+		}
+	case *wire.MsgStreamAck:
+		if h.versionRecvd {
+			return []wire.Message{wire.NewMsgReject(m.Command(), wire.RejectNonstandard, "Invalid streamack")}, ErrStreamMessageAfterVersion
+		}
 	}
 
 	// net_processing.cpp: "Must have a version or createstream message

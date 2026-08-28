@@ -653,14 +653,18 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 	info := p.hs.PeerInfo()
 	p.mu.Unlock()
 
-	if err != nil {
-		return err
-	}
-
+	// The handshake's reply always goes out before its error: a stream
+	// setup rejection (net_processing.cpp:1521-1528, :1598-1604) carries
+	// both a reject reply and ErrStreamMessageAfterVersion, and the reject
+	// must reach the peer before the connection drops.
 	for _, r := range replies {
 		if err := p.cfg.Conn.SendPriority(r); err != nil {
 			return err
 		}
+	}
+
+	if err != nil {
+		return err
 	}
 
 	firstEstablished := false
