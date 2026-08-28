@@ -213,6 +213,16 @@ type PeerManager struct {
 	// test can shorten it.
 	firstMessageTimeout time.Duration
 
+	// newStreams is CConnman::mPendingStreams (net.h:357): the queue of
+	// further streams an outbound peer's policy asked for, filled by
+	// queueNewStream and drained by openNewStreamsLoop.
+	newStreams chan pendingStream
+
+	// protoconfWait bounds how long the policy choice waits for an
+	// established peer's protoconf. A field for the same reason
+	// firstMessageTimeout is one.
+	protoconfWait time.Duration
+
 	// syncMu is this package's cs_main: ONE mutex over the whole sync-state
 	// graph — HeaderSync, BlockDownloader, every peerSyncState, activeTip,
 	// and every WRITE to headerIndex. Those machines are all caller-locked by
@@ -307,6 +317,8 @@ func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList
 		fixedSeedGrace: defaultFixedSeedGrace,
 
 		firstMessageTimeout: defaultFirstMessageTimeout,
+		protoconfWait:       defaultProtoconfWait,
+		newStreams:          make(chan pendingStream, newStreamQueueLen),
 	}
 
 	m.fixedSeeds = m.defaultFixedSeeds
@@ -636,6 +648,18 @@ func (m *PeerManager) Start(ctx context.Context, listenAddresses []string) error
 		}(ln)
 	}
 
+	// net.cpp:2645-2651 CConnman::Start: threadOpenNewStreamConnections runs
+	// for the whole life of the node, and only a node that allows further
+	// streams ever queues one.
+	if m.tSettings.Legacy.AllowBlockPriority {
+		m.wg.Add(1)
+
+		go func() {
+			defer m.wg.Done()
+			m.openNewStreamsLoop(ctx)
+		}()
+	}
+
 	for _, addr := range m.tSettings.Legacy.ConnectPeers {
 		m.wg.Add(1)
 
@@ -785,7 +809,10 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 	// message (net_processing.cpp:1775) and the watcher below registers.
 	var ourAssociationID []byte
 
-	if !inbound {
+	// net_processing.cpp:209-211: the ID is created only when multistreams
+	// are enabled, so a node with them off never names an association and can
+	// never be given a second stream.
+	if !inbound && m.tSettings.Legacy.AllowBlockPriority {
 		id, err := generateAssociationID()
 		if err != nil {
 			m.logger.Warnf("[svp2p] running %s without multistreams: %v", nc.RemoteAddr(), err)
@@ -892,12 +919,19 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 			id = peer.Info().AssociationID
 		}
 
-		if len(id) == 0 {
+		if len(id) > 0 {
+			assoc.SetID(id)
+			m.registerAssociation(assoc)
+		}
+
+		// association.cpp:113-115: only the side that dialled opens further
+		// streams. The side that accepted keeps the Default policy until the
+		// peer's own createstream names one (net.cpp:3233-3236 MoveStream).
+		if inbound {
 			return
 		}
 
-		assoc.SetID(id)
-		m.registerAssociation(assoc)
+		m.setupStreams(ctx, peer, assoc, nc.RemoteAddr().String())
 	}()
 
 	err := peer.Run(ctx)

@@ -352,6 +352,13 @@ type PeerSnapshot struct {
 	// the one we generated on an outbound one.
 	AssociationID []byte
 
+	// TheirStreamPolicies is the stream policy list the peer's protoconf
+	// carried, and ProtoconfReceived says whether that message has arrived at
+	// all. Together they are what the outbound policy choice reads
+	// (net.cpp:948-965 GetPreferredStreamPolicyName).
+	TheirStreamPolicies []string
+	ProtoconfReceived   bool
+
 	// TxDropped counts inbound txs this peer had refused entry to txMsgCh
 	// because it was already full (queueTx) — sustained loss that would
 	// otherwise be invisible in production (review round 1, Minor 5). Not
@@ -1340,7 +1347,11 @@ func (p *Peer) Info() PeerSnapshot {
 		LastRecv:         p.lastRecv,
 		MisbehaviorScore: p.hs.MisbehaviorScore(),
 		AssociationID:    info.AssociationID,
-		TxDropped:        p.txDropped.Load(),
+
+		TheirStreamPolicies: info.TheirStreamPolicies,
+		ProtoconfReceived:   info.ProtoconfReceived,
+
+		TxDropped: p.txDropped.Load(),
 	}
 }
 

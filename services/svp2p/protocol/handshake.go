@@ -91,8 +91,14 @@ type PeerInfo struct {
 	AssociationID             []byte // stored for Phase 4 (multistreams)
 	TheirMaxRecvPayloadLength uint32
 	TheirStreamPolicies       []string
-	WantsHeaders              bool // they sent sendheaders
-	FeeFilter                 int64
+	// ProtoconfReceived is true once the peer's protoconf has been processed.
+	// The stream policies above are only meaningful from that point: a peer
+	// that allows no policy at all and one that has not spoken yet both leave
+	// TheirStreamPolicies empty (net_processing.cpp:4402-4405 sets them only
+	// when the message carries two fields).
+	ProtoconfReceived bool
+	WantsHeaders      bool // they sent sendheaders
+	FeeFilter         int64
 }
 
 // Handshake is the per-peer handshake state machine. It is not safe for
@@ -275,7 +281,14 @@ func (h *Handshake) onProtoconf(m *wire.MsgProtoconf) ([]wire.Message, error) {
 	}
 
 	h.info.TheirMaxRecvPayloadLength = m.MaxRecvPayloadLength
-	h.info.TheirStreamPolicies = m.StreamPolicies
+
+	// net_processing.cpp:4402-4405: the policies are read only when the
+	// message declares the field.
+	if m.NumberOfFields >= 2 {
+		h.info.TheirStreamPolicies = m.StreamPolicies
+	}
+
+	h.info.ProtoconfReceived = true
 
 	return nil, nil
 }

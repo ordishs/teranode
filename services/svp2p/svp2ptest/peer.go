@@ -24,12 +24,15 @@ const (
 	Out
 )
 
-// Entry is one message in a Transcript.
+// Entry is one message in a Transcript. Conn is the connection it travelled
+// on, so a multi-stream scenario can tell the association's GENERAL stream
+// from its DATA1 stream.
 type Entry struct {
-	At  time.Time
-	Dir Direction
-	Cmd string
-	Msg wire.Message
+	At   time.Time
+	Dir  Direction
+	Cmd  string
+	Msg  wire.Message
+	Conn net.Conn
 }
 
 // Transcript records every message a ScriptedPeer exchanged and who ended the
@@ -40,11 +43,11 @@ type Transcript struct {
 	closedBy string
 }
 
-func (tr *Transcript) add(dir Direction, msg wire.Message) {
+func (tr *Transcript) add(conn net.Conn, dir Direction, msg wire.Message) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 
-	tr.entries = append(tr.entries, Entry{At: time.Now(), Dir: dir, Cmd: msg.Command(), Msg: msg})
+	tr.entries = append(tr.entries, Entry{At: time.Now(), Dir: dir, Cmd: msg.Command(), Msg: msg, Conn: conn})
 }
 
 // Count returns how many entries travelled in dir with the given command.
@@ -61,6 +64,37 @@ func (tr *Transcript) Count(dir Direction, cmd string) int {
 	}
 
 	return n
+}
+
+// CountOn is Count restricted to one connection.
+func (tr *Transcript) CountOn(conn net.Conn, dir Direction, cmd string) int {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+
+	n := 0
+
+	for _, e := range tr.entries {
+		if e.Conn == conn && e.Dir == dir && e.Cmd == cmd {
+			n++
+		}
+	}
+
+	return n
+}
+
+// FirstOn returns the first entry travelling in dir with the given command,
+// and whether there was one.
+func (tr *Transcript) FirstOn(dir Direction, cmd string) (Entry, bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+
+	for _, e := range tr.entries {
+		if e.Dir == dir && e.Cmd == cmd {
+			return e, true
+		}
+	}
+
+	return Entry{}, false
 }
 
 // Snapshot copies the entries recorded so far.
@@ -115,6 +149,9 @@ type Script struct {
 	// BeforeVersion is sent when the node's version arrives, BEFORE the peer's
 	// own version — the "missing-version" offence.
 	BeforeVersion []wire.Message
+	// StreamPolicies is what the peer's protoconf advertises. Nil means the
+	// honest default of a node that allows block priority.
+	StreamPolicies []string
 	// OnCreateStream answers the node's createstream on a second connection.
 	// The default acks it on the same connection, which is what
 	// net_processing.cpp:1569-1571 does.
@@ -351,6 +388,30 @@ func ReadOne(t *testing.T, conn net.Conn, netMagic wire.BitcoinNet, timeout time
 	return msg
 }
 
+// Conns copies the connections this peer holds, in the order they appeared.
+func (p *ScriptedPeer) Conns() []net.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return append([]net.Conn(nil), p.conns...)
+}
+
+// protoconf is the peer's protocol configuration announcement. The stream
+// policies it carries are the ones the node picks its preferred policy from
+// (net.cpp:904-921 SetSupportedStreamPolicies).
+func (p *ScriptedPeer) protoconf() *wire.MsgProtoconf {
+	policies := p.Script.StreamPolicies
+	if policies == nil {
+		policies = []string{wire.BlockPriorityStreamPolicy, wire.DefaultStreamPolicy}
+	}
+
+	return &wire.MsgProtoconf{
+		NumberOfFields:       2,
+		MaxRecvPayloadLength: wire.DefaultMaxRecvPayloadLength,
+		StreamPolicies:       policies,
+	}
+}
+
 // Close ends every connection and stops listening.
 func (p *ScriptedPeer) Close() {
 	p.mu.Lock()
@@ -430,7 +491,7 @@ func (p *ScriptedPeer) write(conn net.Conn, msg wire.Message) error {
 		return err
 	}
 
-	p.Transcript.add(Out, msg)
+	p.Transcript.add(conn, Out, msg)
 
 	if msg.Command() == "block" {
 		p.mu.Lock()
@@ -471,7 +532,7 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 			return
 		}
 
-		p.Transcript.add(In, msg)
+		p.Transcript.add(conn, In, msg)
 
 		switch m := msg.(type) {
 		case *wire.MsgVersion:
@@ -501,7 +562,7 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 				return
 			}
 
-			if !p.writeAll(conn, []wire.Message{version, wire.NewMsgVerAck(), wire.NewMsgProtoconf(wire.DefaultMaxRecvPayloadLength, true)}) {
+			if !p.writeAll(conn, []wire.Message{version, wire.NewMsgVerAck(), p.protoconf()}) {
 				return
 			}
 

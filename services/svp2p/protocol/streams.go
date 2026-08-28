@@ -407,3 +407,254 @@ func (m *PeerManager) associationByID(id []byte) *transport.Association {
 
 	return m.associations[string(id)]
 }
+
+// ---------------------------------------------------------------------------
+// Outbound: choosing the stream policy and opening DATA1.
+// ---------------------------------------------------------------------------
+
+// newStreamQueueLen bounds CConnman::mPendingStreams (net.h:357). SVNode's own
+// deque is unbounded; a bound is what keeps a queue nothing is draining from
+// growing without limit, and an overflowed entry costs one missing DATA1
+// stream, never a disconnect.
+const newStreamQueueLen = 64
+
+// defaultProtoconfWait bounds the wait for the peer's protoconf before the
+// policy choice gives up. SVNode has no such timer: it makes the choice inside
+// ProcessProtoconfMessage, so the message has arrived by construction
+// (net_processing.cpp:4413-4423). This port watches the peer from another
+// goroutine and needs an upper bound instead.
+const defaultProtoconfWait = 30 * time.Second
+
+// protoconfPollInterval is how often that wait re-reads the peer.
+const protoconfPollInterval = 10 * time.Millisecond
+
+// pendingStream is one entry of CConnman::mPendingStreams (net.cpp:2105
+// QueueNewStream): the peer to dial again, the association the new connection
+// must join, the policy that asked for it, and the version that association
+// negotiated.
+type pendingStream struct {
+	addr   string
+	assoc  *transport.Association
+	policy transport.StreamPolicy
+	pver   uint32
+}
+
+// ourStreamPolicies is the prioritised list of policies this node is willing
+// to use, which is also exactly what its own protoconf advertises
+// (handshake.go ourVersion's reply, wire.NewMsgProtoconf). net.cpp:904-921
+// SetSupportedStreamPolicies intersects the peer's list with ours, so a node
+// that does not allow block priority must not offer it here either.
+func (m *PeerManager) ourStreamPolicies() []string {
+	if m.tSettings.Legacy.AllowBlockPriority {
+		return transport.OurPolicyPriority
+	}
+
+	return []string{wire.DefaultStreamPolicy}
+}
+
+// setupStreams is association.cpp:111-129 OpenRequiredStreams driving
+// stream_policy.cpp:132-137 BlockPriorityStreamPolicy::SetupStreams. Only the
+// side that dialled opens further streams; the side that accepted waits to see
+// what its peer wants to do.
+func (m *PeerManager) setupStreams(ctx context.Context, peer *Peer, assoc *transport.Association, addr string) {
+	info, ok := m.awaitStreamPolicies(ctx, peer, assoc)
+	if !ok {
+		m.logger.Debugf("[svp2p] peer %s never sent a usable protoconf; keeping the default stream policy", addr)
+
+		return
+	}
+
+	// net.cpp:948-965 GetPreferredStreamPolicyName: the first of our
+	// prioritised policies the peer also supports.
+	policy := transport.PreferredPolicy(m.ourStreamPolicies(), info.TheirStreamPolicies)
+
+	// association.cpp:124: the policy is fixed on the association before any
+	// stream is asked for.
+	assoc.SetPolicy(policy)
+
+	if !policy.RequiresData1() {
+		return
+	}
+
+	id := assoc.ID()
+	if len(id) == 0 {
+		// association.cpp:128-129: no association ID, no further streams.
+		return
+	}
+
+	m.queueNewStream(pendingStream{addr: addr, assoc: assoc, policy: policy, pver: info.ProtocolVersion})
+}
+
+// awaitStreamPolicies waits for the peer's protoconf, which is the message
+// that names its stream policies. SVNode chooses the policy at the END of
+// ProcessProtoconfMessage (net_processing.cpp:4413-4423), not at the verack
+// that establishes the peer, and protoconf follows verack on the wire. The
+// watcher this runs in wakes on the verack, so it must wait for the protoconf
+// here or it would read an empty policy list and always fall back to Default.
+func (m *PeerManager) awaitStreamPolicies(ctx context.Context, peer *Peer, assoc *transport.Association) (PeerSnapshot, bool) {
+	deadline := time.NewTimer(m.protoconfWait)
+	defer deadline.Stop()
+
+	tick := time.NewTicker(protoconfPollInterval)
+	defer tick.Stop()
+
+	for {
+		if info := peer.Info(); info.ProtoconfReceived {
+			return info, true
+		}
+
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			return PeerSnapshot{}, false
+		case <-assoc.Done():
+			return PeerSnapshot{}, false
+		case <-m.quit:
+			return PeerSnapshot{}, false
+		case <-ctx.Done():
+			return PeerSnapshot{}, false
+		}
+	}
+}
+
+// queueNewStream is net.cpp:2105-2110 CConnman::QueueNewStream. It must never
+// block: SVNode appends under a lock it holds for that append alone, and this
+// runs on the goroutine watching a peer establish.
+func (m *PeerManager) queueNewStream(ps pendingStream) {
+	select {
+	case m.newStreams <- ps:
+	default:
+		m.logger.Warnf("[svp2p] new stream queue is full, dropping the DATA1 request for %s", ps.addr)
+	}
+}
+
+// openNewStreamsLoop is net.cpp:2112-2142 ThreadOpenNewStreamConnections. A
+// dial that fails is logged and nothing more (net.cpp:2129-2132).
+func (m *PeerManager) openNewStreamsLoop(ctx context.Context) {
+	for {
+		select {
+		case ps := <-m.newStreams:
+			if err := m.openNewStreamConnection(ctx, ps); err != nil {
+				m.logger.Infof("[svp2p] failed to open DATA1 stream to %s: %v", ps.addr, err)
+			}
+
+		case <-m.quit:
+			return
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// openNewStreamConnection is net.cpp:2143 OpenNetworkConnection for a
+// fNewStream entry: dial the peer again, send createstream as the FIRST
+// message on the new socket (net_processing.cpp:204-206 PushCreateStream),
+// wait for the streamack that confirms it, and only then make the socket a
+// stream of the association.
+//
+// Every failure closes the new socket and returns. The peer's existing
+// connection is never touched: net.cpp:2131 logs "Failed to open new stream
+// connection" and carries on.
+func (m *PeerManager) openNewStreamConnection(ctx context.Context, ps pendingStream) error {
+	id := ps.assoc.ID()
+	if len(id) == 0 {
+		return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: association has no id")
+	}
+
+	nc, err := m.dialTCP(ps.addr)
+	if err != nil {
+		return errors.New(errors.ERR_NETWORK_ERROR, "svp2p: cannot dial %s for a new stream", ps.addr, err)
+	}
+
+	ack, err := m.requestStream(ctx, nc, id, ps.policy)
+	if err != nil {
+		_ = nc.Close()
+
+		return err
+	}
+
+	stream := transport.New(nc, transport.Config{
+		Net:             m.tSettings.ChainCfgParams.Net,
+		ProtocolVersion: ps.pver,
+		SendBudgetBytes: sendBudgetBytes,
+		RecvQueueLen:    recvQueueLen,
+		WriteTimeout:    writeTimeout,
+		StreamType:      ack.StreamType,
+	})
+
+	// The association is already running, so Attach starts the stream. Attach
+	// closes the Conn it refuses, which closes nc with it.
+	if err := ps.assoc.Attach(stream); err != nil {
+		return errors.New(errors.ERR_NETWORK_ERROR, "svp2p: cannot attach the new stream to association %x", id, err)
+	}
+
+	m.logger.Infof("[svp2p] stream %d for association %x opened to %s under policy %s", ack.StreamType, id, ps.addr, ps.policy.Name())
+
+	return nil
+}
+
+// requestStream performs the createstream/streamack exchange on a socket that
+// has no transport.Conn behind it yet. The reply has to be read here, with a
+// deadline, because a Conn started before the ack would consume it into its
+// own inbound queue where nothing is waiting for it.
+func (m *PeerManager) requestStream(ctx context.Context, nc net.Conn, id []byte, policy transport.StreamPolicy) (*wire.MsgStreamAck, error) {
+	magic := m.tSettings.ChainCfgParams.Net
+
+	if err := nc.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return nil, errors.New(errors.ERR_NETWORK_ERROR, "svp2p: cannot set the createstream deadline", err)
+	}
+
+	// net_processing.cpp:180-192 PushCreateStream: createstream is the first
+	// thing on the wire, before any version.
+	cs := wire.NewMsgCreateStream(id, wire.StreamTypeData1, policy.Name())
+
+	if err := wire.WriteMessage(nc, cs, wire.ProtocolVersion, magic); err != nil {
+		return nil, errors.New(errors.ERR_NETWORK_ERROR, "svp2p: cannot send createstream", err)
+	}
+
+	if err := nc.SetWriteDeadline(time.Time{}); err != nil {
+		return nil, errors.New(errors.ERR_NETWORK_ERROR, "svp2p: cannot clear the createstream deadline", err)
+	}
+
+	// The read below would otherwise hold Stop for the whole first message
+	// timeout, exactly as the inbound classifier's does.
+	read := make(chan struct{})
+
+	go func() {
+		select {
+		case <-read:
+		case <-m.quit:
+			_ = nc.SetReadDeadline(time.Now())
+		case <-ctx.Done():
+			_ = nc.SetReadDeadline(time.Now())
+		}
+	}()
+
+	msg, _, err := readFirstMessage(nc, magic, m.firstMessageTimeout)
+
+	close(read)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// net_processing.cpp:1593-1610 ProcessStreamAckMessage: anything other
+	// than a streamack naming the association and stream we asked for ends the
+	// attempt. A reject arrives here too, which is what a refused setup looks
+	// like from this side.
+	ack, ok := msg.(*wire.MsgStreamAck)
+	if !ok {
+		return nil, errors.New(errors.ERR_NETWORK_INVALID_RESPONSE, "svp2p: %s answered createstream, not streamack", msg.Command())
+	}
+
+	if !bytes.Equal(ack.AssociationID, id) {
+		return nil, errors.New(errors.ERR_NETWORK_INVALID_RESPONSE, "svp2p: streamack names association %x, not %x", ack.AssociationID, id)
+	}
+
+	if ack.StreamType != cs.StreamType {
+		return nil, errors.New(errors.ERR_NETWORK_INVALID_RESPONSE, "svp2p: streamack names stream type %d, not %d", ack.StreamType, cs.StreamType)
+	}
+
+	return ack, nil
+}

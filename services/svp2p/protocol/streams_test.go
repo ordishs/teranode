@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/svp2p/svp2ptest"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -431,4 +433,189 @@ func TestInbound_OverLongFirstMessageDisconnects(t *testing.T) {
 	requireEOF(t, raw, 5*time.Second)
 	require.Equal(t, 0, len(m.peerHandles()))
 	require.Equal(t, 0, associationCount(m))
+}
+
+// ---------------------------------------------------------------------------
+// Outbound: choosing the stream policy and opening DATA1.
+// ---------------------------------------------------------------------------
+
+// fixtureChainSettings carries the regtest parameters BuildFixtureChain mines
+// against. The manager under test speaks MainNet magic (managerSettings), and
+// the scripted peer is given that magic separately, so the chain's own
+// parameters only ever decide its proof of work.
+func fixtureChainSettings() *settings.Settings {
+	return &settings.Settings{ChainCfgParams: &chaincfg.RegressionNetParams}
+}
+
+// outboundManager starts a manager whose only configured peer is addr, so the
+// legacy_connect_peers dialer makes it an OUTBOUND connection.
+func outboundManager(t *testing.T, addr string, tweak func(*settings.Settings)) *PeerManager {
+	t.Helper()
+
+	return startedManagerWith(t, func(s *settings.Settings) {
+		s.Legacy.ConnectPeers = []string{addr}
+
+		if tweak != nil {
+			tweak(s)
+		}
+	}, nil)
+}
+
+func scriptedListener(t *testing.T, script svp2ptest.Script) *svp2ptest.ScriptedPeer {
+	t.Helper()
+
+	chain := svp2ptest.BuildFixtureChain(t, fixtureChainSettings(), 2)
+
+	peer := svp2ptest.NewScriptedPeer(t, chain, managerSettings().ChainCfgParams.Net, script, false)
+	peer.Listen()
+
+	return peer
+}
+
+// firstIn is the first message of the given command the peer received.
+func firstIn(t *testing.T, tr *svp2ptest.Transcript, cmd string) svp2ptest.Entry {
+	t.Helper()
+
+	entry, ok := tr.FirstOn(svp2ptest.In, cmd)
+	require.True(t, ok, "the peer never received a %s", cmd)
+
+	return entry
+}
+
+// association.cpp:111-129 OpenRequiredStreams + stream_policy.cpp:132-137
+// BlockPriorityStreamPolicy::SetupStreams: after an OUTBOUND handshake whose
+// protoconf lists BlockPriority, the node dials the peer a second time, sends
+// createstream FIRST, and attaches the connection as DATA1 on the streamack.
+func TestOutbound_OpensData1AfterBlockPriorityHandshake(t *testing.T) {
+	peer := scriptedListener(t, svp2ptest.Script{})
+
+	// The node's own ping is what proves the policy is in force on the wire.
+	// effectivePingInterval halves an idle timeout below 2*pingInterval, so a
+	// 6 s idle window gives a 3 s ping cadence; the scripted peer answers
+	// every ping with a pong, which keeps the idle timer from firing.
+	m := outboundManager(t, peer.Addr, func(s *settings.Settings) {
+		s.Legacy.PeerIdleTimeout = 6 * time.Second
+	})
+
+	require.Eventually(t, func() bool { return peer.Connections() == 2 }, 10*time.Second, 50*time.Millisecond,
+		"the node must dial the peer a second time for DATA1")
+
+	require.Equal(t, 1, peer.Transcript.Count(svp2ptest.In, wire.CmdCreateStream))
+
+	entry := firstIn(t, peer.Transcript, wire.CmdCreateStream)
+
+	cs, ok := entry.Msg.(*wire.MsgCreateStream)
+	require.True(t, ok)
+	require.Equal(t, wire.StreamTypeData1, cs.StreamType)
+	require.Equal(t, wire.BlockPriorityStreamPolicy, cs.StreamPolicyName)
+
+	// net_processing.cpp:180-192 PushCreateStream: createstream is the FIRST
+	// message on the new connection, before any version.
+	require.Equal(t, 0, peer.Transcript.CountOn(entry.Conn, svp2ptest.In, wire.CmdVersion))
+
+	require.Eventually(t, func() bool {
+		a := m.associationByID(cs.AssociationID)
+
+		return a != nil && a.HasStream(wire.StreamTypeData1)
+	}, 5*time.Second, 20*time.Millisecond)
+
+	a := m.associationByID(cs.AssociationID)
+	require.NotNil(t, a)
+	require.Equal(t, wire.BlockPriorityStreamPolicy, a.Policy().Name())
+
+	data1 := entry.Conn
+
+	general := generalConn(t, peer, data1)
+
+	// stream_policy.cpp:187-195: a ping is a high priority message, so every
+	// ping the node sends AFTER the attach travels on DATA1. Pings sent
+	// before it had only GENERAL to travel on, which is why the GENERAL count
+	// is compared against its value at the attach rather than against zero.
+	baseline := peer.Transcript.CountOn(general, svp2ptest.In, wire.CmdPing)
+
+	require.Eventually(t, func() bool { return peer.Transcript.CountOn(data1, svp2ptest.In, wire.CmdPing) > 0 },
+		15*time.Second, 50*time.Millisecond, "a ping must travel on DATA1 once it is attached")
+
+	require.Equal(t, baseline, peer.Transcript.CountOn(general, svp2ptest.In, wire.CmdPing),
+		"no ping may travel on GENERAL once DATA1 is attached")
+}
+
+// generalConn is the peer's connection that is NOT the DATA1 one.
+func generalConn(t *testing.T, peer *svp2ptest.ScriptedPeer, data1 net.Conn) net.Conn {
+	t.Helper()
+
+	for _, c := range peer.Conns() {
+		if c != data1 {
+			return c
+		}
+	}
+
+	require.FailNow(t, "the peer holds no GENERAL connection")
+
+	return nil
+}
+
+// net.cpp:948-965 GetPreferredStreamPolicyName: a peer that offers only
+// Default leaves Default as the common policy, and stream_policy.h:104
+// DefaultStreamPolicy::SetupStreams opens nothing.
+func TestOutbound_NoData1WithoutBlockPriority(t *testing.T) {
+	peer := scriptedListener(t, svp2ptest.Script{StreamPolicies: []string{wire.DefaultStreamPolicy}})
+
+	m := outboundManager(t, peer.Addr, nil)
+
+	require.Eventually(t, func() bool { return establishedCount(m) == 1 }, 10*time.Second, 50*time.Millisecond)
+
+	require.Never(t, func() bool { return peer.Connections() != 1 }, 3*time.Second, 100*time.Millisecond,
+		"a Default-only peer must not be dialed a second time")
+
+	require.Equal(t, 0, peer.Transcript.Count(svp2ptest.In, wire.CmdCreateStream))
+}
+
+// net_processing.cpp:209-211: the association ID is created only when
+// multistreams are enabled, so with legacy_allowBlockPriority off the peer
+// never learns one and no second stream is ever possible.
+func TestOutbound_NoStreamsWhenBlockPriorityOff(t *testing.T) {
+	peer := scriptedListener(t, svp2ptest.Script{})
+
+	m := outboundManager(t, peer.Addr, func(s *settings.Settings) {
+		s.Legacy.AllowBlockPriority = false
+	})
+
+	require.Eventually(t, func() bool { return establishedCount(m) == 1 }, 10*time.Second, 50*time.Millisecond)
+
+	version, ok := firstIn(t, peer.Transcript, wire.CmdVersion).Msg.(*wire.MsgVersion)
+	require.True(t, ok)
+	require.Empty(t, version.AssociationID, "a node with multistreams off must not name an association")
+
+	require.Never(t, func() bool { return peer.Connections() != 1 }, 3*time.Second, 100*time.Millisecond)
+
+	require.Equal(t, 0, peer.Transcript.Count(svp2ptest.In, wire.CmdCreateStream))
+	require.Equal(t, 0, associationCount(m))
+}
+
+// net.cpp:2129-2132: a second dial that fails is logged and nothing more. The
+// peer stays connected on its single GENERAL stream.
+func TestOutbound_Data1DialFailureIsNotFatal(t *testing.T) {
+	peer := scriptedListener(t, svp2ptest.Script{
+		OnCreateStream: func(_ *svp2ptest.ScriptedPeer, conn net.Conn, _ *wire.MsgCreateStream) []wire.Message {
+			_ = conn.Close()
+
+			return nil
+		},
+	})
+
+	m := outboundManager(t, peer.Addr, nil)
+
+	require.Eventually(t, func() bool { return peer.Transcript.Count(svp2ptest.In, wire.CmdCreateStream) == 1 },
+		10*time.Second, 50*time.Millisecond)
+
+	cs, ok := firstIn(t, peer.Transcript, wire.CmdCreateStream).Msg.(*wire.MsgCreateStream)
+	require.True(t, ok)
+
+	require.Never(t, func() bool { return establishedCount(m) != 1 }, 2*time.Second, 100*time.Millisecond,
+		"a refused DATA1 dial must not disconnect the peer")
+
+	a := m.associationByID(cs.AssociationID)
+	require.NotNil(t, a)
+	require.False(t, a.HasStream(wire.StreamTypeData1))
 }
