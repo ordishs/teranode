@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -238,4 +239,61 @@ func TestSendBlock_ExtendedRefusedForOldPeer(t *testing.T) {
 		Open:   func(context.Context) (io.ReadCloser, error) { return nopCloser{&countingReader{}}, nil },
 	})
 	require.ErrorIs(t, err, ErrBlockTooLargeToFrame)
+}
+
+// failAfterConn is a net.Conn stand-in whose Write starts failing once it has
+// accepted `after` bytes. It exists so a body write failure on the extended
+// path can be forced deterministically, in-process, without racing the read
+// loop's own failure detection on a real or piped socket (closing either end
+// of a net.Pipe or a real TCP connection kills both directions at once, so
+// the read loop can observe the failure and unblock SendBlock via c.quit
+// before writeBlock's own error path is ever reached).
+type failAfterConn struct {
+	net.Conn
+	after int
+	wrote int
+}
+
+func (f *failAfterConn) Write(p []byte) (int, error) {
+	if f.wrote >= f.after {
+		return 0, errors.New(errors.ERR_ERROR, "svp2p: test write failure")
+	}
+
+	n := len(p)
+	if f.wrote+n > f.after {
+		n = f.after - f.wrote
+	}
+
+	f.wrote += n
+
+	return n, nil
+}
+
+// TestWriteBlock_ExtendedWriteFailureWrapsCleanly is the extended-path
+// analogue of TestSendBlockShortSecondPassFailsTheConnection: a body write
+// that fails partway through must report a wrapped error whose message
+// renders cleanly. It calls writeBlock directly, bypassing SendBlock and
+// Start's read loop, so the failure it observes is exactly and only the one
+// writeBlock's own error path produces.
+func TestWriteBlock_ExtendedWriteFailureWrapsCleanly(t *testing.T) {
+	nc := &failAfterConn{after: extHeaderSize + 5}
+	c := &Conn{nc: nc, cfg: Config{Net: wire.MainNet}}
+
+	length := MaxBlockFrameBytes + 2
+	bs := &blockSend{
+		ctx: context.Background(),
+		req: BlockSendRequest{
+			Length: length,
+			Open:   func(context.Context) (io.ReadCloser, error) { return nopCloser{&countingReader{left: length}}, nil },
+		},
+		extended: true,
+		done:     make(chan error, 1),
+	}
+
+	ok := c.writeBlock(bs)
+	require.False(t, ok, "a body write that ends early must fail the connection")
+
+	err := <-bs.done
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "%!", "the wrapped error must render, not an unmatched verb")
 }
