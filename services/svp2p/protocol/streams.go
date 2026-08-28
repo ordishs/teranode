@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"io"
 	"net"
 	"time"
@@ -397,6 +398,28 @@ func (m *PeerManager) unregisterAssociation(a *transport.Association) {
 	}
 }
 
+// AssociationStreams reports the stream types every registered association
+// holds, keyed by the hex of its association ID. It is a read of the registry
+// net.cpp:3192-3202 walks, and it is what tells a multi-stream peer apart from
+// a single-stream one from outside this package.
+func (m *PeerManager) AssociationStreams() map[string][]wire.StreamType {
+	m.mu.Lock()
+
+	held := make(map[string]*transport.Association, len(m.associations))
+	for key, a := range m.associations {
+		held[key] = a
+	}
+
+	m.mu.Unlock()
+
+	out := make(map[string][]wire.StreamType, len(held))
+	for key, a := range held {
+		out[hex.EncodeToString([]byte(key))] = a.Streams()
+	}
+
+	return out
+}
+
 func (m *PeerManager) associationByID(id []byte) *transport.Association {
 	if len(id) == 0 {
 		return nil
@@ -425,8 +448,32 @@ const newStreamQueueLen = 64
 // goroutine and needs an upper bound instead.
 const defaultProtoconfWait = 30 * time.Second
 
-// protoconfPollInterval is how often that wait re-reads the peer.
-const protoconfPollInterval = 10 * time.Millisecond
+// protoconfPollInterval is how often that wait re-reads the peer. A protoconf
+// follows its verack immediately, so the wait is over within a poll or two in
+// every honest case, and a coarse interval costs nothing.
+const protoconfPollInterval = 100 * time.Millisecond
+
+// streamAckTimeout bounds the wait for the streamack answering our
+// createstream. SVNode has no separate constant for it: its
+// ThreadOpenNewStreamConnections (net.cpp:2112-2142) hands the socket to the
+// same poll loop every other connection runs on, so a silent peer costs it
+// nothing. This port drains the queue on ONE goroutine, so the bound is ours
+// and it has to be short: a peer that accepts the connection and then says
+// nothing must not hold the DATA1 stream of every peer behind it.
+const streamAckTimeout = 5 * time.Second
+
+var (
+	// ErrNoProtoconf reports a peer that established and then never announced
+	// its protocol configuration, so no stream policy could be chosen.
+	ErrNoProtoconf = errors.New(errors.ERR_NETWORK_TIMEOUT, "svp2p: peer sent no protoconf")
+
+	// ErrAssociationGone reports an association that ended before its policy
+	// was chosen.
+	ErrAssociationGone = errors.New(errors.ERR_ERROR, "svp2p: association closed before a stream policy was chosen")
+
+	// ErrManagerStopping reports the node shutting down mid-choice.
+	ErrManagerStopping = errors.New(errors.ERR_SERVICE_ERROR, "svp2p: node is stopping")
+)
 
 // pendingStream is one entry of CConnman::mPendingStreams (net.cpp:2105
 // QueueNewStream): the peer to dial again, the association the new connection
@@ -457,9 +504,9 @@ func (m *PeerManager) ourStreamPolicies() []string {
 // side that dialled opens further streams; the side that accepted waits to see
 // what its peer wants to do.
 func (m *PeerManager) setupStreams(ctx context.Context, peer *Peer, assoc *transport.Association, addr string) {
-	info, ok := m.awaitStreamPolicies(ctx, peer, assoc)
-	if !ok {
-		m.logger.Debugf("[svp2p] peer %s never sent a usable protoconf; keeping the default stream policy", addr)
+	info, err := m.awaitStreamPolicies(ctx, peer, assoc)
+	if err != nil {
+		m.logger.Debugf("[svp2p] no stream policy chosen for %s, keeping the default: %v", addr, err)
 
 		return
 	}
@@ -491,7 +538,7 @@ func (m *PeerManager) setupStreams(ctx context.Context, peer *Peer, assoc *trans
 // that establishes the peer, and protoconf follows verack on the wire. The
 // watcher this runs in wakes on the verack, so it must wait for the protoconf
 // here or it would read an empty policy list and always fall back to Default.
-func (m *PeerManager) awaitStreamPolicies(ctx context.Context, peer *Peer, assoc *transport.Association) (PeerSnapshot, bool) {
+func (m *PeerManager) awaitStreamPolicies(ctx context.Context, peer *Peer, assoc *transport.Association) (PeerSnapshot, error) {
 	deadline := time.NewTimer(m.protoconfWait)
 	defer deadline.Stop()
 
@@ -500,19 +547,19 @@ func (m *PeerManager) awaitStreamPolicies(ctx context.Context, peer *Peer, assoc
 
 	for {
 		if info := peer.Info(); info.ProtoconfReceived {
-			return info, true
+			return info, nil
 		}
 
 		select {
 		case <-tick.C:
 		case <-deadline.C:
-			return PeerSnapshot{}, false
+			return PeerSnapshot{}, ErrNoProtoconf
 		case <-assoc.Done():
-			return PeerSnapshot{}, false
+			return PeerSnapshot{}, ErrAssociationGone
 		case <-m.quit:
-			return PeerSnapshot{}, false
+			return PeerSnapshot{}, ErrManagerStopping
 		case <-ctx.Done():
-			return PeerSnapshot{}, false
+			return PeerSnapshot{}, ErrManagerStopping
 		}
 	}
 }
@@ -562,7 +609,10 @@ func (m *PeerManager) openNewStreamConnection(ctx context.Context, ps pendingStr
 		return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: association has no id")
 	}
 
-	nc, err := m.dialTCP(ps.addr)
+	// Context-aware, unlike the dial the peer loops make: this one runs on the
+	// single goroutine draining the queue, so a dial that cannot be abandoned
+	// would hold Stop and every DATA1 request behind it.
+	nc, err := m.dialTCPContext(ctx, ps.addr)
 	if err != nil {
 		return errors.New(errors.ERR_NETWORK_ERROR, "svp2p: cannot dial %s for a new stream", ps.addr, err)
 	}
@@ -631,7 +681,7 @@ func (m *PeerManager) requestStream(ctx context.Context, nc net.Conn, id []byte,
 		}
 	}()
 
-	msg, _, err := readFirstMessage(nc, magic, m.firstMessageTimeout)
+	msg, _, err := readFirstMessage(nc, magic, streamAckTimeout)
 
 	close(read)
 

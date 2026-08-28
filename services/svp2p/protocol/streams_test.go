@@ -619,3 +619,117 @@ func TestOutbound_Data1DialFailureIsNotFatal(t *testing.T) {
 	require.NotNil(t, a)
 	require.False(t, a.HasStream(wire.StreamTypeData1))
 }
+
+// net.cpp:2112-2142 ThreadOpenNewStreamConnections drains its queue on ONE
+// thread, so a peer that accepts the second connection and then never acks
+// must be given up on quickly (streamAckTimeout). Otherwise every DATA1
+// request queued behind it waits out that peer's silence.
+func TestOutbound_SilentStreamAckDoesNotStallTheQueue(t *testing.T) {
+	silent := scriptedListener(t, svp2ptest.Script{
+		// Accept the connection, answer nothing, and keep it open.
+		OnCreateStream: func(_ *svp2ptest.ScriptedPeer, _ net.Conn, _ *wire.MsgCreateStream) []wire.Message {
+			return nil
+		},
+	})
+
+	// The honest peer holds its protoconf back, which is what puts the silent
+	// peer in the queue first: the request is made when protoconf names the
+	// policy. Without this the queue order would be a race.
+	honest := scriptedListener(t, svp2ptest.Script{
+		WriteDelay: func(msg wire.Message, _ int) time.Duration {
+			if msg.Command() == wire.CmdProtoconf {
+				return 1500 * time.Millisecond
+			}
+
+			return 0
+		},
+	})
+
+	start := time.Now()
+
+	m := startedManagerWith(t, func(s *settings.Settings) {
+		s.Legacy.ConnectPeers = []string{silent.Addr, honest.Addr}
+	}, nil)
+
+	require.Eventually(t, func() bool { return silent.Transcript.Count(svp2ptest.In, wire.CmdCreateStream) == 1 },
+		5*time.Second, 50*time.Millisecond, "the silent peer was never asked for DATA1")
+
+	require.Eventually(t, func() bool { return hasData1(m, honest) }, 10*time.Second, 50*time.Millisecond,
+		"a peer that never acks must not stall the DATA1 request behind it")
+
+	require.Less(t, time.Since(start), 12*time.Second,
+		"the honest peer waited out the silent peer instead of the streamack bound")
+
+	// The silent peer keeps its single GENERAL stream: net.cpp:2129-2132 logs
+	// the failure and nothing else.
+	require.False(t, hasData1(m, silent))
+	require.Equal(t, 2, establishedCount(m))
+}
+
+// hasData1 reports whether the association the peer was asked to join now
+// holds a DATA1 stream.
+func hasData1(m *PeerManager, peer *svp2ptest.ScriptedPeer) bool {
+	entry, ok := peer.Transcript.FirstOn(svp2ptest.In, wire.CmdCreateStream)
+	if !ok {
+		return false
+	}
+
+	cs, ok := entry.Msg.(*wire.MsgCreateStream)
+	if !ok {
+		return false
+	}
+
+	a := m.associationByID(cs.AssociationID)
+
+	return a != nil && a.HasStream(wire.StreamTypeData1)
+}
+
+// The stream dialer drains its queue on one goroutine and Stop waits on that
+// goroutine (net.cpp:2112-2142 runs the same loop, but on a socket set its own
+// shutdown breaks). A dial this port cannot abandon would hold Stop for the
+// whole dial timeout.
+func TestOutbound_StreamDialIsAbandonedOnStop(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	held := make(chan struct{})
+
+	m := startedManagerWith(t, nil, func(m *PeerManager) {
+		m.dialTCP = func(_ string) (net.Conn, error) {
+			entered <- struct{}{}
+			<-held
+
+			return nil, errors.New(errors.ERR_NETWORK_ERROR, "svp2p: test dial released")
+		}
+	})
+
+	defer close(held)
+
+	dialed := make(chan error, 1)
+
+	go func() {
+		_, err := m.dialTCPContext(context.Background(), "203.0.113.1:8333")
+		dialed <- err
+	}()
+
+	<-entered
+
+	stopped := make(chan struct{})
+
+	go func() {
+		_ = m.Stop()
+
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "Stop was held by a dial still in flight")
+	}
+
+	select {
+	case err := <-dialed:
+		require.Error(t, err, "an abandoned dial must report why it gave up")
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the abandoned dial never returned")
+	}
+}

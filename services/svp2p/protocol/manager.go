@@ -287,6 +287,13 @@ type PeerManager struct {
 	// bypassed.
 	dialTCP func(addr string) (net.Conn, error)
 
+	// dialTCPContext is dialTCP for a caller that must be able to abandon the
+	// dial. The stream dialer needs it because it drains its queue on ONE
+	// goroutine: a dial it cannot give up on holds Stop and every DATA1
+	// request behind it. The default routes through dialTCP, so a test that
+	// replaces the seam above still governs both.
+	dialTCPContext func(ctx context.Context, addr string) (net.Conn, error)
+
 	// dnsLookup, dnsSeedDelay, fixedSeedGrace and fixedSeeds are the seams of
 	// seeds.go: the resolver, ThreadDNSAddressSeed's opening sleep, the
 	// fixed-seed grace period and the fixed-seed table. Fields so tests can
@@ -325,6 +332,10 @@ func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList
 
 	m.dialTCP = func(addr string) (net.Conn, error) {
 		return net.DialTimeout("tcp", addr, dialTimeout)
+	}
+
+	m.dialTCPContext = func(ctx context.Context, addr string) (net.Conn, error) {
+		return m.dialWithContext(ctx, addr)
 	}
 
 	// net.cpp CConnman::Start seeds nSeed0/nSeed1 from GetRand; a failed read
@@ -710,6 +721,47 @@ func (m *PeerManager) Start(ctx context.Context, listenAddresses []string) error
 	}
 
 	return nil
+}
+
+// dialWithContext runs the dial seam on its own goroutine so the caller can
+// give up on it. The abandoned dial still finishes on its own dialTimeout and
+// closes whatever it produced; it is detached from m.wg on purpose, which is
+// what keeps Stop from waiting on a socket nobody wants any more.
+func (m *PeerManager) dialWithContext(ctx context.Context, addr string) (net.Conn, error) {
+	type dialed struct {
+		nc  net.Conn
+		err error
+	}
+
+	done := make(chan dialed, 1)
+
+	go func() {
+		nc, err := m.dialTCP(addr)
+		done <- dialed{nc: nc, err: err}
+	}()
+
+	select {
+	case d := <-done:
+		return d.nc, d.err
+
+	case <-ctx.Done():
+		go func() {
+			if d := <-done; d.nc != nil {
+				_ = d.nc.Close()
+			}
+		}()
+
+		return nil, errors.New(errors.ERR_NETWORK_ERROR, "svp2p: dial to %s abandoned", addr, ctx.Err())
+
+	case <-m.quit:
+		go func() {
+			if d := <-done; d.nc != nil {
+				_ = d.nc.Close()
+			}
+		}()
+
+		return nil, errors.New(errors.ERR_SERVICE_ERROR, "svp2p: dial to %s abandoned, the node is stopping", addr)
+	}
 }
 
 func (m *PeerManager) acceptLoop(ctx context.Context, ln net.Listener) {
