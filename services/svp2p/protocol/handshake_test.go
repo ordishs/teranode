@@ -300,3 +300,66 @@ func TestGenerateAssociationID(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, id, other)
 }
+
+// versionIn picks the version message out of a handshake reply.
+func versionIn(t *testing.T, msgs []wire.Message) *wire.MsgVersion {
+	t.Helper()
+
+	for _, msg := range msgs {
+		if v, ok := msg.(*wire.MsgVersion); ok {
+			return v
+		}
+	}
+
+	require.Fail(t, "the reply carries no version message")
+
+	return nil
+}
+
+// net_processing.cpp:1750-1757 ProcessVersionMessage stores the dialer's
+// association ID on the accepting node (SetAssociationID at :1756), and
+// net_processing.cpp:1798-1799 then answers with PushNodeVersion, which reads
+// that same ID back off the node (net_processing.cpp:143-147). The accepting
+// side therefore echoes the ID the dialer named.
+func TestHandshake_InboundVersionEchoesTheirAssociationID(t *testing.T) {
+	cfg := outboundConfig()
+	cfg.Inbound = true
+	h := NewHandshake(cfg)
+
+	id := []byte{0x00, 4, 5, 6}
+	their := remoteVersion(1234)
+	their.AssociationID = id
+
+	reply, err := h.OnMessage(their)
+	require.NoError(t, err)
+	require.Equal(t, id, versionIn(t, reply).AssociationID)
+}
+
+// net_processing.cpp:1741: the received ID is only stored when
+// config.GetMultistreamsEnabled() is true, so a node with multistreams off
+// echoes nothing and never gets a second stream.
+func TestHandshake_InboundEchoesNothingWithoutBlockPriority(t *testing.T) {
+	cfg := outboundConfig()
+	cfg.Inbound = true
+	cfg.AllowBlockPriority = false
+	h := NewHandshake(cfg)
+
+	their := remoteVersion(1234)
+	their.AssociationID = []byte{0x00, 4, 5, 6}
+
+	reply, err := h.OnMessage(their)
+	require.NoError(t, err)
+	require.Empty(t, versionIn(t, reply).AssociationID)
+}
+
+// net_processing.cpp:143-146: PushNodeVersion sends an empty ID when the node
+// has none, which for an inbound peer means the dialer named none either.
+func TestHandshake_InboundNamesNoAssociationWhenTheyNameNone(t *testing.T) {
+	cfg := outboundConfig()
+	cfg.Inbound = true
+	h := NewHandshake(cfg)
+
+	reply, err := h.OnMessage(remoteVersion(1234))
+	require.NoError(t, err)
+	require.Empty(t, versionIn(t, reply).AssociationID)
+}

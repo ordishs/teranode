@@ -840,11 +840,23 @@ func (m *PeerManager) dialLoop(ctx context.Context, addr string) {
 	}
 }
 
+// connectionDirection names which side dialled, for the connect and disconnect
+// log lines.
+func connectionDirection(inbound bool) string {
+	if inbound {
+		return "inbound"
+	}
+
+	return "outbound"
+}
+
 // runPeer drives one connection's whole life. first carries the bytes the
 // inbound classifier already took off the socket, which the general stream
 // replays before it reads any further (transport.Config.Prefix); it is nil for
 // an outbound connection, which nothing has read from yet.
 func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, first []byte) error {
+	m.logger.Infof("[svp2p] peer %s connected (%s)", nc.RemoteAddr(), connectionDirection(inbound))
+
 	general := transport.New(nc, transport.Config{
 		Net:             m.tSettings.ChainCfgParams.Net,
 		ProtocolVersion: wire.ProtocolVersion,

@@ -733,3 +733,81 @@ func TestOutbound_StreamDialIsAbandonedOnStop(t *testing.T) {
 		require.FailNow(t, "the abandoned dial never returned")
 	}
 }
+
+// net_processing.cpp:1750-1757 then :1798-1799: a peer that dials this node
+// and names an association must get that same name back in the node's version
+// reply, or it never sends createstream and the association never gets a
+// DATA1 stream.
+func TestInbound_VersionReplyEchoesTheDialersAssociationID(t *testing.T) {
+	m := startedManager(t)
+
+	far := dialScripted(t, nodeAddr(t, m, "127.0.0.1"))
+	t.Cleanup(func() { _ = far.nc.Close() })
+
+	id := []byte{0x00, 7, 7, 7, 7}
+	version := remoteVersion(4321)
+	version.AssociationID = id
+
+	far.write(t, version)
+
+	var ours *wire.MsgVersion
+
+	for ours == nil {
+		if v, ok := far.read(t).(*wire.MsgVersion); ok {
+			ours = v
+		}
+	}
+
+	require.Equal(t, id, ours.AssociationID, "the accepting side must echo the dialer's association ID")
+}
+
+// net_processing.cpp:1741: with multistreams off the accepting side stores no
+// ID, so its version reply names no association.
+func TestInbound_NoEchoWhenBlockPriorityOff(t *testing.T) {
+	m := startedManagerWith(t, func(s *settings.Settings) { s.Legacy.AllowBlockPriority = false }, nil)
+
+	far := dialScripted(t, nodeAddr(t, m, "127.0.0.1"))
+	t.Cleanup(func() { _ = far.nc.Close() })
+
+	version := remoteVersion(4321)
+	version.AssociationID = []byte{0x00, 6, 6, 6, 6}
+
+	far.write(t, version)
+
+	var ours *wire.MsgVersion
+
+	for ours == nil {
+		if v, ok := far.read(t).(*wire.MsgVersion); ok {
+			ours = v
+		}
+	}
+
+	require.Empty(t, ours.AssociationID, "a node with multistreams off must not name an association")
+}
+
+// An accepted connection must be logged. The live regtest run found svp2p
+// silent about inbound peers, which left an operator no way to tell an
+// unreachable listener from a peer that never dialled.
+func TestManager_LogsEveryAcceptedConnection(t *testing.T) {
+	logger := &captureLogger{}
+
+	banList, err := NewBanList("")
+	require.NoError(t, err)
+
+	m := NewPeerManager(logger, managerSettings(), banList)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+	t.Cleanup(func() { require.NoError(t, m.Stop()) })
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+	t.Cleanup(func() { _ = far.nc.Close() })
+
+	far.completeOutboundHandshake(t)
+
+	require.Eventually(t, func() bool {
+		return logger.contains("inbound") && logger.contains(far.nc.LocalAddr().String())
+	}, 5*time.Second, 20*time.Millisecond, "an accepted peer must be logged with its address and direction")
+}

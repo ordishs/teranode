@@ -69,8 +69,9 @@ type HandshakeConfig struct {
 	RemoteAddr           *wire.NetAddress
 
 	// AssociationID rides in our version message when non-nil
-	// (net_processing.cpp PushNodeVersion). Outbound only in effect: the
-	// manager sets it only for outbound peers.
+	// (net_processing.cpp PushNodeVersion). Outbound only: the manager sets
+	// it only for outbound peers, and the inbound side echoes the dialer's ID
+	// instead (see associationIDForVersion).
 	AssociationID []byte
 
 	// CheckIncomingNonce mirrors net.cpp CConnman::CheckIncomingNonce: true
@@ -134,9 +135,34 @@ func (h *Handshake) Initial() []wire.Message {
 func (h *Handshake) ourVersion() *wire.MsgVersion {
 	msg := wire.NewMsgVersion(h.cfg.LocalAddr, h.cfg.RemoteAddr, h.cfg.Nonce, h.cfg.StartingHeight)
 	msg.UserAgent = h.cfg.UserAgent
-	msg.AssociationID = h.cfg.AssociationID
+	msg.AssociationID = h.associationIDForVersion()
 
 	return msg
+}
+
+// associationIDForVersion is the association ID our version message carries.
+// net_processing.cpp:143-147 PushNodeVersion reads it off the node itself, so
+// which ID that is depends on how the connection started:
+//
+//   - Outbound: net_processing.cpp:209-211 creates the ID before the version
+//     goes out, and the manager hands it over as cfg.AssociationID.
+//   - Inbound: net_processing.cpp:1756 SetAssociationID stores the DIALER's ID
+//     on the node while the version is being processed, and the reply at
+//     net_processing.cpp:1798-1799 then carries that same ID back. An inbound
+//     peer that gets no echo clears its own ID and never sends createstream.
+//
+// Both sides are gated on config.GetMultistreamsEnabled()
+// (net_processing.cpp:209 and :1741), which is AllowBlockPriority here.
+func (h *Handshake) associationIDForVersion() []byte {
+	if !h.cfg.Inbound {
+		return h.cfg.AssociationID
+	}
+
+	if !h.cfg.AllowBlockPriority {
+		return nil
+	}
+
+	return h.info.AssociationID
 }
 
 func (h *Handshake) OnMessage(msg wire.Message) ([]wire.Message, error) {
