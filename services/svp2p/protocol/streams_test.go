@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"strings"
 	"testing"
@@ -192,6 +193,11 @@ func TestInbound_CreateStreamFromOtherIPIsBanned(t *testing.T) {
 	require.True(t, ok, "a refused createstream must be rejected before the disconnect")
 	require.Equal(t, rejectStreamSetup, rej.Code)
 
+	// net.cpp:3227-3229 names both endpoints in its own message; ours must
+	// not, or the attacker learns the victim's address.
+	require.Equal(t, reasonOtherAddress, rej.Reason)
+	require.False(t, strings.Contains(rej.Reason, "127.0.0.1"), "the reject must not echo the association's address: %q", rej.Reason)
+
 	requireEOF(t, raw, 5*time.Second)
 
 	require.True(t, m.banList.IsBanned(otherHost), "the misbehaving IP must be banned")
@@ -253,27 +259,27 @@ func TestInbound_CreateStreamSetupFailures(t *testing.T) {
 		{
 			name:   "unknown association id",
 			msg:    &wire.MsgCreateStream{AssociationID: []byte{0x00, 1, 2, 3}, StreamType: wire.StreamTypeData1, StreamPolicyName: wire.BlockPriorityStreamPolicy},
-			reason: "No node found with association ID",
+			reason: reasonNoSuchNode,
 		},
 		{
 			name:   "duplicate data1",
 			msg:    &wire.MsgCreateStream{AssociationID: id, StreamType: wire.StreamTypeData1, StreamPolicyName: wire.BlockPriorityStreamPolicy},
-			reason: "Attempt to overwrite existing stream in move",
+			reason: reasonStreamExists,
 		},
 		{
 			name:   "unknown policy",
 			msg:    &wire.MsgCreateStream{AssociationID: id, StreamType: wire.StreamTypeData1, StreamPolicyName: "Nope"},
-			reason: "unknown stream policy",
+			reason: reasonUnknownPolicy,
 		},
 		{
 			name:   "unknown stream type",
 			msg:    &wire.MsgCreateStream{AssociationID: id, StreamType: wire.StreamTypeUnknown, StreamPolicyName: wire.BlockPriorityStreamPolicy},
-			reason: "StreamType out of range",
+			reason: reasonStreamTypeRange,
 		},
 		{
 			name:   "stream type out of range",
 			msg:    &wire.MsgCreateStream{AssociationID: id, StreamType: wire.StreamType(9), StreamPolicyName: wire.BlockPriorityStreamPolicy},
-			reason: "StreamType out of range",
+			reason: reasonStreamTypeRange,
 		},
 	}
 
@@ -286,7 +292,11 @@ func TestInbound_CreateStreamSetupFailures(t *testing.T) {
 			require.True(t, ok, "stream setup failure must answer with reject")
 			require.Equal(t, rejectStreamSetup, rej.Code)
 			require.Equal(t, wire.CmdCreateStream, rej.Cmd)
-			require.True(t, strings.Contains(rej.Reason, test.reason), "reject reason %q must mention %q", rej.Reason, test.reason)
+			// The reason is a plain SVNode string: no teranode error code, no
+			// package prefix, and inside MAX_REJECT_MESSAGE_LENGTH
+			// (validation.h:155).
+			require.Equal(t, test.reason, rej.Reason)
+			require.LessOrEqual(t, len(rej.Reason), 111)
 
 			requireEOF(t, raw, 5*time.Second)
 		})
@@ -341,7 +351,7 @@ func TestInbound_CreateStreamRefusedWhenBlockPriorityOff(t *testing.T) {
 	rej, ok := readMsg(t, raw, 5*time.Second).(*wire.MsgReject)
 	require.True(t, ok, "createstream must be rejected when multistreams are off")
 	require.Equal(t, rejectStreamSetup, rej.Code)
-	require.True(t, strings.Contains(rej.Reason, "multistreams disabled"), "reject reason %q", rej.Reason)
+	require.Equal(t, reasonMultistreamsOff, rej.Reason)
 
 	requireEOF(t, raw, 5*time.Second)
 	require.False(t, m.associationByID(id).HasStream(wire.StreamTypeData1))
@@ -368,4 +378,57 @@ func TestInbound_AssociationUnregistersOnDisconnect(t *testing.T) {
 	require.NoError(t, far.nc.Close())
 
 	require.Eventually(t, func() bool { return m.associationByID(id) == nil }, 5*time.Second, 20*time.Millisecond)
+}
+
+// associationCount reads the registry under the lock that guards it, so a test
+// assertion never races the manager's own goroutines.
+func associationCount(m *PeerManager) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return len(m.associations)
+}
+
+// writeRawHeader hand-frames a 24-byte message header with no payload behind
+// it, so a test can present framing the typed messages cannot build.
+func writeRawHeader(t *testing.T, nc net.Conn, command string, length uint32) {
+	t.Helper()
+
+	hdr := make([]byte, wire.MessageHeaderSize)
+	binary.LittleEndian.PutUint32(hdr[0:4], uint32(wire.MainNet))
+	copy(hdr[4:4+wire.CommandSize], command)
+	binary.LittleEndian.PutUint32(hdr[16:20], length)
+
+	require.NoError(t, nc.SetWriteDeadline(time.Now().Add(5*time.Second)))
+
+	_, err := nc.Write(hdr)
+	require.NoError(t, err)
+}
+
+// protocol.cpp:220-237 only frames a payload with the extended header once it
+// exceeds uint32 max, which no first message ever does. An extmsg header as
+// the first message is refused before a single payload byte is read.
+func TestInbound_ExtendedFirstMessageDisconnects(t *testing.T) {
+	m := startedManager(t)
+
+	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
+	writeRawHeader(t, raw, wire.CmdExtMsg, 0xffffffff)
+
+	requireEOF(t, raw, 5*time.Second)
+	require.Equal(t, 0, len(m.peerHandles()))
+	require.Equal(t, 0, associationCount(m))
+}
+
+// A first message that declares more payload than we ever advertise we will
+// receive (net_processing.cpp:3306 maxRecvPayloadLength) is refused on the
+// header alone, so nothing allocates the payload it claims.
+func TestInbound_OverLongFirstMessageDisconnects(t *testing.T) {
+	m := startedManager(t)
+
+	raw := dialRaw(t, nodeAddr(t, m, "127.0.0.1"))
+	writeRawHeader(t, raw, wire.CmdVersion, wire.DefaultMaxRecvPayloadLength+1)
+
+	requireEOF(t, raw, 5*time.Second)
+	require.Equal(t, 0, len(m.peerHandles()))
+	require.Equal(t, 0, associationCount(m))
 }

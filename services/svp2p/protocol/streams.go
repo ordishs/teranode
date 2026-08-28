@@ -19,8 +19,15 @@ import (
 const rejectStreamSetup = wire.RejectCode(0x60)
 
 // defaultFirstMessageTimeout bounds how long a fresh inbound connection may
-// stay silent before its first message. net.cpp TIMEOUT_INTERVAL is the same
-// 60 s bound SVNode gives a connection that has sent nothing.
+// stay silent before its first message. It is SVNode's handshake bound, not
+// its inactivity bound: net.h:88 DEFAULT_P2P_HANDSHAKE_TIMEOUT_INTERVAL is
+// 1 * 60, and net.cpp:1058-1064 CNode::ServiceSockets disconnects a connection
+// that has still received nothing (nLastRecv == 0) once that window passes.
+//
+// This is a DIFFERENT constant from net.h:86
+// DEFAULT_P2P_TIMEOUT_INTERVAL (20 * 60), the idle window cited by
+// effectivePingInterval further down manager.go. A connection that has said
+// nothing at all gets 60 s; one that is talking gets 20 min of quiet.
 const defaultFirstMessageTimeout = 60 * time.Second
 
 // extLengthMarker is protocol.cpp:220-237's extended-header length marker. A
@@ -40,6 +47,56 @@ var (
 	// payload than we ever advertise we will receive.
 	ErrFirstMessageTooLong = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: first message payload too long")
 )
+
+// The reject reason a stream-setup failure puts ON THE WIRE. SVNode sends
+// what its own exception carried (net_processing.cpp:1580 e.what()), so the
+// first four are its strings verbatim. The last three name cases SVNode has no
+// string for: its own message for the address mismatch (net.cpp:3227-3229)
+// names both endpoints, which would hand an attacker the victim's IP.
+//
+// Every one of them is a fixed constant well inside
+// MAX_REJECT_MESSAGE_LENGTH (validation.h:155, 111 bytes), and none carries
+// this node's internal error text. The detail belongs in the log line.
+const (
+	reasonStreamTypeRange = "StreamType out of range"
+	reasonNoSuchNode      = "No node found with association ID"
+	reasonStreamExists    = "Attempt to overwrite existing stream in move"
+	reasonBadlyFormatted  = "Badly formatted message"
+	reasonMultistreamsOff = "Multistreams disabled"
+	reasonUnknownPolicy   = "Unknown stream policy"
+	reasonOtherAddress    = "Stream setup from a different address"
+)
+
+// streamSetupError splits what a stream-setup failure says on the wire from
+// what it says in the log. Reason is the plain constant the reject carries;
+// Error is the detail — IPs, IDs, codes — which stays local.
+type streamSetupError struct {
+	reason string
+	err    error
+}
+
+func (e *streamSetupError) Error() string { return e.err.Error() }
+
+func (e *streamSetupError) Unwrap() error { return e.err }
+
+func (e *streamSetupError) Reason() string { return e.reason }
+
+func streamSetupFailure(reason string, err error) error {
+	return &streamSetupError{reason: reason, err: err}
+}
+
+// rejectReason is the wire string for a stream-setup failure. Anything that
+// did not name its own reason is reported as a malformed message rather than
+// leaking the text of an error this node did not intend to publish.
+func rejectReason(err error) string {
+	var setup *streamSetupError
+
+	if errors.As(err, &setup) {
+		return setup.Reason()
+	}
+
+	return reasonBadlyFormatted
+}
 
 // classifyInbound decides what a fresh inbound connection is from its FIRST
 // message. net_processing.cpp:4708-4715 takes version, createstream and
@@ -86,7 +143,7 @@ func (m *PeerManager) classifyInbound(ctx context.Context, nc net.Conn) {
 		if moveErr := m.moveStream(nc, first); moveErr != nil {
 			m.logger.Infof("[svp2p] peer %s failed to setup new stream (%v); disconnecting", nc.RemoteAddr(), moveErr)
 
-			m.writeAndClose(nc, wire.NewMsgReject(wire.CmdCreateStream, rejectStreamSetup, moveErr.Error()))
+			m.writeAndClose(nc, wire.NewMsgReject(wire.CmdCreateStream, rejectStreamSetup, rejectReason(moveErr)))
 		}
 
 	case *wire.MsgStreamAck:
@@ -169,19 +226,22 @@ func readFirstMessage(nc net.Conn, magic wire.BitcoinNet, timeout time.Duration)
 // association; the caller must not close it.
 func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 	if !m.tSettings.Legacy.AllowBlockPriority {
-		return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: multistreams disabled")
+		return streamSetupFailure(reasonMultistreamsOff,
+			errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: multistreams disabled"))
 	}
 
 	// net_processing.cpp:1547-1551: a raw stream type at or above
 	// MAX_STREAM_TYPE is out of range. UNKNOWN names no stream either.
 	if cs.StreamType == wire.StreamTypeUnknown || cs.StreamType > wire.StreamTypeData4 {
-		return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: StreamType out of range")
+		return streamSetupFailure(reasonStreamTypeRange,
+			errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: stream type %d out of range", cs.StreamType))
 	}
 
 	// This port carries GENERAL plus DATA1 only (association.cpp:43); GENERAL
 	// is the stream the association was built on and can never be moved in.
 	if cs.StreamType != wire.StreamTypeData1 {
-		return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: unsupported stream type")
+		return streamSetupFailure(reasonStreamTypeRange,
+			errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: unsupported stream type %d", cs.StreamType))
 	}
 
 	// net.cpp:3233-3236: an empty policy name leaves the association's
@@ -191,7 +251,8 @@ func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 	if cs.StreamPolicyName != "" {
 		found, ok := transport.PolicyForName(cs.StreamPolicyName)
 		if !ok {
-			return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: unknown stream policy %q", cs.StreamPolicyName)
+			return streamSetupFailure(reasonUnknownPolicy,
+				errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: unknown stream policy %q", cs.StreamPolicyName))
 		}
 
 		policy = found
@@ -199,7 +260,8 @@ func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 
 	a := m.associationByID(cs.AssociationID)
 	if a == nil {
-		return errors.New(errors.ERR_NOT_FOUND, "svp2p: No node found with association ID")
+		return streamSetupFailure(reasonNoSuchNode,
+			errors.New(errors.ERR_NOT_FOUND, "svp2p: no node found with association id %x", cs.AssociationID))
 	}
 
 	// net.cpp:3220-3230: moving a stream between two different endpoints is a
@@ -213,14 +275,16 @@ func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 			m.logger.Errorf("[svp2p] cannot ban %s: %v", from, err)
 		}
 
-		return errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: attempt to move stream between peers with different IPs: %s != %s", from, to)
+		return streamSetupFailure(reasonOtherAddress,
+			errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: attempt to move stream between peers with different IPs: %s != %s", from, to))
 	}
 
 	// association.cpp:150-153, checked before the socket becomes a stream:
 	// Attach closes the Conn it refuses, which would take the socket the
 	// reject below still has to travel over.
 	if a.HasStream(cs.StreamType) {
-		return errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: Attempt to overwrite existing stream in move")
+		return streamSetupFailure(reasonStreamExists,
+			errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: stream type %d already attached to association %x", cs.StreamType, cs.AssociationID))
 	}
 
 	stream := transport.New(nc, transport.Config{
@@ -232,19 +296,40 @@ func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 		StreamType:      cs.StreamType,
 	})
 
-	if policy != nil {
-		a.SetPolicy(policy)
+	// Attach BEFORE SetPolicy: a refused Attach closes the stream it refused,
+	// and the association must not be left carrying a policy for a stream that
+	// never joined it.
+	if err := a.Attach(stream); err != nil {
+		return streamSetupFailure(attachReason(err), err)
 	}
 
-	if err := a.Attach(stream); err != nil {
-		return err
+	if policy != nil {
+		a.SetPolicy(policy)
 	}
 
 	m.logger.Infof("[svp2p] stream %d for association %x moved from %s into its association", cs.StreamType, cs.AssociationID, nc.RemoteAddr())
 
 	// net_processing.cpp:1569-1571: the ack goes out ON THE NEW STREAM, not
-	// on the association's general stream.
-	return stream.SendPriority(wire.NewMsgStreamAck(cs.AssociationID, cs.StreamType))
+	// on the association's general stream. The socket now belongs to that
+	// stream, so a failure here is the stream's to report and must NOT come
+	// back as a setup failure — the reject would be written over a socket this
+	// function no longer owns.
+	if err := stream.SendPriority(wire.NewMsgStreamAck(cs.AssociationID, cs.StreamType)); err != nil {
+		m.logger.Warnf("[svp2p] cannot ack stream %d for association %x: %v", cs.StreamType, cs.AssociationID, err)
+	}
+
+	return nil
+}
+
+// attachReason maps an Attach refusal to its wire reason. Attach has taken the
+// socket by the time it refuses, so these travel over a connection that is
+// already closing.
+func attachReason(err error) string {
+	if errors.Is(err, transport.ErrStreamExists) {
+		return reasonStreamExists
+	}
+
+	return reasonNoSuchNode
 }
 
 // sameHost is net.cpp:3218-3222's fromAddr != toAddr: a CNetAddr compare, so
