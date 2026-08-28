@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -142,4 +143,99 @@ func (zeroReader) Read(p []byte) (int, error) {
 	}
 
 	return len(p), nil
+}
+
+// countingReader yields n bytes of a repeating pattern without allocating
+// them, so the 4 GiB round trip below never materializes a payload.
+type countingReader struct {
+	left uint64
+	pos  uint64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if r.left == 0 {
+		return 0, io.EOF
+	}
+
+	n := uint64(len(p))
+	if n > r.left {
+		n = r.left
+	}
+
+	for i := uint64(0); i < n; i++ {
+		p[i] = byte(r.pos + i)
+	}
+
+	r.pos += n
+	r.left -= n
+
+	return int(n), nil
+}
+
+type nopCloser struct{ io.Reader }
+
+func (nopCloser) Close() error { return nil }
+
+// spec §9: MaxBlockFrameBytes (basic), MaxBlockFrameBytes+1 == 0xffffffff
+// (extended, the reserved marker), MaxBlockFrameBytes+2 == 4 GiB+1 (extended,
+// genuinely beyond a uint32). Bodies are generated, never materialized; the
+// receiver drains and counts.
+func TestSendBlock_RoundTripsAcrossTheExtendedBoundary(t *testing.T) {
+	for _, length := range []uint64{MaxBlockFrameBytes, MaxBlockFrameBytes + 1, MaxBlockFrameBytes + 2} {
+		t.Run(fmt.Sprintf("%d", length), func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+
+			go func() {
+				nc, err := net.Dial("tcp", ln.Addr().String())
+				require.NoError(t, err)
+
+				c := New(nc, Config{Net: wire.MainNet, ProtocolVersion: ExtendedPayloadVersion, SendBudgetBytes: 1 << 20, RecvQueueLen: 4, WriteTimeout: time.Minute})
+				c.Start(context.Background())
+
+				err = c.SendBlock(context.Background(), BlockSendRequest{
+					Length: length,
+					Open:   func(context.Context) (io.ReadCloser, error) { return nopCloser{&countingReader{left: length}}, nil },
+				})
+				require.NoError(t, err)
+			}()
+
+			nc, err := ln.Accept()
+			require.NoError(t, err)
+
+			rx := New(nc, Config{Net: wire.MainNet, ProtocolVersion: ExtendedPayloadVersion, SendBudgetBytes: 1 << 20, RecvQueueLen: 4, WriteTimeout: time.Minute, MaxBlockPayload: 8 << 30})
+			rx.Start(context.Background())
+			defer rx.Close()
+
+			bs := <-rx.InboundBlocks()
+			require.Equal(t, length, bs.Length())
+			require.Equal(t, length > MaxBlockFrameBytes, bs.Extended())
+
+			// newBlockStream already decoded the block header and tx-count
+			// varint off the socket before handing the stream back, so the
+			// remaining reader delivers fewer than Length bytes; account for
+			// what was already consumed to check the round trip end to end.
+			preConsumed := bs.consumed()
+
+			n, err := io.Copy(io.Discard, bs.TxReader())
+			require.NoError(t, err)
+			require.Equal(t, length, preConsumed+uint64(n))
+		})
+	}
+}
+
+// A peer below ExtendedPayloadVersion cannot receive an extended frame:
+// SendBlock refuses as before.
+func TestSendBlock_ExtendedRefusedForOldPeer(t *testing.T) {
+	a, _ := net.Pipe()
+	c := New(a, Config{Net: wire.MainNet, ProtocolVersion: ExtendedPayloadVersion - 1, SendBudgetBytes: 1 << 20, RecvQueueLen: 4, WriteTimeout: time.Second})
+	c.Start(context.Background())
+	defer c.Close()
+
+	err := c.SendBlock(context.Background(), BlockSendRequest{
+		Length: MaxBlockFrameBytes + 2,
+		Open:   func(context.Context) (io.ReadCloser, error) { return nopCloser{&countingReader{}}, nil },
+	})
+	require.ErrorIs(t, err, ErrBlockTooLargeToFrame)
 }

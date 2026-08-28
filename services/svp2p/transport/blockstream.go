@@ -99,9 +99,10 @@ func readWireHeader(r io.Reader) (int, wireHeader, error) {
 // The consumer owns the stream until it calls Close. Close is idempotent and
 // safe from any goroutine.
 type BlockStream struct {
-	header  wire.BlockHeader
-	txCount uint64
-	length  uint64
+	header   wire.BlockHeader
+	txCount  uint64
+	length   uint64
+	extended bool
 
 	// mu serializes TxReader reads against the drain that Close performs,
 	// because Close may run on a goroutine other than the reading one.
@@ -166,6 +167,11 @@ func (b *BlockStream) TxCount() uint64 { return b.txCount }
 // weight for an admission budget keyed on block size — the consumer cannot
 // derive that from the header or the transaction count.
 func (b *BlockStream) Length() uint64 { return b.length }
+
+// Extended reports whether this block arrived framed with the extended
+// message header (protocol.cpp:220-237), i.e. its declared payload exceeded
+// MaxBlockFrameBytes.
+func (b *BlockStream) Extended() bool { return b.extended }
 
 // TxReader returns the transaction bytes, bounded to the declared payload
 // length. It reports io.EOF at the payload boundary, so a payload that carries

@@ -183,12 +183,17 @@ func TestSendBlockInterleavedWithQueuedMessagesHoldsFraming(t *testing.T) {
 	require.Equal(t, uint64(22), last.Nonce)
 }
 
-// TestSendBlockRefusesAboveTheFramingLimit is the >4 GiB refusal: the header's
-// length field is a uint32, so a longer payload cannot be framed at all until
-// the extmsg path arrives. Nothing may be opened, let alone written.
+// TestSendBlockRefusesAboveTheFramingLimit is the >4 GiB refusal for a peer
+// that has not negotiated ExtendedPayloadVersion: the header's length field
+// is a uint32, so a longer payload cannot be framed at all without the extmsg
+// path. Nothing may be opened, let alone written. A 70016 peer instead gets
+// the extended header — see TestSendBlock_RoundTripsAcrossTheExtendedBoundary.
 func TestSendBlockRefusesAboveTheFramingLimit(t *testing.T) {
 	a, b := net.Pipe()
-	ca := New(a, testConfig())
+
+	cfg := testConfig()
+	cfg.ProtocolVersion = ExtendedPayloadVersion - 1
+	ca := New(a, cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

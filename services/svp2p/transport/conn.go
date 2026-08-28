@@ -213,6 +213,7 @@ func (c *Conn) readBlock(hdr wireHeader) error {
 	}
 
 	bs, err := newBlockStream(c.nc, length, c.pver.Load())
+	bs.extended = hdr.extended
 
 	// Payload bytes are charged as they leave the socket, in two steps: the
 	// part the read loop decoded itself, then whatever the consumer read plus

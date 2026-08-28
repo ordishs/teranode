@@ -45,8 +45,8 @@ import (
 // So the reservation is a real boundary and it belongs in the constant rather
 // than in each comparison: a payload AT this value is servable, above it is not.
 //
-// A larger payload needs SVNode's extended header (src/protocol.cpp:220-237),
-// deferred to Phase 4. Until then such a block cannot be served at all.
+// A larger payload is framed with the extended header (extheader.go) when the
+// peer negotiated 70016; otherwise it cannot be served.
 const MaxBlockFrameBytes = uint64(math.MaxUint32) - 1
 
 // ErrBlockTooLargeToFrame reports a block that no basic message header can
@@ -82,6 +82,7 @@ type blockSend struct {
 	ctx      context.Context
 	req      BlockSendRequest
 	checksum [4]byte
+	extended bool
 	done     chan error
 }
 
@@ -152,21 +153,40 @@ func (c *Conn) SendBlock(ctx context.Context, req BlockSendRequest) error {
 		return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: block send has no payload opener")
 	}
 
-	// Decided before anything is opened, so an unservable block costs no read.
-	if req.Length > MaxBlockFrameBytes {
-		return errors.New(errors.ERR_INVALID_ARGUMENT,
-			"svp2p: block payload of %d bytes exceeds the %d byte basic message header limit", req.Length, MaxBlockFrameBytes, ErrBlockTooLargeToFrame)
+	// req.Length feeds int64(...) conversions on the write path below; the
+	// caller is expected to stay within wire.MaxBlockPayload(), which is far
+	// below this, but the guard is explicit rather than a bare conversion.
+	if req.Length > math.MaxInt64 {
+		return errors.New(errors.ERR_INVALID_ARGUMENT, "svp2p: block payload of %d bytes exceeds the maximum representable length", req.Length)
 	}
 
-	checksum, err := c.hashBlockPayload(ctx, req)
-	if err != nil {
-		return err
+	// Decided before anything is opened, so an unservable block costs no read.
+	extended := req.Length > MaxBlockFrameBytes
+
+	if extended && c.pver.Load() < ExtendedPayloadVersion {
+		return errors.New(errors.ERR_INVALID_ARGUMENT,
+			"svp2p: block payload of %d bytes needs the extended header and the peer negotiated version %d, below %d", req.Length, c.pver.Load(), ExtendedPayloadVersion, ErrBlockTooLargeToFrame)
+	}
+
+	var (
+		checksum [4]byte
+		err      error
+	)
+
+	if !extended {
+		// Only basic frames carry a checksum (protocol.cpp:226-235), so only
+		// they pay for the hashing pass.
+		checksum, err = c.hashBlockPayload(ctx, req)
+		if err != nil {
+			return err
+		}
 	}
 
 	bs := &blockSend{
 		ctx:      ctx,
 		req:      req,
 		checksum: checksum,
+		extended: extended,
 		done:     make(chan error, 1),
 	}
 
@@ -252,7 +272,12 @@ func (c *Conn) writeBlock(bs *blockSend) (ok bool) {
 
 	defer func() { _ = body.Close() }()
 
-	hdr := blockFrameHeader(c.cfg.Net, bs.req.Length, bs.checksum)
+	var hdr []byte
+	if bs.extended {
+		hdr = extBlockFrameHeader(c.cfg.Net, bs.req.Length)
+	} else {
+		hdr = blockFrameHeader(c.cfg.Net, bs.req.Length, bs.checksum)
+	}
 
 	n, err := c.nc.Write(hdr)
 
@@ -263,6 +288,26 @@ func (c *Conn) writeBlock(bs *blockSend) (ok bool) {
 
 		// A partial header is as misaligned as a partial body.
 		return n == 0
+	}
+
+	// The extended path carries a zero checksum on the wire
+	// (protocol.cpp:226), so there is nothing to verify: copy straight
+	// through and skip the second hashing pass entirely.
+	if bs.extended {
+		copied, err := io.CopyN(c.nc, body, int64(bs.req.Length))
+
+		c.sent.Add(uint64(copied)) //nolint:gosec // byte count is never negative
+
+		if err == nil {
+			bs.done <- nil
+
+			return true
+		}
+
+		bs.done <- errors.New(errors.ERR_ERROR,
+			"svp2p: block send wrote %d of %d declared payload bytes, connection is no longer byte aligned: %v", copied, bs.req.Length, err)
+
+		return false
 	}
 
 	// Hashed AS IT IS COPIED, not merely counted. Copying Length bytes proves
