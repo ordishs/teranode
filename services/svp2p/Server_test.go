@@ -11,6 +11,7 @@ import (
 
 	bt "github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -553,4 +554,25 @@ func TestServerReconcileWalkStopsAtDepthCap(t *testing.T) {
 
 	_, tipHeight := idx.Tip()
 	require.Equal(t, int32(0), tipHeight, "a failed reconciliation must not advance the index tip")
+}
+
+// go-wire's `ebs` bounds every buffered block and tx message it reads or
+// writes, so Init must feed it the node's own excessiveblocksize. A literal
+// there caps the node below its configured limit and, once the literal is
+// under 4,294,967,295, refuses every block large enough to need an extended
+// header.
+func TestServerInitFeedsWireLimitsFromExcessiveBlockSize(t *testing.T) {
+	const excessive = 6_000_000_000
+
+	// wire's limits are process-wide, so put back what the rest of the
+	// package expects.
+	original := wire.MaxBlockPayload()
+	t.Cleanup(func() { wire.SetLimits(original) })
+
+	srv, _ := newTestServer(t)
+	srv.settings.Policy.ExcessiveBlockSize = excessive
+
+	require.NoError(t, srv.Init(context.Background()))
+
+	require.Equal(t, uint64(excessive), wire.MaxBlockPayload())
 }

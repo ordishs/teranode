@@ -294,6 +294,7 @@ func (m *PeerManager) moveStream(nc net.Conn, cs *wire.MsgCreateStream) error {
 		SendBudgetBytes: sendBudgetBytes,
 		RecvQueueLen:    recvQueueLen,
 		WriteTimeout:    writeTimeout,
+		MaxBlockPayload: m.maxBlockPayload,
 		StreamType:      cs.StreamType,
 	})
 
@@ -630,6 +631,7 @@ func (m *PeerManager) openNewStreamConnection(ctx context.Context, ps pendingStr
 		SendBudgetBytes: sendBudgetBytes,
 		RecvQueueLen:    recvQueueLen,
 		WriteTimeout:    writeTimeout,
+		MaxBlockPayload: m.maxBlockPayload,
 		StreamType:      ack.StreamType,
 	})
 

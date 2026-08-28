@@ -82,9 +82,9 @@ func (c *Conn) StreamType() wire.StreamType {
 	return c.cfg.StreamType
 }
 
-// maxBlockPayload returns the configured block payload ceiling, or the
+// MaxBlockPayload returns the configured block payload ceiling, or the
 // process-wide default when the connection did not set one.
-func (c *Conn) maxBlockPayload() uint64 {
+func (c *Conn) MaxBlockPayload() uint64 {
 	if c.cfg.MaxBlockPayload != 0 {
 		return c.cfg.MaxBlockPayload
 	}
@@ -272,7 +272,7 @@ func (c *Conn) readBlock(hdr wireHeader) error {
 	}
 
 	length := hdr.length
-	if maxPayload := c.maxBlockPayload(); length > maxPayload {
+	if maxPayload := c.MaxBlockPayload(); length > maxPayload {
 		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
 			"svp2p: block payload of %d bytes exceeds the %d byte maximum", length, maxPayload)
 	}

@@ -232,7 +232,7 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 }
 
 func (s *Server) Init(_ context.Context) error {
-	wire.SetLimits(4000000000)
+	wire.SetLimits(protocol.BlockPayloadLimit(s.settings))
 
 	s.listenAddresses = s.settings.Legacy.ListenAddresses
 	if len(s.listenAddresses) == 0 {

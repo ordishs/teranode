@@ -127,6 +127,23 @@ func (a *Association) Streams() []wire.StreamType {
 	return out
 }
 
+// MaxBlockPayload reports the block payload ceiling the named stream enforces,
+// and whether the association holds that stream at all. Every stream of one
+// association is built from the same node configuration, so the numbers agree;
+// they are reported per stream because each stream is a separate socket with
+// its own Config.
+func (a *Association) MaxBlockPayload(t wire.StreamType) (uint64, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	c, ok := a.streams[t]
+	if !ok {
+		return 0, false
+	}
+
+	return c.MaxBlockPayload(), true
+}
+
 func (a *Association) HasStream(t wire.StreamType) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()

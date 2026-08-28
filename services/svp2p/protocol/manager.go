@@ -193,6 +193,12 @@ type PeerManager struct {
 	tSettings *settings.Settings
 	banList   *BanList
 
+	// maxBlockPayload is the node's excessiveblocksize, read once at
+	// construction and given to every stream this manager builds. Server.Init
+	// gives the same number to wire.SetLimits, so the buffered and the
+	// streaming block paths share one ceiling.
+	maxBlockPayload uint64
+
 	// mu guards the connection registry only: peers, listeners, nonces and
 	// the started flag.
 	mu        sync.Mutex
@@ -310,18 +316,19 @@ type PeerManager struct {
 
 func NewPeerManager(logger ulogger.Logger, tSettings *settings.Settings, banList *BanList) *PeerManager {
 	m := &PeerManager{
-		logger:         logger,
-		tSettings:      tSettings,
-		banList:        banList,
-		peers:          make(map[*Peer]*SyncPeer),
-		associations:   make(map[string]*transport.Association),
-		outboundDials:  make(map[string]struct{}),
-		quit:           make(chan struct{}),
-		syncTick:       defaultSyncTick,
-		outboundTick:   defaultOpenConnectionsTick,
-		dnsLookup:      defaultDNSLookup,
-		dnsSeedDelay:   defaultDNSSeedDelay,
-		fixedSeedGrace: defaultFixedSeedGrace,
+		logger:          logger,
+		tSettings:       tSettings,
+		banList:         banList,
+		maxBlockPayload: BlockPayloadLimit(tSettings),
+		peers:           make(map[*Peer]*SyncPeer),
+		associations:    make(map[string]*transport.Association),
+		outboundDials:   make(map[string]struct{}),
+		quit:            make(chan struct{}),
+		syncTick:        defaultSyncTick,
+		outboundTick:    defaultOpenConnectionsTick,
+		dnsLookup:       defaultDNSLookup,
+		dnsSeedDelay:    defaultDNSSeedDelay,
+		fixedSeedGrace:  defaultFixedSeedGrace,
 
 		firstMessageTimeout: defaultFirstMessageTimeout,
 		protoconfWait:       defaultProtoconfWait,
@@ -863,6 +870,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 		SendBudgetBytes: sendBudgetBytes,
 		RecvQueueLen:    recvQueueLen,
 		WriteTimeout:    writeTimeout,
+		MaxBlockPayload: m.maxBlockPayload,
 		StreamType:      wire.StreamTypeGeneral,
 		Prefix:          first,
 	})
