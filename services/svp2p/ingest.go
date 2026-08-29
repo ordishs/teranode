@@ -60,7 +60,9 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 	// our own store), so it must refresh the peer's stall clock rather than
 	// count against it.
 	if err := b.admission.SkipForBackoff(hash); err != nil {
-		return protocol.IngestOutcome{Err: b.release(req.TxReader, err), TransientLocal: true}
+		remaining, _, _ := b.admission.BackoffRemaining(hash)
+
+		return protocol.IngestOutcome{Err: b.release(req.TxReader, err), TransientLocal: true, RetryAfter: remaining}
 	}
 
 	// ONLY the pre-admission lookups read this deadline
@@ -150,7 +152,7 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 			backoff := b.admission.RecordFailure(hash)
 			b.logger.Warnf("[svp2p] block %s failed on a local fault, backing off for %s: %v", hash, backoff, err)
 
-			return protocol.IngestOutcome{Err: err, TransientLocal: true}
+			return protocol.IngestOutcome{Err: err, TransientLocal: true, RetryAfter: backoff}
 		}
 
 		// Only a fault of the block ITSELF is the peer's: a block that fails

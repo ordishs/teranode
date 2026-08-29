@@ -232,6 +232,11 @@ type inFlightHolder struct {
 type deferredBlock struct {
 	until  int64
 	height int32
+
+	// waitParent marks a parent-missing deferral, which holding the parent
+	// releases early. A backoff deferral (BlockDeferred) has its parent already
+	// and waits for the stamp alone.
+	waitParent bool
 }
 
 // BlockDownloader is the net_processing.cpp block download scheduler: the
@@ -954,7 +959,29 @@ func (bd *BlockDownloader) BlockParentMissing(peer *SyncPeer, hash chainhash.Has
 
 	if node, known := bd.idx.Lookup(hash); known {
 		bd.retryAfter[hash] = deferredBlock{
-			until:  nowMicros + micros64(ParentMissingRetryDelay),
+			until:      nowMicros + micros64(ParentMissingRetryDelay),
+			height:     node.Height,
+			waitParent: true,
+		}
+	}
+
+	return true
+}
+
+// BlockDeferred is BlockFailed for a block the ingest path refused for OUR
+// fault and asked us to leave alone until untilMicros — the admission backoff
+// window. The walk skips it until the stamp expires; holding its parent (which
+// it already does) releases nothing. SVNode has no counterpart: its ingest
+// cannot fail transiently the way a remote store can.
+func (bd *BlockDownloader) BlockDeferred(peer *SyncPeer, hash chainhash.Hash, nowMicros, untilMicros int64) bool {
+	released := bd.BlockFailed(peer, hash, nowMicros)
+	if !released {
+		return false
+	}
+
+	if node, known := bd.idx.Lookup(hash); known {
+		bd.retryAfter[hash] = deferredBlock{
+			until:  untilMicros,
 			height: node.Height,
 		}
 	}
@@ -971,7 +998,7 @@ func (bd *BlockDownloader) deferredForParent(hash chainhash.Hash, parentHeld boo
 		return false
 	}
 
-	if parentHeld || nowMicros > deferred.until {
+	if (deferred.waitParent && parentHeld) || nowMicros > deferred.until {
 		delete(bd.retryAfter, hash)
 
 		return false

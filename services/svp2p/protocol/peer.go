@@ -117,6 +117,14 @@ type IngestOutcome struct {
 	// delivering peer did its job, so refresh its stall clock and never
 	// rotate or penalize it for our own fault.
 	TransientLocal bool
+
+	// RetryAfter is how long the scheduler must keep this block off the wire
+	// after a TransientLocal failure: the admission backoff window
+	// (bridge.Admission.BackoffRemaining). Zero means no deferral. Without it
+	// BlockDone re-offers the hash at once and the same peer re-serves — and
+	// the ingestor re-drains — the whole payload every sync tick until the
+	// window elapses (measured live: ~5x a 4.63 GB block).
+	RetryAfter time.Duration
 }
 
 // TxIngestor is this package's whole view of Teranode-side transaction

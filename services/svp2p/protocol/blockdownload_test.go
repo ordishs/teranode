@@ -2718,3 +2718,43 @@ func TestBlockReceived_ClearsTheCarriedClock(t *testing.T) {
 	require.True(t, f.bd.MarkBlockAsInFlight(peer, f.node(t, 2), again))
 	require.Equal(t, again, peer.State.nDownloadingSince, "a delivery clears the carried clock")
 }
+
+// TestBlockDeferred_HoldsUntilTheStampEvenWhenTheParentIsHeld is the backoff
+// twin of the parent-missing deferral. A block the ingest path refused for OUR
+// fault (admission backoff after a transient store error) has its parent in
+// the chain, so the parent-held release must not apply: only the stamp does.
+// Measured live on regtest before this change: a 4.63 GB block was re-served
+// and re-drained four extra times inside one 5 s backoff window.
+func TestBlockDeferred_HoldsUntilTheStampEvenWhenTheParentIsHeld(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+	activeTip := f.node(t, 0)
+
+	require.Equal(t, heightRange(1, 10), f.requestedHeights(t, peer, activeTip, testNow))
+
+	first := f.node(t, 1)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, first, testNow))
+	require.True(t, f.bd.BlockDeferred(peer, first.Hash, testNow, testNow+micros(5*time.Second)))
+
+	// Block 1's parent is the active tip itself, so the parent IS held.
+	got := f.requestedHeights(t, peer, activeTip, testNow+micros(time.Second))
+	require.NotContains(t, got, int32(1), "a backoff-deferred block must wait for its stamp even with its parent held")
+	require.Contains(t, got, int32(2), "the rest of the window is unaffected")
+
+	got = f.requestedHeights(t, peer, activeTip, testNow+micros(6*time.Second))
+	require.Contains(t, got, int32(1), "the stamp's expiry puts the block back on offer")
+}
+
+// A parent-missing deferral keeps releasing on parent-held; the new flag must
+// not change it.
+func TestBlockParentMissing_StillReleasesOnParentHeld(t *testing.T) {
+	f := newDownloadFixture(t, 10)
+	peer := f.peerAt(t, "1.2.3.4:8333", 10)
+
+	third := f.node(t, 3)
+	require.True(t, f.bd.MarkBlockAsInFlight(peer, third, testNow))
+	require.True(t, f.bd.BlockParentMissing(peer, third.Hash, testNow))
+
+	require.False(t, f.bd.deferredForParent(third.Hash, true, testNow+micros(time.Second)),
+		"holding the parent releases a parent-missing deferral immediately")
+}

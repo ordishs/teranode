@@ -576,3 +576,26 @@ func TestBlockIngestorHoldsBackAnOrphanOverTheRetentionBudget(t *testing.T) {
 	require.Equal(t, 1, stream.closeCount())
 	require.Zero(t, ingestor.retained.Len())
 }
+
+// TestBlockIngestorReportsTheBackoffWindow: a block skipped for backoff, or one
+// that just failed on a local fault, must tell the scheduler how long to keep it
+// off the wire — otherwise the same peer re-serves it every tick.
+func TestBlockIngestorReportsTheBackoffWindow(t *testing.T) {
+	br := &stubBridge{err: errors.NewStorageError("store down")}
+	ing, adm := newTestIngestor(t, br)
+
+	header := testIngestHeader()
+
+	outcome := ing.Ingest(context.Background(), testIngestRequest(header, &countingStream{Reader: bytes.NewReader(nil)}))
+	require.Error(t, outcome.Err)
+	require.True(t, outcome.TransientLocal)
+	require.Greater(t, outcome.RetryAfter, time.Duration(0), "a recorded failure must report its backoff window")
+
+	remaining, _, skip := adm.BackoffRemaining(header.BlockHash())
+	require.True(t, skip)
+
+	skipped := ing.Ingest(context.Background(), testIngestRequest(header, &countingStream{Reader: bytes.NewReader(nil)}))
+	require.True(t, skipped.TransientLocal)
+	require.Greater(t, skipped.RetryAfter, time.Duration(0))
+	require.LessOrEqual(t, skipped.RetryAfter, remaining)
+}

@@ -1721,8 +1721,15 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		m.logger.Debugf("[svp2p] block %s is waiting for its parent: %v", hash, outcome.Err)
 
 	default:
-		// The block is back on offer to any peer, including this one.
-		m.blockDownloader.BlockFailed(syncPeer, hash, now)
+		if outcome.RetryAfter > 0 {
+			// Our own fault, with a backoff window: keep the block off the wire
+			// for that long rather than letting the next tick re-request the
+			// same bytes from the same peer.
+			m.blockDownloader.BlockDeferred(syncPeer, hash, now, now+micros64(outcome.RetryAfter))
+		} else {
+			// The block is back on offer to any peer, including this one.
+			m.blockDownloader.BlockFailed(syncPeer, hash, now)
+		}
 
 		if outcome.TransientLocal && syncPeer != nil && syncPeer.State != nil {
 			// Admission.SkipForBackoff's caller contract: our own store

@@ -769,6 +769,7 @@ func TestManagerBlockDoneDisconnectsOnlyOnPeerFault(t *testing.T) {
 		{name: "pre-admission timeout", outcome: IngestOutcome{Err: fault, Rotate: true}},
 		{name: "transient local", outcome: IngestOutcome{Err: fault, TransientLocal: true}},
 		{name: "unclassified", outcome: IngestOutcome{Err: fault}},
+		{name: "transient local with backoff", outcome: IngestOutcome{Err: fault, TransientLocal: true, RetryAfter: 5 * time.Second}},
 		{name: "peer fault", outcome: IngestOutcome{Err: fault, PeerFault: true}, drops: true, delta: scoreInvalidBlock},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2642,4 +2643,42 @@ func TestBlockDone_RetainedCountsAsReceived(t *testing.T) {
 	require.True(t, held, "a retained block counts as data we hold, so the walk never asks for it again")
 	_, deferred := m.blockDownloader.retryAfter[block.Hash]
 	require.False(t, deferred, "a retained block is not parked for a retry")
+}
+
+// TestManagerDefersAReRequestForTheBackoffWindow closes the live loop: a
+// TransientLocal outcome that carries RetryAfter must keep the block off the
+// walk for that long instead of putting it straight back on offer.
+func TestManagerDefersAReRequestForTheBackoffWindow(t *testing.T) {
+	genesis := syncGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	chain := minedRun(genesis, 1, 8)
+
+	connected, err := idx.AddHeader(chain[0])
+	require.NoError(t, err)
+	require.True(t, connected)
+
+	m := syncTestManager(t, idx, &recordingIngestor{})
+
+	block, ok := idx.Lookup(chain[0].BlockHash())
+	require.True(t, ok)
+
+	peer := NewSyncPeer("1.2.3.4:8333", wire.SFNodeNetwork, newPeerSyncState())
+
+	m.syncMu.Lock()
+	require.True(t, m.blockDownloader.MarkBlockAsInFlight(peer, block, testNow))
+	m.syncMu.Unlock()
+
+	_, err = m.BlockDone(peer, block.Hash, IngestOutcome{Err: errors.New(errors.ERR_ERROR, "store down"), TransientLocal: true, RetryAfter: 5 * time.Second})
+	require.NoError(t, err)
+
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	deferred, stamped := m.blockDownloader.retryAfter[block.Hash]
+	require.True(t, stamped, "a backoff outcome must stamp the block")
+	require.False(t, deferred.waitParent, "a backoff stamp does not release on parent-held")
+	require.Greater(t, deferred.until, time.Now().UnixMicro()+micros(4*time.Second))
 }
