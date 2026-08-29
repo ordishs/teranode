@@ -252,10 +252,6 @@ type PeerManager struct {
 	fetcher         BlockTxFetcher
 	txIngestor      TxIngestor
 	txInvProducer   TxInvProducer
-	// txIdx is bridge's recent-tx index (txindex.go), read by compact-block
-	// reconstruction. nil means compact blocks are off regardless of
-	// legacy_compactBlocks: Server only calls SetTxIndex when the flag is on.
-	txIdx TxIndex
 	// activeTip is our own best chain tip (the chainActive counterpart),
 	// fed from the blockchain service and always a header present in the
 	// index — the download scheduler cannot place a tip it cannot look up.
@@ -270,6 +266,15 @@ type PeerManager struct {
 	// addrman.go's own LOCKING note), and every one of its methods is a
 	// blocking call that must not run under syncMu.
 	addrMan *AddrMan
+
+	// txIdx is bridge's recent-tx index (txindex.go), read by compact-block
+	// reconstruction, or nil when compact blocks are off regardless of
+	// legacy_compactBlocks: Server only calls SetTxIndex when the flag is on.
+	// It is guarded by mu (the registry lock), not syncMu, for the same
+	// reason addrMan is: Match hashes millions of entries and Open fetches
+	// from the store, so both TxIndex methods are blocking calls that must
+	// not run under syncMu.
+	txIdx TxIndex
 
 	// addrRelaySeed is CConnman's nSeed0/nSeed1 as used by
 	// GetDeterministicRandomizer(RANDOMIZER_ID_ADDRESS_RELAY) (net.cpp:3429):
@@ -381,16 +386,19 @@ func (m *PeerManager) addrManager() *AddrMan {
 // reconstruction reads from. It must be called before Start; a nil TxIndex
 // leaves compact blocks off regardless of legacy_compactBlocks.
 func (m *PeerManager) SetTxIndex(idx TxIndex) {
-	m.syncMu.Lock()
-	defer m.syncMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	m.txIdx = idx
 }
 
-// txIndex reads the transaction index under syncMu, mirroring txIngestor.
+// txIndex reads the transaction index under mu. Never called with syncMu
+// held: Match hashes millions of entries and Open fetches from the store, so
+// both TxIndex methods are blocking calls that must run with no manager lock
+// held, exactly the AddrMan contract above.
 func (m *PeerManager) txIndex() TxIndex {
-	m.syncMu.Lock()
-	defer m.syncMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	return m.txIdx
 }
