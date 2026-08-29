@@ -613,7 +613,7 @@ func TestCompactBlock_IndexCollisionJoinsTheGaps(t *testing.T) {
 // TestCompactBlock_UnknownHeldTransactionFallsBackWithoutAScore is the Task 7
 // ruling's READ_STATUS_FAILED path: the index named a transaction whose bytes
 // it can no longer open, which SVNode treats as a collision rather than
-// malice (net_processing.cpp:3617-3622, "Might have collided, fall back to
+// malice (net_processing.cpp:3618-3623, "Might have collided, fall back to
 // getdata now"). No score, and the block is offered again.
 func TestCompactBlock_UnknownHeldTransactionFallsBackWithoutAScore(t *testing.T) {
 	genesis := syncGenesis()

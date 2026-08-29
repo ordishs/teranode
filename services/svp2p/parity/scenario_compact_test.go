@@ -406,7 +406,7 @@ func TestParity_UnsolicitedBlockTxnIsDroppedUnscored(t *testing.T) {
 }
 
 // unreconstructableLog is the Debugf manager.go writes on the READ_STATUS_FAILED
-// branch (net_processing.cpp:3655-3660, "Might have collided, fall back to
+// branch (net_processing.cpp:3618-3623, "Might have collided, fall back to
 // getdata now"). No score is applied there, so this line is the only evidence
 // the branch ran.
 const unreconstructableLog = "unreconstructable, falling back to getdata"
@@ -420,7 +420,7 @@ const unreconstructableLog = "unreconstructable, falling back to getdata"
 // fails the slot instead (compactblock.go readGap, which sets readFailed).
 //
 // A short ID is 48 bits, so an honest peer's transaction can hash onto the slot
-// we asked about. net_processing.cpp:3655-3660 treats that as a possible
+// we asked about. net_processing.cpp:3618-3623 treats that as a possible
 // collision and not as malice — "Might have collided, fall back to getdata now"
 // — with no Misbehaving call: the block goes back on offer and the ordinary
 // getdata path fetches it. Both legs must reach the same height.
@@ -476,14 +476,12 @@ func TestParity_CompactBlockWrongGapFallsBackToGetData(t *testing.T) {
 				n.WaitFor(t, func() bool { return n.Logger.Contains(unreconstructableLog) }, 60*time.Second,
 					"the wrong gap transaction never reached the fallback branch")
 
-				// The announcing peer is the only one the node knows holds this
-				// block, so the fallback has nowhere to go until the other peer
-				// has advertised it too. A real network reaches this state on
-				// its own; the rig has to arrange it.
-				inv := wire.NewMsgInv()
-				require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash)))
-
-				peers[0].Send(inv)
+				// Nothing else is done here. The cmpctblock already recorded
+				// that peer1 holds this block (updateBlockAvailability), and
+				// BlockFailed put it back on offer, so the next syncPass walk
+				// must re-offer it to that same peer on its own. Prompting a
+				// second peer with an inv would prove only that the rig can
+				// route around the fallback.
 			} else {
 				peers[0].Chain.PublishHeader(t, block)
 

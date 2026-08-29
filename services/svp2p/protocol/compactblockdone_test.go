@@ -21,7 +21,7 @@ import (
 //   - readInvalid — net_processing.cpp:3610-3616, Misbehaving(pfrom, 100,
 //     "invalid-cmpctblk-txns"). The peer supplied bytes that cannot be what it
 //     was asked for.
-//   - readFailed — net_processing.cpp:3655-3660, "Might have collided, fall
+//   - readFailed — net_processing.cpp:3618-3623, "Might have collided, fall
 //     back to getdata now". A short ID is 48 bits, so an honest peer's
 //     transaction can hash onto the slot we asked about. SVNode does not
 //     Misbehaving here at all; the block goes back on offer and the ordinary

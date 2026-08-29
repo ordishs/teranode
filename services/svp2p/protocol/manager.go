@@ -1862,7 +1862,7 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 				"svp2p: compact block %s was filled with invalid transactions", hash, outcome.Err)
 
 		case readFailed:
-			// net_processing.cpp:3655-3660, "Might have collided, fall back to
+			// net_processing.cpp:3618-3623, "Might have collided, fall back to
 			// getdata now" — a short ID is 48 bits, so an honest peer's
 			// transaction can hash onto the slot we asked about, and the index
 			// entry we matched may be bytes we no longer hold. SVNode has no
@@ -1874,6 +1874,14 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 			// the same disconnect as a malicious fill — which also strands the
 			// block, since the peer that announced it is the only one known to
 			// hold it. BlockFailed has already put the block back on offer.
+			//
+			// :3618-3623 pushes a getdata to pfrom right here. This port
+			// releases the block instead and lets the next syncPass walk
+			// re-offer it, the same choice CompactBlock's own readFailed
+			// branch makes and for the same reason: the scheduler owns
+			// getdata. Same end state one TickInterval later, and any peer
+			// known to hold the block may serve it, not only the one whose
+			// reply collided.
 			delta = 0
 			disconnect = nil
 

@@ -522,7 +522,7 @@ path. The peer answers the gap request with the right count and the wrong
 transaction, so the arity check passes and the assembler's short-ID check fails
 the slot (`compactblock.go` `readGap`). A short ID is 48 bits, so an honest
 peer's transaction can hash onto the slot we asked about; SVNode treats that as a
-possible collision and not as malice (`net_processing.cpp:3655-3660`, "Might have
+possible collision and not as malice (`net_processing.cpp:3618-3623`, "Might have
 collided, fall back to getdata now"), with no `Misbehaving` call.
 
 **PORT DEFECT FOUND BY THIS ROW, and FIXED.** `manager.go` `BlockDone` read its
