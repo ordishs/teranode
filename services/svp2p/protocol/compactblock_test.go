@@ -12,18 +12,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// compactFixtureTxCount is the size of the fixture block every table row in
-// this file reconstructs. It is large enough that the prefilled/short-ID index
-// offset walk (blockencodings.cpp:140-146) is exercised over many slots.
+// compactFixtureTxCount sizes the fixture block so the index_offset walk
+// (blockencodings.cpp:140-146) runs over many slots.
 const compactFixtureTxCount = 50
 
-// compactFixtureNonce is an arbitrary but fixed cmpctblock nonce, so the short
-// IDs a row computes are stable across runs.
 const compactFixtureNonce = uint64(0x0123456789abcdef)
 
-// compactFixtureTx builds transaction i of the fixture block. Every
-// transaction differs in its outpoint, script and value, so no two share a
-// txid and therefore no two share a short ID by accident.
 func compactFixtureTx(i int) *wire.MsgTx {
 	tx := wire.NewMsgTx(1)
 
@@ -38,7 +32,7 @@ func compactFixtureTx(i int) *wire.MsgTx {
 }
 
 // compactFixtureBlock builds a block of n transactions with a non-null header
-// (Bits != 0, primitives/block.h:60 CBlockHeader::IsNull).
+// (Bits != 0; CBlockHeader::IsNull, primitives/block.h:60).
 func compactFixtureBlock(t *testing.T, n int) *wire.MsgBlock {
 	t.Helper()
 
@@ -56,8 +50,6 @@ func compactFixtureBlock(t *testing.T, n int) *wire.MsgBlock {
 	return blk
 }
 
-// encodeTx returns the wire bytes of one transaction, the same bytes a
-// blocktxn payload or a block body carries.
 func encodeTx(t *testing.T, tx *wire.MsgTx) []byte {
 	t.Helper()
 
@@ -68,8 +60,6 @@ func encodeTx(t *testing.T, tx *wire.MsgTx) []byte {
 	return buf.Bytes()
 }
 
-// encodeBlock returns the wire bytes of a whole block payload: the 80 byte
-// header, the compactsize transaction count, then the transactions in order.
 func encodeBlock(t *testing.T, blk *wire.MsgBlock) []byte {
 	t.Helper()
 
@@ -80,9 +70,6 @@ func encodeBlock(t *testing.T, blk *wire.MsgBlock) []byte {
 	return buf.Bytes()
 }
 
-// compactMsgFor builds the cmpctblock a peer would send for blk, prefilling
-// exactly the given block indexes and carrying a short ID for every other
-// transaction, in block order.
 func compactMsgFor(t *testing.T, blk *wire.MsgBlock, prefilled ...int) *wire.MsgCmpctBlock {
 	t.Helper()
 
@@ -107,23 +94,15 @@ func compactMsgFor(t *testing.T, blk *wire.MsgBlock, prefilled ...int) *wire.Msg
 	return msg
 }
 
-// compactTestIndex is a TxIndex whose held set and collision reports the test
-// controls exactly, so a row can put any slot into any of the three states
-// InitData produces: prefilled, held, or missing.
 type compactTestIndex struct {
 	raw       map[chainhash.Hash][]byte
 	openFails map[chainhash.Hash]bool
-	// shortBy makes Open report the transaction's true size but hand back a
-	// reader holding that many fewer bytes, which is the store that ends its
-	// stream early.
-	shortBy map[chainhash.Hash]int
-	// collideAt marks positions in the block's short ID list that the index
-	// reports as a collision: a nil hash plus collision=true, which is what
-	// RecentTxIndex.Match does for a short ID two indexed hashes share
+	shortBy   map[chainhash.Hash]int
+	extraBy   map[chainhash.Hash]int
+	stallAt   map[chainhash.Hash]bool
+	// collideAt marks a short ID two indexed hashes share
 	// (blockencodings.cpp:181-190).
-	collideAt map[int]bool
-	// truncateMatch makes Match return one answer fewer than it was asked
-	// about, which is the misbehaving TxIndex implementation.
+	collideAt     map[int]bool
 	truncateMatch bool
 }
 
@@ -132,11 +111,12 @@ func newCompactTestIndex() *compactTestIndex {
 		raw:       make(map[chainhash.Hash][]byte),
 		openFails: make(map[chainhash.Hash]bool),
 		shortBy:   make(map[chainhash.Hash]int),
+		extraBy:   make(map[chainhash.Hash]int),
+		stallAt:   make(map[chainhash.Hash]bool),
 		collideAt: make(map[int]bool),
 	}
 }
 
-// hold adds a transaction to the index under its own txid.
 func (f *compactTestIndex) hold(t *testing.T, tx *wire.MsgTx) {
 	t.Helper()
 
@@ -182,16 +162,27 @@ func (f *compactTestIndex) Open(_ context.Context, hash chainhash.Hash) (io.Read
 		return nil, 0, ErrTxUnknown
 	}
 
+	if f.stallAt[hash] {
+		return io.NopCloser(stalledReader{}), uint64(len(raw)), nil
+	}
+
 	if n := f.shortBy[hash]; n > 0 {
 		return io.NopCloser(bytes.NewReader(raw[:len(raw)-n])), uint64(len(raw)), nil
+	}
+
+	if n := f.extraBy[hash]; n > 0 {
+		over := append(append([]byte(nil), raw...), bytes.Repeat([]byte{0xee}, n)...)
+
+		return io.NopCloser(bytes.NewReader(over)), uint64(len(raw)), nil
 	}
 
 	return io.NopCloser(bytes.NewReader(raw)), uint64(len(raw)), nil
 }
 
-// gapStream concatenates the wire encodings of the transactions at the given
-// block indexes, which is the shape transport.TxnStream's Reader() hands the
-// state: back to back transactions with no framing between them.
+type stalledReader struct{}
+
+func (stalledReader) Read([]byte) (int, error) { return 0, nil }
+
 func gapStream(t *testing.T, blk *wire.MsgBlock, indexes []uint32) io.Reader {
 	t.Helper()
 
@@ -204,8 +195,6 @@ func gapStream(t *testing.T, blk *wire.MsgBlock, indexes []uint32) io.Reader {
 	return &buf
 }
 
-// drain reads a reader to EOF and closes it, returning the bytes and the read
-// error, so a row can assert on both the payload and a mid-stream failure.
 func drain(t *testing.T, rc io.ReadCloser) ([]byte, error) {
 	t.Helper()
 
@@ -215,10 +204,8 @@ func drain(t *testing.T, rc io.ReadCloser) ([]byte, error) {
 	return out, err
 }
 
-// TestCompactState_AllHeld_AssemblesWithoutGapRequest is SVNode's best case:
-// every short ID resolves in the index, so FillBlock has nothing to wait for
-// and the block is assembled straight away (spec §6 step 5,
-// net_processing.cpp:3931-3945).
+// TestCompactState_AllHeld_AssemblesWithoutGapRequest is the no-getblocktxn
+// case (net_processing.cpp:3931-3945).
 func TestCompactState_AllHeld_AssemblesWithoutGapRequest(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -243,9 +230,8 @@ func TestCompactState_AllHeld_AssemblesWithoutGapRequest(t *testing.T) {
 	require.Equal(t, encodeBlock(t, blk), got)
 }
 
-// TestCompactState_HalfHeld_GapRequestIndexes proves the getblocktxn a partial
-// match produces: the absolute indexes of exactly the slots the index could
-// not fill, strictly increasing so the differential encoding accepts them
+// TestCompactState_HalfHeld_GapRequestIndexes pins the getblocktxn indexes as
+// strictly increasing, which the differential encoding requires
 // (blockencodings.h:36-82).
 func TestCompactState_HalfHeld_GapRequestIndexes(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
@@ -285,9 +271,6 @@ func TestCompactState_HalfHeld_GapRequestIndexes(t *testing.T) {
 	require.Equal(t, want, round.Indexes)
 }
 
-// TestCompactState_FillAndAssemble runs the full round trip: gaps requested,
-// a blocktxn carrying exactly those transactions, then a block body identical
-// to the one the peer would have sent as a plain block message.
 func TestCompactState_FillAndAssemble(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0, 17, 33)
@@ -322,9 +305,6 @@ func TestCompactState_FillAndAssemble(t *testing.T) {
 	require.Equal(t, readOK, c.fillStatus())
 }
 
-// TestCompactState_AssembleTxs_OmitsHeaderAndCount pins the reader the ingest
-// seam takes: BlockIngestRequest carries the header and the count as fields,
-// so its TxReader is the transactions alone (spec §6 step 7).
 func TestCompactState_AssembleTxs_OmitsHeaderAndCount(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -349,9 +329,8 @@ func TestCompactState_AssembleTxs_OmitsHeaderAndCount(t *testing.T) {
 	require.Less(t, len(got), len(body))
 }
 
-// TestCompactState_Fill_WrongCount is FillBlock's count check: a blocktxn that
-// does not carry exactly the requested number of transactions is a bogus
-// message, not a reconstruction failure (blockencodings.cpp:268-270, :283-285).
+// TestCompactState_Fill_WrongCount is FillBlock's count check
+// (blockencodings.cpp:268-270, blockencodings.cpp:283-285).
 func TestCompactState_Fill_WrongCount(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -375,11 +354,8 @@ func TestCompactState_Fill_WrongCount(t *testing.T) {
 	}
 }
 
-// TestCompactState_Fill_ShortIDMismatch is the collision case SVNode detects
-// through CheckBlock's merkle root (blockencodings.cpp:288-298,
-// "Possible Short ID collision" → READ_STATUS_FAILED). This port checks the
-// short ID of every supplied transaction against its own slot while the
-// stream runs, so the failure is FAILED and never a score.
+// TestCompactState_Fill_ShortIDMismatch is the "Possible Short ID collision"
+// READ_STATUS_FAILED of blockencodings.cpp:288-298.
 func TestCompactState_Fill_ShortIDMismatch(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -419,10 +395,8 @@ func TestCompactState_Fill_ShortIDMismatch(t *testing.T) {
 	require.Equal(t, readFailed, c.fillStatus())
 }
 
-// TestCompactState_DuplicateShortIDs is InitData's own short ID map check
-// (blockencodings.cpp:148-169). SVNode returns FAILED there; the Phase 5 spec
-// makes a duplicate INSIDE the message INVALID, because only the sender can
-// produce one, and reserves FAILED for the index-side collision it cannot.
+// TestCompactState_DuplicateShortIDs is InitData's short ID map check
+// (blockencodings.cpp:148-169), READ_STATUS_FAILED there and readInvalid here.
 func TestCompactState_DuplicateShortIDs(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -435,9 +409,7 @@ func TestCompactState_DuplicateShortIDs(t *testing.T) {
 	require.Nil(t, c)
 }
 
-// TestCompactState_PrefilledIndexOutOfRange is blockencodings.cpp:119-125: a
-// prefilled index beyond the short IDs plus the prefilled transactions before
-// it names a slot the message never described.
+// TestCompactState_PrefilledIndexOutOfRange is blockencodings.cpp:119-125.
 func TestCompactState_PrefilledIndexOutOfRange(t *testing.T) {
 	blk := compactFixtureBlock(t, 4)
 	msg := compactMsgFor(t, blk, 0)
@@ -450,10 +422,8 @@ func TestCompactState_PrefilledIndexOutOfRange(t *testing.T) {
 	require.Nil(t, c)
 }
 
-// TestCompactState_IndexCollision_IsMissingNotFailed is the rule corrected on
-// 2026-08-29: SVNode clears a slot two indexed transactions both match and
-// requests it with the other gaps (blockencodings.cpp:181-190). It is not a
-// reconstruction failure.
+// TestCompactState_IndexCollision_IsMissingNotFailed is
+// blockencodings.cpp:181-190: the slot is cleared and requested, not failed.
 func TestCompactState_IndexCollision_IsMissingNotFailed(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -486,9 +456,6 @@ func TestCompactState_IndexCollision_IsMissingNotFailed(t *testing.T) {
 	require.Equal(t, encodeBlock(t, blk), got)
 }
 
-// TestCompactState_HeldTxGoneAtAssembly is the second FAILED path: the index
-// named a hash the store can no longer supply, so reconstruction falls back to
-// getdata without scoring the peer (spec §6 step 4).
 func TestCompactState_HeldTxGoneAtAssembly(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -513,8 +480,6 @@ func TestCompactState_HeldTxGoneAtAssembly(t *testing.T) {
 	require.Equal(t, readFailed, c.fillStatus())
 }
 
-// TestCompactState_InvalidMessages covers the InitData rejections that need no
-// index at all.
 func TestCompactState_InvalidMessages(t *testing.T) {
 	blk := compactFixtureBlock(t, 4)
 
@@ -548,10 +513,8 @@ func TestCompactState_InvalidMessages(t *testing.T) {
 	}
 }
 
-// TestCompactState_TooManyTransactions is the bound InitData applies before it
-// sizes anything (blockencodings.cpp:92-95: shorttxids + prefilledtxn against
-// the excessive block size divided by the smallest possible transaction,
-// validation.h:67-68 MIN_TRANSACTION_SIZE).
+// TestCompactState_TooManyTransactions is InitData's count bound
+// (blockencodings.cpp:92-95; MIN_TRANSACTION_SIZE, validation.h:67-68).
 func TestCompactState_TooManyTransactions(t *testing.T) {
 	restore := wire.MaxBlockPayload()
 
@@ -564,8 +527,6 @@ func TestCompactState_TooManyTransactions(t *testing.T) {
 	msg := compactMsgFor(t, blk, 0)
 	msg.ShortIDs = make([]uint64, maxCompactBlockTxs()+1)
 
-	// Distinct short IDs, so the duplicate check at placeShortIDs cannot
-	// reject the message and only the count bound can.
 	for i := range msg.ShortIDs {
 		msg.ShortIDs[i] = uint64(i) + 1 //nolint:gosec // fixture indexes are small
 	}
@@ -576,9 +537,6 @@ func TestCompactState_TooManyTransactions(t *testing.T) {
 	require.Nil(t, c)
 }
 
-// TestCompactState_NoIndex_RequestsEverything is the flag-on, index-empty
-// case: with nothing held every short ID slot is a gap, and the exchange
-// degrades to one getblocktxn carrying the whole block (spec §11).
 func TestCompactState_NoIndex_RequestsEverything(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -604,12 +562,6 @@ func TestCompactState_NoIndex_RequestsEverything(t *testing.T) {
 	require.Equal(t, encodeBlock(t, blk), got)
 }
 
-// TestCompactState_GapStreamTruncated guards the attacker-controlled tail: a
-// blocktxn that declares the requested count but ends early must stop the
-// assembly with an error, never a short block. A blocktxn is length framed, so
-// only the sender can produce a payload that declares a count it does not
-// carry — the same fault class as fill's arity mismatch, and therefore
-// readInvalid rather than readFailed.
 func TestCompactState_GapStreamTruncated(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -640,9 +592,7 @@ func TestCompactState_GapStreamTruncated(t *testing.T) {
 }
 
 // TestCompactState_PrefilledIndexesNotIncreasing is the monotonicity
-// blockencodings.cpp:114-117 gets for free from the differential encoding. Two
-// prefilled transactions in one slot would leave a slot with no source at all,
-// so a message that names one is rejected before any slot is laid out.
+// blockencodings.cpp:114-117 accumulates from the differential encoding.
 func TestCompactState_PrefilledIndexesNotIncreasing(t *testing.T) {
 	blk := compactFixtureBlock(t, 6)
 	msg := compactMsgFor(t, blk, 0, 2)
@@ -655,10 +605,6 @@ func TestCompactState_PrefilledIndexesNotIncreasing(t *testing.T) {
 	require.Nil(t, c)
 }
 
-// TestCompactState_HeldTxUnderSupplied is the store that promises size bytes
-// and delivers fewer. io.LimitReader reports a clean EOF for that, so the slot
-// must compare what arrived against what Open declared; otherwise the consumer
-// gets a silently short block with readOK.
 func TestCompactState_HeldTxUnderSupplied(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -684,10 +630,6 @@ func TestCompactState_HeldTxUnderSupplied(t *testing.T) {
 	require.NotEqual(t, encodeBlock(t, blk), got)
 }
 
-// TestCompactState_GapRequest_CopiesAndRepeats pins two properties of the
-// getblocktxn: the caller gets its own slice, so sorting or truncating
-// Indexes cannot corrupt the slot bookkeeping fill checks against, and a
-// second call describes the same gaps rather than a mutated set.
 func TestCompactState_GapRequest_CopiesAndRepeats(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -717,12 +659,6 @@ func TestCompactState_GapRequest_CopiesAndRepeats(t *testing.T) {
 	require.True(t, c.requested)
 }
 
-// TestCompactState_IndexMatchWrongLength is the programming fault a TxIndex
-// can make: an answer slice that does not line up with the short IDs it was
-// asked about. Placing those answers would attribute a hash to the wrong slot,
-// so InitData must refuse the block and say why rather than degrade it to a
-// full getblocktxn in silence. The index is ours, not the peer's, so the
-// verdict is readFailed and the peer is not scored.
 func TestCompactState_IndexMatchWrongLength(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -741,9 +677,6 @@ func TestCompactState_IndexMatchWrongLength(t *testing.T) {
 	require.Nil(t, c)
 }
 
-// TestCompactState_Fill_LatchesStream proves fill owns the blocktxn stream:
-// the reader it checked the arity against is the one assemble consumes, so a
-// caller cannot check one stream and then assemble from another.
 func TestCompactState_Fill_LatchesStream(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -774,9 +707,6 @@ func TestCompactState_Fill_LatchesStream(t *testing.T) {
 	require.Equal(t, readOK, c.fillStatus())
 }
 
-// TestCompactState_AssembleWithoutFill is the caller that skips fill on a
-// block that has gaps. Nothing can supply those slots, so the stream must stop
-// with a failure rather than emit a short or wrong block.
 func TestCompactState_AssembleWithoutFill(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -792,4 +722,84 @@ func TestCompactState_AssembleWithoutFill(t *testing.T) {
 	require.Error(t, drainErr)
 	require.ErrorIs(t, drainErr, ErrCompactFillFailed)
 	require.Equal(t, readFailed, c.fillStatus())
+}
+
+func TestCompactState_HeldTxOverSupplied(t *testing.T) {
+	blk := compactFixtureBlock(t, compactFixtureTxCount)
+	msg := compactMsgFor(t, blk, 0)
+
+	idx := newCompactTestIndex()
+	for i := 1; i < len(blk.Transactions); i++ {
+		idx.hold(t, blk.Transactions[i])
+	}
+
+	idx.extraBy[blk.Transactions[20].TxHash()] = 3
+
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
+	require.Equal(t, readOK, status)
+	require.Nil(t, c.gapRequest())
+
+	_, rc := c.assemble(context.Background(), idx)
+
+	_, drainErr := drain(t, rc)
+	require.Error(t, drainErr)
+	require.ErrorIs(t, drainErr, ErrCompactFillFailed)
+	require.Equal(t, readFailed, c.fillStatus())
+}
+
+func TestCompactState_HeldTxStalls(t *testing.T) {
+	blk := compactFixtureBlock(t, compactFixtureTxCount)
+	msg := compactMsgFor(t, blk, 0)
+
+	idx := newCompactTestIndex()
+	for i := 1; i < len(blk.Transactions); i++ {
+		idx.hold(t, blk.Transactions[i])
+	}
+
+	idx.stallAt[blk.Transactions[20].TxHash()] = true
+
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
+	require.Equal(t, readOK, status)
+
+	_, rc := c.assemble(context.Background(), idx)
+
+	_, drainErr := drain(t, rc)
+	require.Error(t, drainErr)
+	require.ErrorIs(t, drainErr, ErrCompactFillFailed)
+	require.Contains(t, drainErr.Error(), io.ErrNoProgress.Error())
+	require.Equal(t, readFailed, c.fillStatus())
+}
+
+// TestCompactState_PrefilledIndexAtAcceptingEdge is the accepting edge of
+// blockencodings.cpp:119-125: p.Index == len(ShortIDs)+i.
+func TestCompactState_PrefilledIndexAtAcceptingEdge(t *testing.T) {
+	tests := []struct {
+		name      string
+		txCount   int
+		prefilled []int
+		move      int
+	}{
+		{name: "one prefilled, i=0", txCount: 4, prefilled: []int{0}, move: 0},
+		{name: "two prefilled, i=1", txCount: 6, prefilled: []int{0, 2}, move: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			blk := compactFixtureBlock(t, tc.txCount)
+			msg := compactMsgFor(t, blk, tc.prefilled...)
+
+			edge := uint32(len(msg.ShortIDs) + tc.move) //nolint:gosec // fixture indexes are small
+			msg.PrefilledTxn[tc.move].Index = edge
+
+			c, status, err := newCompactState(msg, newCompactTestIndex())
+			require.NoError(t, err)
+			require.Equal(t, readOK, status)
+			require.NotNil(t, c)
+			require.Len(t, c.txs, tc.txCount)
+			require.NotNil(t, c.txs[edge].prefilled)
+			require.NotContains(t, c.missing, edge)
+		})
+	}
 }
