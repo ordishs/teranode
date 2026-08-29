@@ -98,7 +98,7 @@ func (m *PeerManager) CompactBlock(ctx context.Context, sp *SyncPeer, msg *wire.
 		return nil, nil, 0, nil
 	}
 
-	out, score, err, claimed := m.claimCompactBlock(sp, &msg.Header, hash)
+	out, score, claimed, err := m.claimCompactBlock(sp, &msg.Header, hash)
 	if !claimed {
 		return out, nil, score, err
 	}
@@ -137,7 +137,9 @@ func (m *PeerManager) CompactBlock(ctx context.Context, sp *SyncPeer, msg *wire.
 		return []wire.Message{req}, nil, 0, nil
 	}
 
-	m.holdCompactBlock(sp, state)
+	// No blocktxn was asked for, so this partial block goes straight to the
+	// ingesting state: nothing may fill it again.
+	m.handOffCompactBlock(sp, state)
 
 	return nil, readyFrom(ctx, state, idx, nil), 0, nil
 }
@@ -147,12 +149,12 @@ func (m *PeerManager) CompactBlock(ctx context.Context, sp *SyncPeer, msg *wire.
 // header accept, the availability update, the guards wantCompact carries, and
 // the claim itself. claimed is false when the announcement goes no further,
 // in which case out, score and err are the verdict.
-func (m *PeerManager) claimCompactBlock(sp *SyncPeer, header *wire.BlockHeader, hash chainhash.Hash) (out []wire.Message, score int, err error, claimed bool) {
+func (m *PeerManager) claimCompactBlock(sp *SyncPeer, header *wire.BlockHeader, hash chainhash.Hash) (out []wire.Message, score int, claimed bool, err error) {
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
 
 	if m.headerSync == nil || m.blockDownloader == nil || sp == nil || sp.State == nil {
-		return nil, 0, nil, false
+		return nil, 0, false, nil
 	}
 
 	// net_processing.cpp:3721-3733: a header whose parent we do not hold is
@@ -161,9 +163,24 @@ func (m *PeerManager) claimCompactBlock(sp *SyncPeer, header *wire.BlockHeader, 
 	// peer is not scored for announcing a block we are simply behind on; we
 	// ask for the headers that would connect it.
 	if _, known := m.headerIndex.Lookup(header.PrevBlock); !known {
+		// :3725 gates the push on !IsInitialBlockDownload(). This port's
+		// proxy for that predicate is HeaderSync.tipIsNearAdjustedTime, the
+		// same one BlockDownloader.maxDownloadTimeMicros uses and for the same
+		// stated reason: the work half of IsInitialBlockDownload has no
+		// counterpart here, so the age half carries it. Without the gate a
+		// peer can make a catching-up node emit one full locator per
+		// non-connecting announcement, which is a small message answered by a
+		// large one.
+		if !m.headerSync.tipIsNearAdjustedTime() {
+			m.logger.Debugf("[svp2p] ignoring non-connecting cmpctblock %s from %s: still in initial sync",
+				hash, peerAddrOf(sp))
+
+			return nil, 0, false, nil
+		}
+
 		m.logger.Debugf("[svp2p] cmpctblock %s from %s does not connect, asking for headers", hash, peerAddrOf(sp))
 
-		return []wire.Message{m.blockDownloader.getHeadersFor(chainhash.Hash{})}, 0, nil, false
+		return []wire.Message{m.blockDownloader.getHeadersFor(chainhash.Hash{})}, 0, false, nil
 	}
 
 	// net_processing.cpp:3740-3762 ProcessNewBlockHeaders. A header already in
@@ -175,7 +192,7 @@ func (m *PeerManager) claimCompactBlock(sp *SyncPeer, header *wire.BlockHeader, 
 	if !known {
 		inserted, headerScore, accepted, acceptErr := m.headerSync.acceptHeader(header, hash)
 		if acceptErr != nil {
-			return nil, 0, acceptErr, false
+			return nil, 0, false, acceptErr
 		}
 
 		// net_processing.cpp:3743-3751: the refusal's own DoS value, applied
@@ -183,7 +200,7 @@ func (m *PeerManager) claimCompactBlock(sp *SyncPeer, header *wire.BlockHeader, 
 		if !accepted {
 			m.logger.Debugf("[svp2p] peer %s sent an invalid header via cmpctblock %s", peerAddrOf(sp), hash)
 
-			return nil, headerScore, nil, false
+			return nil, headerScore, false, nil
 		}
 
 		node = inserted
@@ -198,37 +215,58 @@ func (m *PeerManager) claimCompactBlock(sp *SyncPeer, header *wire.BlockHeader, 
 		m.logger.Debugf("[svp2p] ignoring cmpctblock %s at height %d from %s: not wanted at tip height %d",
 			hash, node.Height, peerAddrOf(sp), m.activeTip.Height)
 
-		return nil, 0, nil, false
+		return nil, 0, false, nil
 	}
 
 	// net_processing.cpp:3839-3844, "Peer sent us compact block we were
 	// already syncing!" — see peerSyncState.compact for why this port reads it
-	// as one partial block per peer rather than one per in-flight entry.
-	if sp.State.compact != nil {
+	// as one partial block per peer rather than one per in-flight entry. Both
+	// states count: a reconstruction still being ingested is as much "already
+	// syncing" as one waiting on a blocktxn.
+	if outstanding := sp.State.compact; outstanding != nil {
 		m.logger.Debugf("[svp2p] ignoring cmpctblock %s from %s: already reconstructing %s",
-			hash, peerAddrOf(sp), sp.State.compact.hash)
+			hash, peerAddrOf(sp), outstanding.hash)
 
-		return nil, 0, nil, false
+		return nil, 0, false, nil
 	}
 
-	// net_processing.cpp:3832 MarkBlockAsInFlight. From here the block is this
-	// peer's to deliver, and the per-block download timeout runs on it exactly
-	// as it does for a block requested by getdata.
-	if !m.blockDownloader.MarkBlockAsInFlight(sp, node, time.Now().UnixMicro()) {
-		m.logger.Debugf("[svp2p] ignoring cmpctblock %s from %s: already in flight", hash, peerAddrOf(sp))
+	if ingesting := sp.State.compactIngest; ingesting != nil {
+		m.logger.Debugf("[svp2p] ignoring cmpctblock %s from %s: still ingesting %s",
+			hash, peerAddrOf(sp), ingesting.hash)
 
-		return nil, 0, nil, false
+		return nil, 0, false, nil
 	}
 
-	return nil, 0, nil, true
+	// net_processing.cpp:3832-3845 MarkBlockAsInFlight. A false return means
+	// the block was ALREADY in flight from this peer, which the source does not
+	// read as a refusal — it reuses that QueuedBlock and hangs the partial
+	// block off it (:3833-3838). wantCompact has already applied the :3826-3828
+	// rule that decides whether a claim may be taken at all, so the return
+	// value carries no further verdict here.
+	m.blockDownloader.MarkBlockAsInFlight(sp, node, time.Now().UnixMicro())
+
+	return nil, 0, true, nil
 }
 
-// holdCompactBlock records the partial block against the peer that sent it.
+// holdCompactBlock records a partial block that is WAITING on a blocktxn.
 func (m *PeerManager) holdCompactBlock(sp *SyncPeer, state *compactState) {
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
 
 	sp.State.compact = state
+}
+
+// handOffCompactBlock moves a partial block from "waiting on a blocktxn" to
+// "being ingested", which is what stops a replayed blocktxn from filling it a
+// second time. It is this port's stand-in for the MarkBlockAsReceived at
+// net_processing.cpp:3646, which destroys the QueuedBlock the partial block
+// hangs off before the block is processed. See peerSyncState.compactIngest.
+func (m *PeerManager) handOffCompactBlock(sp *SyncPeer, state *compactState) {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	sp.State.compact = nil
+	sp.State.compactIngest = state
 }
 
 // failCompactBlock releases a claim the reconstruction could not use, which is
@@ -239,6 +277,7 @@ func (m *PeerManager) failCompactBlock(sp *SyncPeer, hash chainhash.Hash) {
 	defer m.syncMu.Unlock()
 
 	sp.State.compact = nil
+	sp.State.compactIngest = nil
 
 	m.blockDownloader.BlockFailed(sp, hash, time.Now().UnixMicro())
 }
@@ -253,6 +292,8 @@ func (m *PeerManager) failCompactBlock(sp *SyncPeer, hash chainhash.Hash) {
 func (m *PeerManager) BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.TxnStream) ([]wire.Message, *CompactReady, int, error) {
 	hash := ts.BlockHash()
 
+	// Read before syncMu, like CompactBlock's own read: txIndex() takes m.mu,
+	// and the two mutexes are never held together.
 	idx := m.txIndex()
 
 	state, status, err := m.fillCompactBlock(sp, hash, ts)
@@ -264,7 +305,8 @@ func (m *PeerManager) BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.
 		// There is no Misbehaving call on that path and no MarkBlockAsFailed —
 		// the only score in this function is the READ_STATUS_INVALID branch
 		// below. A blocktxn racing a claim this node released (a rotation, a
-		// timeout) is a timing artefact, not evidence of malice.
+		// timeout, the handoff of a reply already accepted) is a timing
+		// artefact, not evidence of malice.
 		_ = ts.Close()
 
 		m.logger.Debugf("[svp2p] peer %s sent us block transactions for block %s we weren't expecting",
@@ -278,6 +320,30 @@ func (m *PeerManager) BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.
 		_ = ts.Close()
 
 		return nil, nil, scoreInvalidBlock, err
+
+	case status != readOK:
+		// Unreachable today: fill returns only readOK or readInvalid. Handled
+		// rather than fallen through, because falling through would hand the
+		// caller an ingest of a block fillCompactBlock has already failed and
+		// put back on offer.
+		_ = ts.Close()
+
+		m.logger.Debugf("[svp2p] compact block for %s could not be filled: %v", hash, err)
+
+		return nil, nil, 0, nil
+	}
+
+	// legacy_compactBlocks was turned off, or the index was withdrawn, between
+	// the cmpctblock and this reply. The assembler would fail the block slot by
+	// slot at openHeld; release it here instead and let the ordinary getdata
+	// path take it. Not the peer's fault, so no score.
+	if idx == nil {
+		_ = ts.Close()
+
+		m.failCompactBlock(sp, hash)
+		m.logger.Debugf("[svp2p] compact block for %s abandoned: no transaction index", hash)
+
+		return nil, nil, 0, nil
 	}
 
 	return nil, readyFrom(ctx, state, idx, ts), 0, nil
@@ -312,11 +378,21 @@ func (m *PeerManager) fillCompactBlock(sp *SyncPeer, hash chainhash.Hash, ts *tr
 	status, err := state.fill(ts.Count(), ts.Reader())
 	if status != readOK {
 		sp.State.compact = nil
+		sp.State.compactIngest = nil
 
 		m.blockDownloader.BlockFailed(sp, hash, time.Now().UnixMicro())
 
 		return state, status, err
 	}
+
+	// The handoff, done HERE rather than by the caller so it is inside the same
+	// critical section as the guard above: from this moment the partial block is
+	// no longer reachable as `compact`, so a replayed blocktxn finds nothing and
+	// takes the unsolicited path. This is the MarkBlockAsReceived at
+	// net_processing.cpp:3646, which destroys the QueuedBlock before the block
+	// is processed.
+	sp.State.compact = nil
+	sp.State.compactIngest = state
 
 	return state, readOK, nil
 }
@@ -348,19 +424,19 @@ func peerAddrOf(sp *SyncPeer) string {
 	return sp.Addr
 }
 
-// takeCompactStatus removes the partial block for hash from this peer, and
-// reports the status its assembly reached. found is false when no compact
+// takeCompactStatus removes the INGESTING partial block for hash from this
+// peer, and reports the status its assembly reached. found is false when no compact
 // block from this peer produced the ingest being reported — the ordinary case,
 // since most blocks arrive whole.
 //
 // Requires the caller to hold PeerManager's sync-state mutex.
 func takeCompactStatus(sp *SyncPeer, hash chainhash.Hash) (status readStatus, found bool) {
-	if sp == nil || sp.State == nil || sp.State.compact == nil || sp.State.compact.hash != hash {
+	if sp == nil || sp.State == nil || sp.State.compactIngest == nil || sp.State.compactIngest.hash != hash {
 		return readOK, false
 	}
 
-	status = sp.State.compact.fillStatus()
-	sp.State.compact = nil
+	status = sp.State.compactIngest.fillStatus()
+	sp.State.compactIngest = nil
 
 	return status, true
 }

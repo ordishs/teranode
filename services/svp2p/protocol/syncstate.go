@@ -269,11 +269,40 @@ type peerSyncState struct {
 	// ordinary getdata path, which is what this port does for every block
 	// anyway.
 	//
+	// It holds a partial block ONLY while a getblocktxn is outstanding. The
+	// moment the blocktxn fills it, it moves to compactIngest below — see that
+	// field for why the handoff has to clear this one.
+	//
 	// Cleared on three occasions, which between them cover every way the claim
-	// it belongs to can end: BlockDone (the ingest reported, whatever the
-	// outcome), BlockTxn's own refusal paths, and clearPeer — a disconnect or
-	// a sync-peer rotation.
+	// it belongs to can end: the blocktxn arriving (either outcome), the
+	// dispatcher's own refusal paths, and clearPeer — a disconnect or a
+	// sync-peer rotation.
 	compact *compactState
+
+	// compactIngest is the partial block whose assembled stream is being
+	// ingested. It is where compact moves at the handoff, and it is separate
+	// from compact for one reason: a partial block that is still reachable as
+	// `compact` will accept a SECOND blocktxn for the same hash and start a
+	// second ingest of the same block.
+	//
+	// That window is not narrow. BlockIngestor.Ingest releases the transaction
+	// stream as soon as it is drained, which unparks the transport read loop,
+	// and the block is not reported through BlockDone until the whole
+	// post-stream pipeline tail has run — minutes on a large block. A peer that
+	// simply sends its blocktxn twice would be ingested twice.
+	//
+	// SVNode has no equivalent field because it needs none: FillBlock is
+	// followed immediately by MarkBlockAsReceived (net_processing.cpp:3646),
+	// which destroys the QueuedBlock the partial block hangs off, so the second
+	// copy throws in GetBlockDetails and takes the unsolicited path at
+	// :3595-3606. This port cannot release the block that early — the
+	// reconstruction is not proven until the stream has been read — so it keeps
+	// the state under a name the blocktxn path does not look at.
+	//
+	// Read and cleared by BlockDone through takeCompactStatus, which is what
+	// classifies a failure the assembler could only reach mid-stream. Also
+	// cleared by clearPeer.
+	compactIngest *compactState
 }
 
 // newPeerSyncState returns a zero-value peerSyncState: no best known block,

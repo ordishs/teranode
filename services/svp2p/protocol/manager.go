@@ -1707,9 +1707,10 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 	now := time.Now().UnixMicro()
 
 	var (
-		rotate     bool
-		delta      int
-		disconnect error
+		rotate      bool
+		delta       int
+		disconnect  error
+		streamFault bool
 	)
 
 	m.syncMu.Lock()
@@ -1776,6 +1777,10 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		m.logger.Debugf("[svp2p] block %s is waiting for its parent: %v", hash, outcome.Err)
 
 	default:
+		// The compact override below applies to THIS branch only: see the note
+		// where it runs.
+		streamFault = true
+
 		if outcome.RetryAfter > 0 {
 			// Our own fault, with a backoff window: keep the block off the wire
 			// for that long rather than letting the next tick re-request the
@@ -1832,7 +1837,14 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 	// error, which the default branch above has already treated as nobody's
 	// fault; the partial block's own status is what separates the two cases
 	// the branch cannot tell apart.
-	if compactSeen && outcome.Err != nil {
+	//
+	// It is gated on streamFault — the switch's own default branch — rather
+	// than on outcome.Err alone. Duplicate, Retained and ParentMissing all
+	// carry an error too, and every one of them is decided BEFORE the stream is
+	// read, so a compact status cannot be their cause; overriding them here
+	// would disconnect a peer from a branch whose own comment says "nothing
+	// here is a rotation, a disconnect or a warning".
+	if compactSeen && streamFault && outcome.Err != nil {
 		switch compactStatus {
 		case readInvalid:
 			// The peer supplied a transaction that is not the one the slot

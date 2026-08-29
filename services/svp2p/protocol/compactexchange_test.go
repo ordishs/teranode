@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"sync"
 	"testing"
@@ -739,4 +740,368 @@ func (s *scriptedPeer) mustNotReceive(t *testing.T, window time.Duration, comman
 		_, forbidden := banned[msg.Command()]
 		require.False(t, forbidden, "the node must not send %s", msg.Command())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1
+// ---------------------------------------------------------------------------
+
+// minedChildAt is minedChild with the timestamp chosen rather than taken from
+// the clock, so a test can put the chain's tip far enough in the past to reach
+// the initial-block-download and direct-fetch guards.
+func minedChildAt(parent *wire.BlockHeader, bits, salt uint32, unixTime int64) *wire.BlockHeader {
+	prevHash := parent.BlockHash()
+
+	merkle := chainhash.Hash{}
+	merkle[0] = byte(salt)
+	merkle[1] = byte(salt >> 8)
+
+	h := wire.NewBlockHeader(1, &prevHash, &merkle, bits, 0)
+	h.Timestamp = time.Unix(unixTime, 0)
+
+	for !testMeetsTarget(h) {
+		h.Nonce++
+	}
+
+	return h
+}
+
+// agedGenesis is syncGenesis with its timestamp pushed back, which is what
+// makes tipIsNearAdjustedTime (the port's initial-block-download predicate)
+// and canDirectFetch answer false.
+func agedGenesis(age time.Duration) *wire.BlockHeader {
+	zero := chainhash.Hash{}
+
+	h := wire.NewBlockHeader(1, &zero, &zero, testEasyBits, 0)
+	h.Timestamp = time.Unix(time.Now().Add(-age).Unix(), 0)
+
+	for !testMeetsTarget(h) {
+		h.Nonce++
+	}
+
+	return h
+}
+
+// writeRawBlockTxn frames a blocktxn message by hand, so a test can send a
+// declared transaction count with a body that does not decode. go-wire's
+// MsgBlockTxn can only carry transactions that already encode, so the
+// malformed case is unreachable through it.
+func writeRawBlockTxn(t *testing.T, s *scriptedPeer, hash chainhash.Hash, count uint64, body []byte) {
+	t.Helper()
+
+	var payload bytes.Buffer
+
+	payload.Write(hash[:])
+	require.NoError(t, wire.WriteVarInt(&payload, wire.ProtocolVersion, count))
+	payload.Write(body)
+
+	frame := make([]byte, wire.MessageHeaderSize)
+	binary.LittleEndian.PutUint32(frame[0:4], uint32(wire.MainNet))
+	copy(frame[4:4+wire.CommandSize], wire.CmdBlockTxn)
+	binary.LittleEndian.PutUint32(frame[16:20], uint32(payload.Len())) //nolint:gosec // test payload is small
+	// Bytes 20:24 are the checksum, which the streaming path does not verify
+	// (transport.TxnStream's own note).
+
+	_, err := s.nc.Write(frame)
+	require.NoError(t, err)
+
+	_, err = s.nc.Write(payload.Bytes())
+	require.NoError(t, err)
+}
+
+// tailIngestor models what the real bridge does and what recordingBodyIngestor
+// does not: it releases the transaction stream as soon as the stream is drained
+// (BlockIngestor.Ingest's own contract, "It must release req.TxReader on every
+// exit path"), and only THEN runs its post-stream pipeline tail. On a real
+// block that tail — extendTransactions, createUtxos, createSubtrees,
+// ProcessBlock — is where most of the wall clock goes.
+//
+// That gap matters here. Releasing the stream unparks the transport read loop
+// (transport/conn.go serveStream waits on the stream's done channel), so the
+// peer's NEXT message is dispatched while this ingest is still running and long
+// before BlockDone reports it. A fake that closes and returns in the same breath
+// hides the window almost completely.
+type tailIngestor struct {
+	release chan struct{}
+
+	mu       sync.Mutex
+	ingested []chainhash.Hash
+	firstOut chan struct{}
+}
+
+func newTailIngestor() *tailIngestor {
+	return &tailIngestor{release: make(chan struct{}), firstOut: make(chan struct{})}
+}
+
+func (r *tailIngestor) WatchProgress(rd io.ReadCloser) IngestProgress { return newTestProgress(rd) }
+
+func (r *tailIngestor) Ingest(_ context.Context, req BlockIngestRequest) IngestOutcome {
+	_, err := io.Copy(io.Discard, req.TxReader)
+
+	if closeErr := req.TxReader.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+
+	r.mu.Lock()
+	r.ingested = append(r.ingested, req.Header.BlockHash())
+	first := len(r.ingested) == 1
+	r.mu.Unlock()
+
+	if first {
+		close(r.firstOut)
+	}
+
+	// The pipeline tail, held open by the test.
+	<-r.release
+
+	if err != nil {
+		return IngestOutcome{Err: err}
+	}
+
+	return IngestOutcome{}
+}
+
+func (r *tailIngestor) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.ingested)
+}
+
+// TestBlockTxn_ReplayAfterTheHandoffIsDroppedUnscored is the B1 regression.
+//
+// Once FillBlock succeeds, SVNode has already called MarkBlockAsReceived
+// (net_processing.cpp:3646), which destroys the QueuedBlock the partial block
+// hangs off. A second copy of the same blocktxn therefore throws in
+// GetBlockDetails and takes the unsolicited path at :3595-3606 — logged,
+// dropped, unscored. It must never start a second ingest of the same block.
+//
+// The window this drives is the real one: the ingestor releases the stream,
+// which unparks the transport read loop, and the partial block stays on the
+// peer until BlockDone runs at the far end of the pipeline tail. The replay is
+// written INSIDE that window, so the outcome does not depend on scheduling.
+func TestBlockTxn_ReplayAfterTheHandoffIsDroppedUnscored(t *testing.T) {
+	genesis := syncGenesis()
+	header := minedRun(genesis, 1, 31)[0]
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	txs := testTxs(4, 0xd0)
+	txIdx := newTestTxIndex(txs[1], txs[2])
+
+	ingestor := newTailIngestor()
+	m := compactSyncManager(t, idx, ingestor, txIdx)
+
+	far := connectCompactPeer(t, m)
+	far.write(t, compactBlockFor(t, header, txs, 0))
+
+	req, ok := far.readUntil(t, wire.CmdGetBlockTxn).(*wire.MsgGetBlockTxn)
+	require.True(t, ok)
+	require.Equal(t, []uint32{3}, req.Indexes)
+
+	reply := blockTxnFor(t, header.BlockHash(), txs, req.Indexes)
+	far.write(t, reply)
+
+	// The first ingest has drained and released the stream. BlockDone has not
+	// run and cannot run until the tail is released below.
+	select {
+	case <-ingestor.firstOut:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the compact block never reached the ingest interface")
+	}
+
+	// The byte-identical reply, replayed squarely inside the window.
+	far.write(t, reply)
+
+	require.Never(t, func() bool { return ingestor.count() > 1 }, 2*time.Second, 50*time.Millisecond,
+		"a replayed blocktxn must never start a second ingest of the same block")
+
+	close(ingestor.release)
+
+	require.Equal(t, int32(1), m.ConnectedCount(), "a replayed blocktxn must not disconnect the peer")
+
+	snaps := m.Snapshots()
+	require.Len(t, snaps, 1)
+	require.Equal(t, 0, snaps[0].MisbehaviorScore, "a replayed blocktxn must not be scored")
+}
+
+// TestCompactBlock_NonConnectingHeaderSendsNoGetHeadersDuringInitialSync is the
+// gate this port dropped in round 1: net_processing.cpp:3725 wraps the
+// GETHEADERS push in `if(!IsInitialBlockDownload())`. Without it a peer can
+// make the node emit a full locator per malformed announcement while it is
+// still catching up.
+func TestCompactBlock_NonConnectingHeaderSendsNoGetHeadersDuringInitialSync(t *testing.T) {
+	// A tip a day old is what this port reads as initial block download
+	// (HeaderSync.tipIsNearAdjustedTime, NearTipHeaderSyncWindow).
+	genesis := agedGenesis(48 * time.Hour)
+
+	// Two above genesis, so its parent is a header the node has never seen.
+	orphanParent := minedChildAt(genesis, testEasyBits, 32, time.Now().Add(-47*time.Hour).Unix())
+	header := minedChildAt(orphanParent, testEasyBits, 33, time.Now().Add(-46*time.Hour).Unix())
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	txs := testTxs(3, 0xe0)
+	txIdx := newTestTxIndex(txs[1], txs[2])
+
+	ingestor := &recordingBodyIngestor{}
+	m := compactSyncManager(t, idx, ingestor, txIdx)
+
+	far := connectCompactPeer(t, m)
+	far.write(t, compactBlockFor(t, header, txs, 0))
+
+	far.mustNotReceive(t, 1*time.Second, wire.CmdGetHeaders, wire.CmdGetBlockTxn)
+
+	require.Equal(t, 0, ingestor.count())
+	require.Equal(t, int32(1), m.ConnectedCount())
+
+	snaps := m.Snapshots()
+	require.Len(t, snaps, 1)
+	require.Equal(t, 0, snaps[0].MisbehaviorScore)
+}
+
+// TestCompactBlock_NotCloseToTipIsIgnored is net_processing.cpp:3817-3820,
+// "If we're not close to tip yet, give up and let parallel block fetch work its
+// magic": CanDirectFetch (:308-311) is the active tip's own time inside
+// nPowTargetSpacing * 20 of now.
+func TestCompactBlock_NotCloseToTipIsIgnored(t *testing.T) {
+	// Four hours is outside the 20 * 10-minute direct-fetch window and inside
+	// the 24 hour initial-sync window, so this guard is the one under test and
+	// not the header path's.
+	genesis := agedGenesis(4 * time.Hour)
+	header := minedChildAt(genesis, testEasyBits, 34, time.Now().Add(-3*time.Hour).Unix())
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	txs := testTxs(3, 0xf0)
+	txIdx := newTestTxIndex(txs[1], txs[2])
+
+	ingestor := &recordingBodyIngestor{}
+	m := compactSyncManager(t, idx, ingestor, txIdx)
+
+	far := connectCompactPeer(t, m)
+	far.write(t, compactBlockFor(t, header, txs, 0))
+
+	far.mustNotReceive(t, 1*time.Second, wire.CmdGetBlockTxn)
+
+	require.Equal(t, 0, ingestor.count(), "a block announced while we are far from the tip must not be reconstructed")
+	require.Equal(t, int32(1), m.ConnectedCount())
+}
+
+// TestCompactBlock_PeerAtTheInFlightCapIsIgnored is net_processing.cpp:3826-3828:
+// the claim is taken only when `(!fAlreadyInFlight && nodestate->nBlocksInFlight
+// < MAX_BLOCKS_IN_TRANSIT_PER_PEER) || fAlreadyInFlightFromThisPeer`. Without
+// it the compact path walks straight past the 16-block per-peer cap the getdata
+// scheduler enforces.
+func TestCompactBlock_PeerAtTheInFlightCapIsIgnored(t *testing.T) {
+	genesis := syncGenesis()
+
+	// Siblings, so every one of them sits at height 1 and the announced block
+	// stays inside the tip+2 ceiling however many are already in flight.
+	siblings := make([]*wire.BlockHeader, 0, MaxBlocksInTransitPerPeer+1)
+	for i := 0; i <= MaxBlocksInTransitPerPeer; i++ {
+		siblings = append(siblings, minedChild(genesis, testEasyBits, uint32(100+i))) //nolint:gosec // test salt is small
+	}
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	// Every sibling but the last is already in the index and claimed.
+	for _, h := range siblings[:MaxBlocksInTransitPerPeer] {
+		connected, addErr := idx.AddHeader(h)
+		require.NoError(t, addErr)
+		require.True(t, connected)
+	}
+
+	txs := testTxs(3, 0x11)
+	txIdx := newTestTxIndex(txs[1], txs[2])
+
+	ingestor := &recordingBodyIngestor{}
+	m := compactSyncManager(t, idx, ingestor, txIdx)
+
+	require.True(t, m.SetActiveTip(genesis.BlockHash()))
+
+	far := connectCompactPeer(t, m)
+
+	state := onlySyncPeerState(t, m)
+	sp := onlySyncPeer(t, m)
+
+	m.syncMu.Lock()
+	for _, h := range siblings[:MaxBlocksInTransitPerPeer] {
+		node, known := m.headerIndex.Lookup(h.BlockHash())
+		require.True(t, known)
+		require.True(t, m.blockDownloader.MarkBlockAsInFlight(sp, node, time.Now().UnixMicro()))
+	}
+
+	atCap := state.nBlocksInFlight
+	m.syncMu.Unlock()
+
+	require.Equal(t, MaxBlocksInTransitPerPeer, atCap, "the peer must start the announcement at the cap")
+
+	far.write(t, compactBlockFor(t, siblings[MaxBlocksInTransitPerPeer], txs, 0))
+
+	far.mustNotReceive(t, 1*time.Second, wire.CmdGetBlockTxn)
+
+	require.Equal(t, 0, ingestor.count(), "a peer already at the in-flight cap must not claim another block")
+	require.Equal(t, int32(1), m.ConnectedCount())
+}
+
+// TestCompactBlock_UndecodableGapTransactionIsPeerFault is the
+// readInvalid-via-BlockDone branch, the one the round-1 review found untested.
+// The peer answers with the DECLARED number of transactions but with bytes
+// that do not decode, which compactAssembler.readGap reaches as a.invalid.
+// That surfaces only while the assembled stream is read, so the verdict is
+// BlockDone's: net_processing.cpp:3610-3616, Misbehaving(pfrom, 100,
+// "invalid-cmpctblk-txns").
+func TestCompactBlock_UndecodableGapTransactionIsPeerFault(t *testing.T) {
+	genesis := syncGenesis()
+	header := minedRun(genesis, 1, 35)[0]
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	txs := testTxs(3, 0x12)
+
+	// Slots 0 and 1 are covered, so slot 2 is the only gap and the reply
+	// declares exactly the one transaction the request asked for.
+	txIdx := newTestTxIndex(txs[1])
+
+	ingestor := &recordingBodyIngestor{}
+	m := compactSyncManager(t, idx, ingestor, txIdx)
+
+	far := connectCompactPeer(t, m)
+	far.write(t, compactBlockFor(t, header, txs, 0))
+
+	req, ok := far.readUntil(t, wire.CmdGetBlockTxn).(*wire.MsgGetBlockTxn)
+	require.True(t, ok)
+	require.Equal(t, []uint32{2}, req.Indexes)
+
+	// Twelve bytes that cannot be a transaction: the version reads, then the
+	// input-count varint claims an eight byte length the payload cannot hold.
+	garbage := bytes.Repeat([]byte{0xff}, 12)
+	writeRawBlockTxn(t, far, header.BlockHash(), 1, garbage)
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 0 }, 10*time.Second, 20*time.Millisecond,
+		"a blocktxn whose transactions do not decode must disconnect the peer")
+
+	require.Equal(t, 0, ingestor.count(), "a block that failed to assemble must never count as ingested")
+}
+
+// onlySyncPeer returns the sole connected peer's SyncPeer.
+func onlySyncPeer(t *testing.T, m *PeerManager) *SyncPeer {
+	t.Helper()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	require.Len(t, m.peers, 1)
+
+	for _, sp := range m.peers {
+		return sp
+	}
+
+	return nil
 }

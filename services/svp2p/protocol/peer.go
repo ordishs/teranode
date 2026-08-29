@@ -807,6 +807,10 @@ func (p *Peer) handleMessage(ctx context.Context, msg wire.Message) error {
 // rather than as a decoded message, so the Run loop selects on it directly and
 // hands it to handleBlockTxn, the same shape a block takes.
 //
+// The nil-dispatcher check is per case, not at the top: without it an inbound
+// getblocktxn on a connection with no dispatcher would be dropped with no log
+// at all, since dispatchUnsupported has no case for it either.
+//
 // Kept separate from dispatchUnsupported: sendcmpct must be recorded even on a
 // connection where cfg.Sync is nil (compactDispatcher's own doc comment). It
 // CAN now end the connection — an invalid compact block is one of the ways a
@@ -816,15 +820,24 @@ func (p *Peer) dispatchCompact(ctx context.Context, msg wire.Message, establishe
 	// net_processing.cpp ProcessMessage drops everything that arrives before
 	// the handshake completes; the handshake already scores those messages
 	// (the existing "missing-version" rule, unchanged by this task).
-	if !established || p.cfg.Compact == nil {
+	if !established {
 		return nil
 	}
 
 	switch m := msg.(type) {
 	case *wire.MsgSendcmpct:
-		p.cfg.Compact.SendCmpct(p.cfg.SyncPeer, m)
+		if p.cfg.Compact != nil {
+			p.cfg.Compact.SendCmpct(p.cfg.SyncPeer, m)
+		}
 
 	case *wire.MsgCmpctBlock:
+		if p.cfg.Compact == nil {
+			p.cfg.Logger.Debugf("[svp2p] ignoring cmpctblock from %s: no compact dispatcher",
+				p.cfg.Conn.RemoteAddr())
+
+			return nil
+		}
+
 		return p.handleCompactBlock(ctx, m)
 
 	case *wire.MsgGetBlockTxn:

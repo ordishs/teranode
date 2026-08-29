@@ -1041,6 +1041,28 @@ func (bd *BlockDownloader) IsInFlightFrom(peer *SyncPeer, hash chainhash.Hash) b
 // is receive-only (spec §2), so it never reaches that rule.
 const MaxCompactBlockHeightAhead = 2
 
+// DirectFetchSpacingMultiple is the 20 of CanDirectFetch
+// (net_processing.cpp:308-311): the active tip's own timestamp must be inside
+// nPowTargetSpacing * 20 of the adjusted time for a direct fetch to be worth
+// attempting.
+const DirectFetchSpacingMultiple = 20
+
+// canDirectFetch is net_processing.cpp CanDirectFetch (:308-311):
+//
+//	chainActive.Tip()->GetBlockTime() > GetAdjustedTime() - nPowTargetSpacing * 20
+//
+// It reads the ACTIVE CHAIN tip, not the header index tip, so it is a different
+// question from HeaderSync.tipIsNearAdjustedTime (which is this port's
+// IsInitialBlockDownload proxy and measures pindexBestHeader against a 24 hour
+// window). A node whose headers are current but whose blocks are hours behind
+// answers true to one and false to the other, which is exactly the state this
+// guard exists for.
+func (bd *BlockDownloader) canDirectFetch(activeTip HeaderNode) bool {
+	window := targetSpacingSeconds(bd.hs.cfg.Params) * DirectFetchSpacingMultiple
+
+	return activeTip.Time > bd.hs.cfg.AdjustedTime()-window
+}
+
 // wantCompact reports whether a compact block announcing node is worth
 // reconstructing. It is the run of guards ProcessCompactBlockMessage applies
 // between the header accept and MarkBlockAsInFlight, in the source's own
@@ -1052,13 +1074,31 @@ const MaxCompactBlockHeightAhead = 2
 //     chainActive.Tip()->GetChainWork(): "We know something better." The
 //     sibling GetBlockTxCount() test at :3803 has no counterpart here, because
 //     this port prunes nothing and so has no "had it once, pruned it" state.
-//   - net_processing.cpp:3825, the height ceiling above.
-//   - net_processing.cpp:3827-3829, fAlreadyInFlightFromThisPeer: a block this
-//     peer is already delivering is not announced again.
+//   - net_processing.cpp:3818-3820, !fAlreadyInFlight && !CanDirectFetch: "If
+//     we're not close to tip yet, give up and let parallel block fetch work its
+//     magic."
+//   - net_processing.cpp:3825, the height ceiling.
+//   - net_processing.cpp:3826-3828, the claim rule itself:
+//     (!fAlreadyInFlight && nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+//     || fAlreadyInFlightFromThisPeer.
+//
+// THE LAST ONE IS WHY THIS IS NOT SIMPLY "not in flight from this peer". A block
+// already in flight from THIS peer is admitted, not refused: the source reuses
+// that QueuedBlock and hangs the partial block off it (:3833-3838), and only a
+// QueuedBlock that ALREADY carries a partial block is refused, at :3839-3844.
+// This port applies that second refusal through peerSyncState.compact instead.
+// The first half of the rule is what keeps the compact path inside the same
+// 16-block per-peer cap the getdata scheduler enforces at SendGetDataBlocks;
+// MarkBlockAsInFlight does not re-check it, so without this a peer already
+// holding 16 blocks could claim a 17th through a cmpctblock.
 //
 // Requires the caller to hold PeerManager's sync-state mutex, like every other
 // method here.
 func (bd *BlockDownloader) wantCompact(peer *SyncPeer, node, activeTip HeaderNode) bool {
+	if peer == nil || peer.State == nil {
+		return false
+	}
+
 	if _, held := bd.haveData[node.Hash]; held {
 		return false
 	}
@@ -1067,11 +1107,21 @@ func (bd *BlockDownloader) wantCompact(peer *SyncPeer, node, activeTip HeaderNod
 		return false
 	}
 
+	alreadyAnyPeer := bd.IsInFlight(node.Hash)
+
+	if !alreadyAnyPeer && !bd.canDirectFetch(activeTip) {
+		return false
+	}
+
 	if node.Height > activeTip.Height+MaxCompactBlockHeightAhead {
 		return false
 	}
 
-	return !bd.IsInFlightFrom(peer, node.Hash)
+	if bd.IsInFlightFrom(peer, node.Hash) {
+		return true
+	}
+
+	return !alreadyAnyPeer && peer.State.nBlocksInFlight < MaxBlocksInTransitPerPeer
 }
 
 // BlockNotDelivered releases a block this peer will NOT deliver after all,
@@ -1161,13 +1211,15 @@ func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
 		peer.State.nStallingSince = 0
 		peer.State.pindexLastCommonBlock = nil
 
-		// The partial block goes with the claim it belonged to. C++ holds it
-		// on the QueuedBlock this walk just dropped (node_state.h:80,
-		// QueuedBlock::partialBlock), so ClearPeer disposes of it in the same
-		// step. A rotation reaches here too, and that is correct: the peer
-		// keeps the connection but no longer owes us this block, so a blocktxn
-		// for it would be unsolicited.
+		// The partial block goes with the claim it belonged to, in whichever
+		// of its two states it is. C++ holds it on the QueuedBlock this walk
+		// just dropped (node_state.h:80, QueuedBlock::partialBlock), so
+		// ClearPeer disposes of it in the same step. A rotation reaches here
+		// too, and that is correct: the peer keeps the connection but no
+		// longer owes us this block, so a blocktxn for it would be
+		// unsolicited.
 		peer.State.compact = nil
+		peer.State.compactIngest = nil
 	}
 }
 
