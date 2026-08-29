@@ -280,6 +280,23 @@ type addrDispatcher interface {
 	Addr(sp *SyncPeer, msg *wire.MsgAddr, inbound bool, remoteAddr *wire.NetAddress) (int, error)
 }
 
+// compactDispatcher is the peer loop's view of the manager-owned compact-block
+// negotiation state (Task 6): the three sendcmpct flags on peerSyncState,
+// guarded by PeerManager's shared sync-state mutex. PeerManager implements it.
+//
+// Separate from syncDispatcher for the same reason addrDispatcher is (see its
+// own doc comment): negotiation must run on a connection where cfg.Sync is
+// nil, because a peer's sendcmpct is recorded regardless of whether block
+// sync itself is enabled (spec §5: "Flag off: sendcmpct inbound still
+// recorded (harmless)" — and that gate is legacy_compactBlocks, not
+// SyncEnabled()).
+type compactDispatcher interface {
+	// SendCmpct dispatches NetMsgType::SENDCMPCT
+	// (net_processing.cpp ProcessSendCompactMessage:2417-2437). It cannot end
+	// the connection: SVNode scores nothing here, whatever the version.
+	SendCmpct(sp *SyncPeer, msg *wire.MsgSendcmpct)
+}
+
 type PeerConfig struct {
 	Handshake    HandshakeConfig
 	Conn         transport.PeerConn
@@ -315,6 +332,13 @@ type PeerConfig struct {
 	// was supplied. Without it getaddr is neither answered nor sent and an
 	// inbound addr is ignored entirely — see dispatchAddr.
 	Addrs addrDispatcher
+
+	// Compact is the manager's compact-block negotiation dispatch. Always
+	// wired by runPeer, independent of SyncEnabled(): a nil check still
+	// guards it here for the low-level test peers this package's own tests
+	// build directly (newTestPeer et al.), which construct PeerConfig without
+	// it.
+	Compact compactDispatcher
 
 	// SyncPeer is this peer's CNodeState entry, owned by PeerManager and
 	// mutated only under its sync-state mutex.
@@ -729,11 +753,50 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 		return err
 	}
 
+	// Compact-block negotiation runs before the unsupported-message policy so
+	// sendcmpct and getblocktxn are handled here rather than falling through
+	// to it; neither can end the connection (see dispatchCompact's own doc
+	// comment).
+	p.dispatchCompact(msg, est)
+
 	// The unsupported-message policy runs LAST, so a message that reaches
 	// either of the two branches above is handled there rather than judged
 	// here. It is the only dispatch step that must run with cfg.Sync nil as
 	// well as set (see its own doc comment).
 	return p.dispatchUnsupported(msg, est)
+}
+
+// dispatchCompact routes the two compact-block negotiation commands Task 6
+// adds: sendcmpct records this peer's flags, and getblocktxn is refused with
+// nothing, matching spec §2's non-goal ("we never announce compact blocks, so
+// no peer asks us; an inbound getblocktxn is answered with nothing, like
+// today's unsupported-message policy for reject/notfound").
+// cmpctblock/blocktxn are Task 8's receive path, not dispatched here.
+//
+// Kept separate from dispatchUnsupported: unlike that policy's two branches,
+// neither of these ever disconnects, and sendcmpct must be recorded even on a
+// connection where cfg.Sync is nil (compactDispatcher's own doc comment).
+func (p *Peer) dispatchCompact(msg wire.Message, established bool) {
+	// net_processing.cpp ProcessMessage drops everything that arrives before
+	// the handshake completes; the handshake already scores those messages
+	// (the existing "missing-version" rule, unchanged by this task).
+	if !established {
+		return
+	}
+
+	switch m := msg.(type) {
+	case *wire.MsgSendcmpct:
+		if p.cfg.Compact != nil {
+			p.cfg.Compact.SendCmpct(p.cfg.SyncPeer, m)
+		}
+
+	case *wire.MsgGetBlockTxn:
+		// spec §2: we never announce compact blocks, so a peer should never
+		// ask; SVNode's own serving handler (net_processing.cpp:4765) is not
+		// carried here at all.
+		p.cfg.Logger.Debugf("[svp2p] ignoring getblocktxn from %s: compact blocks are receive-only",
+			p.cfg.Conn.RemoteAddr())
+	}
 }
 
 // dispatchSync feeds one post-handshake message to the manager-owned sync

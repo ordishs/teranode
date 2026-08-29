@@ -228,6 +228,32 @@ type peerSyncState struct {
 	// legacy's own state.requestedTxns.Stop() at DonePeer
 	// (netsync/manager.go:1140).
 	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
+
+	// fProvidesHeaderAndIDs mirrors CNodeState::fProvidesHeaderAndIDs
+	// (net_processing.cpp ProcessSendCompactMessage:2428-2431, "used to 'lock
+	// in' version of compact blocks we send"): true once this peer has ever
+	// sent a version-1 sendcmpct. Set once and never cleared, matching
+	// SVNode's own `if(!state->fProvidesHeaderAndIDs)` guard, which only ever
+	// writes true. Populated by Task 6 (sendcmpct negotiation); Phase 5b's
+	// announcement path is its only planned reader.
+	fProvidesHeaderAndIDs bool
+
+	// fPreferHeaderAndIDs mirrors CNodeState::fPreferHeaderAndIDs
+	// (net_processing.cpp:2434): the announce bit of this peer's MOST RECENT
+	// version-1 sendcmpct, overwritten on every one it sends (SVNode does not
+	// guard this write the way it guards fProvidesHeaderAndIDs). Because this
+	// port never announces its own blocks (spec §2 non-goal), nothing reads
+	// this field yet; it is recorded for Phase 5b.
+	fPreferHeaderAndIDs bool
+
+	// fSupportsDesiredCmpctVersion mirrors CNodeState::fSupportsDesiredCmpctVersion
+	// (net_processing.cpp:2435-2436): true once this peer has sent a
+	// version-1 sendcmpct at all. Set once and never cleared, matching
+	// SVNode's own `if(!state->fSupportsDesiredCmpctVersion)` guard. Read by
+	// Task 6's own receive path is not needed yet — carried for parity with
+	// CNodeState and as the seam Phase 6 (net_processing.cpp:3591) needs to
+	// gate whether an announced compact block is even worth accepting.
+	fSupportsDesiredCmpctVersion bool
 }
 
 // newPeerSyncState returns a zero-value peerSyncState: no best known block,
@@ -448,4 +474,30 @@ func (s *peerSyncState) processBlockAvailability(idx *HeaderIndex) {
 	}
 
 	s.hashLastUnknownBlock = chainhash.Hash{}
+}
+
+// recordSendCmpct mirrors net_processing.cpp ProcessSendCompactMessage
+// (:2417-2437): a version-1 sendcmpct locks in fProvidesHeaderAndIDs and
+// fSupportsDesiredCmpctVersion (set once, never cleared) and overwrites
+// fPreferHeaderAndIDs with this message's announce bit every time. Any other
+// version changes nothing, matching SVNode's own
+// `if(nCMPCTBLOCKVersion == 1)` gate, which leaves the whole block unread for
+// any other value — no score, no state.
+//
+// Requires the caller to hold PeerManager's shared sync-state mutex (see the
+// locking note on peerSyncState).
+func (s *peerSyncState) recordSendCmpct(msg *wire.MsgSendcmpct) {
+	if msg.Version != 1 {
+		return
+	}
+
+	if !s.fProvidesHeaderAndIDs {
+		s.fProvidesHeaderAndIDs = true
+	}
+
+	s.fPreferHeaderAndIDs = msg.SendCmpct
+
+	if !s.fSupportsDesiredCmpctVersion {
+		s.fSupportsDesiredCmpctVersion = true
+	}
 }

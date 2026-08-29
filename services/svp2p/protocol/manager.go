@@ -986,6 +986,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 		DisableBanning: m.tSettings.Legacy.DisableBanning,
 		Sync:           dispatch,
 		Addrs:          addrs,
+		Compact:        m,
 		SyncPeer:       syncPeer,
 		Ingestor:       ingestor,
 		Fetcher:        fetcher,
@@ -1015,6 +1016,17 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 		case <-peer.Established():
 		case <-assoc.Done():
 			return
+		}
+
+		// net_processing.cpp SendMessages (:1960-1975): once per peer, right
+		// after the handshake, independent of which side dialled — sent
+		// before the direction-specific branching below because SVNode sends
+		// it to every peer, inbound and outbound alike. Gated on the same
+		// two conditions Task 4's TxIndex seam already established:
+		// legacy_compactBlocks on, and a TxIndex actually wired
+		// (SetTxIndex's own doc comment).
+		if m.tSettings.Legacy.CompactBlocks && m.txIndex() != nil {
+			peer.send([]wire.Message{wire.NewMsgSendcmpct(false)})
 		}
 
 		id := ourAssociationID
