@@ -18,7 +18,7 @@
 | OutpointBatcherConcurrency | int | 32 | legacy_outpointBatcherConcurrency | Outpoint operation parallelism |
 | PrintInvMessages | bool | false | legacy_printInvMessages | Debug logging for inventory messages |
 | GRPCAddress | string | "" | legacy_grpcAddress | **CRITICAL** - gRPC client connections (required for client, returns error if empty) |
-| AllowBlockPriority | bool | false | legacy_allowBlockPriority | Block priority handling |
+| AllowBlockPriority | bool | true | legacy_allowBlockPriority | Offer the SVNode `BlockPriority` stream policy: opens/accepts a second DATA1 stream per peer for blocks, headers, getheaders and pings (svp2p); legacy uses it for block/headers/ping routing |
 | GRPCListenAddress | string | "" | legacy_grpcListenAddress | gRPC server binding |
 | SavePeers | bool | false | legacy_savePeers | Peer information persistence |
 | AllowSyncCandidateFromLocalPeers | bool | false | legacy_allowSyncCandidateFromLocalPeers | **CRITICAL** - Local peer sync candidate selection |
@@ -32,6 +32,17 @@
 | MaxFeelerPeers | int | 1 | legacy_maxFeelerPeers | Peer slots reserved for short-lived feeler probes (0 disables feelers and the reservation together) |
 | FeelerInterval | time.Duration | 120s | legacy_feelerInterval | Mean of the randomised gap between feeler probes (not a disable lever; a non-positive value falls back to the default) |
 | FeelerHandshakeTimeout | time.Duration | 25s | legacy_feelerHandshakeTimeout | How long a feeler waits for a version message; must stay under the 30s peer negotiate timeout |
+| ReplenishInterval | time.Duration | 2s | legacy_replenishInterval | How often the connection manager tops up outbound peers |
+| MaxAddnodePeers | int | 8 | legacy_maxAddnodePeers | Maximum peers connected via addnode |
+| TargetOutboundPeers | int | 8 | legacy_targetOutboundPeers | svp2p: outbound peers the addrman-driven dialer keeps (SVNode DEFAULT_MAX_OUTBOUND_CONNECTIONS) |
+| BlockDownloadTimeoutBasePercent | int | 100 | legacy_blockDownloadTimeoutBasePercent | svp2p: per-block download timeout base, in percent of the block interval (SVNode BLOCK_DOWNLOAD_TIMEOUT_BASE) |
+| BlockDownloadTimeoutBaseIBDPercent | int | 600 | legacy_blockDownloadTimeoutBaseIBDPercent | svp2p: the same base during initial block download (SVNode BLOCK_DOWNLOAD_TIMEOUT_BASE_IBD) |
+| BlockDownloadTimeoutPerPeerPercent | int | 50 | legacy_blockDownloadTimeoutPerPeerPercent | svp2p: added per other downloading peer (SVNode BLOCK_DOWNLOAD_TIMEOUT_PER_PEER) |
+| BlockDownloadSlowFetchTimeout | time.Duration | 30s | legacy_blockDownloadSlowFetchTimeout | svp2p: a block still not delivered after this may be fetched in parallel from another peer |
+| BlockDownloadMaxParallelFetch | int | 3 | legacy_blockDownloadMaxParallelFetch | svp2p: maximum peers a single block is fetched from at once |
+| MinSyncPeerNetworkSpeed | uint64 | 51200 | legacy_minSyncPeerNetworkSpeed | svp2p: bytes/s below which the sync peer is rotated (0 disables). Falls back to `legacy_config_MinSyncPeerNetworkSpeed` with a deprecation warning |
+| DisableBanning | bool | false | legacy_disableBanning | svp2p: the bsvd `--nobanning` switch. Falls back to `legacy_config_DisableBanning` with a deprecation warning |
+| DisableDNSSeed | bool | false | legacy_disableDNSSeed | svp2p: the bsvd `--nodnsseed` switch; with it off the fixed-seed list still applies after 60 s. Falls back to `legacy_config_DisableDNSSeed` with a deprecation warning |
 
 ## Configuration Dependencies
 
@@ -40,8 +51,22 @@
 - `ListenAddresses` controls incoming connections (falls back to external IP:8333 if empty)
 - `ConnectPeers` forces outgoing connections to specific peers
 - When `ConnectPeers` is set, `MaxPeers` automatically set to match count (exclusive mode)
-- `ConnectPeers` disables DNS seeding
+- `ConnectPeers` disables DNS seeding (legacy and svp2p alike; svp2p also skips the fixed-seed fallback and the addrman-driven dialer)
 - `SavePeers` controls peer information persistence to disk
+
+### svp2p and the `legacy_config_*` namespace
+
+The svp2p service (`-svp2p=1`, mutually exclusive with `-legacy=1`) reuses the `legacy_*` keys
+above so a cutover changes no settings. Three keys the legacy service reads through its
+reflective `legacy_config_<Field>` loader have svp2p-owned names: `legacy_disableBanning`,
+`legacy_disableDNSSeed` and `legacy_minSyncPeerNetworkSpeed`. svp2p reads the old spelling as
+a fallback when the new key is unset and prints
+`WARN: setting legacy_config_X is deprecated ... set legacy_Y instead` at startup. The
+`legacy_config_*` namespace is removed with the legacy service.
+
+svp2p also honours `excessiveblocksize` at the wire: it is the receive cap for a single block
+(blocks over 4 GiB use the SVNode extended message header), and a value of 0 — documented as
+"unlimited" for validation — is mapped to the 4 GiB default at the wire, with a warning at start.
 
 ### Feeler Probes
 
