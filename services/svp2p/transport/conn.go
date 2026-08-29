@@ -139,6 +139,7 @@ type Conn struct {
 	pver          atomic.Uint32
 	inbound       chan wire.Message
 	inboundBlocks chan *BlockStream
+	inboundTxns   chan *TxnStream
 	sendCh        chan queuedMsg
 	priCh         chan queuedMsg
 	pending       atomic.Int64
@@ -166,6 +167,7 @@ func New(nc net.Conn, cfg Config) *Conn {
 		// Unbuffered: the read loop hands the socket to one consumer at a
 		// time and waits for it. See InboundBlocks.
 		inboundBlocks: make(chan *BlockStream),
+		inboundTxns:   make(chan *TxnStream),
 		sendCh:        make(chan queuedMsg, 64),
 		priCh:         make(chan queuedMsg, 16),
 		quit:          make(chan struct{}),
@@ -216,6 +218,7 @@ func (c *Conn) Start(ctx context.Context) {
 func (c *Conn) readLoop() {
 	defer close(c.inbound)
 	defer close(c.inboundBlocks)
+	defer close(c.inboundTxns)
 
 	for {
 		n, hdr, err := readWireHeader(c.nc)
@@ -238,22 +241,33 @@ func (c *Conn) readLoop() {
 			// header on the COMMAND alone and would read such a frame whatever
 			// it carries. protocol.cpp:220-237 only WRITES one for a payload
 			// above uint32 max, and any such payload already exceeds our
-			// advertised maxRecvPayloadLength (net_processing.cpp:3306), so no
-			// honest peer sends a non-block message this way and refusing is
-			// the safer half of the difference.
-			if hdr.command != wire.CmdBlock {
+			// advertised maxRecvPayloadLength (net_processing.cpp:3306). Only
+			// the two streamed commands can grow that far, so no honest peer
+			// sends anything else this way and refusing is the safer half of
+			// the difference.
+			if !isStreamedCommand(hdr.command) {
 				c.fail(ErrExtendedNonBlock)
 				return
 			}
 
-			c.debugf("[svp2p] extended block frame from %s: %d bytes", c.RemoteAddr(), hdr.length)
+			c.debugf("[svp2p] extended %s frame from %s: %d bytes", hdr.command, c.RemoteAddr(), hdr.length)
 		}
 
-		// Detect "block" before any payload byte is materialized, and hand
-		// the socket to the consumer as a stream, whether the header is basic
-		// or extended: hdr.command already carries the real command either way.
-		if hdr.command == wire.CmdBlock {
+		// Detect a streamed command before any payload byte is materialized,
+		// and hand the socket to the consumer as a stream, whether the header
+		// is basic or extended: hdr.command already carries the real command
+		// either way.
+		switch hdr.command {
+		case wire.CmdBlock:
 			if err := c.readBlock(hdr); err != nil {
+				c.fail(err)
+				return
+			}
+
+			continue
+
+		case wire.CmdBlockTxn:
+			if err := c.readTxns(hdr); err != nil {
 				c.fail(err)
 				return
 			}
@@ -287,60 +301,107 @@ func (c *Conn) readLoop() {
 	}
 }
 
+// isStreamedCommand reports whether a command takes the streaming path instead
+// of go-wire's buffered framing. Both entries can exceed uint32 bytes, so both
+// are also the only commands an extended header may legitimately carry
+// (protocol.cpp:220-263).
+func isStreamedCommand(cmd string) bool {
+	return cmd == wire.CmdBlock || cmd == wire.CmdBlockTxn
+}
+
+// checkStreamHeader repeats the two checks wire.ReadMessageWithEncodingN makes
+// on the buffered path that matter for a streamed payload. readWireHeader
+// bypasses them, and both commands answer to the same block payload ceiling:
+// a blocktxn carries whole transactions of one block, so it can approach the
+// block's own size and nothing smaller would bound it honestly.
+func (c *Conn) checkStreamHeader(hdr wireHeader) error {
+	if hdr.magic != c.cfg.Net {
+		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
+			"svp2p: %s message from other network [%v]", hdr.command, hdr.magic)
+	}
+
+	if maxPayload := c.MaxBlockPayload(); hdr.length > maxPayload {
+		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
+			"svp2p: %s payload of %d bytes exceeds the %d byte maximum", hdr.command, hdr.length, maxPayload)
+	}
+
+	return nil
+}
+
 // readBlock owns the socket for the whole declared block payload. It delivers
 // the stream, then blocks until the consumer closes it. An error returned here
 // means the connection is no longer byte aligned, or the peer framing is
 // broken, so the caller fails the connection.
 func (c *Conn) readBlock(hdr wireHeader) error {
-	// readWireHeader bypasses the checks wire.ReadMessageWithEncodingN makes
-	// on the buffered path, so repeat the two that matter for a block.
-	if hdr.magic != c.cfg.Net {
-		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE, "svp2p: block message from other network [%v]", hdr.magic)
-	}
-
-	length := hdr.length
-	if maxPayload := c.MaxBlockPayload(); length > maxPayload {
-		return errors.New(errors.ERR_NETWORK_INVALID_RESPONSE,
-			"svp2p: block payload of %d bytes exceeds the %d byte maximum", length, maxPayload)
-	}
-
-	bs, err := newBlockStream(c.nc, length, c.pver.Load())
-	bs.extended = hdr.extended
-
-	// Payload bytes are charged as they leave the socket, in two steps: the
-	// part the read loop decoded itself, then whatever the consumer read plus
-	// whatever the drain discarded. A stream the consumer closes is always
-	// drained to the boundary, so a completed block charges the full declared
-	// length, as the buffered path does. The paths that charge less are the
-	// ones that fail the connection.
-	counted := bs.consumed()
-	c.received.Add(counted)
-
-	if err != nil {
+	if err := c.checkStreamHeader(hdr); err != nil {
 		return err
 	}
 
-	defer func() { c.received.Add(bs.consumed() - counted) }()
+	bs, err := newBlockStream(c.nc, hdr.length, c.pver.Load())
+	bs.extended = hdr.extended
+
+	return serveStream(c, c.inboundBlocks, bs, wire.CmdBlock, err)
+}
+
+// readTxns owns the socket for the whole declared blocktxn payload, exactly as
+// readBlock does for a block.
+func (c *Conn) readTxns(hdr wireHeader) error {
+	if err := c.checkStreamHeader(hdr); err != nil {
+		return err
+	}
+
+	ts, err := newTxnStream(c.nc, hdr.length, c.pver.Load())
+	ts.extended = hdr.extended
+
+	return serveStream(c, c.inboundTxns, ts, wire.CmdBlockTxn, err)
+}
+
+// serveStream is the half readBlock and readTxns share: charge the bytes the
+// read loop already took off the socket, deliver the stream, and park until
+// the consumer closes it.
+//
+// Payload bytes are charged as they leave the socket, in two steps: the part
+// the read loop decoded itself, then whatever the consumer read plus whatever
+// the drain discarded. A stream the consumer closes is always drained to the
+// boundary, so a completed payload charges the full declared length, as the
+// buffered path does. The paths that charge less are the ones that fail the
+// connection.
+//
+// decodeErr is the error from decoding the fixed prefix. It is taken as an
+// argument rather than checked by the caller so that the bytes the failed
+// decode consumed are charged first — a caller that returned early would
+// under-count them.
+func serveStream[T streamedPayload](c *Conn, ch chan<- T, s T, kind string, decodeErr error) error {
+	ps := s.core()
+
+	counted := ps.consumed()
+	c.received.Add(counted)
+
+	if decodeErr != nil {
+		return decodeErr
+	}
+
+	defer func() { c.received.Add(ps.consumed() - counted) }()
 
 	select {
-	case c.inboundBlocks <- bs:
+	case ch <- s:
 	case <-c.quit:
-		return errors.New(errors.ERR_ERROR, "svp2p: connection closed before the block stream was delivered")
+		return errors.New(errors.ERR_ERROR, "svp2p: connection closed before the %s stream was delivered", kind)
 	case <-c.sockClosed:
-		return errors.New(errors.ERR_ERROR, "svp2p: socket closed before the block stream was delivered")
+		return errors.New(errors.ERR_ERROR, "svp2p: socket closed before the %s stream was delivered", kind)
 	}
 
 	select {
-	case <-bs.done:
+	case <-ps.done:
 	case <-c.quit:
-		return errors.New(errors.ERR_ERROR, "svp2p: connection closed with a block stream still open")
+		return errors.New(errors.ERR_ERROR, "svp2p: connection closed with a %s stream still open", kind)
 	case <-c.sockClosed:
-		return errors.New(errors.ERR_ERROR, "svp2p: socket closed with a block stream still open")
+		return errors.New(errors.ERR_ERROR, "svp2p: socket closed with a %s stream still open", kind)
 	}
 
 	// Close is idempotent; this call reports whether the drain reached the
 	// payload boundary. A short stream leaves the socket misaligned.
-	return bs.Close()
+	return ps.Close()
 }
 
 func (c *Conn) writeLoop() {
@@ -540,6 +601,12 @@ func (c *Conn) Inbound() <-chan wire.Message { return c.inbound }
 // idle timer in services/svp2p/protocol, which the caller must hold off while
 // a stream is open.
 func (c *Conn) InboundBlocks() <-chan *BlockStream { return c.inboundBlocks }
+
+// InboundTxns carries inbound "blocktxn" replies as streams, on the same terms
+// as InboundBlocks: the payload stays on the socket, the read loop blocks on
+// this connection until the consumer calls Close on the stream, and nothing
+// else is read from that peer meanwhile.
+func (c *Conn) InboundTxns() <-chan *TxnStream { return c.inboundTxns }
 
 func (c *Conn) Done() <-chan struct{} { return c.done }
 

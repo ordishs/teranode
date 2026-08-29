@@ -47,6 +47,7 @@ type Association struct {
 
 	inbound       chan wire.Message
 	inboundBlocks chan *BlockStream
+	inboundTxns   chan *TxnStream
 
 	quit chan struct{}
 	done chan struct{}
@@ -76,9 +77,13 @@ func NewAssociation(general *Conn, id []byte) *Association {
 		// Unbuffered, like Conn.inboundBlocks: the reader that produced the
 		// stream is parked on the socket until the consumer closes it.
 		inboundBlocks: make(chan *BlockStream),
-		quit:          make(chan struct{}),
-		done:          make(chan struct{}),
-		ctx:           context.Background(),
+		// Unbuffered for the same reason, and for the same producer: a
+		// blocktxn reply parks its stream's read loop until the consumer
+		// closes it.
+		inboundTxns: make(chan *TxnStream),
+		quit:        make(chan struct{}),
+		done:        make(chan struct{}),
+		ctx:         context.Background(),
 	}
 	a.pver.Store(general.pver.Load())
 
@@ -181,7 +186,7 @@ func (a *Association) Start(ctx context.Context) {
 		pending = append(pending, c)
 	}
 
-	a.wg.Add(2 * len(pending))
+	a.wg.Add(forwardersPerStream * len(pending))
 
 	a.mu.Unlock()
 
@@ -236,7 +241,7 @@ func (a *Association) Attach(c *Conn) error {
 
 	// Under mu, so that fail cannot snapshot this stream and then reach
 	// wg.Wait before these forwarders are counted.
-	a.wg.Add(2)
+	a.wg.Add(forwardersPerStream)
 
 	// The version the association negotiated, applied before the stream reads
 	// or writes a byte: an extended block frame on DATA1 is refused unless
@@ -258,8 +263,13 @@ func (a *Association) Attach(c *Conn) error {
 	return nil
 }
 
-// forward merges one stream's two inbound channels into the association's.
-// The caller has already added 2 to wg under mu.
+// forwardersPerStream is how many goroutines forward one stream's inbound
+// channels into the association's. It is the number forward starts, and the
+// number Start and Attach add to wg before calling it.
+const forwardersPerStream = 3
+
+// forward merges one stream's inbound channels into the association's. The
+// caller has already added forwardersPerStream to wg under mu.
 func (a *Association) forward(c *Conn) {
 	go func() {
 		defer a.wg.Done()
@@ -282,26 +292,34 @@ func (a *Association) forward(c *Conn) {
 		}
 	}()
 
-	go func() {
-		defer a.wg.Done()
+	go forwardStream(a, c.InboundBlocks(), a.inboundBlocks)
+	go forwardStream(a, c.InboundTxns(), a.inboundTxns)
+}
 
-		for {
+// forwardStream moves one stream's payload streams onto the merged channel.
+// The merged channel is unbuffered, so this goroutine is the only thing
+// between the producing read loop and the consumer: it hands the stream over
+// and takes the next one, and it leaves when the source closes or the
+// association quits.
+func forwardStream[T any](a *Association, src <-chan T, dst chan<- T) {
+	defer a.wg.Done()
+
+	for {
+		select {
+		case s, ok := <-src:
+			if !ok {
+				return
+			}
+
 			select {
-			case bs, ok := <-c.InboundBlocks():
-				if !ok {
-					return
-				}
-
-				select {
-				case a.inboundBlocks <- bs:
-				case <-a.quit:
-					return
-				}
+			case dst <- s:
 			case <-a.quit:
 				return
 			}
+		case <-a.quit:
+			return
 		}
-	}()
+	}
 }
 
 // watch turns one stream's death into the association's. association.cpp:93-109
@@ -351,6 +369,7 @@ func (a *Association) fail(cause error) {
 
 		close(a.inbound)
 		close(a.inboundBlocks)
+		close(a.inboundTxns)
 		close(a.done)
 	})
 }
@@ -358,6 +377,8 @@ func (a *Association) fail(cause error) {
 func (a *Association) Inbound() <-chan wire.Message { return a.inbound }
 
 func (a *Association) InboundBlocks() <-chan *BlockStream { return a.inboundBlocks }
+
+func (a *Association) InboundTxns() <-chan *TxnStream { return a.inboundTxns }
 
 // streamFor resolves the stream a message routes to. association.cpp:205-210:
 // when the policy names a type the association does not hold, the send falls

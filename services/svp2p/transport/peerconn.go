@@ -14,6 +14,7 @@ type PeerConn interface {
 	Start(ctx context.Context)
 	Inbound() <-chan wire.Message
 	InboundBlocks() <-chan *BlockStream
+	InboundTxns() <-chan *TxnStream
 	Send(msg wire.Message) error
 	SendPriority(msg wire.Message) error
 	SendBlock(ctx context.Context, req BlockSendRequest) error

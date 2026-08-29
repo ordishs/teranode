@@ -281,6 +281,13 @@ func TestAssociation_TeardownFromEitherStream(t *testing.T) {
 			t.Fatalf("victim %v: the merged block channel did not close", victim)
 		}
 
+		select {
+		case _, open := <-a.InboundTxns():
+			require.False(t, open, "victim %v: the merged txns channel stayed open", victim)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("victim %v: the merged txns channel did not close", victim)
+		}
+
 		late, _ := pipeConn(t, wire.StreamTypeData1, wire.ProtocolVersion)
 		require.ErrorIs(t, a.Attach(late), ErrAssociationClosed, "victim %v", victim)
 

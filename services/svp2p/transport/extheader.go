@@ -25,26 +25,34 @@ var (
 	// sends an extended message header.
 	ErrExtendedVersion = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended message from a peer below protocol version 70016")
 
-	// ErrExtendedNonBlock is returned when a peer frames a non-block message
-	// with the extended header. This is a DEVIATION: protocol.cpp:262-266
-	// keys the extended header on the command alone and would read such a
-	// frame. protocol.cpp:220-237 only WRITES one for a payload above uint32
-	// max, and any such payload already exceeds our advertised
-	// maxRecvPayloadLength (net_processing.cpp:3306), so no non-block message
-	// ever legitimately arrives extended and refusing it costs no honest peer.
-	ErrExtendedNonBlock = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended header on a non-block message")
+	// ErrExtendedNonBlock is returned when a peer frames anything but the two
+	// streamed commands with the extended header. This is a DEVIATION:
+	// protocol.cpp:262-266 keys the extended header on the command alone and
+	// would read such a frame. protocol.cpp:220-237 only WRITES one for a
+	// payload above uint32 max, and any such payload already exceeds our
+	// advertised maxRecvPayloadLength (net_processing.cpp:3306). Only "block"
+	// and "blocktxn" can grow that far — a blocktxn carries whole transactions
+	// of one block (blockencodings.h:84-113) — so refusing every other command
+	// costs no honest peer.
+	ErrExtendedNonBlock = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, "svp2p: extended header on a message that is not streamed")
 )
 
-// extBlockFrameHeader is the 44-byte extended header for a block payload.
-func extBlockFrameHeader(magic wire.BitcoinNet, length uint64) []byte {
+// extFrameHeader is the 44-byte extended header for one streamed payload.
+func extFrameHeader(magic wire.BitcoinNet, cmd string, length uint64) []byte {
 	hdr := make([]byte, extHeaderSize)
 
 	binary.LittleEndian.PutUint32(hdr[0:4], uint32(magic))
 	copy(hdr[4:4+wire.CommandSize], wire.CmdExtMsg)
 	binary.LittleEndian.PutUint32(hdr[16:20], extLengthMarker)
 	// checksum hdr[20:24] stays zero (protocol.cpp:226)
-	copy(hdr[24:24+wire.CommandSize], wire.CmdBlock)
+	copy(hdr[24:24+wire.CommandSize], cmd)
 	binary.LittleEndian.PutUint64(hdr[36:44], length)
 
 	return hdr
+}
+
+// extBlockFrameHeader is the extended header for a block payload, the only one
+// this node writes: it never serves a blocktxn (spec: receive path only).
+func extBlockFrameHeader(magic wire.BitcoinNet, length uint64) []byte {
+	return extFrameHeader(magic, wire.CmdBlock, length)
 }
