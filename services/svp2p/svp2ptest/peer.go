@@ -176,6 +176,15 @@ type Script struct {
 	// The default acks it on the same connection, which is what
 	// net_processing.cpp:1569-1571 does.
 	OnCreateStream func(p *ScriptedPeer, conn net.Conn, m *wire.MsgCreateStream) []wire.Message
+	// OnSendCmpct answers the node's sendcmpct. The default sends nothing,
+	// which is what SVNode does: ProcessSendCompactMessage
+	// (net_processing.cpp:2417-2437) records the peer's preference and
+	// answers no message. A peer's own sendcmpct is announced from
+	// Script.OnConnect, not from here.
+	OnSendCmpct func(p *ScriptedPeer, conn net.Conn, m *wire.MsgSendcmpct) []wire.Message
+	// OnGetBlockTxn answers the node's getblocktxn. The default serves the
+	// requested indexes from the fixture chain (BlockTxnFor).
+	OnGetBlockTxn func(p *ScriptedPeer, conn net.Conn, m *wire.MsgGetBlockTxn) []wire.Message
 }
 
 // Raw is a wire message with an arbitrary command and payload, for sending
@@ -728,6 +737,18 @@ func (p *ScriptedPeer) writeAll(conn net.Conn, msgs []wire.Message) bool {
 	return true
 }
 
+// writeAllReply is writeAll for messages that answer the inbound entry
+// requestSeq, so the transcript records which request each one answered.
+func (p *ScriptedPeer) writeAllReply(conn net.Conn, requestSeq int, msgs []wire.Message) bool {
+	for _, m := range msgs {
+		if p.writeReply(conn, m, requestSeq) != nil {
+			return false
+		}
+	}
+
+	return true
+}
+
 // writeGetDataReply writes a getdata answer, routing each block message onto
 // the requesting connection's DATA1 stream when one has been recorded and
 // leaving every other message (notfound, and so on) on conn, which is the
@@ -935,6 +956,28 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 			}
 
 			if !p.writeAll(conn, out) {
+				return
+			}
+
+		case *wire.MsgSendcmpct:
+			if p.Script.OnSendCmpct != nil && !p.writeAllReply(conn, inSeq, p.Script.OnSendCmpct(p, conn, m)) {
+				return
+			}
+
+		case *wire.MsgGetBlockTxn:
+			var out []wire.Message
+
+			if p.Script.OnGetBlockTxn != nil {
+				out = p.Script.OnGetBlockTxn(p, conn, m)
+			} else if reply := p.BlockTxnFor(m); reply != nil {
+				out = []wire.Message{reply}
+			}
+
+			// blocktxn stays on the connection its getblocktxn arrived on. Only
+			// a block message is routed onto an association's DATA1 stream
+			// (stream_policy.cpp:25-31, IsHighPriorityMsg), which is why
+			// writeGetDataReply routes CmdBlock and nothing else.
+			if !p.writeAllReply(conn, inSeq, out) {
 				return
 			}
 
