@@ -51,7 +51,7 @@ func (p *ScriptedPeer) CompactBlockFor(block *wire.MsgBlock, nonce uint64, prefi
 
 	for _, index := range ordered {
 		if err := msg.AddPrefilledTransaction(uint32(index), block.Transactions[index]); err != nil { //nolint:gosec // bounded by the block's transaction count
-			return nil, err
+			return nil, errors.NewProcessingError("svp2ptest: cannot prefill index %d", index, err)
 		}
 	}
 
@@ -75,15 +75,27 @@ func (p *ScriptedPeer) CompactBlockFor(block *wire.MsgBlock, nonce uint64, prefi
 //
 // It returns the build error when the announcement cannot be made, and the
 // first write error otherwise, so a scenario knows whether the node was told.
+//
+// Having NO general connection is an error, not a quiet success. A scenario
+// that announces before the node has connected would otherwise pass here and
+// then block waiting for a getblocktxn that no peer was ever told to expect.
+// This is where AnnounceCompact parts company with Send, which is free to
+// write to nobody: Send's callers do not ask whether anyone heard.
 func (p *ScriptedPeer) AnnounceCompact(block *wire.MsgBlock, nonce uint64, prefilled []int) error {
 	msg, err := p.CompactBlockFor(block, nonce, prefilled)
 	if err != nil {
 		return err
 	}
 
+	conns := p.generalConns()
+	if len(conns) == 0 {
+		return errors.NewProcessingError("svp2ptest: cannot announce compact block %s: no general connection",
+			msg.Header.BlockHash())
+	}
+
 	var firstErr error
 
-	for _, conn := range p.generalConns() {
+	for _, conn := range conns {
 		if writeErr := p.write(conn, msg); writeErr != nil && firstErr == nil {
 			firstErr = writeErr
 		}

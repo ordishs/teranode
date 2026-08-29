@@ -3,11 +3,13 @@ package svp2ptest
 import (
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
@@ -139,15 +141,19 @@ func TestScriptedPeer_GetBlockTxnOutOfRangeIndexAnswersNothing(t *testing.T) {
 }
 
 func TestScriptedPeer_ScriptOverridesGetBlockTxn(t *testing.T) {
-	var seen *wire.MsgGetBlockTxn
+	// The reply is built HERE, on the test goroutine, and the hook only hands
+	// it back. A require inside the hook would run on the peer's serve
+	// goroutine, where a failure calls runtime.Goexit off the test goroutine:
+	// that kills the serve loop and turns a clear assertion failure into a
+	// five second readUntil timeout.
+	//
+	// A peer that answers a gap request with one transaction too few is the
+	// READ_STATUS_INVALID offence a parity scenario wants to script.
+	short := wire.NewMsgBlockTxn(&chainhash.Hash{})
+	require.NoError(t, short.AddTransaction(wire.NewMsgTx(1)))
 
 	script := Script{OnGetBlockTxn: func(p *ScriptedPeer, conn net.Conn, m *wire.MsgGetBlockTxn) []wire.Message {
-		seen = m
-
-		// A peer that answers a gap request with one transaction too few is
-		// the READ_STATUS_INVALID offence a parity scenario wants to script.
-		short := wire.NewMsgBlockTxn(&m.BlockHash)
-		require.NoError(t, short.AddTransaction(wire.NewMsgTx(1)))
+		short.BlockHash = m.BlockHash
 
 		return []wire.Message{short}
 	}}
@@ -160,9 +166,15 @@ func TestScriptedPeer_ScriptOverridesGetBlockTxn(t *testing.T) {
 
 	reply := c.readUntil(wire.CmdBlockTxn, 5*time.Second).(*wire.MsgBlockTxn)
 	require.Len(t, reply.Transactions, 1)
+	require.Equal(t, block.BlockHash(), reply.BlockHash)
 
-	require.NotNil(t, seen)
-	require.Equal(t, []uint32{1, 2}, seen.Indexes)
+	// Read the request back from the Transcript rather than from a variable the
+	// hook wrote on another goroutine: the transcript is mutex-guarded, so this
+	// declares the happens-before edge instead of relying on the socket round
+	// trip to provide one.
+	entry, ok := peer.Transcript.FirstOn(In, wire.CmdGetBlockTxn)
+	require.True(t, ok)
+	require.Equal(t, []uint32{1, 2}, entry.Msg.(*wire.MsgGetBlockTxn).Indexes)
 }
 
 // The wire form of getblocktxn stores each index as the difference from the
@@ -330,11 +342,7 @@ func TestScriptedPeer_RecordsSendCmpctAndAnswersNothingByDefault(t *testing.T) {
 }
 
 func TestScriptedPeer_ScriptOverridesSendCmpct(t *testing.T) {
-	var seen *wire.MsgSendcmpct
-
 	script := Script{OnSendCmpct: func(p *ScriptedPeer, conn net.Conn, m *wire.MsgSendcmpct) []wire.Message {
-		seen = m
-
 		return []wire.Message{wire.NewMsgSendcmpct(false)}
 	}}
 
@@ -346,8 +354,11 @@ func TestScriptedPeer_ScriptOverridesSendCmpct(t *testing.T) {
 	reply := c.readUntil(wire.CmdSendcmpct, 5*time.Second).(*wire.MsgSendcmpct)
 	require.False(t, reply.SendCmpct)
 
-	require.NotNil(t, seen)
-	require.True(t, seen.SendCmpct)
+	// Read the request from the Transcript, not from a variable written on the
+	// serve goroutine. See TestScriptedPeer_ScriptOverridesGetBlockTxn.
+	entry, ok := peer.Transcript.FirstOn(In, wire.CmdSendcmpct)
+	require.True(t, ok)
+	require.True(t, entry.Msg.(*wire.MsgSendcmpct).SendCmpct)
 }
 
 // Every scripted answer names the request it answers, so a scenario can judge
@@ -367,4 +378,174 @@ func TestScriptedPeer_CompactRepliesNameTheirRequest(t *testing.T) {
 	require.True(t, ok)
 
 	require.Equal(t, request.Seq, reply.ReplyTo)
+}
+
+// Announcing to nobody is an error. A scenario that races the node's connect
+// would otherwise pass here and then block waiting for a getblocktxn that no
+// peer was ever told to expect.
+func TestScriptedPeer_AnnounceCompactWithNoGeneralConnIsAnError(t *testing.T) {
+	peer, chain := newTestPeer(t, 3, Script{})
+	block := multiTxBlock(t, chain, 2)
+
+	err := peer.AnnounceCompact(block, 1, []int{0})
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrProcessing), "want a teranode processing error, got %v", err)
+	require.Contains(t, err.Error(), "no general connection")
+	require.Equal(t, 0, peer.Transcript.Count(Out, wire.CmdCmpctBlock))
+
+	// It starts working the moment a connection exists, so the error is about
+	// having no audience and nothing else.
+	_ = dialScripted(t, peer)
+	require.NoError(t, peer.AnnounceCompact(block, 1, []int{0}))
+}
+
+// A getblocktxn asking for nothing is answered with an empty blocktxn, which is
+// what serving exactly the requested indexes means when there are none.
+func TestScriptedPeer_GetBlockTxnEmptyIndexListAnswersEmptyBlockTxn(t *testing.T) {
+	peer, chain := newTestPeer(t, 3, Script{})
+	block := multiTxBlock(t, chain, 2)
+
+	hash := block.BlockHash()
+
+	reply := peer.BlockTxnFor(getBlockTxnFor(hash, nil))
+	require.NotNil(t, reply)
+	require.Equal(t, hash, reply.BlockHash)
+	require.Empty(t, reply.Transactions)
+
+	c := dialScripted(t, peer)
+	c.write(getBlockTxnFor(hash, nil))
+
+	onWire := c.readUntil(wire.CmdBlockTxn, 5*time.Second).(*wire.MsgBlockTxn)
+	require.Equal(t, hash, onWire.BlockHash)
+	require.Empty(t, onWire.Transactions)
+}
+
+// Writes on one connection are serialised, so the Transcript records messages
+// in the order their bytes reached the socket.
+//
+// The bytes themselves never interleave even without the lock: go-wire writes
+// header and payload in a single w.Write, and net.TCPConn.Write holds the
+// connection's own write lock for the whole call. The TRANSCRIPT is what needs
+// serialising — recording happens after the write returns, so two unsynchronised
+// writers can record in the opposite order to the order they wrote, which breaks
+// the promise Entry.Seq makes in its doc comment.
+func TestScriptedPeer_ConcurrentWritesKeepTranscriptInWireOrder(t *testing.T) {
+	peer, chain := newTestPeer(t, 3, Script{})
+	block := multiTxBlock(t, chain, 4)
+
+	c := dialScripted(t, peer)
+
+	conns := peer.Conns()
+	require.Len(t, conns, 1)
+
+	conn := conns[0]
+
+	const (
+		writers = 16
+		each    = 60
+	)
+
+	var wg sync.WaitGroup
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+
+		go func(w int) {
+			defer wg.Done()
+
+			for i := 0; i < each; i++ {
+				// The nonce is this message's identity, so the two orders can
+				// be compared element by element.
+				msg, err := peer.CompactBlockFor(block, uint64(w*each+i), []int{0, 2}) //nolint:gosec // small test values
+				if err != nil {
+					return
+				}
+
+				_ = peer.Write(conn, msg)
+			}
+		}(w)
+	}
+
+	var onWire []uint64
+
+	for len(onWire) < writers*each {
+		require.NoError(t, c.conn.SetReadDeadline(time.Now().Add(20*time.Second)))
+
+		msg, _, err := wire.ReadMessage(c.conn, wire.ProtocolVersion, c.net)
+		require.NoError(t, err, "frame %d failed to decode", len(onWire))
+
+		if cmpct, ok := msg.(*wire.MsgCmpctBlock); ok {
+			onWire = append(onWire, cmpct.Nonce)
+		}
+	}
+
+	wg.Wait()
+
+	var recorded []uint64
+
+	for _, e := range peer.Transcript.Snapshot() {
+		if e.Dir == Out && e.Cmd == wire.CmdCmpctBlock {
+			recorded = append(recorded, e.Msg.(*wire.MsgCmpctBlock).Nonce)
+		}
+	}
+
+	require.Equal(t, onWire, recorded, "transcript order must equal wire order")
+}
+
+// AnnounceCompact runs on the scenario goroutine while the peer's serve
+// goroutine answers requests on the same connection. Every frame must still
+// decode, and every reply must still be recorded.
+func TestScriptedPeer_AnnounceRacingRepliesOnOneConn(t *testing.T) {
+	peer, chain := newTestPeer(t, 3, Script{})
+	block := multiTxBlock(t, chain, 4)
+
+	c := dialScripted(t, peer)
+	hash := block.BlockHash()
+
+	const rounds = 60
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < rounds; i++ {
+			_ = peer.AnnounceCompact(block, uint64(i), []int{0, 2}) //nolint:gosec // small test values
+		}
+	}()
+
+	for i := 0; i < rounds; i++ {
+		c.write(getBlockTxnFor(hash, []uint32{1, 3}))
+	}
+
+	announced, replied := 0, 0
+
+	for announced < rounds || replied < rounds {
+		require.NoError(t, c.conn.SetReadDeadline(time.Now().Add(20*time.Second)))
+
+		msg, _, err := wire.ReadMessage(c.conn, wire.ProtocolVersion, c.net)
+		require.NoError(t, err, "a frame failed to decode after %d announcements and %d replies", announced, replied)
+
+		switch m := msg.(type) {
+		case *wire.MsgCmpctBlock:
+			require.Equal(t, hash, m.Header.BlockHash())
+
+			announced++
+
+		case *wire.MsgBlockTxn:
+			require.Len(t, m.Transactions, 2)
+			require.Equal(t, block.Transactions[1].TxHash(), m.Transactions[0].TxHash())
+			require.Equal(t, block.Transactions[3].TxHash(), m.Transactions[1].TxHash())
+
+			replied++
+		}
+	}
+
+	wg.Wait()
+
+	require.Equal(t, rounds, peer.Transcript.Count(Out, wire.CmdCmpctBlock))
+	require.Equal(t, rounds, peer.Transcript.Count(Out, wire.CmdBlockTxn))
 }

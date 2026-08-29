@@ -350,6 +350,9 @@ type ScriptedPeer struct {
 	assocOfConn map[net.Conn]string
 	data1Conns  map[string]net.Conn
 	extFrames   []ExtendedFrame
+
+	// writeMu serialises writes per connection. See writeLockFor.
+	writeMu map[net.Conn]*sync.Mutex
 }
 
 // Connections is how many times the node connected to this peer. With
@@ -382,6 +385,7 @@ func NewScriptedPeer(t *testing.T, chain *FixtureChain, netMagic wire.BitcoinNet
 		requested:   make(map[chainhash.Hash]int),
 		assocOfConn: make(map[net.Conn]string),
 		data1Conns:  make(map[string]net.Conn),
+		writeMu:     make(map[net.Conn]*sync.Mutex),
 	}
 
 	require.NoError(t, ln.Close())
@@ -692,6 +696,7 @@ func (p *ScriptedPeer) forgetConn(conn net.Conn) {
 	defer p.mu.Unlock()
 
 	delete(p.assocOfConn, conn)
+	delete(p.writeMu, conn)
 
 	for id, dc := range p.data1Conns {
 		if dc == conn {
@@ -704,6 +709,36 @@ func (p *ScriptedPeer) write(conn net.Conn, msg wire.Message) error {
 	return p.writeReply(conn, msg, -1)
 }
 
+// writeLockFor returns the mutex that serialises writes on conn, creating it on
+// first use.
+//
+// The bytes of one message cannot interleave with another's without it: go-wire
+// writes header and payload in a single w.Write (message.go, "Write header and
+// payload in 1 go"), and net.TCPConn.Write holds the connection's own write lock
+// for the whole call, however many syscalls the payload takes.
+//
+// The TRANSCRIPT is what needs the lock. Recording happens after the write
+// returns, so two goroutines writing on one connection can record in the
+// opposite order to the order their bytes reached the socket. That breaks the
+// promise Entry.Seq makes in its own doc comment — "the ordering a scenario
+// should compare on". Holding this across both the write and the record keeps
+// transcript order equal to wire order.
+//
+// The write delay is applied OUTSIDE the lock by writeReply, so a scenario that
+// slows one message down does not stall every other writer on that connection.
+func (p *ScriptedPeer) writeLockFor(conn net.Conn) *sync.Mutex {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	mu, ok := p.writeMu[conn]
+	if !ok {
+		mu = &sync.Mutex{}
+		p.writeMu[conn] = mu
+	}
+
+	return mu
+}
+
 // writeReply is write for a message that answers the inbound entry replyTo.
 func (p *ScriptedPeer) writeReply(conn net.Conn, msg wire.Message, replyTo int) error {
 	if p.Script.WriteDelay != nil {
@@ -711,6 +746,11 @@ func (p *ScriptedPeer) writeReply(conn net.Conn, msg wire.Message, replyTo int) 
 			time.Sleep(d)
 		}
 	}
+
+	mu := p.writeLockFor(conn)
+
+	mu.Lock()
+	defer mu.Unlock()
 
 	if err := wire.WriteMessage(conn, msg, wire.ProtocolVersion, p.Net); err != nil {
 		return err
