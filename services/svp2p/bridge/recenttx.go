@@ -32,6 +32,14 @@ type TxFetchFunc func(ctx context.Context, hash chainhash.Hash) (io.ReadCloser, 
 // The index carries its own RWMutex and is never touched under the peer
 // manager's syncMu: Match hashes the whole ring and Open reads the store, so
 // both are long calls by the manager's standards.
+//
+// Memory: about 105 bytes per held hash — 32 bytes in the ring, the rest in
+// the dedup map, whose 32-byte key costs roughly 70 bytes all-in. At the
+// 5,000,000 default that is ~504 MiB of resident heap once the ring fills
+// (a 160 MiB ring plus a ~344 MiB map), measured by
+// TestRecentTxIndex_FootprintAtDefaultCapacity. Match adds a transient
+// copy of the ring alone, 160 MiB at that capacity, for the length of one
+// call.
 type RecentTxIndex struct {
 	mu sync.RWMutex
 
@@ -212,10 +220,15 @@ func (i *RecentTxIndex) Match(k0, k1 uint64, shortIDs []uint64) ([]*chainhash.Ha
 	return matched, collision
 }
 
-// Open reads a held transaction's bytes through the fetch seam. A store
-// that does not hold the transaction becomes protocol.ErrTxUnknown, which
-// is the caller's signal to ask the peer for it; every other store error is
-// passed through, so a sick store never reads as a missing transaction.
+// Open reads a transaction's bytes through the fetch seam. A store that does
+// not hold the transaction becomes protocol.ErrTxUnknown, which is the
+// caller's signal to ask the peer for it; every other store error is passed
+// through, so a sick store never reads as a missing transaction.
+//
+// Open deliberately does not check the ring first. The store outlives
+// eviction, so a hash that fell off the ring between Match and Open is
+// still readable, and the store is the only authority on whether the bytes
+// are actually there.
 func (i *RecentTxIndex) Open(ctx context.Context, hash chainhash.Hash) (io.ReadCloser, uint64, error) {
 	if i == nil || i.fetch == nil {
 		return nil, 0, protocol.ErrTxUnknown

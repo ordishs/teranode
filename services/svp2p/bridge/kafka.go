@@ -24,9 +24,11 @@ import (
 // BlockFinalHandler is called once per successfully decoded blocks-final
 // message: a block our own chain has already finalized, for the caller to
 // relay to peers (protocol.PeerManager.RelayBlock). It is declared here
-// rather than satisfied by a protocol type, because spec §4.4 forbids this
-// package from importing protocol — the composition happens in the svp2p
-// service package, which imports both.
+// rather than satisfied by a protocol type so that the composition happens
+// in the svp2p service package, which imports both. (Spec §4.4 governs the
+// other direction — protocol never imports bridge — and says nothing
+// against bridge reading protocol, which it does for the compact-block
+// short-ID helpers.)
 type BlockFinalHandler func(hash chainhash.Hash, header *wire.BlockHeader)
 
 // StartBlocksFinalConsumer wires the blocks-final Kafka topic
@@ -156,8 +158,8 @@ var (
 // serialized size (bytes), exactly the three fields legacy's own
 // TxHashAndFee carries (netsync/manager.go:361-365) — for the caller to
 // batch and relay to peers. Declared with primitive parameters rather than
-// a protocol type for the same reason as BlockFinalHandler: spec §4.4
-// forbids this package from importing protocol.
+// a protocol type for the same reason as BlockFinalHandler: the composition
+// belongs in the service package that imports both.
 type TxMetaHandler func(hash chainhash.Hash, fee uint64, size uint64)
 
 // txRunningPollInterval mirrors legacy netsync's own control-goroutine tick

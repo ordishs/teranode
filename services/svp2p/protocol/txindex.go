@@ -21,7 +21,9 @@ type TxIndex interface {
 	// hashes map to one short ID), which BIP152 says must abort
 	// reconstruction.
 	Match(k0, k1 uint64, shortIDs []uint64) (hashes []*chainhash.Hash, collision bool)
-	// Open returns the raw bytes of a held transaction as a reader, or
-	// ErrTxUnknown.
+	// Open returns the raw bytes of a transaction the node holds as a
+	// reader, or ErrTxUnknown. The answer comes from the node's own
+	// storage, not from whatever Match matched against: an implementation
+	// may hold bytes for a transaction its index no longer names.
 	Open(ctx context.Context, hash chainhash.Hash) (io.ReadCloser, uint64, error)
 }

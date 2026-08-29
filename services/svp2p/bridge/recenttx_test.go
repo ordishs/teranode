@@ -2,8 +2,11 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
 	"io"
 	"net/url"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -565,4 +568,91 @@ func TestNew_IndexOpensThroughFetchTx(t *testing.T) {
 
 	_, _, err = sm.RecentTxIndex().Open(context.Background(), testHash(1))
 	require.True(t, errors.Is(err, protocol.ErrTxUnknown), "expected ErrTxUnknown, got %v", err)
+}
+
+// TestRecentTxIndex_FootprintAtDefaultCapacity is the measurement behind the
+// footprint figure in RecentTxIndex's own doc comment and in
+// legacy_compactBlocksRecentTxs's settings documentation: fill the ring at
+// the shipped default and report what it actually costs.
+//
+// It is opt-in, and stays out of CI and `make test`, because it holds half a
+// gigabyte for a few seconds and its numbers are machine-dependent. Run it
+// with:
+//
+//	SVP2P_MEASURE_INDEX=1 go test ./services/svp2p/bridge/ \
+//	    -run TestRecentTxIndex_FootprintAtDefaultCapacity -v -count=1
+//
+// The assertions are deliberately loose bounds, not the measured numbers: a
+// tightened one would fail on an unrelated allocator change, while these
+// still catch a per-entry cost that has moved by a factor.
+func TestRecentTxIndex_FootprintAtDefaultCapacity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("footprint measurement holds ~500 MiB; skipped under -short")
+	}
+
+	if os.Getenv("SVP2P_MEASURE_INDEX") == "" {
+		t.Skip("set SVP2P_MEASURE_INDEX=1 to run the recent-tx index footprint measurement")
+	}
+
+	// The shipped legacy_compactBlocksRecentTxs default. Written out rather
+	// than read from settings.NewSettings(), so a settings_local.conf
+	// override cannot silently change what this measures.
+	const defaultCapacity = 5_000_000
+
+	idx := NewRecentTxIndex(defaultCapacity, noFetch)
+
+	runtime.GC()
+
+	var before, after runtime.MemStats
+
+	runtime.ReadMemStats(&before)
+
+	// Random hashes, because the dedup map's cost depends on its keys being
+	// distinct and well spread — which is what real transaction IDs are.
+	const batch = 10_000
+
+	buf := make([]byte, chainhash.HashSize*batch)
+
+	for n := 0; n < defaultCapacity/batch; n++ {
+		_, err := rand.Read(buf)
+		require.NoError(t, err)
+
+		for k := 0; k < batch; k++ {
+			var hash chainhash.Hash
+
+			copy(hash[:], buf[k*chainhash.HashSize:(k+1)*chainhash.HashSize])
+			idx.Add(hash)
+		}
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	require.Equal(t, defaultCapacity, idx.Len())
+
+	heapDelta := int64(after.HeapInuse) - int64(before.HeapInuse)
+
+	t.Logf("recent-tx index at %d entries: HeapInuse delta %.1f MiB (%.1f bytes per hash)",
+		idx.Len(), float64(heapDelta)/(1<<20), float64(heapDelta)/float64(defaultCapacity))
+
+	// One compact block's worth of short IDs, none of which the index holds:
+	// the whole ring is walked, which is the worst case and the one the
+	// 5,000,000-SipHashes cost estimate is about.
+	ids := make([]uint64, 3000)
+	for n := range ids {
+		ids[n] = uint64(n)
+	}
+
+	start := time.Now()
+	matched, collision := idx.Match(1, 2, ids)
+	elapsed := time.Since(start)
+
+	t.Logf("Match over %d entries took %s", idx.Len(), elapsed)
+
+	require.Len(t, matched, len(ids))
+	require.False(t, collision)
+
+	require.Greater(t, heapDelta, int64(300)<<20, "the index costs far less than expected — check the ring and the dedup map are both being filled")
+	require.Less(t, heapDelta, int64(1)<<30, "the index costs more than 1 GiB at the default capacity, which the settings documentation does not warn about")
+	require.Less(t, elapsed, 2*time.Second, "a full-ring Match must stay far below the per-block download timeout")
 }
