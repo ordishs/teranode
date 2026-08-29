@@ -517,23 +517,30 @@ request on svp2p and as a full download on legacy. Scenario CLOSED.
 
 **Fix round 1, 2026-08-30.** Two more sub-cases, and one OPEN DEFECT.
 
-`TestParity_CompactBlockWrongGapIsScoredAndDropped` — the `READ_STATUS_FAILED`
+`TestParity_CompactBlockWrongGapFallsBackToGetData` — the `READ_STATUS_FAILED`
 path. The peer answers the gap request with the right count and the wrong
 transaction, so the arity check passes and the assembler's short-ID check fails
-the slot (`compactblock.go` `readGap`). SVNode treats that as a possible short-ID
-collision and not as malice (`net_processing.cpp:3655-3660`, "Might have collided,
-fall back to getdata now"): no `Misbehaving` call, the block back on offer, the
-ordinary `getdata` path fetches it.
+the slot (`compactblock.go` `readGap`). A short ID is 48 bits, so an honest
+peer's transaction can hash onto the slot we asked about; SVNode treats that as a
+possible collision and not as malice (`net_processing.cpp:3655-3660`, "Might have
+collided, fall back to getdata now"), with no `Misbehaving` call.
 
-**Recorded 2026-08-30: svp2p does NOT match.** The fallback log is written and
-then the peer is scored 100 and dropped anyway. The reconstruction surfaces as an
-ingest failure with `outcome.PeerFault` set, so `manager.go` `BlockDone` has
-already set `delta` and `disconnect` before its `readFailed` case runs — and that
-case only logs, never clearing either. `readInvalid` and `readFailed` are
-indistinguishable to a peer today, and with its only advertiser dropped the block
-never arrives (height stays 5). The test pins what the port does so the defect
-cannot be lost. **Scenario OPEN**; when the port is fixed the expected values
-become score 0, peer connected, block by `getdata`, height 6.
+**PORT DEFECT FOUND BY THIS ROW, and FIXED.** `manager.go` `BlockDone` read its
+compact override as additive when it is a replacement: the default branch had
+already set the score and the disconnect from `outcome.PeerFault`, and the
+`readFailed` case only logged. A collision therefore cost an honest peer the same
+100 and the same disconnect as a malicious fill — `readInvalid` and `readFailed`
+were indistinguishable to a peer — and it stranded the block, because the peer
+that announced it is normally the only one known to hold it. `PeerFault` is the
+pipeline's verdict on the BYTES, and on a compact ingest this node assembled those
+bytes itself, from its own index and against its own short IDs, so it cannot stand
+as a verdict on the peer. The branch now clears both. Unit test:
+`protocol.TestBlockDoneCompactStatusDecidesThePeersFate`.
+
+**Recorded 2026-08-30, after the fix:** svp2p asked 1 `getblocktxn`, fell back to
+1 `getdata`, scored the peer 0, kept the connection, and reached height 6; legacy
+reached height 6. The 15b row is the control that `readInvalid` still scores 100
+and still drops. Sub-case CLOSED.
 
 `TestParity_CompactBlockAboveHeightCeilingIsDeclined` — the height ceiling
 (`net_processing.cpp:3825`, `MaxCompactBlockHeightAhead` = 2). The peer publishes

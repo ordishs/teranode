@@ -411,7 +411,7 @@ func TestParity_UnsolicitedBlockTxnIsDroppedUnscored(t *testing.T) {
 // the branch ran.
 const unreconstructableLog = "unreconstructable, falling back to getdata"
 
-// TestParity_CompactBlockWrongGapIsScoredAndDropped — watch-list scenario 15,
+// TestParity_CompactBlockWrongGapFallsBackToGetData — watch-list scenario 15,
 // the READ_STATUS_FAILED sub-case.
 //
 // The gap request is answered with the right COUNT and the wrong CONTENT: one
@@ -419,26 +419,19 @@ const unreconstructableLog = "unreconstructable, falling back to getdata"
 // passes and this is NOT the invalid branch; the assembler's own short-ID check
 // fails the slot instead (compactblock.go readGap, which sets readFailed).
 //
-// OPEN DEFECT, recorded rather than asserted away. SVNode treats
-// READ_STATUS_FAILED as a possible short-ID collision and not as malice
-// (net_processing.cpp:3655-3660, "Might have collided, fall back to getdata
-// now"): no Misbehaving call, the block goes back on offer, and the ordinary
-// getdata path fetches it. This port reaches the fallback log and then scores
-// the peer 100 and drops it anyway, because the reconstruction surfaces as an
-// ingest failure with outcome.PeerFault set, and manager.go BlockDone has
-// already set delta and disconnect by the time its readFailed case runs — that
-// case only logs, and never clears either. readInvalid and readFailed are
-// therefore indistinguishable to a peer today.
+// A short ID is 48 bits, so an honest peer's transaction can hash onto the slot
+// we asked about. net_processing.cpp:3655-3660 treats that as a possible
+// collision and not as malice — "Might have collided, fall back to getdata now"
+// — with no Misbehaving call: the block goes back on offer and the ordinary
+// getdata path fetches it. Both legs must reach the same height.
 //
-// This test pins what the port DOES, so the defect cannot be lost, and states
-// what it SHOULD do. When the port is fixed the expected values become: score 0,
-// peer still connected, block by ordinary getdata, height 6 — and this row
-// should be rewritten to that.
-//
-// svp2p alone: while the defect stands the two legs cannot end on the same
-// height, because the only peer that announced the block is dropped and no
-// other peer has advertised it.
-func TestParity_CompactBlockWrongGapIsScoredAndDropped(t *testing.T) {
+// This row is what found the defect the preceding commit fixes: BlockDone's
+// readFailed case used to log the fallback and then leave the score and the
+// disconnect the ingest failure had already set, so a collision cost an honest
+// peer the same 100 as a malicious fill and stranded the block with it. The
+// paired unit test is protocol.TestBlockDoneCompactStatusDecidesThePeersFate;
+// 15b is the control that readInvalid still scores 100 and still drops.
+func TestParity_CompactBlockWrongGapFallsBackToGetData(t *testing.T) {
 	// The block's coinbase: a transaction the peer certainly holds, that decodes
 	// cleanly, and whose short ID is not the requested slot's.
 	wrongGap := svp2ptest.Script{
@@ -461,7 +454,6 @@ func TestParity_CompactBlockWrongGapIsScoredAndDropped(t *testing.T) {
 	obs, _ := RunParity(t, Scenario{
 		Name:   "compact-block-wrong-gap",
 		Chain:  compactChain,
-		Only:   []Impl{Svp2p},
 		Tweaks: compactTweaks,
 		Peers: func(t *testing.T, chain *svp2ptest.FixtureChain, netMagic wire.BitcoinNet) []*svp2ptest.ScriptedPeer {
 			return []*svp2ptest.ScriptedPeer{
@@ -475,15 +467,33 @@ func TestParity_CompactBlockWrongGapIsScoredAndDropped(t *testing.T) {
 			block, _, _ := seedCompactBlock(t, n, peers)
 			hash := block.Header.BlockHash()
 
-			require.NoError(t, peers[1].AnnounceCompact(block, compactNonce, []int{0}))
+			if n.Impl == Svp2p {
+				require.NoError(t, peers[1].AnnounceCompact(block, compactNonce, []int{0}))
 
-			// GATE: the fallback branch ran. Asserted before the peer's fate
-			// below, so the score cannot be attributed to the wrong branch.
-			n.WaitFor(t, func() bool { return n.Logger.Contains(unreconstructableLog) }, 60*time.Second,
-				"the wrong gap transaction never reached the fallback branch")
+				// GATE: the fallback branch ran. Asserted before the height
+				// below, so a block that arrived some other way cannot pass for
+				// the fallback.
+				n.WaitFor(t, func() bool { return n.Logger.Contains(unreconstructableLog) }, 60*time.Second,
+					"the wrong gap transaction never reached the fallback branch")
 
-			n.WaitFor(t, func() bool { return peers[1].Transcript.ClosedBy() != "" }, 60*time.Second,
-				"the defect above says the peer is dropped; it was not")
+				// The announcing peer is the only one the node knows holds this
+				// block, so the fallback has nowhere to go until the other peer
+				// has advertised it too. A real network reaches this state on
+				// its own; the rig has to arrange it.
+				inv := wire.NewMsgInv()
+				require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash)))
+
+				peers[0].Send(inv)
+			} else {
+				peers[0].Chain.PublishHeader(t, block)
+
+				inv := wire.NewMsgInv()
+				require.NoError(t, inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash)))
+
+				peers[1].Send(inv)
+			}
+
+			n.WaitForHeight(t, compactChain+1, 90*time.Second)
 
 			n.scores = sampler.Result()
 
@@ -502,23 +512,29 @@ func TestParity_CompactBlockWrongGapIsScoredAndDropped(t *testing.T) {
 
 			return o
 		},
+		Accepted: []Divergence{
+			{Field: "Requests", Reason: "svp2p pays one getblocktxn and one wasted reconstruction before the getdata legacy makes straight away"},
+			{Field: "Served", Reason: "as Requests"},
+			{Field: "Scores", Reason: "legacy's figure is scraped from its log, which never names a zero; svp2p reports a live one"},
+		},
 	})
 
-	notes := obs[Svp2p].Notes
+	svp := obs[Svp2p].Notes
 
-	require.Equal(t, "true", notes["fallback-branch"], "the READ_STATUS_FAILED branch must be the one that ran")
-	require.Equal(t, "1", notes["getblocktxn"], "the gap must have been asked for once")
+	require.Equal(t, "true", svp["fallback-branch"], "the READ_STATUS_FAILED branch must be the one that ran")
+	require.Equal(t, "1", svp["getblocktxn"], "the gap must have been asked for once")
+	require.Equal(t, "0", svp["peer1-score"], "a possible short-ID collision is not malice and earns no score")
+	require.Empty(t, obs[Svp2p].Disconnected, "no peer may be dropped for a collision")
+	require.Equal(t, fmt.Sprint(compactChain+1), svp["ingested-height"], "the block must still arrive")
 
-	// The defect, pinned. SVNode scores this 0 and keeps the peer.
-	require.Equal(t, "100", notes["peer1-score"],
-		"DEFECT: readFailed reaches the same score as readInvalid; SVNode punishes neither collision")
-	require.Equal(t, "node", obs[Svp2p].Disconnected["peer1"],
-		"DEFECT: readFailed drops the peer; SVNode falls back to getdata and keeps it")
-	require.Equal(t, fmt.Sprint(compactChain), notes["ingested-height"],
-		"DEFECT: with its only advertiser dropped, the block never arrives")
+	getData, err := strconv.Atoi(svp["getdata-for-block"])
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, getData, 1, "the block must arrive by the ordinary getdata path")
 
-	t.Logf("compact wrong gap: fallback branch ran, then the peer was scored %s and dropped; height stayed %s",
-		notes["peer1-score"], notes["ingested-height"])
+	require.Equal(t, obs[Legacy].BlocksAccepted, obs[Svp2p].BlocksAccepted, "both legs must end on the same height")
+
+	t.Logf("compact wrong gap: svp2p asked %s getblocktxn, fell back to %s getdata, scored the peer %s, reached height %s",
+		svp["getblocktxn"], svp["getdata-for-block"], svp["peer1-score"], svp["ingested-height"])
 }
 
 // notWantedLog is the Debugf claimCompactBlock writes when wantCompact refuses
