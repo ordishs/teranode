@@ -28,10 +28,10 @@ func compactBlocksManager(t *testing.T, tweak func(*settings.Settings)) *PeerMan
 	})
 }
 
-// TestSendCmpct_SentOnceToInboundPeerWhenEnabled is SVNode's SendMessages
-// (net_processing.cpp:1960-1975): once the handshake completes, and compact
-// blocks are enabled, the node sends sendcmpct(announce=false, version=1) —
-// here to a peer that dialled IN.
+// TestSendCmpct_SentOnceToInboundPeerWhenEnabled is SVNode's
+// ProcessVerAckMessage (net_processing.cpp:1961-1972): once the handshake
+// completes, and compact blocks are enabled, the node sends
+// sendcmpct(announce=false, version=1) — here to a peer that dialled IN.
 func TestSendCmpct_SentOnceToInboundPeerWhenEnabled(t *testing.T) {
 	m := compactBlocksManager(t, nil)
 
@@ -60,7 +60,7 @@ func TestSendCmpct_SentOnceToInboundPeerWhenEnabled(t *testing.T) {
 }
 
 // TestSendCmpct_SentOnceToOutboundPeerWhenEnabled proves the same send fires
-// on a connection this node itself dialled, since SVNode's SendMessages loop
+// on a connection this node itself dialled, since SVNode's ProcessVerAckMessage
 // sends it to every peer regardless of direction.
 func TestSendCmpct_SentOnceToOutboundPeerWhenEnabled(t *testing.T) {
 	peer := svp2ptest.NewScriptedPeer(t, svp2ptest.BuildFixtureChain(t, fixtureChainSettings(), 2), managerSettings().ChainCfgParams.Net, svp2ptest.Script{}, false)

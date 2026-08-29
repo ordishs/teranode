@@ -1018,13 +1018,21 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 			return
 		}
 
-		// net_processing.cpp SendMessages (:1960-1975): once per peer, right
-		// after the handshake, independent of which side dialled — sent
-		// before the direction-specific branching below because SVNode sends
-		// it to every peer, inbound and outbound alike. Gated on the same
-		// two conditions Task 4's TxIndex seam already established:
-		// legacy_compactBlocks on, and a TxIndex actually wired
+		// net_processing.cpp ProcessVerAckMessage (:1961-1972): once per
+		// peer, right after the handshake, independent of which side dialled
+		// — sent before the direction-specific branching below because
+		// SVNode sends it to every peer, inbound and outbound alike. Gated
+		// on the same two conditions Task 4's TxIndex seam already
+		// established: legacy_compactBlocks on, and a TxIndex actually wired
 		// (SetTxIndex's own doc comment).
+		//
+		// Queued here from the established-watch goroutine, not from the
+		// peer loop itself, so its position relative to the peer loop's own
+		// post-verack sends (ping, getaddr) is not fixed the way SVNode's
+		// synchronous PushMessage call is. Harmless: every one of them goes
+		// through the same Conn.Send, which only orders what it is actually
+		// given, and nothing here depends on sendcmpct arriving before or
+		// after any of the others.
 		if m.tSettings.Legacy.CompactBlocks && m.txIndex() != nil {
 			peer.send([]wire.Message{wire.NewMsgSendcmpct(false)})
 		}
