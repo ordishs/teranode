@@ -107,14 +107,20 @@ func TestOutboundDialerAddsFixedSeedsWhenTableStaysEmpty(t *testing.T) {
 
 	h := newOutboundHarness(t, outboundHarnessOptions{target: 8}, a)
 	h.m.fixedSeedGrace = 0
-	h.m.fixedSeeds = func() []Address { return []Address{a.addr} }
+
+	// The reachable seed rides with 63 unroutable ones (bulkAddresses' own
+	// note): CAddrMan.Select over a one-entry table walks most of the
+	// 1024x64 new-bucket slots per draw, which under -race took longer than
+	// any sane deadline. SVNode's real tables hold 17-921 fixed seeds.
+	filler := bulkAddresses(63, 8333, wire.SFNodeNetwork, testNow/1_000_000)
+	h.m.fixedSeeds = func() []Address { return append([]Address{a.addr}, filler...) }
 	h.start(t)
 
-	// 15 s, not the harness's usual 5: this test runs the whole dial+handshake
-	// under the full-package -race load, where 5 s has flaked.
 	require.Eventually(t, func() bool { return establishedCount(h.m) == 1 }, 15*time.Second, 20*time.Millisecond,
 		"the fixed seed must be dialed once the table has stayed empty past the grace period")
-	require.Equal(t, 1, h.addrMan.Size())
+	// Bucket collisions may drop a few fillers; what matters is that the table
+	// was seeded and the reachable one was dialed.
+	require.GreaterOrEqual(t, h.addrMan.Size(), 2)
 }
 
 // TestOutboundDialerSeedsFromDNSOnStart wires ThreadDNSAddressSeed into

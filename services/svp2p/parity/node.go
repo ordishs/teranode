@@ -215,7 +215,10 @@ func (n *nodeUnderTest) Stop() {
 	n.cancel()
 	n.cancel = nil
 
-	_ = n.svc.Stop(context.Background())
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelStop()
+
+	_ = n.svc.Stop(stopCtx)
 }
 
 // BestHeight is the node's active chain height.

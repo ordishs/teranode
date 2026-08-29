@@ -2,8 +2,10 @@ package svp2ptest
 
 import (
 	"context"
+	mrand "math/rand/v2"
 	"net"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -25,13 +27,28 @@ import (
 func FreePort(t *testing.T) string {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
+	// Not ":0": an OS-ephemeral port the kernel just released is exactly the
+	// one it hands to the next outgoing dial, and the services here dial each
+	// other constantly — on CI the legacy leg lost its listen port that way
+	// ("no valid listen address"). A random port outside the ephemeral range,
+	// proven free by a bind, leaves only test-vs-test collisions.
+	for attempt := 0; attempt < 50; attempt++ {
+		port := 20000 + mrand.IntN(20000)
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
 
-	return addr
+		require.NoError(t, ln.Close())
+
+		return addr
+	}
+
+	t.Fatal("no free port found in 20000-39999 after 50 attempts")
+
+	return ""
 }
 
 func StartBlockAssembly(ctx context.Context, t *testing.T, logger ulogger.Logger, tSettings *settings.Settings,
@@ -96,7 +113,14 @@ func StartSubtreeValidation(ctx context.Context, t *testing.T, name string, logg
 
 	waitReady(t, readyCh, "subtree validation")
 
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() {
+		// Bounded: a Stop that waits on a start that never completed must not
+		// consume the package's whole test budget (seen on CI: 8 minutes).
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		_ = server.Stop(ctx)
+	})
 
 	client, err := subtreevalidation.NewClient(ctx, logger, tSettings, "svp2p-sync-test")
 	require.NoError(t, err)
@@ -124,7 +148,14 @@ func StartBlockValidation(ctx context.Context, t *testing.T, name string, logger
 
 	waitReady(t, readyCh, "block validation")
 
-	t.Cleanup(func() { _ = server.Stop(context.Background()) })
+	t.Cleanup(func() {
+		// Bounded: a Stop that waits on a start that never completed must not
+		// consume the package's whole test budget (seen on CI: 8 minutes).
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		_ = server.Stop(ctx)
+	})
 
 	client, err := blockvalidation.NewClient(ctx, logger, tSettings, "svp2p-sync-test")
 	require.NoError(t, err)

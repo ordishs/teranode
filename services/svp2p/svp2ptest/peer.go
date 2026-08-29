@@ -40,6 +40,12 @@ type Entry struct {
 	Cmd  string
 	Msg  wire.Message
 	Conn net.Conn
+
+	// ReplyTo is the Seq of the inbound entry this outbound one answers, or
+	// -1 when it answers nothing (unsolicited sends, handshake messages).
+	// Lets a test judge a reply by when its request arrived, not by when the
+	// serve goroutine got round to writing it.
+	ReplyTo int
 }
 
 // Transcript records every message a ScriptedPeer exchanged and who ended the
@@ -50,12 +56,18 @@ type Transcript struct {
 	closedBy string
 }
 
-func (tr *Transcript) add(conn net.Conn, dir Direction, msg wire.Message) {
+func (tr *Transcript) add(conn net.Conn, dir Direction, msg wire.Message) int {
+	return tr.addReply(conn, dir, msg, -1)
+}
+
+func (tr *Transcript) addReply(conn net.Conn, dir Direction, msg wire.Message, replyTo int) int {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 
 	seq := len(tr.entries)
-	tr.entries = append(tr.entries, Entry{At: time.Now(), Seq: seq, Dir: dir, Cmd: msg.Command(), Msg: msg, Conn: conn})
+	tr.entries = append(tr.entries, Entry{At: time.Now(), Seq: seq, Dir: dir, Cmd: msg.Command(), Msg: msg, Conn: conn, ReplyTo: replyTo})
+
+	return seq
 }
 
 // Count returns how many entries travelled in dir with the given command.
@@ -680,6 +692,11 @@ func (p *ScriptedPeer) forgetConn(conn net.Conn) {
 }
 
 func (p *ScriptedPeer) write(conn net.Conn, msg wire.Message) error {
+	return p.writeReply(conn, msg, -1)
+}
+
+// writeReply is write for a message that answers the inbound entry replyTo.
+func (p *ScriptedPeer) writeReply(conn net.Conn, msg wire.Message, replyTo int) error {
 	if p.Script.WriteDelay != nil {
 		if d := p.Script.WriteDelay(msg, int(msg.MaxPayloadLength(wire.ProtocolVersion))); d > 0 { //nolint:gosec // bounded by the wire limit
 			time.Sleep(d)
@@ -690,7 +707,7 @@ func (p *ScriptedPeer) write(conn net.Conn, msg wire.Message) error {
 		return err
 	}
 
-	p.Transcript.add(conn, Out, msg)
+	p.Transcript.addReply(conn, Out, msg, replyTo)
 
 	if msg.Command() == "block" {
 		p.mu.Lock()
@@ -717,7 +734,7 @@ func (p *ScriptedPeer) writeAll(conn net.Conn, msgs []wire.Message) bool {
 // connection getdata itself always arrives on. A connection with no recorded
 // DATA1 stream behaves exactly like writeAll, which keeps every scripted-peer
 // test written before this routing existed unaffected.
-func (p *ScriptedPeer) writeGetDataReply(conn net.Conn, msgs []wire.Message) bool {
+func (p *ScriptedPeer) writeGetDataReply(conn net.Conn, requestSeq int, msgs []wire.Message) bool {
 	for _, m := range msgs {
 		target := conn
 
@@ -727,7 +744,7 @@ func (p *ScriptedPeer) writeGetDataReply(conn net.Conn, msgs []wire.Message) boo
 			}
 		}
 
-		if p.write(target, m) != nil {
+		if p.writeReply(target, m, requestSeq) != nil {
 			return false
 		}
 	}
@@ -811,7 +828,7 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 			return
 		}
 
-		p.Transcript.add(conn, In, msg)
+		inSeq := p.Transcript.add(conn, In, msg)
 
 		switch m := msg.(type) {
 		case *wire.MsgVersion:
@@ -885,7 +902,7 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 				out = p.blocksFor(m)
 			}
 
-			if !p.writeGetDataReply(conn, out) {
+			if !p.writeGetDataReply(conn, inSeq, out) {
 				return
 			}
 
@@ -909,15 +926,16 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 				out = []wire.Message{wire.NewMsgStreamAck(m.AssociationID, m.StreamType)}
 			}
 
-			if !p.writeAll(conn, out) {
-				return
+			// Recorded BEFORE the ack goes out: a client that has read the ack
+			// may rely on this connection being the association's DATA1 stream,
+			// and getdata answered on GENERAL routes its blocks here
+			// (stream_policy.cpp:161-184).
+			if m.StreamType == wire.StreamTypeData1 && len(out) > 0 {
+				p.recordData1Conn(conn, m.AssociationID)
 			}
 
-			// The ack went out: this connection is now the association's
-			// DATA1 stream, and getdata answered on GENERAL can route its
-			// blocks here instead (stream_policy.cpp:187-195).
-			if m.StreamType == wire.StreamTypeData1 {
-				p.recordData1Conn(conn, m.AssociationID)
+			if !p.writeAll(conn, out) {
+				return
 			}
 
 		case *wire.MsgGetAddr:

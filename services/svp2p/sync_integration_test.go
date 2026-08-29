@@ -523,7 +523,11 @@ func TestIntegrationBlocksTravelOnData1(t *testing.T) {
 		case data1Conn:
 			blocksOnData1++
 		case generalConn:
-			if e.Seq > ack.Seq {
+			// Judged by the REQUEST's position: a getdata read before the ack
+			// may still be answered on GENERAL after it (the serve goroutine
+			// decided the target before DATA1 existed). Only a block whose
+			// getdata arrived after the ack is a routing violation.
+			if e.Seq > ack.Seq && e.ReplyTo > ack.Seq {
 				blocksOnGeneralAfterAck++
 			}
 		}

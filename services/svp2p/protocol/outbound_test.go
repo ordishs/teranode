@@ -233,6 +233,13 @@ func newOutboundHarness(t *testing.T, opts outboundHarnessOptions, peers ...*out
 	}
 
 	h.m.outboundTick = outboundTestTick
+
+	// No real DNS in the harness: the manager's chain params are mainnet's,
+	// whose seed would otherwise be resolved for real on an empty table and
+	// flood it with live addresses (and block the fixed-seed fallback, which
+	// only fires on an EMPTY table). Tests that want seeding install their own.
+	h.m.dnsLookup = func(context.Context, string) ([]net.IP, error) { return nil, nil }
+
 	h.m.dialTCP = func(addr string) (net.Conn, error) {
 		h.dials.Add(1)
 
