@@ -252,6 +252,10 @@ type PeerManager struct {
 	fetcher         BlockTxFetcher
 	txIngestor      TxIngestor
 	txInvProducer   TxInvProducer
+	// txIdx is bridge's recent-tx index (txindex.go), read by compact-block
+	// reconstruction. nil means compact blocks are off regardless of
+	// legacy_compactBlocks: Server only calls SetTxIndex when the flag is on.
+	txIdx TxIndex
 	// activeTip is our own best chain tip (the chainActive counterpart),
 	// fed from the blockchain service and always a header present in the
 	// index — the download scheduler cannot place a tip it cannot look up.
@@ -371,6 +375,24 @@ func (m *PeerManager) addrManager() *AddrMan {
 	defer m.mu.Unlock()
 
 	return m.addrMan
+}
+
+// SetTxIndex gives the manager the transaction index compact-block
+// reconstruction reads from. It must be called before Start; a nil TxIndex
+// leaves compact blocks off regardless of legacy_compactBlocks.
+func (m *PeerManager) SetTxIndex(idx TxIndex) {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	m.txIdx = idx
+}
+
+// txIndex reads the transaction index under syncMu, mirroring txIngestor.
+func (m *PeerManager) txIndex() TxIndex {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	return m.txIdx
 }
 
 // ConfigureSync gives the manager the shared header index and, when an

@@ -12,6 +12,11 @@ import (
 	"github.com/ordishs/gocore"
 )
 
+// defaultCompactBlocksRecentTxs is the fallback capacity for
+// legacy_compactBlocksRecentTxs, applied both when the key is unset and when
+// it is set to a non-positive value.
+const defaultCompactBlocksRecentTxs = 5000000
+
 func NewSettings(alternativeContext ...string) *Settings {
 	settingsContext := gocore.Config().GetContext()
 	if len(alternativeContext) > 0 {
@@ -731,6 +736,15 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// only the old key keeps the behaviour, with a deprecation warning.
 			DisableDNSSeed: getBoolWithFallback("legacy_disableDNSSeed", "legacy_config_DisableDNSSeed", false, alternativeContext...),
 			DisableBanning: getBoolWithFallback("legacy_disableBanning", "legacy_config_DisableBanning", false, alternativeContext...),
+			CompactBlocks:  getBool("legacy_compactBlocks", false, alternativeContext...),
+			CompactBlocksRecentTxs: func() int {
+				n := getInt("legacy_compactBlocksRecentTxs", defaultCompactBlocksRecentTxs, alternativeContext...)
+				if n <= 0 {
+					return defaultCompactBlocksRecentTxs
+				}
+
+				return n
+			}(),
 		},
 		Propagation: PropagationSettings{
 			IPv6Addresses:         getString("ipv6_addresses", "", alternativeContext...),
