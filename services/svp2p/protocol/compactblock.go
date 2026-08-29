@@ -77,6 +77,7 @@ type compactState struct {
 	missing   []uint32
 	requested bool
 	status    readStatus
+	gaps      io.Reader
 }
 
 // newCompactState is PartiallyDownloadedBlock::InitData
@@ -86,17 +87,21 @@ type compactState struct {
 //
 // idx may be nil, which leaves every short ID slot missing and degrades the
 // exchange to one getblocktxn carrying the whole block.
-func newCompactState(m *wire.MsgCmpctBlock, idx TxIndex) (*compactState, readStatus) {
+//
+// The error is non-nil only when the TxIndex answers something the message
+// cannot be reconciled with; the peer is blameless there, so the status is
+// readFailed.
+func newCompactState(m *wire.MsgCmpctBlock, idx TxIndex) (*compactState, readStatus, error) {
 	// blockencodings.cpp:88-91 cmpctblock.header.IsNull(): CBlockHeader::IsNull
 	// is nBits == 0 (primitives/block.h:60).
 	if m.Header.Bits == 0 {
-		return nil, readInvalid
+		return nil, readInvalid, nil
 	}
 
 	// blockencodings.cpp:88-91: a compact block that describes no transaction
 	// at all describes no block.
 	if len(m.ShortIDs) == 0 && len(m.PrefilledTxn) == 0 {
-		return nil, readInvalid
+		return nil, readInvalid, nil
 	}
 
 	// blockencodings.cpp:92-95, before txns_available is resized at :105. Both
@@ -104,7 +109,7 @@ func newCompactState(m *wire.MsgCmpctBlock, idx TxIndex) (*compactState, readSta
 	// before anything is allocated from it.
 	total := uint64(len(m.ShortIDs)) + uint64(len(m.PrefilledTxn))
 	if total > maxCompactBlockTxs() {
-		return nil, readInvalid
+		return nil, readInvalid, nil
 	}
 
 	c := &compactState{
@@ -116,18 +121,21 @@ func newCompactState(m *wire.MsgCmpctBlock, idx TxIndex) (*compactState, readSta
 	c.k0, c.k1 = ShortIDKeys(&m.Header, m.Nonce)
 
 	if status := c.placePrefilled(m); status != readOK {
-		return nil, status
+		return nil, status, nil
 	}
 
 	slotOf, status := c.placeShortIDs(m)
 	if status != readOK {
-		return nil, status
+		return nil, status, nil
 	}
 
-	c.matchIndex(m, idx, slotOf)
+	if err := c.matchIndex(m, idx, slotOf); err != nil {
+		return nil, readFailed, err
+	}
+
 	c.collectMissing()
 
-	return c, readOK
+	return c, readOK, nil
 }
 
 // placePrefilled is InitData's prefilled loop (blockencodings.cpp:107-127).
@@ -217,14 +225,21 @@ func (c *compactState) placeShortIDs(m *wire.MsgCmpctBlock) ([]uint32, readStatu
 // ID at once. A slot the index reports as a collision is left empty and joins
 // the gaps, which is what SVNode does at :181-190 when two transactions match
 // one short ID — it is not a reconstruction failure.
-func (c *compactState) matchIndex(m *wire.MsgCmpctBlock, idx TxIndex, slotOf []uint32) {
+//
+// An answer slice of the wrong length cannot be placed: slot i of the answers
+// belongs to slot slotOf[i] of the block, so a short slice would silently move
+// every later hash onto the wrong transaction. That is a fault in the index,
+// never in the peer, so it ends the block with an error and no score.
+func (c *compactState) matchIndex(m *wire.MsgCmpctBlock, idx TxIndex, slotOf []uint32) error {
 	if idx == nil {
-		return
+		return nil
 	}
 
 	hashes, _ := idx.Match(c.k0, c.k1, m.ShortIDs)
 	if len(hashes) != len(slotOf) {
-		return
+		return errors.New(errors.ERR_PROCESSING,
+			"svp2p: block %s index answered %d short ids of %d", c.hash, len(hashes), len(slotOf),
+			ErrCompactFillFailed)
 	}
 
 	for i, h := range hashes {
@@ -234,6 +249,8 @@ func (c *compactState) matchIndex(m *wire.MsgCmpctBlock, idx TxIndex, slotOf []u
 
 		c.txs[slotOf[i]].held = h
 	}
+
+	return nil
 }
 
 // collectMissing lists, in block order, the slots neither the message nor the
@@ -251,6 +268,12 @@ func (c *compactState) collectMissing() {
 // the block can be assembled immediately (net_processing.cpp:3931-3945). The
 // indexes are strictly increasing by construction, which is what the
 // differential wire encoding requires (blockencodings.h:36-82).
+//
+// The message carries a copy of the missing list. fill checks the blocktxn
+// count against that list, so a caller that sorts, truncates or appends to
+// Indexes must not be able to move the number fill compares against. Calling
+// it twice describes the same gaps; whether a second getblocktxn may go on
+// the wire is the manager's rule, not this state machine's.
 func (c *compactState) gapRequest() *wire.MsgGetBlockTxn {
 	if len(c.missing) == 0 {
 		return nil
@@ -258,7 +281,10 @@ func (c *compactState) gapRequest() *wire.MsgGetBlockTxn {
 
 	c.requested = true
 
-	return &wire.MsgGetBlockTxn{BlockHash: c.hash, Indexes: c.missing}
+	indexes := make([]uint32, len(c.missing))
+	copy(indexes, c.missing)
+
+	return &wire.MsgGetBlockTxn{BlockHash: c.hash, Indexes: indexes}
 }
 
 // fill is FillBlock's arity check (blockencodings.cpp:264-285): a blocktxn
@@ -266,9 +292,11 @@ func (c *compactState) gapRequest() *wire.MsgGetBlockTxn {
 // one that carries more fails at :283-285. Both are READ_STATUS_INVALID.
 //
 // It reads nothing. A blocktxn payload can approach the size of the block, so
-// the transactions stay on the socket and are pulled by assemble, which checks
-// each one's short ID against its own slot as it goes.
-func (c *compactState) fill(count uint64, _ io.Reader) (readStatus, error) {
+// the transactions stay on the socket. fill latches the stream instead, and
+// assemble pulls the transactions from that same latched reader, checking each
+// one's short ID against its own slot as it goes. Latching is what keeps the
+// arity check honest: the stream fill counted is the stream assemble consumes.
+func (c *compactState) fill(count uint64, txs io.Reader) (readStatus, error) {
 	if count != uint64(len(c.missing)) {
 		c.status = readInvalid
 
@@ -277,12 +305,15 @@ func (c *compactState) fill(count uint64, _ io.Reader) (readStatus, error) {
 			ErrCompactBlockInvalid)
 	}
 
+	c.gaps = txs
+
 	return readOK, nil
 }
 
 // fillStatus reports the sticky outcome of the streaming half of FillBlock.
-// It is readFailed once assemble has hit a slot it cannot supply, which the
-// stream also reports to its reader as ErrCompactFillFailed.
+// It is readFailed once assemble has hit a slot nobody can supply and
+// readInvalid once the blocktxn payload itself proved short, which the stream
+// also reports to its reader as ErrCompactFillFailed or ErrCompactBlockInvalid.
 func (c *compactState) fillStatus() readStatus { return c.status }
 
 // assemble returns the transaction count and a reader over the whole block
@@ -292,14 +323,14 @@ func (c *compactState) fillStatus() readStatus { return c.status }
 //
 // Nothing is materialized. Prefilled transactions come from the message, held
 // ones are opened lazily one at a time through TxIndex.Open, and the gaps are
-// pulled from the blocktxn stream as the consumer reads.
-func (c *compactState) assemble(ctx context.Context, idx TxIndex, gaps io.Reader) (uint64, io.ReadCloser) {
+// pulled from the blocktxn stream fill latched as the consumer reads.
+func (c *compactState) assemble(ctx context.Context, idx TxIndex) (uint64, io.ReadCloser) {
 	var head bytes.Buffer
 
 	_ = c.header.Serialize(&head)
 	_ = wire.WriteVarInt(&head, wire.ProtocolVersion, uint64(len(c.txs)))
 
-	a := c.newAssembler(ctx, idx, gaps)
+	a := c.newAssembler(ctx, idx)
 	a.head = &head
 
 	return uint64(len(c.txs)), a
@@ -308,12 +339,12 @@ func (c *compactState) assemble(ctx context.Context, idx TxIndex, gaps io.Reader
 // assembleTxs is assemble without the header and the count, the shape
 // BlockIngestRequest.TxReader takes: the transactions alone, in block order
 // (spec §6 step 7).
-func (c *compactState) assembleTxs(ctx context.Context, idx TxIndex, gaps io.Reader) (uint64, io.ReadCloser) {
-	return uint64(len(c.txs)), c.newAssembler(ctx, idx, gaps)
+func (c *compactState) assembleTxs(ctx context.Context, idx TxIndex) (uint64, io.ReadCloser) {
+	return uint64(len(c.txs)), c.newAssembler(ctx, idx)
 }
 
-func (c *compactState) newAssembler(ctx context.Context, idx TxIndex, gaps io.Reader) *compactAssembler {
-	return &compactAssembler{ctx: ctx, state: c, idx: idx, gaps: gaps}
+func (c *compactState) newAssembler(ctx context.Context, idx TxIndex) *compactAssembler {
+	return &compactAssembler{ctx: ctx, state: c, idx: idx}
 }
 
 // compactAssembler is FillBlock's loop (blockencodings.cpp:271-281) turned
@@ -323,13 +354,16 @@ type compactAssembler struct {
 	ctx   context.Context
 	state *compactState
 	idx   TxIndex
-	gaps  io.Reader
 
 	head io.Reader
 	cur  io.Reader
 	open io.Closer
 	next int
 	err  error
+
+	sized bool
+	want  uint64
+	got   uint64
 }
 
 func (a *compactAssembler) Read(p []byte) (int, error) {
@@ -369,10 +403,10 @@ func (a *compactAssembler) Read(p []byte) (int, error) {
 		}
 
 		n, err := a.cur.Read(p)
-		if errors.Is(err, io.EOF) {
-			a.release()
+		a.got += uint64(n) //nolint:gosec // n is never negative
 
-			err = nil
+		if errors.Is(err, io.EOF) {
+			err = a.endSlot()
 		}
 
 		if err != nil {
@@ -407,6 +441,27 @@ func (a *compactAssembler) release() {
 	}
 
 	a.cur = nil
+	a.sized = false
+	a.want = 0
+	a.got = 0
+}
+
+// endSlot closes the slot the consumer just drained. A held transaction ends
+// when TxIndex.Open's declared size is reached, and io.LimitReader reports the
+// same clean io.EOF whether the store supplied that many bytes or stopped
+// early, so the count is compared here. A store that under-supplies is the
+// same fault class as ErrTxUnknown at openHeld: nobody's fault, no score.
+func (a *compactAssembler) endSlot() error {
+	sized, want, got, slot := a.sized, a.want, a.got, a.next-1
+
+	a.release()
+
+	if sized && got != want {
+		return a.fail("svp2p: block %s slot %d received %d bytes of the %d the index declared",
+			a.state.hash, slot, got, want)
+	}
+
+	return nil
 }
 
 // advance opens the next slot's source. blockencodings.cpp:271-281 walks
@@ -450,29 +505,34 @@ func (a *compactAssembler) openHeld(hash chainhash.Hash) error {
 
 	a.open = rc
 	a.cur = io.LimitReader(rc, int64(size)) //nolint:gosec // size is the store's own byte count
+	a.sized = true
+	a.want = size
+	a.got = 0
 
 	return nil
 }
 
 // readGap takes the next transaction off the blocktxn stream and checks it
-// against the slot that asked for it. SVNode catches a wrong transaction here
-// only downstream, when CheckBlock's merkle root fails and CorruptionPossible
-// turns into READ_STATUS_FAILED (blockencodings.cpp:288-298); checking the
-// short ID directly reaches the same verdict a round earlier and without
-// hashing the whole block.
+// against the slot that asked for it. A payload that cannot yield the declared
+// transaction is READ_STATUS_INVALID, the same verdict fill gives the count
+// mismatch. Only a wrong but decodable transaction is READ_STATUS_FAILED:
+// SVNode catches that one downstream, when CheckBlock's merkle root fails and
+// CorruptionPossible turns into READ_STATUS_FAILED (blockencodings.cpp:288-298);
+// checking the short ID directly reaches the same verdict a round earlier and
+// without hashing the whole block.
 //
 // Exactly one transaction is buffered, which is what decoding one costs
 // anyway. The rest of the stream stays on the socket.
 func (a *compactAssembler) readGap(shortID uint64) error {
-	if a.gaps == nil {
+	if a.state.gaps == nil {
 		return a.fail("svp2p: block %s needs a gap transaction with no blocktxn stream", a.state.hash)
 	}
 
 	var buf bytes.Buffer
 
 	tx := &wire.MsgTx{}
-	if err := tx.Bsvdecode(io.TeeReader(a.gaps, &buf), wire.ProtocolVersion, wire.BaseEncoding); err != nil {
-		return a.fail("svp2p: block %s cannot decode a gap transaction: %v", a.state.hash, err)
+	if err := tx.Bsvdecode(io.TeeReader(a.state.gaps, &buf), wire.ProtocolVersion, wire.BaseEncoding); err != nil {
+		return a.invalid("svp2p: block %s cannot decode a gap transaction: %v", a.state.hash, err)
 	}
 
 	raw := buf.Bytes()
@@ -491,4 +551,15 @@ func (a *compactAssembler) fail(format string, args ...any) error {
 	a.state.status = readFailed
 
 	return errors.New(errors.ERR_PROCESSING, format, append(args, ErrCompactFillFailed)...)
+}
+
+// invalid is the streaming half of FillBlock's arity check
+// (blockencodings.cpp:268-270, :283-285). A blocktxn message is length framed,
+// so a payload that declares the requested count and then runs out of
+// transactions is a fault only the sender can produce, exactly like the count
+// mismatch fill rejects before any byte is read.
+func (a *compactAssembler) invalid(format string, args ...any) error {
+	a.state.status = readInvalid
+
+	return errors.New(errors.ERR_NETWORK_PEER_MALICIOUS, format, append(args, ErrCompactBlockInvalid)...)
 }

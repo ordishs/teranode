@@ -113,17 +113,25 @@ func compactMsgFor(t *testing.T, blk *wire.MsgBlock, prefilled ...int) *wire.Msg
 type compactTestIndex struct {
 	raw       map[chainhash.Hash][]byte
 	openFails map[chainhash.Hash]bool
+	// shortBy makes Open report the transaction's true size but hand back a
+	// reader holding that many fewer bytes, which is the store that ends its
+	// stream early.
+	shortBy map[chainhash.Hash]int
 	// collideAt marks positions in the block's short ID list that the index
 	// reports as a collision: a nil hash plus collision=true, which is what
 	// RecentTxIndex.Match does for a short ID two indexed hashes share
 	// (blockencodings.cpp:181-190).
 	collideAt map[int]bool
+	// truncateMatch makes Match return one answer fewer than it was asked
+	// about, which is the misbehaving TxIndex implementation.
+	truncateMatch bool
 }
 
 func newCompactTestIndex() *compactTestIndex {
 	return &compactTestIndex{
 		raw:       make(map[chainhash.Hash][]byte),
 		openFails: make(map[chainhash.Hash]bool),
+		shortBy:   make(map[chainhash.Hash]int),
 		collideAt: make(map[int]bool),
 	}
 }
@@ -157,6 +165,10 @@ func (f *compactTestIndex) Match(k0, k1 uint64, shortIDs []uint64) ([]*chainhash
 		}
 	}
 
+	if f.truncateMatch && len(out) > 0 {
+		out = out[:len(out)-1]
+	}
+
 	return out, collision
 }
 
@@ -168,6 +180,10 @@ func (f *compactTestIndex) Open(_ context.Context, hash chainhash.Hash) (io.Read
 	raw, ok := f.raw[hash]
 	if !ok {
 		return nil, 0, ErrTxUnknown
+	}
+
+	if n := f.shortBy[hash]; n > 0 {
+		return io.NopCloser(bytes.NewReader(raw[:len(raw)-n])), uint64(len(raw)), nil
 	}
 
 	return io.NopCloser(bytes.NewReader(raw)), uint64(len(raw)), nil
@@ -212,13 +228,14 @@ func TestCompactState_AllHeld_AssemblesWithoutGapRequest(t *testing.T) {
 		idx.hold(t, blk.Transactions[i])
 	}
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 	require.NotNil(t, c)
 	require.Empty(t, c.missing)
 	require.Nil(t, c.gapRequest())
 
-	count, rc := c.assemble(context.Background(), idx, nil)
+	count, rc := c.assemble(context.Background(), idx)
 	require.Equal(t, uint64(compactFixtureTxCount), count)
 
 	got, err := drain(t, rc)
@@ -248,7 +265,8 @@ func TestCompactState_HalfHeld_GapRequestIndexes(t *testing.T) {
 		want = append(want, uint32(i)) //nolint:gosec // fixture indexes are small
 	}
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
 	req := c.gapRequest()
@@ -281,7 +299,8 @@ func TestCompactState_FillAndAssemble(t *testing.T) {
 		}
 	}
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
 	req := c.gapRequest()
@@ -294,7 +313,7 @@ func TestCompactState_FillAndAssemble(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, readOK, fillStatus)
 
-	count, rc := c.assemble(context.Background(), idx, gaps)
+	count, rc := c.assemble(context.Background(), idx)
 	require.Equal(t, uint64(compactFixtureTxCount), count)
 
 	got, drainErr := drain(t, rc)
@@ -315,10 +334,11 @@ func TestCompactState_AssembleTxs_OmitsHeaderAndCount(t *testing.T) {
 		idx.hold(t, blk.Transactions[i])
 	}
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
-	count, rc := c.assembleTxs(context.Background(), idx, nil)
+	count, rc := c.assembleTxs(context.Background(), idx)
 	require.Equal(t, uint64(compactFixtureTxCount), count)
 
 	got, err := drain(t, rc)
@@ -341,7 +361,8 @@ func TestCompactState_Fill_WrongCount(t *testing.T) {
 		idx.hold(t, blk.Transactions[i])
 	}
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
 	req := c.gapRequest()
@@ -370,7 +391,8 @@ func TestCompactState_Fill_ShortIDMismatch(t *testing.T) {
 		}
 	}
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
 	req := c.gapRequest()
@@ -389,7 +411,7 @@ func TestCompactState_Fill_ShortIDMismatch(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, readOK, fillStatus)
 
-	_, rc := c.assemble(context.Background(), idx, &buf)
+	_, rc := c.assemble(context.Background(), idx)
 
 	_, drainErr := drain(t, rc)
 	require.Error(t, drainErr)
@@ -407,7 +429,8 @@ func TestCompactState_DuplicateShortIDs(t *testing.T) {
 
 	msg.ShortIDs[7] = msg.ShortIDs[3]
 
-	c, status := newCompactState(msg, newCompactTestIndex())
+	c, status, err := newCompactState(msg, newCompactTestIndex())
+	require.NoError(t, err)
 	require.Equal(t, readInvalid, status)
 	require.Nil(t, c)
 }
@@ -421,7 +444,8 @@ func TestCompactState_PrefilledIndexOutOfRange(t *testing.T) {
 
 	msg.PrefilledTxn[0].Index = uint32(len(msg.ShortIDs) + 1)
 
-	c, status := newCompactState(msg, newCompactTestIndex())
+	c, status, err := newCompactState(msg, newCompactTestIndex())
+	require.NoError(t, err)
 	require.Equal(t, readInvalid, status)
 	require.Nil(t, c)
 }
@@ -441,20 +465,21 @@ func TestCompactState_IndexCollision_IsMissingNotFailed(t *testing.T) {
 
 	idx.collideAt[11] = true
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
 	req := c.gapRequest()
 	require.NotNil(t, req)
 	require.Equal(t, []uint32{12}, req.Indexes)
 
-	fillStatus, err := c.fill(1, nil)
-	require.NoError(t, err)
-	require.Equal(t, readOK, fillStatus)
-
 	gaps := gapStream(t, blk, req.Indexes)
 
-	_, rc := c.assemble(context.Background(), idx, gaps)
+	fillStatus, fillErr := c.fill(1, gaps)
+	require.NoError(t, fillErr)
+	require.Equal(t, readOK, fillStatus)
+
+	_, rc := c.assemble(context.Background(), idx)
 
 	got, drainErr := drain(t, rc)
 	require.NoError(t, drainErr)
@@ -475,11 +500,12 @@ func TestCompactState_HeldTxGoneAtAssembly(t *testing.T) {
 
 	idx.openFails[blk.Transactions[20].TxHash()] = true
 
-	c, status := newCompactState(msg, idx)
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 	require.Nil(t, c.gapRequest())
 
-	_, rc := c.assemble(context.Background(), idx, nil)
+	_, rc := c.assemble(context.Background(), idx)
 
 	_, drainErr := drain(t, rc)
 	require.Error(t, drainErr)
@@ -514,7 +540,8 @@ func TestCompactState_InvalidMessages(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c, status := newCompactState(tc.msg, newCompactTestIndex())
+			c, status, err := newCompactState(tc.msg, newCompactTestIndex())
+			require.NoError(t, err)
 			require.Equal(t, readInvalid, status)
 			require.Nil(t, c)
 		})
@@ -537,7 +564,14 @@ func TestCompactState_TooManyTransactions(t *testing.T) {
 	msg := compactMsgFor(t, blk, 0)
 	msg.ShortIDs = make([]uint64, maxCompactBlockTxs()+1)
 
-	c, status := newCompactState(msg, newCompactTestIndex())
+	// Distinct short IDs, so the duplicate check at placeShortIDs cannot
+	// reject the message and only the count bound can.
+	for i := range msg.ShortIDs {
+		msg.ShortIDs[i] = uint64(i) + 1 //nolint:gosec // fixture indexes are small
+	}
+
+	c, status, err := newCompactState(msg, newCompactTestIndex())
+	require.NoError(t, err)
 	require.Equal(t, readInvalid, status)
 	require.Nil(t, c)
 }
@@ -549,7 +583,8 @@ func TestCompactState_NoIndex_RequestsEverything(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
 
-	c, status := newCompactState(msg, nil)
+	c, status, err := newCompactState(msg, nil)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
 	req := c.gapRequest()
@@ -562,7 +597,7 @@ func TestCompactState_NoIndex_RequestsEverything(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, readOK, fillStatus)
 
-	_, rc := c.assemble(context.Background(), nil, gaps)
+	_, rc := c.assemble(context.Background(), nil)
 
 	got, drainErr := drain(t, rc)
 	require.NoError(t, drainErr)
@@ -571,12 +606,16 @@ func TestCompactState_NoIndex_RequestsEverything(t *testing.T) {
 
 // TestCompactState_GapStreamTruncated guards the attacker-controlled tail: a
 // blocktxn that declares the requested count but ends early must stop the
-// assembly with an error, never a short block.
+// assembly with an error, never a short block. A blocktxn is length framed, so
+// only the sender can produce a payload that declares a count it does not
+// carry — the same fault class as fill's arity mismatch, and therefore
+// readInvalid rather than readFailed.
 func TestCompactState_GapStreamTruncated(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
 
-	c, status := newCompactState(msg, nil)
+	c, status, err := newCompactState(msg, nil)
+	require.NoError(t, err)
 	require.Equal(t, readOK, status)
 
 	req := c.gapRequest()
@@ -591,12 +630,13 @@ func TestCompactState_GapStreamTruncated(t *testing.T) {
 	require.NoError(t, fillErr)
 	require.Equal(t, readOK, fillStatus)
 
-	_, rc := c.assemble(context.Background(), nil, gaps)
+	_, rc := c.assemble(context.Background(), nil)
 
 	_, drainErr := drain(t, rc)
 	require.Error(t, drainErr)
-	require.ErrorIs(t, drainErr, ErrCompactFillFailed)
-	require.Equal(t, readFailed, c.fillStatus())
+	require.ErrorIs(t, drainErr, ErrCompactBlockInvalid)
+	require.NotErrorIs(t, drainErr, ErrCompactFillFailed)
+	require.Equal(t, readInvalid, c.fillStatus())
 }
 
 // TestCompactState_PrefilledIndexesNotIncreasing is the monotonicity
@@ -609,7 +649,147 @@ func TestCompactState_PrefilledIndexesNotIncreasing(t *testing.T) {
 
 	msg.PrefilledTxn[1].Index = msg.PrefilledTxn[0].Index
 
-	c, status := newCompactState(msg, newCompactTestIndex())
+	c, status, err := newCompactState(msg, newCompactTestIndex())
+	require.NoError(t, err)
 	require.Equal(t, readInvalid, status)
 	require.Nil(t, c)
+}
+
+// TestCompactState_HeldTxUnderSupplied is the store that promises size bytes
+// and delivers fewer. io.LimitReader reports a clean EOF for that, so the slot
+// must compare what arrived against what Open declared; otherwise the consumer
+// gets a silently short block with readOK.
+func TestCompactState_HeldTxUnderSupplied(t *testing.T) {
+	blk := compactFixtureBlock(t, compactFixtureTxCount)
+	msg := compactMsgFor(t, blk, 0)
+
+	idx := newCompactTestIndex()
+	for i := 1; i < len(blk.Transactions); i++ {
+		idx.hold(t, blk.Transactions[i])
+	}
+
+	idx.shortBy[blk.Transactions[20].TxHash()] = 3
+
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
+	require.Equal(t, readOK, status)
+	require.Nil(t, c.gapRequest())
+
+	_, rc := c.assemble(context.Background(), idx)
+
+	got, drainErr := drain(t, rc)
+	require.Error(t, drainErr)
+	require.ErrorIs(t, drainErr, ErrCompactFillFailed)
+	require.Equal(t, readFailed, c.fillStatus())
+	require.NotEqual(t, encodeBlock(t, blk), got)
+}
+
+// TestCompactState_GapRequest_CopiesAndRepeats pins two properties of the
+// getblocktxn: the caller gets its own slice, so sorting or truncating
+// Indexes cannot corrupt the slot bookkeeping fill checks against, and a
+// second call describes the same gaps rather than a mutated set.
+func TestCompactState_GapRequest_CopiesAndRepeats(t *testing.T) {
+	blk := compactFixtureBlock(t, compactFixtureTxCount)
+	msg := compactMsgFor(t, blk, 0)
+
+	idx := newCompactTestIndex()
+	for i := 2; i < len(blk.Transactions); i++ {
+		idx.hold(t, blk.Transactions[i])
+	}
+
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
+	require.Equal(t, readOK, status)
+
+	first := c.gapRequest()
+	require.NotNil(t, first)
+
+	want := append([]uint32(nil), first.Indexes...)
+	require.NotEmpty(t, want)
+
+	first.Indexes[0] = 0xffffffff
+	first.Indexes = first.Indexes[:0]
+
+	second := c.gapRequest()
+	require.NotNil(t, second)
+	require.Equal(t, want, second.Indexes)
+	require.Equal(t, want, c.missing)
+	require.True(t, c.requested)
+}
+
+// TestCompactState_IndexMatchWrongLength is the programming fault a TxIndex
+// can make: an answer slice that does not line up with the short IDs it was
+// asked about. Placing those answers would attribute a hash to the wrong slot,
+// so InitData must refuse the block and say why rather than degrade it to a
+// full getblocktxn in silence. The index is ours, not the peer's, so the
+// verdict is readFailed and the peer is not scored.
+func TestCompactState_IndexMatchWrongLength(t *testing.T) {
+	blk := compactFixtureBlock(t, compactFixtureTxCount)
+	msg := compactMsgFor(t, blk, 0)
+
+	idx := newCompactTestIndex()
+	for i := 1; i < len(blk.Transactions); i++ {
+		idx.hold(t, blk.Transactions[i])
+	}
+
+	idx.truncateMatch = true
+
+	c, status, err := newCompactState(msg, idx)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCompactFillFailed)
+	require.Equal(t, readFailed, status)
+	require.Nil(t, c)
+}
+
+// TestCompactState_Fill_LatchesStream proves fill owns the blocktxn stream:
+// the reader it checked the arity against is the one assemble consumes, so a
+// caller cannot check one stream and then assemble from another.
+func TestCompactState_Fill_LatchesStream(t *testing.T) {
+	blk := compactFixtureBlock(t, compactFixtureTxCount)
+	msg := compactMsgFor(t, blk, 0)
+
+	idx := newCompactTestIndex()
+	for i := 1; i < len(blk.Transactions); i++ {
+		if i%2 == 0 {
+			idx.hold(t, blk.Transactions[i])
+		}
+	}
+
+	c, status, err := newCompactState(msg, idx)
+	require.NoError(t, err)
+	require.Equal(t, readOK, status)
+
+	req := c.gapRequest()
+	require.NotNil(t, req)
+
+	fillStatus, fillErr := c.fill(uint64(len(req.Indexes)), gapStream(t, blk, req.Indexes))
+	require.NoError(t, fillErr)
+	require.Equal(t, readOK, fillStatus)
+
+	_, rc := c.assemble(context.Background(), idx)
+
+	got, drainErr := drain(t, rc)
+	require.NoError(t, drainErr)
+	require.Equal(t, encodeBlock(t, blk), got)
+	require.Equal(t, readOK, c.fillStatus())
+}
+
+// TestCompactState_AssembleWithoutFill is the caller that skips fill on a
+// block that has gaps. Nothing can supply those slots, so the stream must stop
+// with a failure rather than emit a short or wrong block.
+func TestCompactState_AssembleWithoutFill(t *testing.T) {
+	blk := compactFixtureBlock(t, compactFixtureTxCount)
+	msg := compactMsgFor(t, blk, 0)
+
+	c, status, err := newCompactState(msg, nil)
+	require.NoError(t, err)
+	require.Equal(t, readOK, status)
+	require.NotNil(t, c.gapRequest())
+
+	_, rc := c.assemble(context.Background(), nil)
+
+	_, drainErr := drain(t, rc)
+	require.Error(t, drainErr)
+	require.ErrorIs(t, drainErr, ErrCompactFillFailed)
+	require.Equal(t, readFailed, c.fillStatus())
 }
