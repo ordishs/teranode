@@ -295,6 +295,20 @@ type compactDispatcher interface {
 	// (net_processing.cpp ProcessSendCompactMessage:2417-2437). It cannot end
 	// the connection: SVNode scores nothing here, whatever the version.
 	SendCmpct(sp *SyncPeer, msg *wire.MsgSendcmpct)
+
+	// CompactBlock dispatches NetMsgType::CMPCTBLOCK
+	// (net_processing.cpp ProcessCompactBlockMessage:3693-3979). Unlike
+	// SendCmpct it CAN end the connection: an invalid compact block is scored
+	// 100 and the error returned here is what drops the peer. A non-nil
+	// CompactReady is a finished block the caller must ingest.
+	CompactBlock(ctx context.Context, sp *SyncPeer, msg *wire.MsgCmpctBlock) ([]wire.Message, *CompactReady, int, error)
+
+	// BlockTxn dispatches NetMsgType::BLOCKTXN
+	// (net_processing.cpp ProcessBlockTxnMessage:3576-3688). It TAKES
+	// OWNERSHIP of the stream: every path either closes it or hands it on
+	// inside the returned CompactReady, so the caller must never close it
+	// itself.
+	BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.TxnStream) ([]wire.Message, *CompactReady, int, error)
 }
 
 type PeerConfig struct {
@@ -616,7 +630,7 @@ func (p *Peer) Run(ctx context.Context) error {
 
 			resetIdle()
 
-			if err := p.handleMessage(msg); err != nil {
+			if err := p.handleMessage(ctx, msg); err != nil {
 				return p.disconnect(err)
 			}
 
@@ -630,6 +644,20 @@ func (p *Peer) Run(ctx context.Context) error {
 			resetIdle()
 
 			if err := p.startIngest(ctx, stream); err != nil {
+				return p.disconnect(err)
+			}
+
+		case stream, open := <-p.cfg.Conn.InboundTxns():
+			if !open {
+				return p.disconnect(p.cfg.Conn.Err())
+			}
+
+			// A blocktxn is the peer answering our getblocktxn, and it carries
+			// block bytes exactly as InboundBlocks does, so it is the same
+			// evidence of a live peer.
+			resetIdle()
+
+			if err := p.handleBlockTxn(ctx, stream); err != nil {
 				return p.disconnect(err)
 			}
 
@@ -688,7 +716,7 @@ func (p *Peer) Run(ctx context.Context) error {
 	}
 }
 
-func (p *Peer) handleMessage(msg wire.Message) error {
+func (p *Peer) handleMessage(ctx context.Context, msg wire.Message) error {
 	p.mu.Lock()
 	p.lastRecv = time.Now()
 	replies, err := p.hs.OnMessage(msg)
@@ -757,7 +785,9 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 	// sendcmpct and getblocktxn are handled here rather than falling through
 	// to it; neither can end the connection (see dispatchCompact's own doc
 	// comment).
-	p.dispatchCompact(msg, est)
+	if err := p.dispatchCompact(ctx, msg, est); err != nil {
+		return err
+	}
 
 	// The unsupported-message policy runs LAST, so a message that reaches
 	// either of the two branches above is handled there rather than judged
@@ -766,29 +796,36 @@ func (p *Peer) handleMessage(msg wire.Message) error {
 	return p.dispatchUnsupported(msg, est)
 }
 
-// dispatchCompact routes the two compact-block negotiation commands Task 6
-// adds: sendcmpct records this peer's flags, and getblocktxn is refused with
-// nothing, matching spec §2's non-goal ("we never announce compact blocks, so
-// no peer asks us; an inbound getblocktxn is answered with nothing, like
-// today's unsupported-message policy for reject/notfound").
-// cmpctblock/blocktxn are Task 8's receive path, not dispatched here.
+// dispatchCompact routes the compact-block commands that arrive as ordinary
+// messages: sendcmpct records this peer's flags (Task 6), cmpctblock drives
+// the receive path, and getblocktxn is refused with nothing, matching spec
+// §2's non-goal ("we never announce compact blocks, so no peer asks us; an
+// inbound getblocktxn is answered with nothing, like today's
+// unsupported-message policy for reject/notfound").
 //
-// Kept separate from dispatchUnsupported: unlike that policy's two branches,
-// neither of these ever disconnects, and sendcmpct must be recorded even on a
-// connection where cfg.Sync is nil (compactDispatcher's own doc comment).
-func (p *Peer) dispatchCompact(msg wire.Message, established bool) {
+// blocktxn is NOT here. It arrives as a live stream on Conn.InboundTxns()
+// rather than as a decoded message, so the Run loop selects on it directly and
+// hands it to handleBlockTxn, the same shape a block takes.
+//
+// Kept separate from dispatchUnsupported: sendcmpct must be recorded even on a
+// connection where cfg.Sync is nil (compactDispatcher's own doc comment). It
+// CAN now end the connection — an invalid compact block is one of the ways a
+// peer is dropped, listed on Run — which is why it returns an error where Task
+// 6's version returned nothing.
+func (p *Peer) dispatchCompact(ctx context.Context, msg wire.Message, established bool) error {
 	// net_processing.cpp ProcessMessage drops everything that arrives before
 	// the handshake completes; the handshake already scores those messages
 	// (the existing "missing-version" rule, unchanged by this task).
-	if !established {
-		return
+	if !established || p.cfg.Compact == nil {
+		return nil
 	}
 
 	switch m := msg.(type) {
 	case *wire.MsgSendcmpct:
-		if p.cfg.Compact != nil {
-			p.cfg.Compact.SendCmpct(p.cfg.SyncPeer, m)
-		}
+		p.cfg.Compact.SendCmpct(p.cfg.SyncPeer, m)
+
+	case *wire.MsgCmpctBlock:
+		return p.handleCompactBlock(ctx, m)
 
 	case *wire.MsgGetBlockTxn:
 		// spec §2: we never announce compact blocks, so a peer should never
@@ -797,6 +834,107 @@ func (p *Peer) dispatchCompact(msg wire.Message, established bool) {
 		p.cfg.Logger.Debugf("[svp2p] ignoring getblocktxn from %s: compact blocks are receive-only",
 			p.cfg.Conn.RemoteAddr())
 	}
+
+	return nil
+}
+
+// handleCompactBlock runs one cmpctblock through the dispatcher and acts on
+// its four-part verdict. The score is applied BEFORE the error, the order
+// every other scoring dispatch in this file uses and the order SVNode's own
+// Misbehaving-then-return does (see dispatchAddr's note): a disconnect that
+// skipped the score would lose the evidence the ban threshold counts.
+func (p *Peer) handleCompactBlock(ctx context.Context, msg *wire.MsgCmpctBlock) error {
+	out, ready, delta, err := p.cfg.Compact.CompactBlock(ctx, p.cfg.SyncPeer, msg)
+
+	p.send(out)
+
+	if scoreErr := p.scoreMisbehavior(delta); scoreErr != nil && err == nil {
+		return scoreErr
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return p.startCompactIngest(ctx, ready)
+}
+
+// handleBlockTxn runs one inbound blocktxn stream through the dispatcher. The
+// dispatcher owns the stream from the moment it is called, so there is no
+// close on any path here: see compactDispatcher.BlockTxn.
+//
+// Without a dispatcher there is nothing that could have asked for this reply,
+// so the stream is released and the peer is left alone — the receive-side
+// equivalent of dispatchCompact's own nil check, and deliberately not a
+// disconnect: an unsolicited blocktxn is not scored (net_processing.cpp
+// :3602-3606).
+func (p *Peer) handleBlockTxn(ctx context.Context, stream *transport.TxnStream) error {
+	if p.cfg.Compact == nil {
+		if err := stream.Close(); err != nil {
+			p.cfg.Logger.Debugf("[svp2p] blocktxn stream from %s closed with: %v", p.cfg.Conn.RemoteAddr(), err)
+		}
+
+		return nil
+	}
+
+	out, ready, delta, err := p.cfg.Compact.BlockTxn(ctx, p.cfg.SyncPeer, stream)
+
+	p.send(out)
+
+	if scoreErr := p.scoreMisbehavior(delta); scoreErr != nil && err == nil {
+		return scoreErr
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return p.startCompactIngest(ctx, ready)
+}
+
+// startCompactIngest hands a reconstructed block to the ingestor on the same
+// terms startIngest hands over a streamed one. ready is nil whenever the
+// exchange is not finished — most cmpctblocks are still waiting on a
+// getblocktxn — and that is the ordinary case, not an error.
+//
+// The two gates startIngest applies do not run here, and neither is missing.
+// A nil ingestor cannot be reached: the dispatcher only reconstructs a block
+// it has claimed through MarkBlockAsInFlight, and the downloader that owns
+// that claim exists only when an ingestor was configured (ConfigureSync).
+// BlockExpected would be answering a question the dispatcher already asked —
+// this block IS in flight from this peer, because the dispatcher put it there.
+func (p *Peer) startCompactIngest(ctx context.Context, ready *CompactReady) error {
+	if ready == nil {
+		return nil
+	}
+
+	if p.cfg.Ingestor == nil {
+		if err := ready.TxReader.Close(); err != nil {
+			p.cfg.Logger.Debugf("[svp2p] compact block %s released with: %v", ready.Hash, err)
+		}
+
+		return nil
+	}
+
+	progress := p.cfg.Ingestor.WatchProgress(ready.TxReader)
+
+	// SizeBytes is zero because no payload declared it (CompactReady's own doc
+	// comment). The admission gate weighs the block at zero as a result, and
+	// the stall meter's ingestTxBytes is zero with it, which makes ingestAlive
+	// treat the ingest as fully-streamed from the start and bound it by
+	// MaxBlockDownloadTime rather than by byte progress. That is the right
+	// bound for this path anyway: a compact block's bytes come mostly from our
+	// own index, not from the peer, so byte silence on the socket says nothing
+	// about the peer.
+	p.startIngestRequest(ctx, ready.Hash, BlockIngestRequest{
+		Header:   ready.Header,
+		TxCount:  ready.TxCount,
+		TxReader: progress,
+		PeerAddr: p.cfg.Conn.RemoteAddr().String(),
+		Quit:     p.gone,
+	}, progress)
+
+	return nil
 }
 
 // dispatchSync feeds one post-handshake message to the manager-owned sync
@@ -1140,6 +1278,19 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) e
 		Quit:      p.gone,
 	}
 
+	p.startIngestRequest(ctx, hash, req, progress)
+
+	return nil
+}
+
+// startIngestRequest is startIngest's tail, shared with the compact-block
+// path (startCompactIngest): arm the stall meter, run the ingest on its own
+// goroutine, release the stream, and report back to the Run loop.
+//
+// It applies none of startIngest's admission gates. Those judge whether an
+// INBOUND BLOCK MESSAGE was solicited, and each caller answers that question
+// its own way before it gets here.
+func (p *Peer) startIngestRequest(ctx context.Context, hash chainhash.Hash, req BlockIngestRequest, progress IngestProgress) {
 	p.mu.Lock()
 	p.ingest = progress
 	p.ingestStarted = time.Now()
@@ -1162,8 +1313,6 @@ func (p *Peer) startIngest(ctx context.Context, stream *transport.BlockStream) e
 		case <-p.gone:
 		}
 	}()
-
-	return nil
 }
 
 // queueTx hands one inbound tx to txIngestLoop instead of validating it on

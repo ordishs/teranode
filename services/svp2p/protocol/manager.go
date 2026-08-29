@@ -1724,6 +1724,11 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		syncPeer.State.knownBlocks.mark(hash)
 	}
 
+	// The partial block this ingest came from, released here because this is
+	// the single completion path for both success and failure. compactSeen is
+	// false for every ordinary block, which is almost all of them.
+	compactStatus, compactSeen := takeCompactStatus(syncPeer, hash)
+
 	if m.blockDownloader == nil {
 		m.syncMu.Unlock()
 		return 0, nil
@@ -1818,6 +1823,34 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 		}
 
 		m.logger.Warnf("[svp2p] block %s ingest failed: %v", hash, outcome.Err)
+	}
+
+	// A compact block's reconstruction can only fail WHILE the assembled
+	// stream is read, because that is where the short IDs of the gap
+	// transactions are checked and where the index is opened (compactblock.go
+	// fill's own doc comment). The ingestor therefore reports it as a stream
+	// error, which the default branch above has already treated as nobody's
+	// fault; the partial block's own status is what separates the two cases
+	// the branch cannot tell apart.
+	if compactSeen && outcome.Err != nil {
+		switch compactStatus {
+		case readInvalid:
+			// The peer supplied a transaction that is not the one the slot
+			// asked for, or bytes that do not decode to the count it declared.
+			// net_processing.cpp:3610-3616 scores exactly this 100.
+			delta = scoreInvalidBlock
+			disconnect = errors.New(errors.ERR_NETWORK_PEER_MALICIOUS,
+				"svp2p: compact block %s was filled with invalid transactions", hash, outcome.Err)
+
+		case readFailed:
+			// net_processing.cpp:3617-3622, "Might have collided, fall back to
+			// getdata now" — a short ID collision or an index entry whose
+			// bytes we no longer hold. Not malice, so no score; BlockFailed
+			// has already put the block back on offer.
+			m.logger.Debugf("[svp2p] compact block for %s unreconstructable, falling back to getdata", hash)
+
+		case readOK:
+		}
 	}
 
 	if rotate {

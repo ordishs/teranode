@@ -1029,6 +1029,51 @@ func (bd *BlockDownloader) IsInFlightFrom(peer *SyncPeer, hash chainhash.Hash) b
 	return false
 }
 
+// MaxCompactBlockHeightAhead is ProcessCompactBlockMessage's own
+// conservatism rule (net_processing.cpp:3823-3825): "We want to be a bit
+// conservative just to be extra careful about DoS possibilities in compact
+// block processing", guarding `pindex->GetHeight() <= chainActive.Height() + 2`.
+//
+// It is NOT MAX_CMPCTBLOCK_DEPTH (validation.h:133). That constant is a floor
+// BELOW our own tip and has exactly one use, at net_processing.cpp:1310-1312,
+// on the getdata SERVE path — "Maximum depth of blocks we're willing to serve
+// as compact blocks to peers when requested" (validation.h:129-133). This port
+// is receive-only (spec §2), so it never reaches that rule.
+const MaxCompactBlockHeightAhead = 2
+
+// wantCompact reports whether a compact block announcing node is worth
+// reconstructing. It is the run of guards ProcessCompactBlockMessage applies
+// between the header accept and MarkBlockAsInFlight, in the source's own
+// order:
+//
+//   - net_processing.cpp:3795-3799, pindex->getStatus().hasData(): we already
+//     hold the block, so "Nothing to do here".
+//   - net_processing.cpp:3801-3802, pindex->GetChainWork() <=
+//     chainActive.Tip()->GetChainWork(): "We know something better." The
+//     sibling GetBlockTxCount() test at :3803 has no counterpart here, because
+//     this port prunes nothing and so has no "had it once, pruned it" state.
+//   - net_processing.cpp:3825, the height ceiling above.
+//   - net_processing.cpp:3827-3829, fAlreadyInFlightFromThisPeer: a block this
+//     peer is already delivering is not announced again.
+//
+// Requires the caller to hold PeerManager's sync-state mutex, like every other
+// method here.
+func (bd *BlockDownloader) wantCompact(peer *SyncPeer, node, activeTip HeaderNode) bool {
+	if _, held := bd.haveData[node.Hash]; held {
+		return false
+	}
+
+	if chainWorkOf(node).Cmp(chainWorkOf(activeTip)) <= 0 {
+		return false
+	}
+
+	if node.Height > activeTip.Height+MaxCompactBlockHeightAhead {
+		return false
+	}
+
+	return !bd.IsInFlightFrom(peer, node.Hash)
+}
+
 // BlockNotDelivered releases a block this peer will NOT deliver after all,
 // without recording it as held. It is removeFromFlight's guard on its own:
 // nothing happens unless this peer is the recorded holder.
@@ -1115,6 +1160,14 @@ func (bd *BlockDownloader) clearPeer(peer *SyncPeer) {
 		peer.State.nDownloadingSince = 0
 		peer.State.nStallingSince = 0
 		peer.State.pindexLastCommonBlock = nil
+
+		// The partial block goes with the claim it belonged to. C++ holds it
+		// on the QueuedBlock this walk just dropped (node_state.h:80,
+		// QueuedBlock::partialBlock), so ClearPeer disposes of it in the same
+		// step. A rotation reaches here too, and that is correct: the peer
+		// keeps the connection but no longer owes us this block, so a blocktxn
+		// for it would be unsolicited.
+		peer.State.compact = nil
 	}
 }
 

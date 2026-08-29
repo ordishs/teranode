@@ -254,6 +254,26 @@ type peerSyncState struct {
 	// CNodeState and as the seam Phase 6 (net_processing.cpp:3591) needs to
 	// gate whether an announced compact block is even worth accepting.
 	fSupportsDesiredCmpctVersion bool
+
+	// compact is this peer's partial compact block, the port of
+	// QueuedBlock::partialBlock (node_state.h:80): the PartiallyDownloadedBlock
+	// C++ hangs off the in-flight record for the block a cmpctblock announced.
+	// nil means no compact block from this peer is being reconstructed.
+	//
+	// AT MOST ONE PER PEER, which is narrower than C++, where every in-flight
+	// entry can carry its own. It is what makes net_processing.cpp:3839-3844
+	// ("Peer sent us compact block we were already syncing!") the rule for a
+	// second announcement of ANY block while one is outstanding, not just of
+	// the same block. The cost is a peer that announces two blocks back to back
+	// getting only the first reconstructed compactly; the second takes the
+	// ordinary getdata path, which is what this port does for every block
+	// anyway.
+	//
+	// Cleared on three occasions, which between them cover every way the claim
+	// it belongs to can end: BlockDone (the ingest reported, whatever the
+	// outcome), BlockTxn's own refusal paths, and clearPeer — a disconnect or
+	// a sync-peer rotation.
+	compact *compactState
 }
 
 // newPeerSyncState returns a zero-value peerSyncState: no best known block,
