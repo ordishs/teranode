@@ -228,7 +228,7 @@ const txRunningPollInterval = 1 * time.Second
 // consumer/cancel pair). Server.Stop relies on the Start ctx already having
 // been cancelled by the daemon before Stop runs, exactly as it already
 // documents for the header index subscription goroutine.
-func StartTxMetaConsumer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, onTx TxMetaHandler) {
+func StartTxMetaConsumer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, index *RecentTxIndex, onTx TxMetaHandler) {
 	configURL := tSettings.Kafka.TxMetaConfig
 	if configURL == nil {
 		logger.Infof("[svp2p] tx announcement relay disabled: kafka_txmetaConfig is not set")
@@ -252,7 +252,7 @@ func StartTxMetaConsumer(ctx context.Context, logger ulogger.Logger, tSettings *
 	go kafka.StartKafkaControlledListener(ctx, logger, groupID, controlCh, configURL,
 		func(lctx context.Context, kafkaURL *url.URL, lGroupID string) {
 			kafka.StartKafkaListener(lctx, logger, kafkaURL, lGroupID, true, func(msg *kafka.KafkaMessage) error {
-				return handleTxMetaMessage(logger, msg, onTx)
+				return handleTxMetaMessage(logger, msg, index, onTx)
 			}, &tSettings.Kafka)
 		})
 }
@@ -299,12 +299,18 @@ func pollTxRunningGate(ctx context.Context, blockchainClient blockchain.ClientI,
 }
 
 // handleTxMetaMessage decodes one txmeta batch message and calls onTx for
-// every entry that should be relayed. Every parse failure at the top level
+// every entry that should be relayed. Every such entry also enters the
+// recent-transaction index (recenttx.go), which is what compact-block
+// reconstruction matches short IDs against: the entries that pass the
+// skips below are this node's nearest equivalent of mempool membership,
+// which is what SVNode's own reconstruction walks
+// (blockencodings.cpp:171-199). index is nil when compact blocks are off,
+// and Add is a no-op on a nil index. Every parse failure at the top level
 // (truncated buffer) logs and returns nil rather than an error, the same
 // never-going-to-become-parseable discipline as handleBlocksFinalMessage
 // and legacy's own processTXmetaBatchMessage (netsync/manager.go:3519-3520,
 // "truncated message", ":3562, "truncated content").
-func handleTxMetaMessage(logger ulogger.Logger, msg *kafka.KafkaMessage, onTx TxMetaHandler) error {
+func handleTxMetaMessage(logger ulogger.Logger, msg *kafka.KafkaMessage, index *RecentTxIndex, onTx TxMetaHandler) error {
 	entries, err := decodeTxMetaBatch(msg.Value)
 	if err != nil {
 		logger.Errorf("[svp2p] failed to decode txmeta batch message, skipping: %v", err)
@@ -341,6 +347,8 @@ func handleTxMetaMessage(logger ulogger.Logger, msg *kafka.KafkaMessage, onTx Tx
 		if txMeta.InBlock {
 			continue
 		}
+
+		index.Add(e.hash)
 
 		onTx(e.hash, txMeta.Fee, txMeta.SizeInBytes)
 	}

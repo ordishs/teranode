@@ -119,7 +119,7 @@ func newOrphanTestBridge(t *testing.T, v validator.Interface, tSettings *setting
 
 	sm.orphanPool = newOrphanPool(tSettings, sm.logger, func(ctx context.Context, tx *bt.Tx) (*meta.Data, error) {
 		return sm.validationClient.Validate(ctx, tx, 0)
-	})
+	}, nil)
 
 	t.Cleanup(sm.Stop)
 
@@ -138,7 +138,7 @@ func TestOrphanPool_DuplicateOrphanNotReAdded(t *testing.T) {
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 	t.Cleanup(pool.stop)
 
 	original := makeIngestTestTx(t, "dup-orphan-original")
@@ -177,7 +177,7 @@ func TestOrphanPool_CapEvictionGivesFinalAttemptAndKeepsSurvivors(t *testing.T) 
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 	t.Cleanup(pool.stop)
 
 	a := makeIngestTestTx(t, "cap-a")
@@ -233,7 +233,7 @@ func TestOrphanPool_TTLEvictionGivesFinalAttemptAndStaysUsable(t *testing.T) {
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 	t.Cleanup(pool.stop)
 
 	stale := makeIngestTestTx(t, "ttl-stale")
@@ -272,7 +272,7 @@ func TestOrphanPool_ZeroMaxOrphanTxsDisablesCap(t *testing.T) {
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 	t.Cleanup(pool.stop)
 
 	const n = 500
@@ -391,7 +391,7 @@ func TestOrphanPool_ReleaseValidatesMultiParentOrphanExactlyOnce(t *testing.T) {
 		return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 	t.Cleanup(pool.stop)
 
 	pool.add(a)
@@ -454,7 +454,7 @@ func TestOrphanPool_ReleaseErrorLadder(t *testing.T) {
 			return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 		}
 
-		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 		t.Cleanup(pool.stop)
 
 		pool.add(stillWaiting)
@@ -493,7 +493,7 @@ func TestOrphanPool_ReleaseErrorLadder(t *testing.T) {
 			return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 		}
 
-		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 		t.Cleanup(pool.stop)
 
 		pool.add(conflicting)
@@ -532,7 +532,7 @@ func TestOrphanPool_ReleaseErrorLadder(t *testing.T) {
 			return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 		}
 
-		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 		t.Cleanup(pool.stop)
 
 		pool.add(invalid)
@@ -588,7 +588,7 @@ func TestOrphanPool_ReleaseHandlesLongChainWithUnboundedCap(t *testing.T) {
 		return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 	}
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
 	t.Cleanup(pool.stop)
 
 	for _, tx := range txs {

@@ -109,6 +109,22 @@ type Server struct {
 	// nil-means-"not built" field in this struct.
 	stoppableBridge stoppableBridge
 
+	// recentTxIndex is the bridge's recent-transaction hash ring
+	// (bridge/recenttx.go), held here because two things outside the bridge
+	// feed or read it: the txmeta Kafka consumer Adds to it, and the peer
+	// manager matches compact-block short IDs against it. nil when the
+	// block ingestion dependencies are not injected (a depless caller) —
+	// bridge.RecentTxIndex's own methods are nil-safe for exactly that
+	// case.
+	recentTxIndex *bridge.RecentTxIndex
+
+	// txIndex is the same index seen as the seam the peer manager takes
+	// (protocol.TxIndex). Held as the interface rather than derived from
+	// recentTxIndex at the call site because a typed nil in an interface is
+	// not nil, and a non-nil TxIndex is what tells the manager compact
+	// blocks are available.
+	txIndex protocol.TxIndex
+
 	// blocksFinalConsumer is the block announcement relay's Kafka leg
 	// (bridge/kafka.go). nil when settings.Kafka.BlocksFinalConfig is unset,
 	// which is not an error: block announcements just do not go out this way.
@@ -395,7 +411,11 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// RUNNING, polling that state itself. s.txAnnouncer was already built
 	// above, before startSync, so both this consumer's callback AND the
 	// peer-sourced tx ingestor (Task 14) share the one announcer instance.
-	bridge.StartTxMetaConsumer(ctx, s.logger, s.settings, s.blockchainClient, s.txAnnouncer.put)
+	// The same consumer is the recent-transaction index's main feed
+	// (bridge/recenttx.go): every entry it relays is also a transaction a
+	// compact block may name. s.recentTxIndex is nil for a depless caller,
+	// which Add treats as "keep nothing".
+	bridge.StartTxMetaConsumer(ctx, s.logger, s.settings, s.blockchainClient, s.recentTxIndex, s.txAnnouncer.put)
 
 	// The tx-inv round trip's CONSUME leg (Task 16), started the same way
 	// and after the same manager readiness point as blocks-final above:
@@ -627,6 +647,15 @@ func (s *Server) startSync(ctx context.Context) error {
 		txIngestorI = &txIngestor{bridge: ing.bridge, announce: s.txAnnouncer.put}
 	}
 
+	// Compact-block reconstruction reads the bridge's recent-transaction
+	// index (spec §7). Set only when legacy_compactBlocks is on and a real
+	// bridge was built: a nil TxIndex is what leaves compact blocks off
+	// inside the manager, so the flag has exactly one place it is read
+	// here. Set before manager.Start, as SetTxIndex requires.
+	if s.settings.Legacy.CompactBlocks && s.txIndex != nil {
+		s.manager.SetTxIndex(s.txIndex)
+	}
+
 	// Task 16's tx-inv round trip PRODUCE seam: s.legacyInvProducer is
 	// *bridge.LegacyInvProducer, built (possibly nil, an unconfigured topic)
 	// before this method ran (Start's own doc comment). Nil-checked the same
@@ -703,6 +732,8 @@ func (s *Server) newBlockIngestor() (*blockIngestor, error) {
 	// that stops satisfying stoppableBridge fails the build here rather
 	// than silently degrading Stop into a no-op.
 	s.stoppableBridge = br
+	s.recentTxIndex = br.RecentTxIndex()
+	s.txIndex = br.TxIndex()
 
 	ing := &blockIngestor{
 		logger:    s.logger,

@@ -143,6 +143,13 @@ type orphanPool struct {
 	validate orphanValidateFunc
 	logger   ulogger.Logger
 
+	// index is the recent-transaction index (recenttx.go) every accepted
+	// orphan is announced to. It is this port's stand-in for SVNode's
+	// separate vExtraTxnForCompact buffer, which its own reconstruction
+	// reads immediately after the mempool walk
+	// (blockencodings.cpp:201-215). nil when compact blocks are off.
+	index *RecentTxIndex
+
 	// ctx/cancel give the eviction worker's validate calls a cancellable
 	// context tied to the pool's own lifetime — legacy's own equivalent is
 	// sm.ctx, passed to its eviction closure's Validate call
@@ -185,7 +192,7 @@ type orphanPool struct {
 // The returned pool owns two background goroutines (expiringmap's TTL
 // ticker and this pool's own eviction worker) that only stop() releases —
 // see stop's own doc comment and the type's.
-func newOrphanPool(tSettings *settings.Settings, logger ulogger.Logger, validate orphanValidateFunc) *orphanPool {
+func newOrphanPool(tSettings *settings.Settings, logger ulogger.Logger, validate orphanValidateFunc, index *RecentTxIndex) *orphanPool {
 	// Idempotent (prometheusMetricsInitOnce): New (bridge.go) already calls
 	// this, but newOrphanPool is also called directly by this package's own
 	// tests, which never go through New, and onEvict's drop path (fix round
@@ -198,6 +205,7 @@ func newOrphanPool(tSettings *settings.Settings, logger ulogger.Logger, validate
 	p := &orphanPool{
 		validate:  validate,
 		logger:    logger,
+		index:     index,
 		ctx:       ctx,
 		cancel:    cancel,
 		evictions: make(chan *orphanEntry, orphanEvictionQueueSize),
@@ -362,6 +370,13 @@ func (p *orphanPool) add(tx *bt.Tx) {
 		parents: parents,
 		addedAt: time.Now(),
 	})
+
+	// Added after the pool accepted it, and only on the branch that
+	// accepted it: a duplicate returned above, so one orphan enters the
+	// index once. Entries are left in the index when the orphan is evicted
+	// or released — the index is "seen recently", and the ring's own
+	// capacity is what bounds it.
+	p.index.Add(hash)
 
 	prometheusSvp2pBridgeOrphans.Inc()
 }

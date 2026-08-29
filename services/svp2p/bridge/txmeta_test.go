@@ -310,7 +310,7 @@ func TestHandleTxMetaMessage_CoinbaseAndInBlockSkip(t *testing.T) {
 		size uint64
 	}
 
-	err := handleTxMetaMessage(ulogger.TestLogger{}, &kafka.KafkaMessage{Value: data}, func(hash chainhash.Hash, fee, size uint64) {
+	err := handleTxMetaMessage(ulogger.TestLogger{}, &kafka.KafkaMessage{Value: data}, nil, func(hash chainhash.Hash, fee, size uint64) {
 		got = append(got, struct {
 			hash chainhash.Hash
 			fee  uint64
@@ -330,7 +330,7 @@ func TestHandleTxMetaMessage_CoinbaseAndInBlockSkip(t *testing.T) {
 // a message decodeTxMetaBatch cannot parse logs and returns nil, not an
 // error, so the Kafka consumer never retries it.
 func TestHandleTxMetaMessage_UnparseableMessageIsSkippedNotRetried(t *testing.T) {
-	err := handleTxMetaMessage(ulogger.TestLogger{}, &kafka.KafkaMessage{Value: []byte{0x01}}, func(chainhash.Hash, uint64, uint64) {
+	err := handleTxMetaMessage(ulogger.TestLogger{}, &kafka.KafkaMessage{Value: []byte{0x01}}, nil, func(chainhash.Hash, uint64, uint64) {
 		t.Fatal("onTx must not be called for an unparseable message")
 	})
 	require.NoError(t, err)
@@ -398,10 +398,15 @@ func TestStartTxMetaConsumer_RunningGateFlipsBothDirections(t *testing.T) {
 
 	handler := &recordingTxHandler{}
 
+	// A live recent-transaction index rides along, so this test also proves
+	// the compact-block feed reaches the index through the real consumer
+	// (Kafka, gate, decode), not only through handleTxMetaMessage.
+	idx := NewRecentTxIndex(16, noFetch)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	StartTxMetaConsumer(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, handler.handle)
+	StartTxMetaConsumer(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, idx, handler.handle)
 
 	// Not RUNNING: the consumer must never even subscribe, let alone
 	// deliver anything, while the poller keeps reporting false.
@@ -455,6 +460,10 @@ func TestStartTxMetaConsumer_RunningGateFlipsBothDirections(t *testing.T) {
 
 		return false
 	}, 5*time.Second, 20*time.Millisecond, "the second RUNNING transition must let a produced tx actually arrive again")
+
+	require.Equal(t, 2, idx.Len(), "both delivered transactions must have entered the recent-transaction index")
+	require.True(t, heldByIndex(idx, firstHash))
+	require.True(t, heldByIndex(idx, secondHash))
 }
 
 // TestStartTxMetaConsumer_ReplayDisabledOnTheURL is E2: the URL the
@@ -474,7 +483,7 @@ func TestStartTxMetaConsumer_ReplayDisabledOnTheURL(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	StartTxMetaConsumer(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, func(chainhash.Hash, uint64, uint64) {})
+	StartTxMetaConsumer(ctx, ulogger.TestLogger{}, tSettings, blockchainClient, nil, func(chainhash.Hash, uint64, uint64) {})
 
 	require.Equal(t, "0", tSettings.Kafka.TxMetaConfig.Query().Get("replay"))
 }
@@ -492,7 +501,7 @@ func TestStartTxMetaConsumer_NilConfigDoesNothing(t *testing.T) {
 	defer cancel()
 
 	require.NotPanics(t, func() {
-		StartTxMetaConsumer(ctx, ulogger.TestLogger{}, tSettings, nil, func(chainhash.Hash, uint64, uint64) {
+		StartTxMetaConsumer(ctx, ulogger.TestLogger{}, tSettings, nil, nil, func(chainhash.Hash, uint64, uint64) {
 			t.Fatal("onTx must never be called when the topic is not configured")
 		})
 	})

@@ -9,6 +9,7 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"io"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
+	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -182,6 +184,14 @@ type svp2pBridge struct {
 	// not just by type — a reject is "we refuse this", an orphan is "we
 	// cannot judge this yet" (see IngestTxResult's own doc comment).
 	orphanPool *orphanPool
+
+	// recentTx is the bounded ring of recently seen transaction hashes
+	// compact-block reconstruction matches short IDs against (recenttx.go),
+	// this node's stand-in for the mempool SVNode walks. It is always
+	// present; legacy_compactBlocks decides whether it has a capacity, and
+	// a capacity of zero is the disabled state (nothing kept, nothing
+	// matched), the same way an empty peers.json path is addrman's.
+	recentTx *RecentTxIndex
 }
 
 // New constructs the bridge with its eight injected Teranode dependencies,
@@ -220,11 +230,50 @@ func New(
 		rejectedTxns:      txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns),
 	}
 
+	// Sized only when compact blocks are on: the ring is the feature's
+	// whole memory cost (legacy_compactBlocksRecentTxs hashes plus the
+	// dedup map), and a node with the flag off must not pay any of it.
+	recentTxCapacity := 0
+	if tSettings.Legacy.CompactBlocks {
+		recentTxCapacity = tSettings.Legacy.CompactBlocksRecentTxs
+	}
+
+	sm.recentTx = NewRecentTxIndex(recentTxCapacity, sm.openTx)
+
 	sm.orphanPool = newOrphanPool(tSettings, logger, func(ctx context.Context, tx *bt.Tx) (*meta.Data, error) {
 		return validationClient.Validate(ctx, tx, 0)
-	})
+	}, sm.recentTx)
 
 	return sm
+}
+
+// TxIndex returns the recent-transaction index as the seam the peer manager
+// takes (protocol/txindex.go). Server hands it to PeerManager.SetTxIndex
+// when legacy_compactBlocks is on.
+func (b *svp2pBridge) TxIndex() protocol.TxIndex {
+	return b.recentTx
+}
+
+// RecentTxIndex returns the same index in its concrete type, which is the
+// write side: the txmeta consumer and the orphan pool Add to it. Two
+// accessors rather than one because the two sides are genuinely different —
+// protocol only ever reads through TxIndex, and TxIndex has no Add.
+func (b *svp2pBridge) RecentTxIndex() *RecentTxIndex {
+	return b.recentTx
+}
+
+// openTx is the fetch seam RecentTxIndex.Open reads through: the bridge's
+// own FetchTx (fetch.go), the same UTXO-store read that answers getdata tx.
+// FetchTx hands back one transaction's bytes, which openTx presents as a
+// reader with its length, because a reader is the shape block assembly
+// consumes each transaction in.
+func (b *svp2pBridge) openTx(ctx context.Context, hash chainhash.Hash) (io.ReadCloser, uint64, error) {
+	raw, err := b.FetchTx(ctx, &hash)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return io.NopCloser(bytes.NewReader(raw)), uint64(len(raw)), nil
 }
 
 // HeaderEvents returns the bridge's tip-change notification channel. It is on
