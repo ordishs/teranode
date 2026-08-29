@@ -1844,6 +1844,13 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 	// read, so a compact status cannot be their cause; overriding them here
 	// would disconnect a peer from a branch whose own comment says "nothing
 	// here is a rotation, a disconnect or a warning".
+	//
+	// The override REPLACES the default branch's verdict on the peer; it does
+	// not merely add to it. The default branch reads outcome.PeerFault, which
+	// is the pipeline's verdict on the BYTES it was handed, and on a compact
+	// ingest those bytes were assembled by this node — from its own index,
+	// against its own short IDs — so PeerFault cannot stand as a verdict on the
+	// peer without the partial block's status to interpret it.
 	if compactSeen && streamFault && outcome.Err != nil {
 		switch compactStatus {
 		case readInvalid:
@@ -1855,10 +1862,21 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 				"svp2p: compact block %s was filled with invalid transactions", hash, outcome.Err)
 
 		case readFailed:
-			// net_processing.cpp:3617-3622, "Might have collided, fall back to
-			// getdata now" — a short ID collision or an index entry whose
-			// bytes we no longer hold. Not malice, so no score; BlockFailed
-			// has already put the block back on offer.
+			// net_processing.cpp:3655-3660, "Might have collided, fall back to
+			// getdata now" — a short ID is 48 bits, so an honest peer's
+			// transaction can hash onto the slot we asked about, and the index
+			// entry we matched may be bytes we no longer hold. SVNode has no
+			// Misbehaving call on this path at all.
+			//
+			// delta and disconnect are CLEARED, not left alone: the default
+			// branch above has already set both from outcome.PeerFault, and
+			// without this a collision costs an honest peer the same 100 and
+			// the same disconnect as a malicious fill — which also strands the
+			// block, since the peer that announced it is the only one known to
+			// hold it. BlockFailed has already put the block back on offer.
+			delta = 0
+			disconnect = nil
+
 			m.logger.Debugf("[svp2p] compact block for %s unreconstructable, falling back to getdata", hash)
 
 		case readOK:
