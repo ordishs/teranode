@@ -25,6 +25,15 @@ var svp2pThresholdLine = regexp.MustCompile(`peer (\S+) done: .*misbehavior thre
 // rejected", so the line stands for that score.
 var svp2pRejectedBlockLine = regexp.MustCompile(`peer (\S+) done: .*svp2p: block \S+ was rejected`)
 
+// svp2pInvalidCompactLine is the third disconnect that carries a score without
+// naming it. Both compact-block READ_STATUS_INVALID branches
+// (compactdispatch.go CompactBlock and BlockTxn) score the peer
+// scoreInvalidBlock and then return the reconstruction error; handleBlockTxn
+// returns that error in preference to the threshold error, so the peer loop's
+// "done" line names the malformed message and not the score. Every such error
+// wraps ErrCompactBlockInvalid, whose text is what this matches.
+var svp2pInvalidCompactLine = regexp.MustCompile(`peer (\S+) done: .*svp2p: invalid compact block`)
+
 const svp2pInvalidBlockScore = 100
 
 // Scores is the node's current misbehaviour total per peer address. svp2p
@@ -48,6 +57,10 @@ func (n *nodeUnderTest) Scores() map[string]int {
 			}
 
 			if m := svp2pRejectedBlockLine.FindStringSubmatch(line); m != nil && out[m[1]] < svp2pInvalidBlockScore {
+				out[m[1]] = svp2pInvalidBlockScore
+			}
+
+			if m := svp2pInvalidCompactLine.FindStringSubmatch(line); m != nil && out[m[1]] < svp2pInvalidBlockScore {
 				out[m[1]] = svp2pInvalidBlockScore
 			}
 		}

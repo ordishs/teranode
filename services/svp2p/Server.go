@@ -232,6 +232,18 @@ func (s *Server) PeerScores() map[string]int {
 	return s.manager.PeerScores()
 }
 
+// RecentTxIndexLen is how many transaction hashes the bridge's
+// recent-transaction index holds (bridge/recenttx.go); 0 before Start, for a
+// depless caller, and whenever compact blocks are off. Test support for the
+// parity harness: the index is filled asynchronously, off the txmeta Kafka
+// topic, and a scenario that announces a compact block has to know the
+// transactions it expects the node to already hold have arrived. Nothing
+// outside the node reports that — the node's own inv for a transaction is
+// raised by the peer-sourced path as well, so it does not stand for this.
+func (s *Server) RecentTxIndexLen() int {
+	return s.recentTxIndex.Len()
+}
+
 func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	if checkLiveness {
 		return http.StatusOK, "OK", nil

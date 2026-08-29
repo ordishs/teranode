@@ -25,7 +25,10 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -139,13 +142,16 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 	utxoStore, err := utxosql.New(ctx, logger, tSettings, utxoStoreURL)
 	require.NoError(t, err)
 
+	startUtxoBlockState(ctx, logger, blockchainClient, utxoStore)
+
 	subtreeStore := blobmemory.New()
 	tempStore := blobmemory.New()
 	txStore := blobmemory.New()
 
 	blockAssemblyClient := svp2ptest.StartBlockAssembly(ctx, t, logger, tSettings, txStore, subtreeStore, utxoStore, blockchainClient)
 
-	validatorClient, err := validator.New(ctx, logger, tSettings, utxoStore, nil, nil, nil, blockAssemblyClient, blockchainClient)
+	validatorClient, err := validator.New(ctx, logger, tSettings, utxoStore, txMetaProducer(ctx, t, logger, tSettings), nil, nil,
+		blockAssemblyClient, blockchainClient)
 	require.NoError(t, err)
 
 	subtreeValidationClient := svp2ptest.StartSubtreeValidation(ctx, t, tSettings.Context, logger, tSettings, subtreeStore,
@@ -206,6 +212,72 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 	return n
 }
 
+// utxoBlockStateInterval is how often the harness republishes the chain tip
+// into the UTXO store. It is a poll rather than a subscription only because
+// blockchain.LocalClient is the client this harness runs on; the effect is the
+// factory's.
+const utxoBlockStateInterval = 100 * time.Millisecond
+
+// startUtxoBlockState keeps the UTXO store's block state (tip height and median
+// time) following the chain, which is what the store factory does in production
+// through its blockchain subscription (stores/utxo/factory/utxo.go:139-190).
+// The harness builds the store directly — the factory's own client is a gRPC
+// one, and every service here runs in process — so the same two calls are made
+// here instead.
+//
+// Without it the store's median time stays zero and the validator refuses every
+// policy-checked transaction with "utxo store not ready", which is the state
+// every parity scenario before Task 10 ran in unnoticed: none of them offered
+// the node a loose transaction.
+func startUtxoBlockState(ctx context.Context, logger ulogger.Logger, blockchainClient blockchain.ClientI, utxoStore utxo.Store) {
+	go func() {
+		ticker := time.NewTicker(utxoBlockStateInterval)
+		defer ticker.Stop()
+
+		for {
+			height, medianTime, err := blockchainClient.GetBestHeightAndTime(ctx)
+			if err == nil && height > 0 {
+				if err = utxoStore.SetBlockState(height, medianTime); err != nil {
+					logger.Errorf("[parity] error setting utxo store block state: %v", err)
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+// txMetaProducer is the validator's txmeta Kafka producer, built only when a
+// scenario configured the topic (kafka_txmetaConfig). It is the PRODUCE half of
+// the path that puts an accepted transaction into the svp2p bridge's
+// recent-transaction index: the validator publishes an ADD entry,
+// bridge.StartTxMetaConsumer reads it back off the same topic and calls
+// RecentTxIndex.Add. Compact block reconstruction has nothing to match short
+// IDs against until that round trip has run, so a scenario that reconstructs a
+// block must configure the topic.
+//
+// Every other scenario leaves Kafka.TxMetaConfig nil and gets an untyped nil
+// back, which is the state the parity harness has always run in — the
+// validator's own "tests may not set this" branch. Returned as the interface,
+// never as a typed nil pointer inside it, because the validator's guard is a
+// plain nil check.
+func txMetaProducer(ctx context.Context, t *testing.T, logger ulogger.Logger, tSettings *settings.Settings) kafka.KafkaAsyncProducerI {
+	t.Helper()
+
+	if tSettings.Kafka.TxMetaConfig == nil {
+		return nil
+	}
+
+	producer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.TxMetaConfig, &tSettings.Kafka)
+	require.NoError(t, err)
+
+	return producer
+}
+
 // Stop tears the node down. Safe to call twice.
 func (n *nodeUnderTest) Stop() {
 	if n.cancel == nil {
@@ -260,6 +332,16 @@ func (n *nodeUnderTest) WaitFor(t *testing.T, cond func() bool, timeout time.Dur
 
 	n.Logger.Dump(t)
 	t.Fatalf("%s (height now %d)", what, n.BestHeight(t))
+}
+
+// RecentTxIndexLen is how many transaction hashes the node's compact-block
+// transaction index holds. Zero on the legacy leg, which has no such index.
+func (n *nodeUnderTest) RecentTxIndexLen() int {
+	if srv, ok := n.svc.(*svp2p.Server); ok {
+		return srv.RecentTxIndexLen()
+	}
+
+	return 0
 }
 
 // ConnectedCount is how many peers the node currently holds.

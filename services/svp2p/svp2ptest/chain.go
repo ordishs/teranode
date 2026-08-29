@@ -30,6 +30,17 @@ type FixtureChain struct {
 	Headers []*wire.BlockHeader // headers[i] is at height i+1
 	Blocks  map[chainhash.Hash]*wire.MsgBlock
 	Heights map[chainhash.Hash]int32 // includes genesis at height 0
+
+	// PrivKey is the key every fixture coinbase pays to, kept so a later
+	// block can spend one of those outputs (fixtureblock.go SpendCoinbase).
+	// Without it the fixture chain can only ever hold coinbase-only blocks,
+	// which is what it held before Task 10.
+	PrivKey *bec.PrivateKey
+	// Address is PrivKey's P2PKH address, the one CreateCoinbase paid.
+	Address string
+	// Coinbases[i] is the coinbase of the block at height i+1, kept in bt
+	// form because that is the form a spend's input is built from.
+	Coinbases []*bt.Tx
 }
 
 func (c *FixtureChain) Tip() chainhash.Hash { return c.Headers[len(c.Headers)-1].BlockHash() }
@@ -60,6 +71,8 @@ func BuildFixtureChainPadded(t *testing.T, tSettings *settings.Settings, count, 
 	chain := &FixtureChain{
 		Blocks:  make(map[chainhash.Hash]*wire.MsgBlock, count),
 		Heights: map[chainhash.Hash]int32{genesisHash: 0},
+		PrivKey: privKey,
+		Address: address.AddressString,
 	}
 
 	bits, err := model.NewNBitFromString(fmt.Sprintf("%08x", genesis.Bits))
@@ -90,28 +103,7 @@ func BuildFixtureChainPadded(t *testing.T, tSettings *settings.Settings, count, 
 			coinbase.AddOutput(&bt.Output{Satoshis: 0, LockingScript: pad})
 		}
 
-		merkleRoot := coinbase.TxIDChainHash()
-		prev := prevHash
-
-		modelHeader := &model.BlockHeader{
-			Version:        0x20000000,
-			HashPrevBlock:  &prev,
-			HashMerkleRoot: merkleRoot,
-			Timestamp:      uint32(baseTime + int64(i)*600), //nolint:gosec // test timestamps are in range
-			Bits:           *bits,
-		}
-
-		for {
-			ok, _, _ := modelHeader.HasMetTargetDifficulty()
-			if ok {
-				break
-			}
-
-			modelHeader.Nonce++
-		}
-
-		wireHeader := &wire.BlockHeader{}
-		require.NoError(t, wireHeader.Deserialize(bytes.NewReader(modelHeader.Bytes())))
+		wireHeader := mineHeader(t, prevHash, *coinbase.TxIDChainHash(), uint32(baseTime+int64(i)*600), *bits) //nolint:gosec // test timestamps are in range
 
 		coinbaseWire := wire.NewMsgTx(1)
 		require.NoError(t, coinbaseWire.Deserialize(bytes.NewReader(coinbase.Bytes())))
@@ -120,9 +112,9 @@ func BuildFixtureChainPadded(t *testing.T, tSettings *settings.Settings, count, 
 		require.NoError(t, block.AddTransaction(coinbaseWire))
 
 		hash := wireHeader.BlockHash()
-		require.Equal(t, *modelHeader.Hash(), hash, "the wire header must round-trip the mined model header")
 
 		chain.Headers = append(chain.Headers, wireHeader)
+		chain.Coinbases = append(chain.Coinbases, coinbase)
 		chain.Blocks[hash] = block
 		chain.Heights[hash] = int32(height) //nolint:gosec // test heights are small
 
@@ -130,6 +122,40 @@ func BuildFixtureChainPadded(t *testing.T, tSettings *settings.Settings, count, 
 	}
 
 	return chain
+}
+
+// mineHeader mines one regtest header over the given parent, merkle root and
+// timestamp, and returns it in wire form. The nonce loop is the whole of
+// "mining" at the regtest limit; the round-trip check is what proves the wire
+// header the peers serve is the header that was mined.
+func mineHeader(t *testing.T, prev, merkleRoot chainhash.Hash, timestamp uint32, bits model.NBit) *wire.BlockHeader {
+	t.Helper()
+
+	prevHash := prev
+	root := merkleRoot
+
+	modelHeader := &model.BlockHeader{
+		Version:        0x20000000,
+		HashPrevBlock:  &prevHash,
+		HashMerkleRoot: &root,
+		Timestamp:      timestamp,
+		Bits:           bits,
+	}
+
+	for {
+		ok, _, _ := modelHeader.HasMetTargetDifficulty()
+		if ok {
+			break
+		}
+
+		modelHeader.Nonce++
+	}
+
+	wireHeader := &wire.BlockHeader{}
+	require.NoError(t, wireHeader.Deserialize(bytes.NewReader(modelHeader.Bytes())))
+	require.Equal(t, *modelHeader.Hash(), wireHeader.BlockHash(), "the wire header must round-trip the mined model header")
+
+	return wireHeader
 }
 
 // ---------------------------------------------------------------------------

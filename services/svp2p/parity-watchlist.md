@@ -484,3 +484,33 @@ the message nor its order changes, only which socket carries it. It is visible
 to a peer that measures per-stream bandwidth, which is what SVNode's own stall
 detection does on its side of the link. No action for legacy: its narrower set
 ends with the legacy service at cutover. Scenario CLOSED.
+
+### 15. Compact block receive
+
+**Task 10 (Phase 5), recorded 2026-08-29.** `TestParity_CompactBlockReceive`,
+`TestParity_CompactBlockShortBlockTxnIsBanned` and
+`TestParity_UnsolicitedBlockTxnIsDroppedUnscored`
+(`services/svp2p/parity/scenario_compact_test.go`).
+
+**Setup.** Both legs sync a five block fixture chain. One scripted peer relays a
+transaction that the node validates and, through the txmeta topic, enters in the
+bridge's recent-transaction index. A second peer then announces a SIXTH block —
+coinbase, that transaction, and one the node has never seen — as `cmpctblock` to
+svp2p and as `inv` to legacy. The `inv` is not a convenience: SVNode sends
+`cmpctblock` only to a peer that sent `sendcmpct`, and legacy sends none.
+
+**Observe.** `getblocktxn` count and the slots it asks for, `getdata` count for
+the announced block, the ingested height, the announcing peer's score, and
+whether it is dropped.
+
+**Pass.** svp2p sends `sendcmpct` once, asks one `getblocktxn` for slot 2 alone,
+sends no `getdata` for the block, and reaches height 6. legacy sends no
+`sendcmpct`, answers no `getblocktxn`, downloads the whole block with one
+`getdata`, and reaches height 6. A `blocktxn` shorter than the request scores the
+peer 100 and drops it, leaving the chain at height 5. A `blocktxn` nobody asked
+for is dropped with no score and no disconnect.
+
+**Recorded 2026-08-29:** svp2p asked 1 `getblocktxn` for slots `[[2]]` and 0
+`getdata`; legacy asked 1 `getdata`. Both legs ended at height 6. The `Requests`
+and `Served` divergence is accepted and IS the row: one block arrives as a gap
+request on svp2p and as a full download on legacy. Scenario CLOSED.
