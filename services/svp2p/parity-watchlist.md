@@ -9,7 +9,9 @@ backlog the harness plan must consume. Nothing here is a known defect. Each entr
 is a place where this port makes a choice a unit test cannot judge, with the
 SVNode or legacy source that defines the correct answer.
 
-SVNode line references are against `bitcoin-sv` @ `879fc8b42`.
+SVNode line references are against `bitcoin-sv` @ `12a9f5b6c`. Rows 1 to 14 were
+written against `879fc8b42`, which no longer resolves in the local checkout;
+only row 15 has been re-checked line by line against `12a9f5b6c` (2026-08-30).
 
 ## How to use an entry
 
@@ -522,7 +524,7 @@ whether it is dropped.
   is the SERVE-side depth (`net_processing.cpp:1310-1312`) and does not apply to
   a receive-only port.
 - `CanDirectFetch` (`net_processing.cpp:3818-3820`) and the claim rule
-  (`:3826-3828`) both run before a compact claim is taken.
+  (`:3827-3829`) both run before a compact claim is taken.
 - A `cmpctblock` whose parent this node does not hold draws a `getheaders` and
   no score (`net_processing.cpp:3721-3733`), gated on `!IsInitialBlockDownload()`
   (`:3725`).

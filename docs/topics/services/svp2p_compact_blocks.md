@@ -17,13 +17,33 @@ The feature is off by default. `legacy_compactBlocks` turns it on.
 
 Three things are deliberately absent:
 
-- svp2p sends `sendcmpct(announce=false, version=1)`, so a peer keeps
-  announcing by `headers` or `inv`.
-- svp2p answers a `getdata` for `MSG_CMPCT_BLOCK` with the full block.
-- High-bandwidth mode, the second `sendcmpct` flag, is not carried.
+- **svp2p never announces a compact block.** It sends
+  `sendcmpct(announce=false, version=1)`, so a peer keeps announcing by
+  `headers` or `inv`. `sendcmpct` carries the announce bool FIRST and the
+  version second (`net_processing.cpp:2390-2394`; go-wire's `MsgSendcmpct` is
+  `{SendCmpct bool, Version uint64}`). That announce bool IS BIP152
+  high-bandwidth mode. There is no separate flag for it.
+- **svp2p never serves a compact block, and it answers nothing when asked for
+  one.** A `getdata` for `MSG_CMPCT_BLOCK` is not recognised: `OnGetData` maps
+  only `InvTypeTx`, `InvTypeBlock` and `InvTypeFilteredBlock`
+  (`services/svp2p/protocol/serving.go:495-505`), and everything else becomes
+  `getDataUnsupported` (`serving.go:336-339`). That entry draws a warning log
+  and no reply at all — not even a `notfound` (`getdata.go:246-248`) — and it
+  does not end the serving pass, because `blockType()` is false for it
+  (`serving.go:342-345`). SVNode instead falls back to the full block
+  (`net_processing.cpp:1310-1312`). This port does not.
+- **svp2p records what it never acts on.** An inbound `sendcmpct` sets
+  `fPreferHeaderAndIDs` from the peer's announce bool
+  (`services/svp2p/protocol/syncstate.go:538-552`). Nothing reads it, because
+  this port never announces. Phase 5b is where it starts to matter.
 
 Every failure of the compact path falls back to an ordinary `getdata` for the
-whole block. The flag can cost bandwidth. It cannot cost a block.
+whole block, so the flag costs bandwidth rather than correctness. It is not free
+of consequence for the announcing peer: a `readFailed` costs that peer nothing
+and any known holder may then serve the block, but a `readInvalid` scores it 100
+and disconnects it (`compactdispatch.go:111-118`, `manager.go:1858-1867`). When
+that peer was the only known holder, the block waits for another announcement.
+Parity row 15b shows exactly that shape: the fixture chain stays at height 5.
 
 ## 2. Why a recent-transaction index
 
@@ -34,8 +54,11 @@ evicted first.
 
 Two sites feed the ring:
 
-- the txmeta topic's ADD entries, which are the closest thing this node has to
-  "entered the mempool";
+- the txmeta topic's ADD entries, filtered to those that are neither coinbase nor
+  block-originated (`services/svp2p/bridge/kafka.go:337-340` skips
+  `txMeta.IsCoinbase`, `:344-351` skips `txMeta.InBlock`). The filter is what
+  keeps mined transactions out of the ring. What is left is the closest thing
+  this node has to "entered the mempool";
 - the orphan pool, which stands in for SVNode's separate `vExtraTxnForCompact`
   buffer (`blockencodings.cpp:194-227`).
 
@@ -54,8 +77,12 @@ assembly time, through the same fetch seam the `getdata tx` answerer uses.
    score.
 3. **Announce.** The peer sends `cmpctblock`: the 80-byte header, a nonce, the
    prefilled transactions, and one 48-bit short ID per remaining transaction.
-4. **Accept the header.** svp2p accepts the header into the index before any
-   other decision.
+4. **Accept the header.** svp2p accepts the header into the index AFTER the
+   parent check and BEFORE every guard in section 4
+   (`services/svp2p/protocol/compactdispatch.go:166-192`). A `cmpctblock` whose
+   parent is unknown returns earlier than this, with no header accepted, exactly
+   as SVNode returns at `net_processing.cpp:3721-3733` before
+   `ProcessNewBlockHeaders` at `:3740`.
 5. **Decide.** Five guards decide whether the block is worth reconstructing.
    Section 4 lists them.
 6. **Match.** svp2p derives the SipHash key from the header and the nonce
@@ -83,7 +110,7 @@ assembly time, through the same fetch seam the `getdata tx` answerer uses.
 | 2. | The block's chain work does not beat the active tip | `net_processing.cpp:3801-3802` |
 | 3. | The block is not in flight and `CanDirectFetch` fails | `net_processing.cpp:3818-3820` |
 | 4. | The height is above tip + 2 | `net_processing.cpp:3825` |
-| 5. | The claim rule: not in flight and under 16 blocks per peer, or already in flight from this peer | `net_processing.cpp:3826-3828` |
+| 5. | The claim rule: not in flight and under 16 blocks per peer, or already in flight from this peer | `net_processing.cpp:3827-3829` |
 
 Two more rules sit outside that table:
 
@@ -190,8 +217,15 @@ Three further points of the fallback:
    plain `headers` message (`:3913-3921`). svp2p's scheduler re-offers the block
    on its own tick, and svp2p's header accept runs ahead of every guard. The end
    state is the same.
-6. **svp2p never serves a compact block.** `MAX_CMPCTBLOCK_DEPTH` and
-   `MAX_BLOCKTXN_DEPTH` have no counterpart here.
+6. **svp2p never serves a compact block, and a peer that asks gets silence.**
+   `MAX_CMPCTBLOCK_DEPTH` and `MAX_BLOCKTXN_DEPTH` have no counterpart here.
+   Section 1 gives the mechanism. Note the consequence of turning the flag on:
+   SVNode reads our `sendcmpct` as "we are willing to provide version 1 or 2
+   cmpctblocks ... they may wish to request compact blocks from us"
+   (`net_processing.cpp:1942-1946`), so a peer MAY now send a `getdata` for
+   `MSG_CMPCT_BLOCK`. svp2p answers that entry with nothing. An inbound
+   `getblocktxn` is refused with nothing for the same reason
+   (`services/svp2p/protocol/peer.go:843-849`).
 
 ## 8. Test harness note
 
