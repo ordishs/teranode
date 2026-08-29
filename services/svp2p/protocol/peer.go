@@ -842,8 +842,9 @@ func (p *Peer) dispatchCompact(ctx context.Context, msg wire.Message, establishe
 
 	case *wire.MsgGetBlockTxn:
 		// spec §2: we never announce compact blocks, so a peer should never
-		// ask; SVNode's own serving handler (net_processing.cpp:4765) is not
-		// carried here at all.
+		// ask; SVNode's own serving handler (net_processing.cpp:4723, which
+		// dispatches to ProcessGetBlockTxnMessage at :2746) is not carried
+		// here at all.
 		p.cfg.Logger.Debugf("[svp2p] ignoring getblocktxn from %s: compact blocks are receive-only",
 			p.cfg.Conn.RemoteAddr())
 	}

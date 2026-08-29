@@ -341,10 +341,19 @@ const (
 
 // blockType is protocol.h:577-578 IsBlockType: MSG_BLOCK, MSG_FILTERED_BLOCK
 // or MSG_CMPCT_BLOCK. It is what ends a serving pass — see the note on
-// Serving.OnGetData. MSG_CMPCT_BLOCK cannot be recognised here, so a peer that
-// asked for one would not end the pass; nothing does, because this port never
-// sends sendcmpct and so is never asked (spec §10 item 5 defers compact
-// blocks).
+// Serving.OnGetData.
+//
+// MSG_CMPCT_BLOCK cannot be recognised here, because go-wire has no InvType
+// constant for it. Such an entry classifies as getDataUnsupported, so it is
+// warn-logged, left unanswered, and does not end the pass.
+//
+// A peer CAN now ask for one. This port sends a version-1 sendcmpct after the
+// handshake (net_processing.cpp ProcessVerAckMessage :1961-1972), which sets
+// fSupportsDesiredCmpctVersion on SVNode's side. SVNode then rewrites a
+// single-block headers direct fetch into MSG_CMPCT_BLOCK (:3553-3560). This
+// port serves no compact block in either case — compact blocks are
+// receive-only — so the only divergence is the missed break, and it is booked
+// as a residual.
 func (k getDataKind) blockType() bool {
 	return k == getDataBlock || k == getDataFilteredBlock
 }
