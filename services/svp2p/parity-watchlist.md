@@ -487,10 +487,10 @@ ends with the legacy service at cutover. Scenario CLOSED.
 
 ### 15. Compact block receive
 
-**Task 10 (Phase 5), recorded 2026-08-29.** `TestParity_CompactBlockReceive`,
-`TestParity_CompactBlockShortBlockTxnIsBanned` and
-`TestParity_UnsolicitedBlockTxnIsDroppedUnscored`
-(`services/svp2p/parity/scenario_compact_test.go`).
+**Task 10 (Phase 5), recorded 2026-08-29, closed 2026-08-30.** Five sub-rows,
+15a to 15e, in `services/svp2p/parity/scenario_compact_test.go`. Every SVNode
+citation in this row was re-checked against `bitcoin-sv` @ `12a9f5b6c` on
+2026-08-30.
 
 **Setup.** Both legs sync a five block fixture chain. One scripted peer relays a
 transaction that the node validates and, through the txmeta topic, enters in the
@@ -503,30 +503,57 @@ svp2p and as `inv` to legacy. The `inv` is not a convenience: SVNode sends
 the announced block, the ingested height, the announcing peer's score, and
 whether it is dropped.
 
-**Pass.** svp2p sends `sendcmpct` once, asks one `getblocktxn` for slot 2 alone,
-sends no `getdata` for the block, and reaches height 6. legacy sends no
-`sendcmpct`, answers no `getblocktxn`, downloads the whole block with one
-`getdata`, and reaches height 6. A `blocktxn` shorter than the request scores the
-peer 100 and drops it, leaving the chain at height 5. A `blocktxn` nobody asked
-for is dropped with no score and no disconnect.
+#### Sub-rows
 
-**Recorded 2026-08-29:** svp2p asked 1 `getblocktxn` for slots `[[2]]` and 0
-`getdata`; legacy asked 1 `getdata`. Both legs ended at height 6. The `Requests`
-and `Served` divergence is accepted and IS the row: one block arrives as a gap
-request on svp2p and as a full download on legacy. Scenario CLOSED.
+| Row | Test | Expected | Observed | Verdict |
+|---|---|---|---|---|
+| 15a | `TestParity_CompactBlockReceive`, svp2p leg | 1 `sendcmpct`; 1 `getblocktxn` for slot 2; 0 `getdata` for the block; height 6 | `sendcmpct`=1, `getblocktxn`=1, slots `[[2]]`, `getdata`=0, height 6 | PASS |
+| 15a | the same test, legacy leg | 0 `sendcmpct`; 0 `getblocktxn`; 1 `getdata`; height 6 | as expected | PASS |
+| 15a | the same test, comparison | both legs end on the same height; `Requests` and `Served` diverge, and that IS the row | 0 unaccepted diffs, 2 accepted | PASS |
+| 15b | `TestParity_CompactBlockShortBlockTxnIsBanned` | a `blocktxn` shorter than the request: score 100, peer dropped, chain stays at 5 | `getblocktxn`=1, score 100, `Disconnected[peer1]`="node", height 5 | PASS |
+| 15c | `TestParity_UnsolicitedBlockTxnIsDroppedUnscored` | a `blocktxn` nobody asked for: branch entered, score 0, both peers connected, height 5 | `unsolicited-branch`=true, score 0, 2 connected, height 5 | PASS |
+| 15d | `TestParity_CompactBlockWrongGapFallsBackToGetData` | the wrong gap transaction (`readFailed`): score 0, peer kept, block by `getdata`, height 6 on both legs | BEFORE the port fix: the fallback ran, THEN score 100 and a disconnect, height 5. AFTER: `getblocktxn`=1, `getdata`=1, score 0, connected, height 6 both legs | **DEFECT FOUND AND FIXED** — PASS |
+| 15e | `TestParity_CompactBlockAboveHeightCeilingIsDeclined` | above the ceiling: no `getblocktxn`, header accepted, peer unscored, block later by `getdata` | declined at tip 5, `getblocktxn`=0, header in the index at height 8, score 0, connected, `getdata`=2, height 8 | PASS |
 
-**Fix round 1, 2026-08-30.** Two more sub-cases, and one OPEN DEFECT.
+#### Rules these sub-rows pin
 
-`TestParity_CompactBlockWrongGapFallsBackToGetData` — the `READ_STATUS_FAILED`
-path. The peer answers the gap request with the right count and the wrong
-transaction, so the arity check passes and the assembler's short-ID check fails
+- The height ceiling is `tip + 2` (`net_processing.cpp:3825`), and it is the
+  RECEIVE-side conservatism rule. `MAX_CMPCTBLOCK_DEPTH` (5, `validation.h:133`)
+  is the SERVE-side depth (`net_processing.cpp:1310-1312`) and does not apply to
+  a receive-only port.
+- `CanDirectFetch` (`net_processing.cpp:3818-3820`) and the claim rule
+  (`:3826-3828`) both run before a compact claim is taken.
+- A `cmpctblock` whose parent this node does not hold draws a `getheaders` and
+  no score (`net_processing.cpp:3721-3733`), gated on `!IsInitialBlockDownload()`
+  (`:3725`).
+- One partial block per peer (`net_processing.cpp:3839-3844`), counting both a
+  reconstruction waiting on a `blocktxn` and one being ingested.
+- The partial block is detached at the fill handoff, so a replayed `blocktxn`
+  is unsolicited. That is `MarkBlockAsReceived` at `net_processing.cpp:3646`.
+- A compact ingest declares no payload size, so `SizeBytes` is zero and the
+  ingest is bounded by `MaxBlockDownloadTime` rather than by byte progress.
+
+#### 15a, recorded 2026-08-29
+
+svp2p asked 1 `getblocktxn` for slots `[[2]]` and 0 `getdata`; legacy asked 1
+`getdata`. Both legs ended at height 6. The `Requests` and `Served` divergence is
+accepted and IS the row: one block arrives as a gap request on svp2p and as a
+full download on legacy. Sub-row CLOSED.
+
+Observed disconnect line for 15b, from the node's own log, is in the Task 10
+report.
+
+#### 15d — the `READ_STATUS_FAILED` path, and a port defect
+
+The peer answers the gap request with the right count and the wrong
+transaction. The arity check passes, and the assembler's short-ID check fails
 the slot (`compactblock.go` `readGap`). A short ID is 48 bits, so an honest
-peer's transaction can hash onto the slot we asked about; SVNode treats that as a
-possible collision and not as malice (`net_processing.cpp:3618-3623`, "Might have
-collided, fall back to getdata now"), with no `Misbehaving` call.
+peer's transaction can hash onto the slot we asked about. SVNode treats that as
+a possible collision and not as malice (`net_processing.cpp:3618-3623`, "Might
+have collided, fall back to getdata now"), with no `Misbehaving` call.
 
-**PORT DEFECT FOUND BY THIS ROW, and FIXED.** `manager.go` `BlockDone` read its
-compact override as additive when it is a replacement: the default branch had
+**PORT DEFECT FOUND BY THIS SUB-ROW, and FIXED.** `manager.go` `BlockDone` read
+its compact override as additive when it is a replacement. The default branch had
 already set the score and the disconnect from `outcome.PeerFault`, and the
 `readFailed` case only logged. A collision therefore cost an honest peer the same
 100 and the same disconnect as a malicious fill — `readInvalid` and `readFailed`
@@ -539,19 +566,24 @@ as a verdict on the peer. The branch now clears both. Unit test:
 
 **Recorded 2026-08-30, after the fix:** svp2p asked 1 `getblocktxn`, fell back to
 1 `getdata`, scored the peer 0, kept the connection, and reached height 6; legacy
-reached height 6. The 15b row is the control that `readInvalid` still scores 100
-and still drops. Sub-case CLOSED.
+reached height 6. 15b is the control that `readInvalid` still scores 100 and
+still drops. Sub-row CLOSED.
 
-`TestParity_CompactBlockAboveHeightCeilingIsDeclined` — the height ceiling
-(`net_processing.cpp:3825`, `MaxCompactBlockHeightAhead` = 2). The peer publishes
-headers 6 and 7 and then withholds every block body, so the node's header index
-reaches 7 while its active tip stays at 5; block 8 is then announced by
-`cmpctblock`. Of wantCompact's four guards only the ceiling can refuse: the node
-never held block 8, block 8 outweighs the tip, and `CanDirectFetch` passes (the
-fixture tip is ~30 minutes old against a 3h20m regtest window).
+#### 15e — the height ceiling
+
+The peer publishes headers 6 and 7 and then withholds every block body, so the
+node's header index reaches 7 while its active tip stays at 5. Block 8 is then
+announced by `cmpctblock`. Of `wantCompact`'s five guards only the ceiling can
+refuse: the node never held block 8, block 8 outweighs the tip, and
+`CanDirectFetch` passes (the fixture tip is about 30 minutes old against a
+3 h 20 m regtest window).
 
 **Recorded 2026-08-30: svp2p matches.** Declined at tip 5 with no `getblocktxn`,
 the header accepted into the index at height 8 — the accept runs ahead of every
 guard, which is what the `:3913-3921` "same treatment as a header message" branch
 achieves — the peer unscored and still connected, and the block ingested by
-ordinary `getdata` once serving resumed. Sub-case CLOSED.
+ordinary `getdata` once serving resumed. Sub-row CLOSED.
+
+**Scenario CLOSED.** See
+[docs/topics/services/svp2p_compact_blocks.md](../../docs/topics/services/svp2p_compact_blocks.md)
+for the message flow and the full divergence list.

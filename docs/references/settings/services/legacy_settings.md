@@ -43,6 +43,8 @@
 | MinSyncPeerNetworkSpeed | uint64 | 51200 | legacy_minSyncPeerNetworkSpeed | svp2p: bytes/s below which the sync peer is rotated (0 disables). Falls back to `legacy_config_MinSyncPeerNetworkSpeed` with a deprecation warning |
 | DisableBanning | bool | false | legacy_disableBanning | svp2p: the bsvd `--nobanning` switch. Falls back to `legacy_config_DisableBanning` with a deprecation warning |
 | DisableDNSSeed | bool | false | legacy_disableDNSSeed | svp2p: the bsvd `--nodnsseed` switch; with it off the fixed-seed list still applies after 60 s. Falls back to `legacy_config_DisableDNSSeed` with a deprecation warning |
+| CompactBlocks | bool | false | legacy_compactBlocks | svp2p: send `sendcmpct(0,1)` after verack and accept `cmpctblock` (the BIP152 receive path). Every failure falls back to a full `getdata` |
+| CompactBlocksRecentTxs | int | 5000000 | legacy_compactBlocksRecentTxs | svp2p: capacity of the recent-transaction hash ring that compact-block reconstruction matches short IDs against. About 105 bytes per hash (~504 MiB at the default), allocated only when `legacy_compactBlocks` is on |
 
 ## Configuration Dependencies
 
@@ -67,6 +69,41 @@ a fallback when the new key is unset and prints
 svp2p also honours `excessiveblocksize` at the wire: it is the receive cap for a single block
 (blocks over 4 GiB use the SVNode extended message header), and a value of 0 — documented as
 "unlimited" for validation — is mapped to the 4 GiB default at the wire, with a warning at start.
+
+### Compact blocks (svp2p)
+
+`legacy_compactBlocks` turns on the BIP152 compact-block RECEIVE path, and nothing else. svp2p
+sends `sendcmpct(announce=false, version=1)` once per peer after verack, and it accepts a
+`cmpctblock` a peer sends. svp2p never announces a block as `cmpctblock` and never serves one:
+`announce=false` tells the peer to keep announcing by `headers` or `inv`, and a `getdata` for
+`MSG_CMPCT_BLOCK` is still answered with the full block. High-bandwidth mode, the second
+`sendcmpct` flag, is not carried.
+
+Every reconstruction failure falls back to an ordinary `getdata` for the whole block, so the
+flag can only cost bandwidth, never a block. See
+[svp2p compact blocks](../../../topics/services/svp2p_compact_blocks.md) for the message flow,
+the outcome table, and the divergences from SVNode.
+
+`legacy_compactBlocksRecentTxs` sizes `bridge.RecentTxIndex`, the ring of recently seen
+transaction hashes that stands in for the mempool SVNode matches short IDs against. Teranode has
+no mempool, so the ring is fed by the txmeta topic's ADD entries and by the orphan pool. Budget
+about 105 bytes per hash: a 32-byte ring slot plus roughly 70 bytes in the dedup map. At the
+5,000,000 default that is about 504 MiB of resident heap once the ring is full — a 160 MiB ring
+and a ~344 MiB map, measured by `TestRecentTxIndex_FootprintAtDefaultCapacity`. A match adds a
+transient 160 MiB copy of the ring for the length of one call. The ring grows into its capacity
+as hashes arrive, so a node that never fills it never pays for the whole of it. A value of 0 or
+below falls back to the default rather than disabling the index.
+
+Cutover guidance:
+
+- Leave `legacy_compactBlocks` at `false` unless the node has the ~504 MiB of headroom the
+  default ring needs, plus the CPU for one pass over the ring per announced block.
+- Turn it on for one node first and watch the reconstruction log lines. A low hit rate is not a
+  fault: it degrades to one `getblocktxn` that carries most of the block, which is no worse than
+  a `getdata`.
+- Lower `legacy_compactBlocksRecentTxs` on a memory-tight node before turning the feature off. A
+  smaller ring reconstructs less and still saves the round trip on the transactions it holds.
+- The index is allocated only when the flag is on, so a node with the flag off pays nothing.
 
 ### Feeler Probes
 
