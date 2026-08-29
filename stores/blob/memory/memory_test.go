@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCleanExpiredFiles(t *testing.T) {
@@ -299,4 +300,30 @@ func TestMemory_Close(t *testing.T) {
 	if store.Counters["close"] != 1 {
 		t.Errorf("expected close counter to be 1, got %d", store.Counters["close"])
 	}
+}
+
+// TestMemory_BlockHeightIsRaceFree: the TTL cleaner reads the current block
+// height on its own goroutine while services write it from a blockchain
+// subscription (subtreevalidation.updateBestBlock). Seen as a DATA RACE by the
+// svp2p parity harness on CI.
+func TestMemory_BlockHeightIsRaceFree(t *testing.T) {
+	m := New()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for i := uint32(1); i <= 200; i++ {
+			m.SetCurrentBlockHeight(i)
+			m.SetBlockHeight(i)
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		cleanExpiredFiles(m, m.blockHeight())
+	}
+
+	<-done
+	require.Equal(t, uint32(200), m.blockHeight())
 }
