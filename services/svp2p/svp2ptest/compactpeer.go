@@ -114,7 +114,7 @@ func (p *ScriptedPeer) AnnounceCompact(block *wire.MsgBlock, nonce uint64, prefi
 // indistinguishable on the wire from a reply to a shorter request. A scenario
 // that wants a short or malformed reply scripts one with Script.OnGetBlockTxn.
 func (p *ScriptedPeer) BlockTxnFor(msg *wire.MsgGetBlockTxn) *wire.MsgBlockTxn {
-	block, known := p.Chain.Blocks[msg.BlockHash]
+	block, known := p.Chain.Block(msg.BlockHash)
 	if !known {
 		return nil
 	}

@@ -514,3 +514,37 @@ for is dropped with no score and no disconnect.
 `getdata`; legacy asked 1 `getdata`. Both legs ended at height 6. The `Requests`
 and `Served` divergence is accepted and IS the row: one block arrives as a gap
 request on svp2p and as a full download on legacy. Scenario CLOSED.
+
+**Fix round 1, 2026-08-30.** Two more sub-cases, and one OPEN DEFECT.
+
+`TestParity_CompactBlockWrongGapIsScoredAndDropped` — the `READ_STATUS_FAILED`
+path. The peer answers the gap request with the right count and the wrong
+transaction, so the arity check passes and the assembler's short-ID check fails
+the slot (`compactblock.go` `readGap`). SVNode treats that as a possible short-ID
+collision and not as malice (`net_processing.cpp:3655-3660`, "Might have collided,
+fall back to getdata now"): no `Misbehaving` call, the block back on offer, the
+ordinary `getdata` path fetches it.
+
+**Recorded 2026-08-30: svp2p does NOT match.** The fallback log is written and
+then the peer is scored 100 and dropped anyway. The reconstruction surfaces as an
+ingest failure with `outcome.PeerFault` set, so `manager.go` `BlockDone` has
+already set `delta` and `disconnect` before its `readFailed` case runs — and that
+case only logs, never clearing either. `readInvalid` and `readFailed` are
+indistinguishable to a peer today, and with its only advertiser dropped the block
+never arrives (height stays 5). The test pins what the port does so the defect
+cannot be lost. **Scenario OPEN**; when the port is fixed the expected values
+become score 0, peer connected, block by `getdata`, height 6.
+
+`TestParity_CompactBlockAboveHeightCeilingIsDeclined` — the height ceiling
+(`net_processing.cpp:3825`, `MaxCompactBlockHeightAhead` = 2). The peer publishes
+headers 6 and 7 and then withholds every block body, so the node's header index
+reaches 7 while its active tip stays at 5; block 8 is then announced by
+`cmpctblock`. Of wantCompact's four guards only the ceiling can refuse: the node
+never held block 8, block 8 outweighs the tip, and `CanDirectFetch` passes (the
+fixture tip is ~30 minutes old against a 3h20m regtest window).
+
+**Recorded 2026-08-30: svp2p matches.** Declined at tip 5 with no `getblocktxn`,
+the header accepted into the index at height 8 — the accept runs ahead of every
+guard, which is what the `:3913-3921` "same treatment as a header message" branch
+achieves — the peer unscored and still connected, and the block ingested by
+ordinary `getdata` once serving resumed. Sub-case CLOSED.

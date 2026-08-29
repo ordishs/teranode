@@ -64,6 +64,9 @@ type nodeUnderTest struct {
 	blockchainStore blockchain_store.Store
 	svc             service
 	cancel          context.CancelFunc
+	// txMeta is the validator's txmeta Kafka producer, held so Stop can close
+	// it: it owns a goroutine that ctx cancellation alone does not join.
+	txMeta *kafka.KafkaAsyncProducer
 
 	// scores is filled by a scenario's Drive from a scoreSampler, for Observe.
 	scores map[string]int
@@ -128,6 +131,8 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 		tweak(tSettings)
 	}
 
+	isolateTxMetaTopic(t, tSettings)
+
 	blockchainStore, err := blockchain_store.NewStore(logger, &url.URL{Scheme: "sqlitememory"}, tSettings)
 	require.NoError(t, err)
 
@@ -150,7 +155,9 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 
 	blockAssemblyClient := svp2ptest.StartBlockAssembly(ctx, t, logger, tSettings, txStore, subtreeStore, utxoStore, blockchainClient)
 
-	validatorClient, err := validator.New(ctx, logger, tSettings, utxoStore, txMetaProducer(ctx, t, logger, tSettings), nil, nil,
+	txMeta := txMetaProducer(ctx, t, logger, tSettings)
+
+	validatorClient, err := validator.New(ctx, logger, tSettings, utxoStore, txMeta, nil, nil,
 		blockAssemblyClient, blockchainClient)
 	require.NoError(t, err)
 
@@ -205,7 +212,8 @@ func newNode(t *testing.T, impl Impl, connectPeers []string, tweaks ...func(*set
 		t.Fatalf("%s did not become ready", impl)
 	}
 
-	n := &nodeUnderTest{Impl: impl, Logger: logger, Settings: tSettings, PeerListen: peerListen, blockchainStore: blockchainStore, svc: svc, cancel: cancel}
+	n := &nodeUnderTest{Impl: impl, Logger: logger, Settings: tSettings, PeerListen: peerListen,
+		blockchainStore: blockchainStore, svc: svc, cancel: cancel, txMeta: txMeta}
 
 	t.Cleanup(n.Stop)
 
@@ -251,26 +259,61 @@ func startUtxoBlockState(ctx context.Context, logger ulogger.Logger, blockchainC
 	}()
 }
 
-// txMetaProducer is the validator's txmeta Kafka producer, built only when a
-// scenario configured the topic (kafka_txmetaConfig). It is the PRODUCE half of
-// the path that puts an accepted transaction into the svp2p bridge's
-// recent-transaction index: the validator publishes an ADD entry,
-// bridge.StartTxMetaConsumer reads it back off the same topic and calls
-// RecentTxIndex.Add. Compact block reconstruction has nothing to match short
-// IDs against until that round trip has run, so a scenario that reconstructs a
-// block must configure the topic.
+// isolateTxMetaTopic gives this leg its own txmeta topic.
 //
-// Every other scenario leaves Kafka.TxMetaConfig nil and gets an untyped nil
-// back, which is the state the parity harness has always run in — the
-// validator's own "tests may not set this" branch. Returned as the interface,
-// never as a typed nil pointer inside it, because the validator's guard is a
-// plain nil check.
-func txMetaProducer(ctx context.Context, t *testing.T, logger ulogger.Logger, tSettings *settings.Settings) kafka.KafkaAsyncProducerI {
+// settings.conf always resolves kafka_txmetaConfig to a non-empty URL, and the
+// test context resolves its scheme to memory, so EVERY leg of EVERY scenario
+// publishes and consumes on the process-wide in-memory broker
+// (in_memory_kafka.GetSharedBroker). Left at the configured default they would
+// all share one topic named "txmeta", and one leg would read what another left
+// behind — which matters the moment a scenario asserts on what the
+// recent-transaction index holds.
+//
+// tSettings.Context already carries the implementation and a process-wide
+// counter (newNode), so it is the name that makes the topic unique. Applied
+// AFTER the scenario's tweaks, deliberately: isolation is not a scenario's to
+// waive.
+func isolateTxMetaTopic(t *testing.T, tSettings *settings.Settings) {
 	t.Helper()
 
-	if tSettings.Kafka.TxMetaConfig == nil {
-		return nil
-	}
+	require.NotNil(t, tSettings.Kafka.TxMetaConfig, "kafka_txmetaConfig is required; validator.New refuses a nil one")
+
+	isolated := *tSettings.Kafka.TxMetaConfig
+	// "txmeta-parity-", not "txmeta-": svp2ptest.StartSubtreeValidation already
+	// runs a consumer on "txmeta-"+Context (services.go), and a scenario waits
+	// on GetSharedBroker().HasConsumer to know the BRIDGE's consumer has
+	// joined. Sharing the name would let that wait be satisfied by the wrong
+	// consumer, and the relayed transaction would then be produced into a topic
+	// the index is not yet reading.
+	isolated.Path = "/txmeta-parity-" + tSettings.Context
+
+	tSettings.Kafka.TxMetaConfig = &isolated
+}
+
+// txMetaTopic is the topic name isolateTxMetaTopic settled on, which is what a
+// scenario waits on before it relays a transaction it expects to be indexed.
+func (n *nodeUnderTest) txMetaTopic() string {
+	return strings.TrimPrefix(n.Settings.Kafka.TxMetaConfig.Path, "/")
+}
+
+// txMetaProducer is the validator's txmeta Kafka producer. It is the PRODUCE
+// half of the path that puts an accepted transaction into the svp2p bridge's
+// recent-transaction index: the validator publishes an ADD entry,
+// bridge.StartTxMetaConsumer reads it back off the same topic and calls
+// RecentTxIndex.Add. Compact block reconstruction has nothing to match short IDs
+// against until that round trip has run.
+//
+// The harness passed nil here until Task 10, which is why nothing was ever
+// published on the topic. It is built for EVERY leg, not only the compact ones:
+// the producer is what the daemon wires in production, and a leg-local topic
+// (isolateTxMetaTopic) is what keeps that from reaching another leg.
+//
+// The returned producer's lifecycle is the node's ctx, like every other
+// background dependency the harness builds; Stop closes it explicitly as well,
+// because it is the one piece of new state whose goroutine outlives the
+// service under test.
+func txMetaProducer(ctx context.Context, t *testing.T, logger ulogger.Logger, tSettings *settings.Settings) *kafka.KafkaAsyncProducer {
+	t.Helper()
 
 	producer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.TxMetaConfig, &tSettings.Kafka)
 	require.NoError(t, err)
@@ -291,6 +334,11 @@ func (n *nodeUnderTest) Stop() {
 	defer cancelStop()
 
 	_ = n.svc.Stop(stopCtx)
+
+	if n.txMeta != nil {
+		kafka.StopProducerCtx(stopCtx, n.Logger, "parity txmeta", n.txMeta)
+		n.txMeta = nil
+	}
 }
 
 // BestHeight is the node's active chain height.
@@ -342,6 +390,32 @@ func (n *nodeUnderTest) RecentTxIndexLen() int {
 	}
 
 	return 0
+}
+
+// HeaderKnown reports whether the node's header index holds hash, and at what
+// height. It is how a scenario distinguishes "the announcement was processed and
+// the block declined" from "the announcement was never processed": the compact
+// dispatcher accepts the header UNCONDITIONALLY, ahead of every guard, so the
+// header is in the index even when the block is refused.
+//
+// Legacy has no such index and always answers false.
+func (n *nodeUnderTest) HeaderKnown(hash chainhash.Hash) (int32, bool) {
+	srv, ok := n.svc.(*svp2p.Server)
+	if !ok {
+		return 0, false
+	}
+
+	idx := srv.HeaderIndex()
+	if idx == nil {
+		return 0, false
+	}
+
+	node, known := idx.Lookup(hash)
+	if !known {
+		return 0, false
+	}
+
+	return node.Height, true
 }
 
 // ConnectedCount is how many peers the node currently holds.

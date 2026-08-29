@@ -63,25 +63,36 @@ func (c *FixtureChain) SpendCoinbase(t *testing.T, height int, fee uint64) *bt.T
 	return spend
 }
 
-// BuildNextBlock mines the block that follows the fixture tip: a coinbase
-// claiming the subsidy at the new height, then txs in the order given. The
-// header carries the merkle root over every one of those transactions, so the
-// block passes the merkle check whichever way the node obtained its
-// transactions — whole from a getdata, or reassembled from a compact block.
-//
-// The block is registered for serving (Blocks, Heights) but its header is NOT
-// appended to Headers, so getheaders and getblocks keep answering with the
-// chain as it stood. That separation is what lets a scenario announce the block
-// by cmpctblock, which carries its own header, without the node having already
-// learnt of it from a headers round. PublishHeader is the other half.
+// BuildNextBlock mines the block that follows the ANNOUNCED tip. It is
+// BuildBlockOn with the tip as the parent, which is what almost every scenario
+// wants.
 func (c *FixtureChain) BuildNextBlock(t *testing.T, tSettings *settings.Settings, txs []*bt.Tx) *wire.MsgBlock {
 	t.Helper()
 
-	require.NotEmpty(t, c.Headers, "the fixture chain must hold at least one block")
+	return c.BuildBlockOn(t, tSettings, c.Tip(), txs)
+}
 
-	tipHeader := c.Headers[len(c.Headers)-1]
-	prevHash := tipHeader.BlockHash()
-	height := uint32(c.Heights[prevHash] + 1) //nolint:gosec // test heights are small
+// BuildBlockOn mines the block that follows parent: a coinbase claiming the
+// subsidy at the new height, then txs in the order given. The header carries the
+// merkle root over every one of those transactions, so the block passes the
+// merkle check whichever way the node obtained its transactions — whole from a
+// getdata, or reassembled from a compact block.
+//
+// The block is registered for serving (Blocks, Heights) but its header is NOT
+// appended to Headers, so getheaders and getblocks keep answering with the chain
+// as it stood. That separation is what lets a scenario announce the block by
+// cmpctblock, which carries its own header, without the node having already
+// learnt of it from a headers round. PublishHeader is the other half.
+//
+// The explicit parent is what lets a scenario mine a RUN of blocks without
+// announcing any of them: BuildNextBlock alone always builds on the announced
+// tip, so two calls without an intervening PublishHeader produce two siblings.
+func (c *FixtureChain) BuildBlockOn(t *testing.T, tSettings *settings.Settings, parent chainhash.Hash, txs []*bt.Tx) *wire.MsgBlock {
+	t.Helper()
+
+	parentHeader, parentHeight := c.parentOf(t, parent)
+
+	height := uint32(parentHeight + 1) //nolint:gosec // test heights are small
 
 	// The subsidy halves every SubsidyReductionInterval blocks, the same rule
 	// BuildFixtureChainPadded's own coinbase follows; a coinbase that claims
@@ -101,9 +112,9 @@ func (c *FixtureChain) BuildNextBlock(t *testing.T, tSettings *settings.Settings
 		leaves = append(leaves, *tx.TxIDChainHash())
 	}
 
-	timestamp := uint32(tipHeader.Timestamp.Unix()) + blockIntervalSeconds //nolint:gosec // fixture timestamps are in range
+	timestamp := uint32(parentHeader.Timestamp.Unix()) + blockIntervalSeconds //nolint:gosec // fixture timestamps are in range
 
-	header := mineHeader(t, prevHash, merkleRootOf(leaves), timestamp, *bits)
+	header := mineHeader(t, parent, merkleRootOf(leaves), timestamp, *bits)
 
 	block := wire.NewMsgBlock(header)
 	require.NoError(t, block.AddTransaction(WireTx(t, coinbase)))
@@ -113,10 +124,34 @@ func (c *FixtureChain) BuildNextBlock(t *testing.T, tSettings *settings.Settings
 	}
 
 	hash := header.BlockHash()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.Blocks[hash] = block
 	c.Heights[hash] = int32(height) //nolint:gosec // test heights are small
 
 	return block
+}
+
+// parentOf reads the header and height of the block a new one will extend. It
+// takes the read lock rather than the write lock the caller ends with, because
+// mining sits between the two and is the long part.
+func (c *FixtureChain) parentOf(t *testing.T, parent chainhash.Hash) (*wire.BlockHeader, int32) {
+	t.Helper()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	block, known := c.Blocks[parent]
+	require.True(t, known, "the fixture chain does not hold the parent %s", parent)
+
+	height, known := c.Heights[parent]
+	require.True(t, known, "the fixture chain has no height for the parent %s", parent)
+
+	header := block.Header
+
+	return &header, height
 }
 
 // PublishHeader appends a block built by BuildNextBlock to the announced
@@ -128,8 +163,12 @@ func (c *FixtureChain) PublishHeader(t *testing.T, block *wire.MsgBlock) {
 
 	hash := block.Header.BlockHash()
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	require.Contains(t, c.Blocks, hash, "only a block this chain already holds can be published")
-	require.Equal(t, c.Tip().String(), block.Header.PrevBlock.String(), "a published header must extend the current tip")
+	require.Equal(t, c.Headers[len(c.Headers)-1].BlockHash().String(), block.Header.PrevBlock.String(),
+		"a published header must extend the current tip")
 
 	header := block.Header
 	c.Headers = append(c.Headers, &header)

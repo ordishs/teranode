@@ -7,6 +7,7 @@ package svp2ptest
 import (
 	"bytes"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,7 +27,24 @@ import (
 // root = the coinbase txid, which is what a single-transaction block's root is).
 // ---------------------------------------------------------------------------
 
+// FixtureChain is the chain the scripted peers serve from.
+//
+// CONCURRENCY. The three exported collections below are written by
+// BuildNextBlock and PublishHeader, which a scenario calls from the test
+// goroutine WHILE peer serve goroutines are answering getheaders, getblocks and
+// getdata out of the same collections. Every such write and every serving read
+// goes through mu; the accessors below are the read side, and are what
+// ScriptedPeer uses.
+//
+// The exported fields stay exported because a scenario builds its peers and
+// reads its fixture blocks before any goroutine is serving, which is safe. A
+// read taken WHILE the node is running must go through the accessors.
 type FixtureChain struct {
+	// mu guards Headers, Blocks and Heights. Never held across a call that
+	// can block: every accessor below copies or returns a map value and
+	// releases it.
+	mu sync.RWMutex
+
 	Headers []*wire.BlockHeader // headers[i] is at height i+1
 	Blocks  map[chainhash.Hash]*wire.MsgBlock
 	Heights map[chainhash.Hash]int32 // includes genesis at height 0
@@ -43,7 +61,56 @@ type FixtureChain struct {
 	Coinbases []*bt.Tx
 }
 
-func (c *FixtureChain) Tip() chainhash.Hash { return c.Headers[len(c.Headers)-1].BlockHash() }
+// Tip is the hash of the highest ANNOUNCED header — the chain as getheaders
+// reports it, which a block built by BuildNextBlock does not join until
+// PublishHeader.
+func (c *FixtureChain) Tip() chainhash.Hash {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.Headers[len(c.Headers)-1].BlockHash()
+}
+
+// Len is how many headers the announced chain holds.
+func (c *FixtureChain) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return len(c.Headers)
+}
+
+// HeaderAt is the header at index i, or nil when i is outside the chain.
+func (c *FixtureChain) HeaderAt(i int) *wire.BlockHeader {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if i < 0 || i >= len(c.Headers) {
+		return nil
+	}
+
+	return c.Headers[i]
+}
+
+// Block is the block for hash, whether or not its header is announced.
+func (c *FixtureChain) Block(hash chainhash.Hash) (*wire.MsgBlock, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	block, known := c.Blocks[hash]
+
+	return block, known
+}
+
+// Height is the height recorded for hash, whether or not its header is
+// announced.
+func (c *FixtureChain) Height(hash chainhash.Hash) (int32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	height, known := c.Heights[hash]
+
+	return height, known
+}
 
 func BuildFixtureChain(t *testing.T, tSettings *settings.Settings, count int) *FixtureChain {
 	t.Helper()

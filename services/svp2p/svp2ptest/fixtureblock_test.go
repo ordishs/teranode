@@ -152,3 +152,24 @@ func headerBytesOf(t *testing.T, header *wire.BlockHeader) []byte {
 
 	return buf.Bytes()
 }
+
+func TestFixtureChain_BuildBlockOnMinesARunWithoutAnnouncingIt(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	chain := BuildFixtureChain(t, tSettings, 3)
+
+	sixth := chain.BuildNextBlock(t, tSettings, nil)
+	seventh := chain.BuildBlockOn(t, tSettings, sixth.Header.BlockHash(), nil)
+	eighth := chain.BuildBlockOn(t, tSettings, seventh.Header.BlockHash(), nil)
+
+	require.Equal(t, sixth.Header.BlockHash().String(), seventh.Header.PrevBlock.String())
+	require.Equal(t, seventh.Header.BlockHash().String(), eighth.Header.PrevBlock.String())
+
+	for want, block := range map[int32]*wire.MsgBlock{4: sixth, 5: seventh, 6: eighth} {
+		height, known := chain.Height(block.Header.BlockHash())
+		require.True(t, known)
+		require.Equal(t, want, height)
+	}
+
+	require.Equal(t, 3, chain.Len(), "a run built this way must stay unannounced")
+	require.NotEqual(t, eighth.Header.BlockHash().String(), chain.Tip().String())
+}

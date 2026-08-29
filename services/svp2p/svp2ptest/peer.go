@@ -306,7 +306,7 @@ func ServeLimit(n int) Script {
 				continue
 			}
 
-			block, known := p.Chain.Blocks[inv.Hash]
+			block, known := p.Chain.Block(inv.Hash)
 			if !known {
 				continue
 			}
@@ -453,7 +453,7 @@ func (p *ScriptedPeer) Dial(nodeAddr string) error {
 
 	// An inbound peer speaks first.
 	local := wire.NewNetAddressIPPort(net.ParseIP("127.0.0.1"), 0, wire.SFNodeNetwork)
-	version := wire.NewMsgVersion(local, local, uint64(time.Now().UnixNano()), int32(len(p.Chain.Headers))) //nolint:gosec // fixture height is small
+	version := wire.NewMsgVersion(local, local, uint64(time.Now().UnixNano()), int32(p.Chain.Len())) //nolint:gosec // fixture height is small
 	version.UserAgent = "/Bitcoin SV:1.0.16/"
 	version.Services = wire.SFNodeNetwork
 
@@ -912,7 +912,7 @@ func (p *ScriptedPeer) serve(conn net.Conn) {
 			// association it just generated in its own version message.
 			p.recordAssociation(conn, m.AssociationID)
 
-			version := wire.NewMsgVersion(local, remote, uint64(time.Now().UnixNano()), int32(len(p.Chain.Headers))) //nolint:gosec // fixture height is small
+			version := wire.NewMsgVersion(local, remote, uint64(time.Now().UnixNano()), int32(p.Chain.Len())) //nolint:gosec // fixture height is small
 			version.UserAgent = "/Bitcoin SV:1.0.16/"
 			version.Services = wire.SFNodeNetwork
 
@@ -1037,7 +1037,7 @@ func (p *ScriptedPeer) blocksFor(m *wire.MsgGetData) []wire.Message {
 			continue
 		}
 
-		if block, known := p.Chain.Blocks[inv.Hash]; known {
+		if block, known := p.Chain.Block(inv.Hash); known {
 			out = append(out, block)
 		}
 	}
@@ -1055,7 +1055,7 @@ func (p *ScriptedPeer) HeadersFor(msg *wire.MsgGetHeaders) *wire.MsgHeaders {
 			continue
 		}
 
-		if height, known := p.Chain.Heights[*hash]; known {
+		if height, known := p.Chain.Height(*hash); known {
 			start = height
 			break
 		}
@@ -1063,12 +1063,15 @@ func (p *ScriptedPeer) HeadersFor(msg *wire.MsgGetHeaders) *wire.MsgHeaders {
 
 	headers := wire.NewMsgHeaders()
 
-	for i := start; i < int32(len(p.Chain.Headers)); i++ { //nolint:gosec // fixture height is small
+	for i := start; i < int32(p.Chain.Len()); i++ { //nolint:gosec // fixture height is small
 		if len(headers.Headers) == wire.MaxBlockHeadersPerMsg {
 			break
 		}
 
-		header := p.Chain.Headers[i]
+		header := p.Chain.HeaderAt(int(i))
+		if header == nil {
+			break
+		}
 
 		_ = headers.AddBlockHeader(header)
 
@@ -1090,7 +1093,7 @@ func (p *ScriptedPeer) InvFor(msg *wire.MsgGetBlocks) *wire.MsgInv {
 			continue
 		}
 
-		if height, known := p.Chain.Heights[*hash]; known {
+		if height, known := p.Chain.Height(*hash); known {
 			start = height
 			break
 		}
@@ -1098,12 +1101,17 @@ func (p *ScriptedPeer) InvFor(msg *wire.MsgGetBlocks) *wire.MsgInv {
 
 	inv := wire.NewMsgInv()
 
-	for i := start; i < int32(len(p.Chain.Headers)); i++ { //nolint:gosec // fixture height is small
+	for i := start; i < int32(p.Chain.Len()); i++ { //nolint:gosec // fixture height is small
 		if len(inv.InvList) == wire.MaxBlocksPerMsg {
 			break
 		}
 
-		hash := p.Chain.Headers[i].BlockHash()
+		header := p.Chain.HeaderAt(int(i))
+		if header == nil {
+			break
+		}
+
+		hash := header.BlockHash()
 
 		_ = inv.AddInvVect(wire.NewInvVect(wire.InvTypeBlock, &hash))
 

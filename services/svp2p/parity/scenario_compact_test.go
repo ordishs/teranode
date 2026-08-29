@@ -3,8 +3,7 @@ package parity
 import (
 	"fmt"
 	"net"
-	"net/url"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,61 +19,35 @@ import (
 )
 
 // The fixture chain row 15 runs on. Five blocks is enough for a coinbase to
-// mature at the lowered maturity below and still leave the run short.
+// mature — util/test.CreateBaseTestSettings already sets CoinbaseMaturity to 1
+// on its own copy of the regtest parameters, so a coinbase at height 1 spent in
+// block 6 is five blocks deep — and still leaves the run short.
 const (
-	compactChain    = 5
-	compactMaturity = 2
-	compactFee      = uint64(2000)
+	compactChain = 5
+	compactFee   = uint64(2000)
 )
 
 // compactNonce keys the short IDs of every announcement in this file. Any value
 // serves; the peer and the node derive the same (k0,k1) from it and the header.
 const compactNonce = uint64(0x5643_0F15)
 
-// compactTopics hands each leg its own txmeta topic. The two legs run in the
-// same process against the same in-memory Kafka broker, and a topic shared
-// between them would let one leg's entries reach the other's index.
-var compactTopicSeq atomic.Uint64
-
-func compactTopic(t *testing.T) *url.URL {
-	t.Helper()
-
-	u, err := url.Parse(fmt.Sprintf("memory://localhost/txmeta-compact-%d", compactTopicSeq.Add(1)))
-	require.NoError(t, err)
-
-	return u
-}
-
-// compactMaturityTweak lowers the coinbase maturity so a fixture coinbase can
-// be spent inside a five block chain. The parameters are copied before the
-// field is written: ChainCfgParams points at the process-wide regtest
-// parameters, which every other test in this binary reads.
-func compactMaturityTweak(_ Impl, _ *svp2ptest.FixtureChain, s *settings.Settings) {
-	params := *s.ChainCfgParams
-	params.CoinbaseMaturity = compactMaturity
-	s.ChainCfgParams = &params
-}
-
-// compactEnabled turns compact blocks on for the svp2p leg and gives it the
-// txmeta topic its recent-transaction index is fed from.
+// compactEnabled turns compact blocks on for the svp2p leg.
 //
-// Applied to ONE leg, unlike every other tweak in this package, because the two
-// keys are not symmetric. legacy_compactBlocks is unread by services/legacy, so
-// setting it for both legs would be noise; kafka_txmetaConfig is NOT — legacy
-// netsync starts its own txmeta listener on it — so setting it for both legs
-// would add a second consumer to the oracle leg for no gain. The legacy leg
-// therefore runs exactly as every other scenario's does.
-func compactEnabled(topics map[Impl]*url.URL) func(Impl, *svp2ptest.FixtureChain, *settings.Settings) {
-	return func(impl Impl, _ *svp2ptest.FixtureChain, s *settings.Settings) {
-		if impl != Svp2p {
-			return
-		}
-
-		s.Legacy.CompactBlocks = true
-		s.Legacy.CompactBlocksRecentTxs = 1024
-		s.Kafka.TxMetaConfig = topics[impl]
+// Applied to ONE leg because legacy_compactBlocks is unread by services/legacy:
+// setting it for both would be noise. The txmeta topic the index is fed from is
+// NOT set here — newNode gives every leg its own (isolateTxMetaTopic), so no
+// scenario has to remember to.
+func compactEnabled(impl Impl, _ *svp2ptest.FixtureChain, s *settings.Settings) {
+	if impl != Svp2p {
+		return
 	}
+
+	s.Legacy.CompactBlocks = true
+	s.Legacy.CompactBlocksRecentTxs = 1024
 }
+
+// compactTweaks is the settings hook every scenario in this file uses.
+var compactTweaks = []func(Impl, *svp2ptest.FixtureChain, *settings.Settings){compactEnabled}
 
 // compactRecorder records every getblocktxn the node sends and answers it
 // honestly from the fixture chain, which is what ScriptedPeer does with no
@@ -130,7 +103,7 @@ func (r *compactRecorder) seen() [][]uint32 {
 //
 // The waits it performs are only meaningful on the svp2p leg; on the legacy leg
 // there is no index and no topic, and it stops after the relay.
-func seedCompactBlock(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer, topic *url.URL) (*wire.MsgBlock, *bt.Tx, *bt.Tx) {
+func seedCompactBlock(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) (*wire.MsgBlock, *bt.Tx, *bt.Tx) {
 	t.Helper()
 
 	n.WaitForHeight(t, compactChain, 60*time.Second)
@@ -141,7 +114,7 @@ func seedCompactBlock(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.Scripte
 		// ticked (bridge.pollTxRunningGate, one second). A transaction relayed
 		// before that is never indexed, so the relay below waits for the
 		// consumer to be registered.
-		name := strings.TrimPrefix(topic.Path, "/")
+		name := n.txMetaTopic()
 
 		n.WaitFor(t, func() bool { return inmemorykafka.GetSharedBroker().HasConsumer(name) },
 			60*time.Second, "the txmeta consumer never registered on "+name)
@@ -186,16 +159,12 @@ func seedCompactBlock(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.Scripte
 // bridge.StartTxMetaConsumer, RecentTxIndex.Add), and the node's own inv for
 // it is what tells the scenario the round trip has finished.
 func TestParity_CompactBlockReceive(t *testing.T) {
-	topics := map[Impl]*url.URL{Svp2p: compactTopic(t)}
 	recorder := &compactRecorder{}
 
 	obs, _ := RunParity(t, Scenario{
-		Name:  "compact-block-receive",
-		Chain: compactChain,
-		Tweaks: []func(Impl, *svp2ptest.FixtureChain, *settings.Settings){
-			compactMaturityTweak,
-			compactEnabled(topics),
-		},
+		Name:   "compact-block-receive",
+		Chain:  compactChain,
+		Tweaks: compactTweaks,
 		Peers: func(t *testing.T, chain *svp2ptest.FixtureChain, netMagic wire.BitcoinNet) []*svp2ptest.ScriptedPeer {
 			return []*svp2ptest.ScriptedPeer{
 				svp2ptest.NewScriptedPeer(t, chain, netMagic, svp2ptest.Script{}, true),
@@ -203,7 +172,7 @@ func TestParity_CompactBlockReceive(t *testing.T) {
 			}
 		},
 		Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
-			block, held, gap := seedCompactBlock(t, n, peers, topics[Svp2p])
+			block, held, gap := seedCompactBlock(t, n, peers)
 			hash := block.Header.BlockHash()
 
 			if n.Impl == Svp2p {
@@ -303,8 +272,6 @@ func blockRequests(peers []*svp2ptest.ScriptedPeer, hash chainhash.Hash) int {
 //
 // svp2p alone: legacy joins no compact exchange, so there is nothing to compare.
 func TestParity_CompactBlockShortBlockTxnIsBanned(t *testing.T) {
-	topics := map[Impl]*url.URL{Svp2p: compactTopic(t)}
-
 	// The reply the node asked for, emptied. An empty blocktxn is a legal wire
 	// message; it is the count that is the lie.
 	short := svp2ptest.Script{
@@ -314,13 +281,10 @@ func TestParity_CompactBlockShortBlockTxnIsBanned(t *testing.T) {
 	}
 
 	obs, _ := RunParity(t, Scenario{
-		Name:  "compact-block-short-blocktxn",
-		Chain: compactChain,
-		Only:  []Impl{Svp2p},
-		Tweaks: []func(Impl, *svp2ptest.FixtureChain, *settings.Settings){
-			compactMaturityTweak,
-			compactEnabled(topics),
-		},
+		Name:   "compact-block-short-blocktxn",
+		Chain:  compactChain,
+		Only:   []Impl{Svp2p},
+		Tweaks: compactTweaks,
 		Peers: func(t *testing.T, chain *svp2ptest.FixtureChain, netMagic wire.BitcoinNet) []*svp2ptest.ScriptedPeer {
 			return []*svp2ptest.ScriptedPeer{
 				svp2ptest.NewScriptedPeer(t, chain, netMagic, svp2ptest.Script{}, true),
@@ -330,7 +294,7 @@ func TestParity_CompactBlockShortBlockTxnIsBanned(t *testing.T) {
 		Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
 			sampler := n.sampleScores()
 
-			block, _, _ := seedCompactBlock(t, n, peers, topics[Svp2p])
+			block, _, _ := seedCompactBlock(t, n, peers)
 
 			require.NoError(t, peers[1].AnnounceCompact(block, compactNonce, []int{0}))
 
@@ -363,6 +327,12 @@ func TestParity_CompactBlockShortBlockTxnIsBanned(t *testing.T) {
 	require.Equal(t, "node", obs[Svp2p].Disconnected["peer1"], "the node must drop the peer")
 }
 
+// unexpectedBlockTxnLog is the Debugf compactdispatch.go BlockTxn writes on the
+// unsolicited path (net_processing.cpp:3602-3606, "Peer %d sent us block
+// transactions for block we weren't expecting"). RecordingLogger records Debugf,
+// so it is an observable fact and not just a log line.
+const unexpectedBlockTxnLog = "sent us block transactions for block"
+
 // TestParity_UnsolicitedBlockTxnIsDroppedUnscored — watch-list scenario 15, the
 // unsolicited reply sub-case.
 //
@@ -373,17 +343,12 @@ func TestParity_CompactBlockShortBlockTxnIsBanned(t *testing.T) {
 //
 // svp2p alone, for the same reason as the sub-case above.
 func TestParity_UnsolicitedBlockTxnIsDroppedUnscored(t *testing.T) {
-	topics := map[Impl]*url.URL{Svp2p: compactTopic(t)}
-
 	obs, _ := RunParity(t, Scenario{
-		Name:  "compact-unsolicited-blocktxn",
-		Chain: compactChain,
-		Only:  []Impl{Svp2p},
-		Tweaks: []func(Impl, *svp2ptest.FixtureChain, *settings.Settings){
-			compactMaturityTweak,
-			compactEnabled(topics),
-		},
-		Peers: honestPeers(2),
+		Name:   "compact-unsolicited-blocktxn",
+		Chain:  compactChain,
+		Only:   []Impl{Svp2p},
+		Tweaks: compactTweaks,
+		Peers:  honestPeers(2),
 		Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
 			sampler := n.sampleScores()
 
@@ -399,17 +364,26 @@ func TestParity_UnsolicitedBlockTxnIsDroppedUnscored(t *testing.T) {
 
 			peers[1].Send(reply)
 
-			// Silence is the expected answer, so the wait is bounded rather
-			// than asserted: it gives the node time to score or drop the peer
-			// if it were going to.
+			// GATE, not a budget. The node's own Debugf for this branch
+			// (compactdispatch.go BlockTxn, "sent us block transactions for
+			// block we weren't expecting") is the positive fact that the
+			// message was routed to PeerManager.BlockTxn and dropped there.
+			// Waiting on it first is what makes the silence below evidence of
+			// a decision rather than of a message still in flight.
+			n.WaitFor(t, func() bool { return n.Logger.Contains(unexpectedBlockTxnLog) }, 60*time.Second,
+				"the blocktxn never reached the unsolicited branch")
+
+			// Only now is a bounded wait meaningful: the branch has run, so a
+			// score or a disconnect would already be on its way.
 			n.WaitFor(t, func() bool { return peers[1].Transcript.ClosedBy() != "" }, 5*time.Second, "")
 
 			n.scores = sampler.Result()
 
 			n.notes = map[string]string{
-				"peer1-score":     fmt.Sprint(n.scores[peers[1].Addr]),
-				"still-connected": fmt.Sprint(n.ConnectedCount(t)),
-				"ingested-height": fmt.Sprint(n.BestHeight(t)),
+				"unsolicited-branch": fmt.Sprint(n.Logger.Contains(unexpectedBlockTxnLog)),
+				"peer1-score":        fmt.Sprint(n.scores[peers[1].Addr]),
+				"still-connected":    fmt.Sprint(n.ConnectedCount(t)),
+				"ingested-height":    fmt.Sprint(n.BestHeight(t)),
 			}
 		},
 		Observe: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) Observation {
@@ -423,8 +397,277 @@ func TestParity_UnsolicitedBlockTxnIsDroppedUnscored(t *testing.T) {
 
 	notes := obs[Svp2p].Notes
 
+	require.Equal(t, "true", notes["unsolicited-branch"],
+		"the test must prove the message was handled and dropped, not merely that nothing happened")
 	require.Equal(t, "0", notes["peer1-score"], "an unsolicited blocktxn earns no score")
 	require.Equal(t, "2", notes["still-connected"], "neither peer may be dropped for it")
 	require.Equal(t, fmt.Sprint(compactChain), notes["ingested-height"], "the chain must not move")
 	require.Empty(t, obs[Svp2p].Disconnected, "no peer may be dropped")
+}
+
+// unreconstructableLog is the Debugf manager.go writes on the READ_STATUS_FAILED
+// branch (net_processing.cpp:3655-3660, "Might have collided, fall back to
+// getdata now"). No score is applied there, so this line is the only evidence
+// the branch ran.
+const unreconstructableLog = "unreconstructable, falling back to getdata"
+
+// TestParity_CompactBlockWrongGapIsScoredAndDropped — watch-list scenario 15,
+// the READ_STATUS_FAILED sub-case.
+//
+// The gap request is answered with the right COUNT and the wrong CONTENT: one
+// transaction, but not the one the slot asked for. The arity check therefore
+// passes and this is NOT the invalid branch; the assembler's own short-ID check
+// fails the slot instead (compactblock.go readGap, which sets readFailed).
+//
+// OPEN DEFECT, recorded rather than asserted away. SVNode treats
+// READ_STATUS_FAILED as a possible short-ID collision and not as malice
+// (net_processing.cpp:3655-3660, "Might have collided, fall back to getdata
+// now"): no Misbehaving call, the block goes back on offer, and the ordinary
+// getdata path fetches it. This port reaches the fallback log and then scores
+// the peer 100 and drops it anyway, because the reconstruction surfaces as an
+// ingest failure with outcome.PeerFault set, and manager.go BlockDone has
+// already set delta and disconnect by the time its readFailed case runs — that
+// case only logs, and never clears either. readInvalid and readFailed are
+// therefore indistinguishable to a peer today.
+//
+// This test pins what the port DOES, so the defect cannot be lost, and states
+// what it SHOULD do. When the port is fixed the expected values become: score 0,
+// peer still connected, block by ordinary getdata, height 6 — and this row
+// should be rewritten to that.
+//
+// svp2p alone: while the defect stands the two legs cannot end on the same
+// height, because the only peer that announced the block is dropped and no
+// other peer has advertised it.
+func TestParity_CompactBlockWrongGapIsScoredAndDropped(t *testing.T) {
+	// The block's coinbase: a transaction the peer certainly holds, that decodes
+	// cleanly, and whose short ID is not the requested slot's.
+	wrongGap := svp2ptest.Script{
+		OnGetBlockTxn: func(p *svp2ptest.ScriptedPeer, _ net.Conn, m *wire.MsgGetBlockTxn) []wire.Message {
+			block, known := p.Chain.Block(m.BlockHash)
+			if !known {
+				return nil
+			}
+
+			reply := wire.NewMsgBlockTxn(&m.BlockHash)
+
+			for range m.Indexes {
+				_ = reply.AddTransaction(block.Transactions[0])
+			}
+
+			return []wire.Message{reply}
+		},
+	}
+
+	obs, _ := RunParity(t, Scenario{
+		Name:   "compact-block-wrong-gap",
+		Chain:  compactChain,
+		Only:   []Impl{Svp2p},
+		Tweaks: compactTweaks,
+		Peers: func(t *testing.T, chain *svp2ptest.FixtureChain, netMagic wire.BitcoinNet) []*svp2ptest.ScriptedPeer {
+			return []*svp2ptest.ScriptedPeer{
+				svp2ptest.NewScriptedPeer(t, chain, netMagic, svp2ptest.Script{}, true),
+				svp2ptest.NewScriptedPeer(t, chain, netMagic, wrongGap, true),
+			}
+		},
+		Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
+			sampler := n.sampleScores()
+
+			block, _, _ := seedCompactBlock(t, n, peers)
+			hash := block.Header.BlockHash()
+
+			require.NoError(t, peers[1].AnnounceCompact(block, compactNonce, []int{0}))
+
+			// GATE: the fallback branch ran. Asserted before the peer's fate
+			// below, so the score cannot be attributed to the wrong branch.
+			n.WaitFor(t, func() bool { return n.Logger.Contains(unreconstructableLog) }, 60*time.Second,
+				"the wrong gap transaction never reached the fallback branch")
+
+			n.WaitFor(t, func() bool { return peers[1].Transcript.ClosedBy() != "" }, 60*time.Second,
+				"the defect above says the peer is dropped; it was not")
+
+			n.scores = sampler.Result()
+
+			n.notes = map[string]string{
+				"fallback-branch":   fmt.Sprint(n.Logger.Contains(unreconstructableLog)),
+				"getblocktxn":       fmt.Sprint(peers[1].Transcript.Count(svp2ptest.In, wire.CmdGetBlockTxn)),
+				"getdata-for-block": fmt.Sprint(blockRequests(peers, hash)),
+				"peer1-score":       fmt.Sprint(n.scores[peers[1].Addr]),
+				"ingested-height":   fmt.Sprint(n.BestHeight(t)),
+			}
+		},
+		Observe: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) Observation {
+			o := ObserveDefault(t, n, peers)
+			o.Notes = n.notes
+			o.Scores = n.scores
+
+			return o
+		},
+	})
+
+	notes := obs[Svp2p].Notes
+
+	require.Equal(t, "true", notes["fallback-branch"], "the READ_STATUS_FAILED branch must be the one that ran")
+	require.Equal(t, "1", notes["getblocktxn"], "the gap must have been asked for once")
+
+	// The defect, pinned. SVNode scores this 0 and keeps the peer.
+	require.Equal(t, "100", notes["peer1-score"],
+		"DEFECT: readFailed reaches the same score as readInvalid; SVNode punishes neither collision")
+	require.Equal(t, "node", obs[Svp2p].Disconnected["peer1"],
+		"DEFECT: readFailed drops the peer; SVNode falls back to getdata and keeps it")
+	require.Equal(t, fmt.Sprint(compactChain), notes["ingested-height"],
+		"DEFECT: with its only advertiser dropped, the block never arrives")
+
+	t.Logf("compact wrong gap: fallback branch ran, then the peer was scored %s and dropped; height stayed %s",
+		notes["peer1-score"], notes["ingested-height"])
+}
+
+// notWantedLog is the Debugf claimCompactBlock writes when wantCompact refuses
+// an announcement (net_processing.cpp:3825, the height ceiling).
+const notWantedLog = "not wanted at tip height"
+
+// gatedServer serves fixture blocks only while its gate is open. It is how a
+// scenario holds the node's ACTIVE tip still while its header index runs ahead:
+// the peer keeps answering getheaders, and stops answering getdata.
+type gatedServer struct {
+	open atomic.Bool
+}
+
+func (g *gatedServer) script() svp2ptest.Script {
+	return svp2ptest.Script{
+		OnGetData: func(p *svp2ptest.ScriptedPeer, m *wire.MsgGetData) []wire.Message {
+			if !g.open.Load() {
+				return nil
+			}
+
+			var out []wire.Message
+
+			for _, inv := range m.InvList {
+				if inv == nil || inv.Type != wire.InvTypeBlock {
+					continue
+				}
+
+				if block, known := p.Chain.Block(inv.Hash); known {
+					out = append(out, block)
+				}
+			}
+
+			return out
+		},
+	}
+}
+
+// TestParity_CompactBlockAboveHeightCeilingIsDeclined — watch-list scenario 15,
+// the height ceiling sub-case.
+//
+// ProcessCompactBlockMessage declines to reconstruct a block more than
+// MaxCompactBlockHeightAhead (2) above the ACTIVE tip (net_processing.cpp:3825,
+// blockdownload.go wantCompact). The header is still accepted — this port runs
+// the header accept unconditionally, ahead of every guard, which is what the
+// :3913-3921 "same treatment as a header message" branch achieves — and the
+// block arrives later by the ordinary getdata path.
+//
+// The rig holds the node's active tip at 5 while its header index reaches 7: the
+// peer publishes headers 6 and 7 and then withholds every block body. Block 8 is
+// then announced by cmpctblock. Of the four guards wantCompact applies, only the
+// ceiling can be the one that refuses:
+//
+//   - hasData: the node has never held block 8.
+//   - chain work: block 8 is three blocks above the tip.
+//   - CanDirectFetch: the fixture tip is ~30 minutes old and the regtest window
+//     is 600s * 20 = 3h20m, so this passes (blockdownload.go canDirectFetch).
+//   - the ceiling: 8 > 5 + 2.
+//
+// svp2p alone: legacy joins no compact exchange.
+func TestParity_CompactBlockAboveHeightCeilingIsDeclined(t *testing.T) {
+	gate := &gatedServer{}
+	gate.open.Store(true)
+
+	obs, _ := RunParity(t, Scenario{
+		Name:   "compact-block-above-ceiling",
+		Chain:  compactChain,
+		Only:   []Impl{Svp2p},
+		Tweaks: compactTweaks,
+		Peers: func(t *testing.T, chain *svp2ptest.FixtureChain, netMagic wire.BitcoinNet) []*svp2ptest.ScriptedPeer {
+			return []*svp2ptest.ScriptedPeer{svp2ptest.NewScriptedPeer(t, chain, netMagic, gate.script(), true)}
+		},
+		Drive: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) {
+			sampler := n.sampleScores()
+			peer := peers[0]
+			chain := peer.Chain
+
+			n.WaitForHeight(t, compactChain, 60*time.Second)
+
+			// From here the peer answers no getdata, so the active tip stays at
+			// 5 however many headers it goes on to publish.
+			gate.open.Store(false)
+
+			sixth := chain.BuildNextBlock(t, n.Settings, nil)
+			seventh := chain.BuildBlockOn(t, n.Settings, sixth.Header.BlockHash(), nil)
+			eighth := chain.BuildBlockOn(t, n.Settings, seventh.Header.BlockHash(), nil)
+
+			// 6 and 7 are announced so block 8's parent is in the node's header
+			// index and the announcement connects; 8 is not, so the node can
+			// only learn it from the cmpctblock.
+			chain.PublishHeader(t, sixth)
+			chain.PublishHeader(t, seventh)
+
+			hash := eighth.Header.BlockHash()
+
+			n.WaitFor(t, func() bool {
+				_, known := n.HeaderKnown(seventh.Header.BlockHash())
+				return known
+			}, 60*time.Second, "the node never took the headers that put block 8 above its tip")
+
+			require.Equal(t, uint32(compactChain), n.BestHeight(t), "the active tip must still be behind")
+
+			require.NoError(t, peer.AnnounceCompact(eighth, compactNonce, []int{0}))
+
+			n.WaitFor(t, func() bool { return n.Logger.Contains(notWantedLog) }, 60*time.Second,
+				"the announcement above the ceiling was never declined")
+
+			height, headerKnown := n.HeaderKnown(hash)
+
+			// Serving resumes: the declined block must still arrive, by the
+			// path the ceiling sends it down.
+			gate.open.Store(true)
+
+			n.WaitForHeight(t, compactChain+3, 120*time.Second)
+
+			n.scores = sampler.Result()
+
+			n.notes = map[string]string{
+				"declined":          fmt.Sprint(n.Logger.Contains(notWantedLog)),
+				"header-accepted":   fmt.Sprint(headerKnown),
+				"header-height":     fmt.Sprint(height),
+				"getblocktxn":       fmt.Sprint(peer.Transcript.Count(svp2ptest.In, wire.CmdGetBlockTxn)),
+				"getdata-for-block": fmt.Sprint(blockRequests(peers, hash)),
+				"peer0-score":       fmt.Sprint(n.scores[peer.Addr]),
+				"ingested-height":   fmt.Sprint(n.BestHeight(t)),
+			}
+		},
+		Observe: func(t *testing.T, n *nodeUnderTest, peers []*svp2ptest.ScriptedPeer) Observation {
+			o := ObserveDefault(t, n, peers)
+			o.Notes = n.notes
+			o.Scores = n.scores
+
+			return o
+		},
+	})
+
+	notes := obs[Svp2p].Notes
+
+	require.Equal(t, "true", notes["declined"], "the announcement must be refused by wantCompact")
+	require.Equal(t, "0", notes["getblocktxn"], "a declined announcement must cost no gap request")
+	require.Equal(t, "true", notes["header-accepted"],
+		"the header accept runs ahead of every guard, so a declined block is still in the index")
+	require.Equal(t, fmt.Sprint(compactChain+3), notes["header-height"])
+	require.Equal(t, "0", notes["peer0-score"], "announcing too far ahead is not misbehaviour")
+	getData, err := strconv.Atoi(notes["getdata-for-block"])
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, getData, 1, "the block must arrive by the ordinary getdata path")
+	require.Equal(t, fmt.Sprint(compactChain+3), notes["ingested-height"])
+	require.Empty(t, obs[Svp2p].Disconnected, "the peer must keep its connection")
+
+	t.Logf("compact above ceiling: declined at tip %d, header accepted at height %s, %s getblocktxn, %s getdata",
+		compactChain, notes["header-height"], notes["getblocktxn"], notes["getdata-for-block"])
 }
