@@ -232,6 +232,10 @@ func (s *Server) Health(ctx context.Context, checkLiveness bool) (int, string, e
 }
 
 func (s *Server) Init(_ context.Context) error {
+	if s.settings.Policy.ExcessiveBlockSize <= 0 {
+		s.logger.Warnf("[svp2p] excessiveblocksize is %d; the wire layer cannot size messages from 0 and uses %d bytes", s.settings.Policy.ExcessiveBlockSize, protocol.BlockPayloadLimit(s.settings))
+	}
+
 	wire.SetLimits(protocol.BlockPayloadLimit(s.settings))
 
 	s.listenAddresses = s.settings.Legacy.ListenAddresses

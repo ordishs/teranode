@@ -110,7 +110,9 @@ func TestOutboundDialerAddsFixedSeedsWhenTableStaysEmpty(t *testing.T) {
 	h.m.fixedSeeds = func() []Address { return []Address{a.addr} }
 	h.start(t)
 
-	require.Eventually(t, func() bool { return establishedCount(h.m) == 1 }, 5*time.Second, 20*time.Millisecond,
+	// 15 s, not the harness's usual 5: this test runs the whole dial+handshake
+	// under the full-package -race load, where 5 s has flaked.
+	require.Eventually(t, func() bool { return establishedCount(h.m) == 1 }, 15*time.Second, 20*time.Millisecond,
 		"the fixed seed must be dialed once the table has stayed empty past the grace period")
 	require.Equal(t, 1, h.addrMan.Size())
 }

@@ -160,6 +160,8 @@ func TestServerStopFlushesLegacyInvProducerDespiteAnEarlyReturn(t *testing.T) {
 	require.Nil(t, srv.legacyInvProducer, "the producer field must still be released")
 	require.Nil(t, srv.legacyInvConsumer, "the consumer field must still be released")
 
-	require.True(t, logger.contains(departedPeerAddr),
+	// The departed-peer line is written by the consumer goroutine after the
+	// flush; Stop returning does not order it, so poll rather than assert once.
+	require.Eventually(t, func() bool { return logger.contains(departedPeerAddr) }, 5*time.Second, 10*time.Millisecond,
 		"the flushed message must still reach PeerManager.InvFromKafka (observed via its departed-peer log line), despite the forced early return")
 }
