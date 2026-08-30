@@ -306,11 +306,17 @@ type BlockDownloader struct {
 	// "update pindexLastCommonBlock as long as all ancestors are already
 	// downloaded" clause) and starts the next walk above it, so a block that
 	// stops being held AFTER the anchor passed it is below every later walk
-	// and is never offered again. SVNode never meets this case: hasData() is
-	// set by AcceptBlock and is never cleared, so its anchor can only be wrong
-	// in the direction its own bootstrap comment calls harmless.
+	// and is never offered again.
 	//
-	// This port can clear a have-data record — a retained block whose spooled
+	// SVNode does clear hasData(): CBlockIndex::ClearFileInfoIfFileNumberEquals
+	// calls nStatus.withData(false) (block_index.h:668-689), reached from the
+	// prune path at validation.cpp:6563. It never invalidates an anchor with
+	// it, because it prunes only block files at or below its own tip — heights
+	// the walk never revisits, and which the walk's own clause covers with
+	// "and therefore don't need it even if pruned".
+	//
+	// This port clears a have-data record in the one direction that DOES
+	// invalidate an anchor: above our tip — a retained block whose spooled
 	// replay failed is the live case — so the anchor has to be told. The
 	// downloader holds no peer registry and the manager's peer lock may not be
 	// taken under the sync-state mutex, so the release records a generation
@@ -1042,6 +1048,15 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash,
 // The stamp does NOT depend on this peer having held the claim. A replay from
 // the retained-block spool reports with no peer at all, and a deferral that was
 // skipped there would put the block straight back on the wire.
+//
+// That widens one pre-existing case, named rather than left implicit: BlockFailed
+// always drops the have-data record, so a claimless report now also stamps a
+// deferral and rolls every peer's anchor back. Two peers race one block, the
+// winner records it, and the loser's copy then fails transiently — the loser's
+// report releases a block we hold. The cost is one redundant download and one
+// anchor reset per peer, and it is self-correcting: the re-fetch answers Exists
+// and records the block again. BlockDone's Duplicate branch avoids exactly this
+// while the admission dedup entry still stands.
 func (bd *BlockDownloader) BlockParentMissing(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
 	released := bd.BlockFailed(peer, hash, nowMicros)
 

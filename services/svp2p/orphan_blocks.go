@@ -87,7 +87,9 @@ func (o *orphanBlocks) Bytes() int64 {
 	return o.bytes
 }
 
-// Wait blocks until every replay in progress has finished. Test support.
+// Wait blocks until every replay in progress has finished. Server.Stop calls it
+// after the manager is joined, so no replay outlives the service; a test uses it
+// to observe a replay that has already been started.
 func (o *orphanBlocks) Wait() { o.replays.Wait() }
 
 // fits reserves budget for a block of the declared size; false means the
@@ -157,9 +159,22 @@ func (o *orphanBlocks) take(parent chainhash.Hash) []retainedBlock {
 	return out
 }
 
-// rearm puts a block back under its parent after a replay that did not
-// consume it, so a later parent-landed event replays it again. The spool entry
-// it names is still in the store.
+// rearm puts a block back under its parent after a replay that did not consume
+// it. The spool entry it names is still in the store.
+//
+// The re-armed entry has two release routes, and the network one is the one to
+// expect. Its parent has already landed, so a second parent-landed event needs
+// that parent to be delivered again (which then answers Exists and replays from
+// there). The ordinary route is the block's own re-fetch: the scheduler was told
+// to offer it again, and the ingest that follows calls discard, which frees both
+// the budget and the spool file.
+//
+// Neither route is guaranteed. A block on a branch nobody offers again, or a
+// shutdown before the re-fetch lands, leaves the entry holding retention budget
+// for the life of the process and the spool file behind after it — there is no
+// startup sweep of the spool. The budget is the block prefetch buffer, so enough
+// leaked entries degrade retention to the refuse-the-block fallback rather than
+// failing anything.
 func (o *orphanBlocks) rearm(rb retainedBlock) {
 	hash := rb.header.BlockHash()
 

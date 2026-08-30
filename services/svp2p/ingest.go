@@ -92,6 +92,16 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 
 		if b.retained != nil {
 			b.retained.discard(ctx, hash)
+
+			// A block reaches our chain by routes this ingest never sees:
+			// block validation's own parent catchup stores it, or ProcessBlock
+			// stores it and then fails, so the next delivery answers Exists.
+			// Its retained children are just as landed as they would be after a
+			// successful ingest, and without this they wait for a parent event
+			// that has already happened — while the scheduler counts them as
+			// held from their Retained report and never re-fetches them either.
+			// Replay does nothing when nothing is spooled under this hash.
+			b.retained.Replay(ctx, hash, b.Ingest)
 		}
 
 		// We hold the block, so the download is complete as far as the

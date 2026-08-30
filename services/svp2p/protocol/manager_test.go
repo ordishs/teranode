@@ -399,13 +399,21 @@ func blockFor(header *wire.BlockHeader) *wire.MsgBlock {
 func syncTestManager(t *testing.T, idx *HeaderIndex, ingestor BlockIngestor, checkpoints ...chaincfg.Checkpoint) *PeerManager {
 	t.Helper()
 
+	return syncTestManagerWithLogger(t, ulogger.TestLogger{}, idx, ingestor, checkpoints...)
+}
+
+// syncTestManagerWithLogger is syncTestManager with the logger chosen, for a
+// test that asserts on what the manager logged.
+func syncTestManagerWithLogger(t *testing.T, logger ulogger.Logger, idx *HeaderIndex, ingestor BlockIngestor, checkpoints ...chaincfg.Checkpoint) *PeerManager {
+	t.Helper()
+
 	tSettings := managerSettings()
 	tSettings.ChainCfgParams = syncTestParams(checkpoints)
 
 	banList, err := NewBanList("")
 	require.NoError(t, err)
 
-	m := NewPeerManager(ulogger.TestLogger{}, tSettings, banList)
+	m := NewPeerManager(logger, tSettings, banList)
 
 	require.NoError(t, m.ConfigureSync(SyncConfig{
 		Index:        idx,

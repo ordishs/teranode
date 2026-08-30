@@ -99,6 +99,12 @@ type Server struct {
 	addrMan   *protocol.AddrMan
 	admission *bridge.Admission
 
+	// retained is the block ingestor's orphan spool, held only so Stop can
+	// join the replay goroutines it starts. A replay reports its outcome into
+	// the peer manager, so it must be joined before the manager's own
+	// resources are released. nil when retention is off.
+	retained *orphanBlocks
+
 	// stoppableBridge is the concrete bridge newBlockIngestor built, held
 	// only so Stop can release its background goroutines (orphanPool's TTL
 	// ticker and eviction worker — orphans.go, fix round 1 Issues I1/I4).
@@ -599,6 +605,18 @@ func (s *Server) Stop(_ context.Context) error {
 		}
 	}
 
+	// Replays are joined AFTER the manager, and this is the only correct
+	// order. A replay runs on its own goroutine, reaches the bridge and the
+	// admission gate, and reports its outcome into the manager when it
+	// finishes; joining before the manager would prove nothing, because a peer
+	// still running could start another one. The manager's join is what stops
+	// new replays; this one waits out the replays already in flight, so no
+	// goroutine is left to touch manager state or the four resources the defer
+	// above releases.
+	if s.retained != nil {
+		s.retained.Wait()
+	}
+
 	// Stopped AFTER the manager, which is the reverse of the start order and
 	// the only correct one: Stop joins the snapshot goroutine and then writes
 	// the final peers.json, so it must run once no peer can still be adding
@@ -766,6 +784,8 @@ func (s *Server) newBlockIngestor() (*blockIngestor, error) {
 		ing.retained.report = func(hash chainhash.Hash, outcome protocol.IngestOutcome) {
 			_, _ = s.manager.BlockDone(nil, hash, outcome)
 		}
+
+		s.retained = ing.retained
 	}
 
 	return ing, nil

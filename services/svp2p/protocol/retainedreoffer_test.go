@@ -2,7 +2,9 @@ package protocol
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
 
@@ -141,9 +144,12 @@ func TestManagerRefetchesARetainedBlockWhoseReplayFailed(t *testing.T) {
 //
 // FindNextBlocksToDownload advances pindexLastCommonBlock over every block it
 // finds held and starts the next walk above it, so a block released AFTER the
-// anchor passed it sits below every later walk. SVNode never meets the case:
-// hasData() is set by AcceptBlock and never cleared. This port clears it — a
-// retained block whose replay failed — so the release has to drop the anchor.
+// anchor passed it sits below every later walk. SVNode clears hasData() only
+// when it prunes a block file (block_index.h:668-689 from validation.cpp:6563),
+// which is only for blocks at or below its own tip — heights the walk never
+// revisits — so its anchor is never invalidated this way. This port clears the
+// record ABOVE its tip, for a retained block whose replay failed, so the
+// release has to drop the anchor.
 func TestBlockRelease_ReanchorsTheWalkBelowTheReleasedBlock(t *testing.T) {
 	f := newDownloadFixture(t, 3)
 	peer := f.peerAt(t, "1.2.3.4:8333", 3)
@@ -168,4 +174,58 @@ func TestBlockRelease_ReanchorsTheWalkBelowTheReleasedBlock(t *testing.T) {
 	// walk had already carried past it.
 	require.Equal(t, []int32{1, 2, 3},
 		f.requestedHeights(t, peer, activeTip, testNow+micros(2*time.Second)))
+}
+
+// warnCaptureLogger records Warnf lines. captureLogger (manager_test.go) takes
+// Infof, and the rotation notice is a warning.
+type warnCaptureLogger struct {
+	ulogger.TestLogger
+
+	mu   sync.Mutex
+	logs []string
+}
+
+func (l *warnCaptureLogger) Warnf(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.logs = append(l.logs, fmt.Sprintf(format, args...))
+}
+
+func (l *warnCaptureLogger) contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, line := range l.logs {
+		if strings.Contains(line, substr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestBlockDone_PeerlessReportCannotRotateTheSyncPeer (review m3): a replay
+// whose PreAdmit times out reports Rotate, and a replay has no peer. The
+// releases a rotation performs are nil-guarded no-ops there, so all that was
+// left was an election excluding nobody and a warning naming an event that did
+// not happen.
+func TestBlockDone_PeerlessReportCannotRotateTheSyncPeer(t *testing.T) {
+	genesis := syncGenesis()
+	chain := minedRun(genesis, 1, 12)
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	logger := &warnCaptureLogger{}
+	m := syncTestManagerWithLogger(t, logger, idx, &recordingIngestor{})
+
+	_, disconnect := m.BlockDone(nil, chain[0].BlockHash(), IngestOutcome{
+		Err:    errors.NewServiceError("svp2p: test blockchain client is wedged"),
+		Rotate: true,
+	})
+	require.NoError(t, disconnect, "a pre-admission timeout is not the peer's fault")
+
+	require.False(t, logger.contains("rotating the sync peer"),
+		"a report with no peer has no sync peer to rotate")
 }

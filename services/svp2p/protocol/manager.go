@@ -1804,7 +1804,13 @@ func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome
 			syncPeer.State.nLastProgressTime = now
 		}
 
-		rotate = outcome.Rotate
+		// A rotation acts on the peer that stranded the block: it releases that
+		// peer's slot and its downloads, and elects a replacement excluding it.
+		// A report with no peer has none of that to do — PeerDisconnected and
+		// SyncPeerTimedOut are nil-guarded no-ops, and electSyncPeer(nil) would
+		// re-run an election excluding nobody while logging a rotation that did
+		// not happen.
+		rotate = outcome.Rotate && syncPeer != nil
 
 		// services/legacy/peer_server.go shouldDisconnectOnBlockErr: a block
 		// the pipeline rejected is the peer's fault and the peer goes, so the

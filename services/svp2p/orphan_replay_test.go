@@ -143,3 +143,47 @@ func TestRetainOverwritesAStaleSpoolEntry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, body, got, "the retained bytes must replace whatever the key held")
 }
+
+// TestExistingParentReplaysItsRetainedChildren closes the same permanent-stall
+// class one level up (review M1). A block can reach our chain without svp2p
+// ever running a successful Ingest for it: block validation's own parent
+// catchup stores it, or ProcessBlock stores it and then fails, so the next
+// delivery answers Exists. Replay used to hang off the success path alone, so
+// a child retained under such a parent was never replayed — and the scheduler
+// still counted it as held from its Retained report, so it was never re-fetched
+// either.
+func TestExistingParentReplaysItsRetainedChildren(t *testing.T) {
+	parent := testIngestHeader()
+	parentHash := parent.BlockHash()
+	child := wire.NewBlockHeader(1, &parentHash, &chainhash.Hash{0x05}, 0x207fffff, 2)
+	childHash := child.BlockHash()
+
+	br := &stubBridge{preAdmitFor: map[chainhash.Hash]bridge.PreAdmitResult{
+		childHash:  {ParentMissing: true},
+		parentHash: {Exists: true},
+	}}
+
+	ingestor, _ := newTestIngestor(t, br)
+	ingestor.retained = newOrphanBlocks(ulogger.TestLogger{}, memory.New(), 1<<20)
+
+	body := []byte("child block transactions")
+	outcome := ingestor.Ingest(context.Background(), testIngestRequest(child, &countingStream{Reader: bytes.NewReader(body)}))
+	require.True(t, outcome.Retained)
+
+	// The parent is already in our chain by the time it is delivered, and the
+	// child's own parent check now passes.
+	br.mu.Lock()
+	br.preAdmitFor[childHash] = bridge.PreAdmitResult{}
+	br.mu.Unlock()
+
+	outcome = ingestor.Ingest(context.Background(), testIngestRequest(parent, &countingStream{Reader: bytes.NewReader([]byte("parent"))}))
+	require.NoError(t, outcome.Err)
+
+	ingestor.retained.Wait()
+
+	got := br.ingestedBlocks()
+	require.Len(t, got, 1, "the parent itself is not re-ingested, but its child must be")
+	require.Equal(t, childHash, got[0].hash)
+	require.Equal(t, body, got[0].payload, "the replay must carry the bytes the peer sent")
+	require.Zero(t, ingestor.retained.Len(), "a replayed block leaves the spool")
+}
