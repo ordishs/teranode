@@ -90,6 +90,10 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 	if result.Exists {
 		b.logger.Debugf("[svp2p] block %s already exists, not admitting it", hash)
 
+		if b.retained != nil {
+			b.retained.discard(ctx, hash)
+		}
+
 		// We hold the block, so the download is complete as far as the
 		// scheduler is concerned. Nothing was reserved and nothing ran.
 		return protocol.IngestOutcome{Err: b.release(req.TxReader, nil)}
@@ -161,6 +165,12 @@ func (b *blockIngestor) Ingest(ctx context.Context, req protocol.BlockIngestRequ
 	}
 
 	if b.retained != nil {
+		// A copy of THIS block may still sit in the spool: a replay that failed
+		// on a local fault keeps its bytes and stays armed, and the scheduler
+		// then fetched the block from the network instead. Drop that copy, or
+		// its bytes hold retention budget nothing will ever use.
+		b.retained.discard(ctx, hash)
+
 		b.retained.Replay(ctx, hash, b.Ingest)
 	}
 

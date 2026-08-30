@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -755,6 +756,16 @@ func (s *Server) newBlockIngestor() (*blockIngestor, error) {
 
 	if s.admission.Enabled() {
 		ing.retained = newOrphanBlocks(s.logger, s.deps.TempStore, s.admission.BudgetBytes())
+
+		// A replay has no delivering peer: the one that sent the bytes was
+		// released the moment the block was retained. BlockDone takes a nil
+		// sync peer for exactly this, and without the report a replay that
+		// fails on a local fault leaves the block recorded as held, so the
+		// download walk never offers it again — the mainnet stall of
+		// 2026-08-30.
+		ing.retained.report = func(hash chainhash.Hash, outcome protocol.IngestOutcome) {
+			_, _ = s.manager.BlockDone(nil, hash, outcome)
+		}
 	}
 
 	return ing, nil

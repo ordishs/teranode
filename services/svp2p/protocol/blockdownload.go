@@ -295,6 +295,32 @@ type BlockDownloader struct {
 	// back at all. Bounded exactly like haveData, by the same height prune.
 	retryAfter map[chainhash.Hash]deferredBlock
 
+	// reanchorHeight is the LOWEST height at which a block we had recorded in
+	// haveData was released back onto the download schedule, and reanchorGen
+	// counts those releases. Together they roll every peer's
+	// pindexLastCommonBlock back below the released block.
+	//
+	// The rollback is needed because the anchor is an upper bound the walk
+	// never revisits on its own. FindNextBlocksToDownload advances
+	// pindexLastCommonBlock over every held block (the C++
+	// "update pindexLastCommonBlock as long as all ancestors are already
+	// downloaded" clause) and starts the next walk above it, so a block that
+	// stops being held AFTER the anchor passed it is below every later walk
+	// and is never offered again. SVNode never meets this case: hasData() is
+	// set by AcceptBlock and is never cleared, so its anchor can only be wrong
+	// in the direction its own bootstrap comment calls harmless.
+	//
+	// This port can clear a have-data record — a retained block whose spooled
+	// replay failed is the live case — so the anchor has to be told. The
+	// downloader holds no peer registry and the manager's peer lock may not be
+	// taken under the sync-state mutex, so the release records a generation
+	// here and each peer's walk consumes it once, from its own state.
+	//
+	// A height of 0 means nothing is pending: genesis is never downloaded, so
+	// no release can name it.
+	reanchorHeight int32
+	reanchorGen    uint64
+
 	// haveDataWatermark is the highest active-chain tip height haveData has
 	// been pruned against. It keeps the prune O(1) while our chain stands
 	// still, which is every call but the ones that follow a new block.
@@ -431,6 +457,12 @@ func (bd *BlockDownloader) pruneHaveData(activeTipHeight int32) {
 		}
 	}
 
+	// A pending anchor rollback at or below our own tip is dead for the same
+	// reason: our chain now covers the height the released block sat at.
+	if bd.reanchorHeight != 0 && bd.reanchorHeight <= activeTipHeight {
+		bd.reanchorHeight = 0
+	}
+
 	// A deferral at or below our own tip is dead: either we hold the block, or
 	// the walk will never look that low again.
 	for hash, deferred := range bd.retryAfter {
@@ -506,6 +538,20 @@ func (bd *BlockDownloader) FindNextBlocksToDownload(peer *SyncPeer, activeTip He
 	if chainWorkOf(*best).Cmp(chainWorkOf(activeTip)) < 0 {
 		// "This peer has nothing interesting."
 		return nil, nil
+	}
+
+	// A block we had recorded as held was released back onto the schedule, so
+	// an anchor standing at or above it is stale: it would start this walk
+	// above the very block that has to be offered again. Dropping the anchor
+	// hands it to the bootstrap guess below, which is what the C++ comment
+	// there calls harmless in either direction.
+	if state.reanchorGen != bd.reanchorGen {
+		state.reanchorGen = bd.reanchorGen
+
+		if bd.reanchorHeight != 0 && state.pindexLastCommonBlock != nil &&
+			state.pindexLastCommonBlock.Height >= bd.reanchorHeight {
+			state.pindexLastCommonBlock = nil
+		}
 	}
 
 	if state.pindexLastCommonBlock == nil {
@@ -879,9 +925,27 @@ func (bd *BlockDownloader) BlockReceived(peer *SyncPeer, hash chainhash.Hash, no
 // cancelled, timed out, or the block was rejected. The block goes back on
 // offer to any peer, including this one.
 func (bd *BlockDownloader) BlockFailed(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
-	delete(bd.haveData, hash)
+	bd.releaseHeld(hash)
 
 	return bd.removeFromFlight(peer, hash, nowMicros)
+}
+
+// releaseHeld drops the have-data record for hash and, when there was one,
+// arms the anchor rollback every peer's walk consumes. See reanchorHeight for
+// why dropping the record alone leaves the block below every later walk.
+func (bd *BlockDownloader) releaseHeld(hash chainhash.Hash) {
+	height, held := bd.haveData[hash]
+	if !held {
+		return
+	}
+
+	delete(bd.haveData, hash)
+
+	bd.reanchorGen++
+
+	if bd.reanchorHeight == 0 || height < bd.reanchorHeight {
+		bd.reanchorHeight = height
+	}
 }
 
 // removeFromFlight is BlockDownloadTracker::removeFromBlockMapNL. It only fires
@@ -974,11 +1038,12 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash,
 // delivered what it was asked for, and our own validation is simply behind the
 // header index. Only a hash the index can place is stamped, the same rule
 // haveData keeps, because a stamp with no height could never be pruned.
+//
+// The stamp does NOT depend on this peer having held the claim. A replay from
+// the retained-block spool reports with no peer at all, and a deferral that was
+// skipped there would put the block straight back on the wire.
 func (bd *BlockDownloader) BlockParentMissing(peer *SyncPeer, hash chainhash.Hash, nowMicros int64) bool {
 	released := bd.BlockFailed(peer, hash, nowMicros)
-	if !released {
-		return false
-	}
 
 	if node, known := bd.idx.Lookup(hash); known {
 		bd.retryAfter[hash] = deferredBlock{
@@ -988,7 +1053,7 @@ func (bd *BlockDownloader) BlockParentMissing(peer *SyncPeer, hash chainhash.Has
 		}
 	}
 
-	return true
+	return released
 }
 
 // BlockDeferred is BlockFailed for a block the ingest path refused for OUR
@@ -996,11 +1061,11 @@ func (bd *BlockDownloader) BlockParentMissing(peer *SyncPeer, hash chainhash.Has
 // window. The walk skips it until the stamp expires; holding its parent (which
 // it already does) releases nothing. SVNode has no counterpart: its ingest
 // cannot fail transiently the way a remote store can.
+//
+// Like BlockParentMissing, the stamp does not depend on this peer having held
+// the claim: the retained-block replay reports with no peer at all.
 func (bd *BlockDownloader) BlockDeferred(peer *SyncPeer, hash chainhash.Hash, nowMicros, untilMicros int64) bool {
 	released := bd.BlockFailed(peer, hash, nowMicros)
-	if !released {
-		return false
-	}
 
 	if node, known := bd.idx.Lookup(hash); known {
 		bd.retryAfter[hash] = deferredBlock{
@@ -1009,7 +1074,7 @@ func (bd *BlockDownloader) BlockDeferred(peer *SyncPeer, hash chainhash.Hash, no
 		}
 	}
 
-	return true
+	return released
 }
 
 // deferredForParent reports whether the walk must skip this block, and clears

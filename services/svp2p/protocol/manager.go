@@ -1703,6 +1703,11 @@ func (m *PeerManager) BlockExpected(syncPeer *SyncPeer, hash chainhash.Hash) boo
 // disconnected, which the caller does with no lock held; the int is the
 // misbehavior delta the outcome earned, which the caller applies FIRST (see
 // Peer.Run's ingest-report case).
+//
+// syncPeer may be nil, which is how an ingest no peer answers for reports its
+// outcome: the retained-block spool replays a block long after the peer that
+// delivered it was released, and that replay's failure still has to reach the
+// scheduler or the block stays recorded as held and is never fetched again.
 func (m *PeerManager) BlockDone(syncPeer *SyncPeer, hash chainhash.Hash, outcome IngestOutcome) (int, error) {
 	now := time.Now().UnixMicro()
 

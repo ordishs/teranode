@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/svp2p/protocol"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
@@ -35,6 +36,14 @@ type orphanBlocks struct {
 	logger ulogger.Logger
 	store  blob.Store
 	budget int64
+
+	// report hands a replay's outcome to the download scheduler. A replay has
+	// no delivering peer — the one that sent the bytes was released the moment
+	// the block was retained — so without this the scheduler keeps counting a
+	// failed replay as a block it holds, and never asks for it again. Wired to
+	// PeerManager.BlockDone with no sync peer (Server.startSync); nil in a test
+	// that does not exercise the seam.
+	report func(hash chainhash.Hash, outcome protocol.IngestOutcome)
 
 	mu       sync.Mutex
 	bytes    int64
@@ -101,7 +110,13 @@ func (o *orphanBlocks) Retain(ctx context.Context, req protocol.BlockIngestReque
 
 	counted := &countingReader{r: req.TxReader}
 
-	if err := o.store.SetFromReader(ctx, hash[:], fileformat.FileTypeBlock, counted); err != nil {
+	// The spool is keyed by block hash, and the same hash can reach here twice:
+	// a replay that finds the parent STILL missing re-retains the block before
+	// the previous entry is removed, and a Del that failed leaves one behind.
+	// Without the overwrite the second attempt fails with BLOB_EXISTS and the
+	// block is refused instead of retained.
+	if err := o.store.SetFromReader(ctx, hash[:], fileformat.FileTypeBlock, counted,
+		options.WithAllowOverwrite(true)); err != nil {
 		return errors.NewStorageError("[svp2p] failed to spool orphan block %s", hash, err)
 	}
 
@@ -142,6 +157,60 @@ func (o *orphanBlocks) take(parent chainhash.Hash) []retainedBlock {
 	return out
 }
 
+// rearm puts a block back under its parent after a replay that did not
+// consume it, so a later parent-landed event replays it again. The spool entry
+// it names is still in the store.
+func (o *orphanBlocks) rearm(rb retainedBlock) {
+	hash := rb.header.BlockHash()
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if _, dup := o.byHash[hash]; dup {
+		return
+	}
+
+	o.byHash[hash] = rb
+	o.byParent[rb.header.PrevBlock] = append(o.byParent[rb.header.PrevBlock], hash)
+	o.bytes += rb.spooled
+}
+
+// discard forgets a retained copy of hash and deletes its spool entry. It is
+// what stops a re-armed block leaking its budget when the same block is
+// ingested from the network instead of from the spool.
+func (o *orphanBlocks) discard(ctx context.Context, hash chainhash.Hash) {
+	o.mu.Lock()
+
+	rb, held := o.byHash[hash]
+	if held {
+		delete(o.byHash, hash)
+		o.bytes -= rb.spooled
+
+		siblings := o.byParent[rb.header.PrevBlock]
+
+		for i, sibling := range siblings {
+			if sibling == hash {
+				o.byParent[rb.header.PrevBlock] = append(siblings[:i], siblings[i+1:]...)
+				break
+			}
+		}
+
+		if len(o.byParent[rb.header.PrevBlock]) == 0 {
+			delete(o.byParent, rb.header.PrevBlock)
+		}
+	}
+
+	o.mu.Unlock()
+
+	if !held {
+		return
+	}
+
+	if err := o.store.Del(ctx, hash[:], fileformat.FileTypeBlock); err != nil {
+		o.logger.Debugf("[svp2p] spool entry %s not removed: %v", hash, err)
+	}
+}
+
 // Replay ingests every block retained under parent, in the background so the
 // caller's own ingest returns at once. Each replay runs through the ingestor's
 // full path — pre-admission, the budget, the pipeline — and may itself land
@@ -174,19 +243,56 @@ func (o *orphanBlocks) Replay(ctx context.Context, parent chainhash.Hash, ingest
 				PeerAddr:  child.peerAddr,
 			})
 
-			if delErr := o.store.Del(ctx, hash[:], fileformat.FileTypeBlock); delErr != nil {
-				o.logger.Debugf("[svp2p] spool entry %s not removed: %v", hash, delErr)
+			if outcome.Retained {
+				// The replay found the parent still missing and spooled the
+				// block again, so the entry and its bytes belong to that new
+				// retention: neither the spool entry nor the scheduler's record
+				// may be touched here.
+				o.logger.Debugf("[svp2p] retained block %s re-spooled: its parent is still not in our chain", hash)
+				continue
 			}
 
-			if outcome.Err != nil {
-				// The scheduler already counts this block as received; a failure
-				// here is logged at the level a lost download deserves.
-				o.logger.Warnf("[svp2p] replay of retained block %s failed: %v", hash, outcome.Err)
-			} else {
+			if outcome.Err == nil {
+				if delErr := o.store.Del(ctx, hash[:], fileformat.FileTypeBlock); delErr != nil {
+					o.logger.Debugf("[svp2p] spool entry %s not removed: %v", hash, delErr)
+				}
+
 				o.logger.Infof("[svp2p] replayed retained block %s (%d bytes) after its parent %s landed", hash, child.spooled, parent)
+
+				o.notify(hash, outcome)
+
+				continue
 			}
+
+			if outcome.TransientLocal {
+				// Our own fault, so the block is still wanted and the bytes are
+				// still good: keep the spool entry and arm it again for the
+				// next parent-landed event. The scheduler is told separately,
+				// because it counts this block as one we hold and would
+				// otherwise never offer it again.
+				o.rearm(child)
+
+				o.logger.Warnf("[svp2p] replay of retained block %s failed on a local fault, it stays spooled: %v", hash, outcome.Err)
+			} else {
+				if delErr := o.store.Del(ctx, hash[:], fileformat.FileTypeBlock); delErr != nil {
+					o.logger.Debugf("[svp2p] spool entry %s not removed: %v", hash, delErr)
+				}
+
+				o.logger.Warnf("[svp2p] replay of retained block %s failed: %v", hash, outcome.Err)
+			}
+
+			o.notify(hash, outcome)
 		}
 	}()
+}
+
+// notify hands one replay outcome to the scheduler, if the seam is wired.
+func (o *orphanBlocks) notify(hash chainhash.Hash, outcome protocol.IngestOutcome) {
+	if o.report == nil {
+		return
+	}
+
+	o.report(hash, outcome)
 }
 
 type countingReader struct {

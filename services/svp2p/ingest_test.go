@@ -39,6 +39,9 @@ type stubBridge struct {
 
 	// preAdmitFor overrides preAdmit for the named block hashes.
 	preAdmitFor map[chainhash.Hash]bridge.PreAdmitResult
+	// errFor overrides err for the named block hashes, so one run can fail a
+	// child's ingest while its parent succeeds.
+	errFor map[chainhash.Hash]error
 	// ingested records every IngestBlock call: header hash and the bytes read.
 	ingested []ingestedBlock
 }
@@ -77,7 +80,12 @@ func (s *stubBridge) IngestBlock(_ context.Context, header *wire.BlockHeader, tx
 
 	s.mu.Lock()
 	s.calls++
+
 	err := s.err
+	if override, ok := s.errFor[header.BlockHash()]; ok {
+		err = override
+	}
+
 	s.ingested = append(s.ingested, ingestedBlock{hash: header.BlockHash(), txCount: txCount, payload: payload, peer: peer})
 	s.mu.Unlock()
 

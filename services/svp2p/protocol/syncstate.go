@@ -60,6 +60,13 @@ type peerSyncState struct {
 	// block download scheduling (Task 6); not touched here.
 	pindexLastCommonBlock *HeaderNode
 
+	// reanchorGen is the BlockDownloader.reanchorGen value this peer has
+	// already acted on. It is how a release of a block we had recorded as held
+	// reaches every peer's own anchor without the downloader holding a peer
+	// registry: the walk compares the two counters and drops a stale anchor
+	// once per release. See BlockDownloader.reanchorHeight.
+	reanchorGen uint64
+
 	// nBlocksInFlight mirrors CNodeState::nBlocksInFlight: the number of
 	// blocks currently being downloaded from this peer. Populated and
 	// consumed by block download scheduling (Task 6); not touched here.
