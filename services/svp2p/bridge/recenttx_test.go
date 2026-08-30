@@ -485,28 +485,37 @@ func TestHandleTxMetaMessage_NilIndexStillRelays(t *testing.T) {
 	require.Equal(t, []chainhash.Hash{plainHash}, relayed)
 }
 
-// TestOrphanPool_AddFeedsTheRecentTxIndex is the second feed site, the one
-// standing in for SVNode's vExtraTxnForCompact: a transaction we cannot yet
-// validate is still a transaction a compact block may name.
-func TestOrphanPool_AddFeedsTheRecentTxIndex(t *testing.T) {
+// TestOrphanPool_AddDoesNotFeedTheRecentTxIndex replaces the Task 5 test that
+// asserted the opposite. That test fixed a feed the final review found harmful
+// (F2): the orphan pool named hashes whose bytes RecentTxIndex.Open cannot
+// serve, because an orphan never reaches the UTXO store. See
+// TestIngestTx_OrphanIsNotAddedToTheRecentTxIndex (orphans_test.go) for the
+// behavioural half of this, driven through the real ingest path.
+//
+// What survives from the old test is the part that was always right: the pool
+// takes an orphan once, and a duplicate changes nothing.
+func TestOrphanPool_AddDoesNotFeedTheRecentTxIndex(t *testing.T) {
 	tSettings := newOrphanTestSettings(time.Hour, 100)
 
 	validate, _ := newCountingValidateFunc(func(chainhash.Hash, int) (*meta.Data, error) {
 		return nil, errors.ErrTxMissingParent
 	})
 
-	idx := NewRecentTxIndex(16, noFetch)
-
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, idx)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 	t.Cleanup(pool.stop)
 
 	orphan := makeIngestTestTx(t, "recent-index-orphan")
 
 	pool.add(orphan)
-	pool.add(orphan) // duplicate: neither the pool nor the index takes it twice
+	pool.add(orphan) // duplicate: the pool does not take it twice
 
-	require.Equal(t, 1, idx.Len())
-	require.True(t, heldByIndex(idx, *orphan.TxIDChainHash()))
+	require.Equal(t, 1, pool.m.Len())
+
+	// The pool holds no index reference at all now, which is what makes the
+	// feed impossible rather than merely absent.
+	idx := NewRecentTxIndex(16, noFetch)
+	require.Equal(t, 0, idx.Len())
+	require.False(t, heldByIndex(idx, *orphan.TxIDChainHash()))
 }
 
 // TestNew_BuildsTheIndexFromTheCompactBlockSettings fixes the wiring the

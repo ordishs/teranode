@@ -52,18 +52,24 @@ SVNode matches a compact block's short IDs against its mempool
 stands in for one. It is a fixed-capacity ring of transaction hashes, oldest
 evicted first.
 
-Two sites feed the ring:
-
-- the txmeta topic's ADD entries, filtered to those that are neither coinbase nor
-  block-originated (`services/svp2p/bridge/kafka.go:337-340` skips
-  `txMeta.IsCoinbase`, `:344-351` skips `txMeta.InBlock`). The filter is what
-  keeps mined transactions out of the ring. What is left is the closest thing
-  this node has to "entered the mempool";
-- the orphan pool, which stands in for SVNode's separate `vExtraTxnForCompact`
-  buffer (`blockencodings.cpp:194-227`).
+One site feeds the ring: the txmeta topic's ADD entries, filtered to those that
+are neither coinbase nor block-originated (`services/svp2p/bridge/kafka.go:337-340`
+skips `txMeta.IsCoinbase`, `:344-351` skips `txMeta.InBlock`). The filter is what
+keeps mined transactions out of the ring. What is left is the closest thing this
+node has to "entered the mempool".
 
 The index holds hashes only. It reads the transaction bytes from the store at
 assembly time, through the same fetch seam the `getdata tx` answerer uses.
+
+The orphan pool deliberately does NOT feed it. An orphan failed validation, so it
+lives only in the pool's memory and never reaches the store, and a hash the index
+names but cannot serve is worse than one it never named: reconstruction matches
+it, marks the slot held, leaves it out of the `getblocktxn`, and then fails at
+that slot mid-assembly and refetches the whole block. Left unnamed, the same slot
+is a gap the `getblocktxn` fills. SVNode's `vExtraTxnForCompact`
+(`blockencodings.cpp:194-227`) can take the opposite side because it stores the
+transaction bytes, not just the hash; carrying those bytes here is a possible
+follow-up.
 
 ## 3. Message flow
 

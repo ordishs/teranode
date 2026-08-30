@@ -242,7 +242,7 @@ func New(
 
 	sm.orphanPool = newOrphanPool(tSettings, logger, func(ctx context.Context, tx *bt.Tx) (*meta.Data, error) {
 		return validationClient.Validate(ctx, tx, 0)
-	}, sm.recentTx)
+	})
 
 	return sm
 }

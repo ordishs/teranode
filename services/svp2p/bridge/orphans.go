@@ -143,13 +143,6 @@ type orphanPool struct {
 	validate orphanValidateFunc
 	logger   ulogger.Logger
 
-	// index is the recent-transaction index (recenttx.go) every accepted
-	// orphan is announced to. It is this port's stand-in for SVNode's
-	// separate vExtraTxnForCompact buffer, which its own reconstruction
-	// reads immediately after the mempool walk
-	// (blockencodings.cpp:201-215). nil when compact blocks are off.
-	index *RecentTxIndex
-
 	// ctx/cancel give the eviction worker's validate calls a cancellable
 	// context tied to the pool's own lifetime — legacy's own equivalent is
 	// sm.ctx, passed to its eviction closure's Validate call
@@ -192,7 +185,7 @@ type orphanPool struct {
 // The returned pool owns two background goroutines (expiringmap's TTL
 // ticker and this pool's own eviction worker) that only stop() releases —
 // see stop's own doc comment and the type's.
-func newOrphanPool(tSettings *settings.Settings, logger ulogger.Logger, validate orphanValidateFunc, index *RecentTxIndex) *orphanPool {
+func newOrphanPool(tSettings *settings.Settings, logger ulogger.Logger, validate orphanValidateFunc) *orphanPool {
 	// Idempotent (prometheusMetricsInitOnce): New (bridge.go) already calls
 	// this, but newOrphanPool is also called directly by this package's own
 	// tests, which never go through New, and onEvict's drop path (fix round
@@ -205,7 +198,6 @@ func newOrphanPool(tSettings *settings.Settings, logger ulogger.Logger, validate
 	p := &orphanPool{
 		validate:  validate,
 		logger:    logger,
-		index:     index,
 		ctx:       ctx,
 		cancel:    cancel,
 		evictions: make(chan *orphanEntry, orphanEvictionQueueSize),
@@ -371,13 +363,19 @@ func (p *orphanPool) add(tx *bt.Tx) {
 		addedAt: time.Now(),
 	})
 
-	// Added after the pool accepted it, and only on the branch that
-	// accepted it: a duplicate returned above, so one orphan enters the
-	// index once. Entries are left in the index when the orphan is evicted
-	// or released — the index is "seen recently", and the ring's own
-	// capacity is what bounds it.
-	p.index.Add(hash)
-
+	// AN ORPHAN IS DELIBERATELY NOT ADDED TO THE RECENT-TRANSACTION INDEX.
+	// It failed validation, so it lives only in this pool's memory and never
+	// reaches the UTXO store — and RecentTxIndex.Open reads the store. A hash
+	// the index names but cannot serve is strictly worse than one it does not
+	// name at all: reconstruction matches it, marks the slot held, and so
+	// leaves it OUT of the getblocktxn, then fails at that slot mid-assembly
+	// and falls back to fetching the whole block. Left unnamed, the same slot
+	// is a gap the getblocktxn fills and the reconstruction succeeds.
+	//
+	// SVNode can afford the opposite choice because vExtraTxnForCompact holds
+	// the transaction BYTES (blockencodings.cpp:201-215), not just the hash, so
+	// what it names it can serve. Carrying those bytes here is a possible
+	// follow-up; naming what we cannot serve is not.
 	prometheusSvp2pBridgeOrphans.Inc()
 }
 

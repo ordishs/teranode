@@ -117,9 +117,14 @@ func newOrphanTestBridge(t *testing.T, v validator.Interface, tSettings *setting
 		rejectedTxns:     txmap.NewSyncedMap[chainhash.Hash, struct{}](maxRejectedTxns),
 	}
 
+	// The recent-transaction index is wired exactly as New() wires it
+	// (bridge.go), so a test can observe what the ingest path does and does
+	// not put in it.
+	sm.recentTx = NewRecentTxIndex(16, sm.openTx)
+
 	sm.orphanPool = newOrphanPool(tSettings, sm.logger, func(ctx context.Context, tx *bt.Tx) (*meta.Data, error) {
 		return sm.validationClient.Validate(ctx, tx, 0)
-	}, nil)
+	})
 
 	t.Cleanup(sm.Stop)
 
@@ -138,7 +143,7 @@ func TestOrphanPool_DuplicateOrphanNotReAdded(t *testing.T) {
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 	t.Cleanup(pool.stop)
 
 	original := makeIngestTestTx(t, "dup-orphan-original")
@@ -177,7 +182,7 @@ func TestOrphanPool_CapEvictionGivesFinalAttemptAndKeepsSurvivors(t *testing.T) 
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 	t.Cleanup(pool.stop)
 
 	a := makeIngestTestTx(t, "cap-a")
@@ -233,7 +238,7 @@ func TestOrphanPool_TTLEvictionGivesFinalAttemptAndStaysUsable(t *testing.T) {
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 	t.Cleanup(pool.stop)
 
 	stale := makeIngestTestTx(t, "ttl-stale")
@@ -272,7 +277,7 @@ func TestOrphanPool_ZeroMaxOrphanTxsDisablesCap(t *testing.T) {
 		return nil, errors.ErrTxMissingParent
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 	t.Cleanup(pool.stop)
 
 	const n = 500
@@ -391,7 +396,7 @@ func TestOrphanPool_ReleaseValidatesMultiParentOrphanExactlyOnce(t *testing.T) {
 		return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 	})
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 	t.Cleanup(pool.stop)
 
 	pool.add(a)
@@ -454,7 +459,7 @@ func TestOrphanPool_ReleaseErrorLadder(t *testing.T) {
 			return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 		}
 
-		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 		t.Cleanup(pool.stop)
 
 		pool.add(stillWaiting)
@@ -493,7 +498,7 @@ func TestOrphanPool_ReleaseErrorLadder(t *testing.T) {
 			return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 		}
 
-		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 		t.Cleanup(pool.stop)
 
 		pool.add(conflicting)
@@ -532,7 +537,7 @@ func TestOrphanPool_ReleaseErrorLadder(t *testing.T) {
 			return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 		}
 
-		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+		pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 		t.Cleanup(pool.stop)
 
 		pool.add(invalid)
@@ -588,7 +593,7 @@ func TestOrphanPool_ReleaseHandlesLongChainWithUnboundedCap(t *testing.T) {
 		return &meta.Data{Fee: 1, SizeInBytes: 1}, nil
 	}
 
-	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate, nil)
+	pool := newOrphanPool(tSettings, ulogger.TestLogger{}, validate)
 	t.Cleanup(pool.stop)
 
 	for _, tx := range txs {
@@ -601,4 +606,52 @@ func TestOrphanPool_ReleaseHandlesLongChainWithUnboundedCap(t *testing.T) {
 
 	require.Len(t, released, chainLength, "the entire chain must release without a stack-depth failure")
 	require.Equal(t, 0, pool.m.Len())
+}
+
+// TestIngestTx_OrphanIsNotAddedToTheRecentTxIndex is F2.
+//
+// An orphan is a transaction this node could NOT validate. It lives in the
+// orphan pool's memory and never reaches the UTXO store, so RecentTxIndex.Open
+// — which reads the store through the bridge's own fetch seam — cannot serve
+// its bytes.
+//
+// Indexing it is therefore strictly worse than leaving it out. A hash the index
+// names is matched during reconstruction and the slot is marked held, so it is
+// NOT requested in the getblocktxn. The exchange completes, the ingest starts,
+// and the assembly then fails at that slot with READ_STATUS_FAILED, which
+// releases the block and fetches the whole thing by getdata. Left out, the same
+// slot would simply have been a gap and the reconstruction would have
+// succeeded — one round trip instead of a wasted one plus a full block.
+//
+// SVNode's vExtraTxnForCompact keeps the transaction BYTES
+// (blockencodings.cpp:201-215), so its equivalent buffer can serve what it
+// names. This port copied the feed but not the bytes; carrying them is a
+// possible follow-up, and until then the honest thing is not to name what we
+// cannot serve.
+func TestIngestTx_OrphanIsNotAddedToTheRecentTxIndex(t *testing.T) {
+	tSettings := newOrphanTestSettings(time.Hour, 100)
+
+	orphan := makeIngestTestTx(t, "orphan-must-not-be-indexed")
+
+	rv := newRecordingValidator(func(chainhash.Hash) (*meta.Data, error) {
+		return nil, errors.ErrTxMissingParent
+	})
+
+	sm := newOrphanTestBridge(t, rv.MockValidator, tSettings)
+
+	result, err := sm.IngestTx(t.Context(), orphan.Bytes(), "peer1:8333")
+	require.NoError(t, err)
+	require.True(t, result.Orphan, "the transaction must have been pooled as an orphan")
+
+	require.Equal(t, 1, sm.orphanPool.m.Len(), "the orphan must be in the pool")
+
+	require.Equal(t, 0, sm.recentTx.Len(),
+		"an orphan's bytes are not in the store, so its hash must not be in the index")
+
+	// The index is live, not merely empty: the txmeta consumer's own feed —
+	// the one whose transactions ARE in the store — still reaches it.
+	stored := makeIngestTestTx(t, "stored-and-indexed")
+	sm.recentTx.Add(*stored.TxIDChainHash())
+
+	require.Equal(t, 1, sm.recentTx.Len(), "the store-backed feed must still fill the index")
 }
