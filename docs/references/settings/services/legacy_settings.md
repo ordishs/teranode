@@ -100,7 +100,7 @@ the outcome table, and the divergences from SVNode.
 
 `legacy_compactBlocksRecentTxs` sizes `bridge.RecentTxIndex`, the ring of recently seen
 transaction hashes that stands in for the mempool SVNode matches short IDs against. Teranode has
-no mempool, so the ring is fed by the orphan pool and by the txmeta topic's ADD entries — those
+no mempool, so the ring is fed by the txmeta topic's ADD entries alone — those
 that are neither coinbase nor block-originated, since `services/svp2p/bridge/kafka.go:337-340`
 and `:344-351` skip both classes, which is what keeps mined transactions out of the ring. Budget
 about 105 bytes per hash: a 32-byte ring slot plus roughly 70 bytes in the dedup map. At the
