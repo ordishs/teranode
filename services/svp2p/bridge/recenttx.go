@@ -23,11 +23,12 @@ type TxFetchFunc func(ctx context.Context, hash chainhash.Hash) (io.ReadCloser, 
 // evicted first, and reads the bytes from the store only when a block
 // actually needs them.
 //
-// Two sites feed it: the txmeta topic's ADD entries (kafka.go
+// One site feeds it: the txmeta topic's ADD entries (kafka.go
 // handleTxMetaMessage), which are the closest thing this node has to
-// "entered the mempool", and the orphan pool (orphans.go add), which stands
-// in for SVNode's separate vExtraTxnForCompact buffer (net_processing.cpp;
-// blockencodings.cpp:194-215 reads it right after the mempool walk).
+// "entered the mempool". The orphan pool does not feed it: an orphan's bytes
+// are not in the store, so an indexed orphan would match as held and fail at
+// assembly. SVNode's vExtraTxnForCompact (blockencodings.cpp:194-215) keeps
+// the bytes and is not ported.
 //
 // The index carries its own RWMutex and is never touched under the peer
 // manager's syncMu: Match hashes the whole ring and Open reads the store, so
