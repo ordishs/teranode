@@ -884,9 +884,7 @@ func (p *Peer) handleCompactBlock(ctx context.Context, msg *wire.MsgCmpctBlock) 
 // :3602-3606).
 func (p *Peer) handleBlockTxn(ctx context.Context, stream *transport.TxnStream) error {
 	if p.cfg.Compact == nil {
-		if err := stream.Close(); err != nil {
-			p.cfg.Logger.Debugf("[svp2p] blocktxn stream from %s closed with: %v", p.cfg.Conn.RemoteAddr(), err)
-		}
+		releaseTxnStream(p.cfg.Logger, stream)
 
 		return nil
 	}

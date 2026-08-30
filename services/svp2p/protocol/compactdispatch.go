@@ -9,7 +9,32 @@ import (
 	"github.com/bsv-blockchain/go-wire"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/svp2p/transport"
+	"github.com/bsv-blockchain/teranode/ulogger"
 )
+
+// releaseTxnStream drains and closes an undelivered blocktxn payload OFF the
+// peer loop.
+//
+// It must never run on Peer.Run's goroutine. payloadStream.Close drains the
+// whole DECLARED payload with io.Copy and the transport sets no read deadline,
+// so a peer that promises a large payload and then dribbles would otherwise
+// hold the goroutine that services the idle timer, the ping ticker and ctx
+// cancellation for as long as it liked. peer.go startIngest states the same
+// rule for the block path, which refuses rather than drains for this reason.
+//
+// The goroutine is bounded by the connection, not by the peer's patience: the
+// transport read loop stays parked until this drain ends, so no further message
+// arrives, the idle timer ends the peer, and Peer.disconnect closes the socket —
+// which fails the read inside io.Copy and releases this goroutine.
+func releaseTxnStream(logger ulogger.Logger, ts *transport.TxnStream) {
+	hash := ts.BlockHash()
+
+	go func() {
+		if err := ts.Close(); err != nil {
+			logger.Debugf("[svp2p] blocktxn stream for %s released with: %v", hash, err)
+		}
+	}()
+}
 
 // CompactReady is one reconstructed compact block, handed back to the peer
 // loop so the ingest runs where a plain block's ingest runs: on the peer's own
@@ -307,7 +332,7 @@ func (m *PeerManager) BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.
 		// below. A blocktxn racing a claim this node released (a rotation, a
 		// timeout, the handoff of a reply already accepted) is a timing
 		// artefact, not evidence of malice.
-		_ = ts.Close()
+		releaseTxnStream(m.logger, ts)
 
 		m.logger.Debugf("[svp2p] peer %s sent us block transactions for block %s we weren't expecting",
 			peerAddrOf(sp), hash)
@@ -317,8 +342,13 @@ func (m *PeerManager) BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.
 	case status == readInvalid:
 		// net_processing.cpp:3610-3616: MarkBlockAsFailed, then
 		// Misbehaving(pfrom, 100, "invalid-cmpctblk-txns").
-		_ = ts.Close()
-
+		//
+		// The stream is deliberately NOT closed here. This return disconnects
+		// the peer, and Peer.disconnect closes the connection, which releases
+		// the parked read loop through sockClosed without reading a byte
+		// (transport/conn.go serveStream). Draining first would run io.Copy
+		// over the undelivered remainder on the peer loop, for a peer we are
+		// about to drop — the refusal pattern peer.go startIngest documents.
 		return nil, nil, scoreInvalidBlock, err
 
 	case status != readOK:
@@ -326,7 +356,7 @@ func (m *PeerManager) BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.
 		// rather than fallen through, because falling through would hand the
 		// caller an ingest of a block fillCompactBlock has already failed and
 		// put back on offer.
-		_ = ts.Close()
+		releaseTxnStream(m.logger, ts)
 
 		m.logger.Debugf("[svp2p] compact block for %s could not be filled: %v", hash, err)
 
@@ -338,7 +368,7 @@ func (m *PeerManager) BlockTxn(ctx context.Context, sp *SyncPeer, ts *transport.
 	// slot at openHeld; release it here instead and let the ordinary getdata
 	// path take it. Not the peer's fault, so no score.
 	if idx == nil {
-		_ = ts.Close()
+		releaseTxnStream(m.logger, ts)
 
 		m.failCompactBlock(sp, hash)
 		m.logger.Debugf("[svp2p] compact block for %s abandoned: no transaction index", hash)

@@ -1105,3 +1105,107 @@ func onlySyncPeer(t *testing.T, m *PeerManager) *SyncPeer {
 
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// Final-review fix round
+// ---------------------------------------------------------------------------
+
+// writeRawBlockTxnFrame writes a blocktxn frame whose DECLARED payload length
+// is chosen independently of the bytes actually sent, so a test can model a
+// peer that promises a large payload and then dribbles.
+func writeRawBlockTxnFrame(t *testing.T, s *scriptedPeer, hash chainhash.Hash, count uint64, declared uint32) {
+	t.Helper()
+
+	var payload bytes.Buffer
+
+	payload.Write(hash[:])
+	require.NoError(t, wire.WriteVarInt(&payload, wire.ProtocolVersion, count))
+
+	require.Greater(t, declared, uint32(payload.Len()), "the frame must declare more than it sends")
+
+	frame := make([]byte, wire.MessageHeaderSize)
+	binary.LittleEndian.PutUint32(frame[0:4], uint32(wire.MainNet))
+	copy(frame[4:4+wire.CommandSize], wire.CmdBlockTxn)
+	binary.LittleEndian.PutUint32(frame[16:20], declared)
+
+	_, err := s.nc.Write(frame)
+	require.NoError(t, err)
+
+	_, err = s.nc.Write(payload.Bytes())
+	require.NoError(t, err)
+}
+
+// idleBoundedManager is a manager whose idle timeout is short enough to observe
+// in a test, so a peer loop that is still servicing its own select can be told
+// apart from one that is wedged.
+func idleBoundedManager(t *testing.T, idle time.Duration) *PeerManager {
+	t.Helper()
+
+	genesis := syncGenesis()
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	tSettings := managerSettings()
+	tSettings.ChainCfgParams = syncTestParams(nil)
+	tSettings.Legacy.PeerIdleTimeout = idle
+
+	banList, err := NewBanList("")
+	require.NoError(t, err)
+
+	m := NewPeerManager(ulogger.TestLogger{}, tSettings, banList)
+
+	require.NoError(t, m.ConfigureSync(SyncConfig{
+		Index:        idx,
+		Ingestor:     &recordingBodyIngestor{},
+		TickInterval: 20 * time.Millisecond,
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	require.NoError(t, m.Start(ctx, []string{"127.0.0.1:0"}))
+	t.Cleanup(func() { require.NoError(t, m.Stop()) })
+
+	return m
+}
+
+// TestBlockTxn_DribbledUnsolicitedPayloadDoesNotWedgeThePeerLoop is F1.
+//
+// payloadStream.Close drains the whole declared payload with io.Copy, and the
+// transport sets no read deadline. Running that drain on Peer.Run's goroutine
+// hands any peer a way to pin the loop for as long as it cares to dribble: the
+// idle timer, the ping ticker and the ctx select are all serviced by that one
+// goroutine.
+//
+// startIngest states the rule for exactly this reason (peer.go): "A drain runs
+// io.Copy over up to MaxBlockPayload bytes ON THIS GOROUTINE, which is the one
+// servicing the idle timer and ctx cancellation — a peer that declares a huge
+// payload and then dribbles would hold the loop for as long as it liked."
+//
+// The flag is OFF here deliberately. Nothing about this needs compact blocks
+// negotiated or enabled: blocktxn is decoded and streamed by the transport
+// either way, so the exposure is flag-independent.
+func TestBlockTxn_DribbledUnsolicitedPayloadDoesNotWedgeThePeerLoop(t *testing.T) {
+	const idle = 3 * time.Second
+
+	m := idleBoundedManager(t, idle)
+
+	far := dialScripted(t, m.ListenAddrs()[0])
+	t.Cleanup(func() { _ = far.nc.Close() })
+
+	version := remoteVersion(4321)
+	version.Services = wire.SFNodeNetwork
+	far.completeOutboundHandshakeAs(t, version)
+
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 1 }, 5*time.Second, 20*time.Millisecond)
+
+	// 100 MB promised, 33 bytes sent, nothing after that. No peer asked for
+	// these transactions, so this takes the unsolicited path.
+	writeRawBlockTxnFrame(t, far, chainhash.Hash{0x77}, 0, 100_000_000)
+
+	// The loop must still be its own master: the idle timer is what ends a peer
+	// that has gone quiet, and it can only fire if Run is servicing its select.
+	require.Eventually(t, func() bool { return m.ConnectedCount() == 0 }, 20*time.Second, 50*time.Millisecond,
+		"the peer loop must stay responsive while an undelivered blocktxn payload is released")
+}
