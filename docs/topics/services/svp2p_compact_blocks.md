@@ -67,7 +67,7 @@ names but cannot serve is worse than one it never named: reconstruction matches
 it, marks the slot held, leaves it out of the `getblocktxn`, and then fails at
 that slot mid-assembly and refetches the whole block. Left unnamed, the same slot
 is a gap the `getblocktxn` fills. SVNode's `vExtraTxnForCompact`
-(`blockencodings.cpp:194-227`) can take the opposite side because it stores the
+(`blockencodings.cpp:194-215`) can take the opposite side because it stores the
 transaction bytes, not just the hash; carrying those bytes here is a possible
 follow-up.
 

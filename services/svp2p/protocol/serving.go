@@ -348,7 +348,7 @@ const (
 // warn-logged, left unanswered, and does not end the pass.
 //
 // A peer CAN now ask for one. This port sends a version-1 sendcmpct after the
-// handshake (net_processing.cpp ProcessVerAckMessage :1961-1972), which sets
+// handshake (net_processing.cpp ProcessVerAckMessage :1942-1953), which sets
 // fSupportsDesiredCmpctVersion on SVNode's side. SVNode then rewrites a
 // single-block headers direct fetch into MSG_CMPCT_BLOCK (:3553-3560). This
 // port serves no compact block in either case — compact blocks are

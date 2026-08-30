@@ -178,7 +178,7 @@ type Script struct {
 	OnCreateStream func(p *ScriptedPeer, conn net.Conn, m *wire.MsgCreateStream) []wire.Message
 	// OnSendCmpct answers the node's sendcmpct. The default sends nothing,
 	// which is what SVNode does: ProcessSendCompactMessage
-	// (net_processing.cpp:2417-2437) records the peer's preference and
+	// (net_processing.cpp:2390-2411) records the peer's preference and
 	// answers no message. A peer's own sendcmpct is announced from
 	// Script.OnConnect, not from here.
 	OnSendCmpct func(p *ScriptedPeer, conn net.Conn, m *wire.MsgSendcmpct) []wire.Message

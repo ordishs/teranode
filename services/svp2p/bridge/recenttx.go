@@ -27,7 +27,7 @@ type TxFetchFunc func(ctx context.Context, hash chainhash.Hash) (io.ReadCloser, 
 // handleTxMetaMessage), which are the closest thing this node has to
 // "entered the mempool", and the orphan pool (orphans.go add), which stands
 // in for SVNode's separate vExtraTxnForCompact buffer (net_processing.cpp;
-// blockencodings.cpp:201-215 reads it right after the mempool walk).
+// blockencodings.cpp:194-215 reads it right after the mempool walk).
 //
 // The index carries its own RWMutex and is never touched under the peer
 // manager's syncMu: Match hashes the whole ring and Open reads the store, so
@@ -149,7 +149,7 @@ func (i *RecentTxIndex) Len() int {
 // megabytes).
 //
 // Two held hashes on one short ID clear that position and set collision
-// (:181-190). SVNode clears the slot too, and merely requests the
+// (:174-183). SVNode clears the slot too, and merely requests the
 // transaction; reporting it lets the caller take BIP152's stricter answer.
 // The early exit once every requested short ID is matched is SVNode's
 // (:192-196), and carries SVNode's own stated risk with it: a collision

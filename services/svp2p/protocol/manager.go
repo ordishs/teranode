@@ -1018,7 +1018,7 @@ func (m *PeerManager) runPeer(ctx context.Context, nc net.Conn, inbound bool, fi
 			return
 		}
 
-		// net_processing.cpp ProcessVerAckMessage (:1961-1972): once per
+		// net_processing.cpp ProcessVerAckMessage (:1942-1953): once per
 		// peer, right after the handshake, independent of which side dialled
 		// — sent before the direction-specific branching below because
 		// SVNode sends it to every peer, inbound and outbound alike. Gated

@@ -152,8 +152,8 @@ func (c *compactState) placePrefilled(m *wire.MsgCmpctBlock) readStatus {
 // index_offset walk is blockencodings.cpp:142-146.
 //
 // Deviation: a duplicate short ID inside the message is READ_STATUS_FAILED at
-// blockencodings.cpp:165-169 and READ_STATUS_INVALID here. The bucket_size > 12
-// guard at blockencodings.cpp:157-161 is not ported.
+// blockencodings.cpp:159-162 and READ_STATUS_INVALID here. The bucket_size > 12
+// guard at blockencodings.cpp:150-153 is not ported.
 func (c *compactState) placeShortIDs(m *wire.MsgCmpctBlock) ([]uint32, readStatus) {
 	seen := make(map[uint64]struct{}, len(m.ShortIDs))
 	slotOf := make([]uint32, len(m.ShortIDs))
@@ -181,7 +181,7 @@ func (c *compactState) placeShortIDs(m *wire.MsgCmpctBlock) ([]uint32, readStatu
 
 // matchIndex is InitData's mempool walk (blockencodings.cpp:171-199). A short
 // ID two indexed hashes share leaves the slot empty and joins the gaps
-// (blockencodings.cpp:181-190).
+// (blockencodings.cpp:174-183).
 func (c *compactState) matchIndex(m *wire.MsgCmpctBlock, idx TxIndex, slotOf []uint32) error {
 	if idx == nil {
 		return nil
@@ -205,7 +205,7 @@ func (c *compactState) matchIndex(m *wire.MsgCmpctBlock, idx TxIndex, slotOf []u
 	return nil
 }
 
-// collectMissing lists the getblocktxn indexes (net_processing.cpp:3915-3925).
+// collectMissing lists the getblocktxn indexes (net_processing.cpp:3864-3869).
 func (c *compactState) collectMissing() {
 	for i := range c.txs {
 		if !c.txs[i].filled() {
@@ -215,7 +215,7 @@ func (c *compactState) collectMissing() {
 }
 
 // gapRequest is the getblocktxn for the missing slots
-// (net_processing.cpp:3931-3945). The indexes are strictly increasing, which
+// (net_processing.cpp:3870-3881). The indexes are strictly increasing, which
 // the differential encoding requires (blockencodings.h:36-82).
 func (c *compactState) gapRequest() *wire.MsgGetBlockTxn {
 	if len(c.missing) == 0 {

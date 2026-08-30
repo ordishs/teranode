@@ -576,7 +576,7 @@ func TestBlockTxn_WithoutAnOutstandingRequestIsDroppedUnscored(t *testing.T) {
 	require.Equal(t, 0, ingestor.count())
 }
 
-// TestCompactBlock_IndexCollisionJoinsTheGaps is blockencodings.cpp:181-190
+// TestCompactBlock_IndexCollisionJoinsTheGaps is blockencodings.cpp:174-183
 // as the Task 5 ruling carries it: a short ID two indexed hashes share leaves
 // the slot empty, so it is requested by getblocktxn like any other gap rather
 // than failing reconstruction.

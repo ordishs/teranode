@@ -230,7 +230,7 @@ type peerSyncState struct {
 	requestedTxns *expiringmap.ExpiringMap[chainhash.Hash, struct{}]
 
 	// fProvidesHeaderAndIDs mirrors CNodeState::fProvidesHeaderAndIDs
-	// (net_processing.cpp ProcessSendCompactMessage:2428-2431, "used to 'lock
+	// (net_processing.cpp ProcessSendCompactMessage:2400-2404, "used to 'lock
 	// in' version of compact blocks we send"): true once this peer has ever
 	// sent a version-1 sendcmpct. Set once and never cleared, matching
 	// SVNode's own `if(!state->fProvidesHeaderAndIDs)` guard, which only ever
@@ -239,7 +239,7 @@ type peerSyncState struct {
 	fProvidesHeaderAndIDs bool
 
 	// fPreferHeaderAndIDs mirrors CNodeState::fPreferHeaderAndIDs
-	// (net_processing.cpp:2434): the announce bit of this peer's MOST RECENT
+	// (net_processing.cpp:2406): the announce bit of this peer's MOST RECENT
 	// version-1 sendcmpct, overwritten on every one it sends (SVNode does not
 	// guard this write the way it guards fProvidesHeaderAndIDs). Because this
 	// port never announces its own blocks (spec §2 non-goal), nothing reads
@@ -247,7 +247,7 @@ type peerSyncState struct {
 	fPreferHeaderAndIDs bool
 
 	// fSupportsDesiredCmpctVersion mirrors CNodeState::fSupportsDesiredCmpctVersion
-	// (net_processing.cpp:2435-2436): true once this peer has sent a
+	// (net_processing.cpp:2407-2409): true once this peer has sent a
 	// version-1 sendcmpct at all. Set once and never cleared, matching
 	// SVNode's own `if(!state->fSupportsDesiredCmpctVersion)` guard. Read by
 	// Task 6's own receive path is not needed yet — carried for parity with
@@ -526,7 +526,7 @@ func (s *peerSyncState) processBlockAvailability(idx *HeaderIndex) {
 }
 
 // recordSendCmpct mirrors net_processing.cpp ProcessSendCompactMessage
-// (:2417-2437): a version-1 sendcmpct locks in fProvidesHeaderAndIDs and
+// (:2390-2411): a version-1 sendcmpct locks in fProvidesHeaderAndIDs and
 // fSupportsDesiredCmpctVersion (set once, never cleared) and overwrites
 // fPreferHeaderAndIDs with this message's announce bit every time. Any other
 // version changes nothing, matching SVNode's own

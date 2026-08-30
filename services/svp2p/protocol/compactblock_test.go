@@ -101,7 +101,7 @@ type compactTestIndex struct {
 	extraBy   map[chainhash.Hash]int
 	stallAt   map[chainhash.Hash]bool
 	// collideAt marks a short ID two indexed hashes share
-	// (blockencodings.cpp:181-190).
+	// (blockencodings.cpp:174-183).
 	collideAt     map[int]bool
 	truncateMatch bool
 }
@@ -205,7 +205,7 @@ func drain(t *testing.T, rc io.ReadCloser) ([]byte, error) {
 }
 
 // TestCompactState_AllHeld_AssemblesWithoutGapRequest is the no-getblocktxn
-// case (net_processing.cpp:3931-3945).
+// case (net_processing.cpp:3870-3881).
 func TestCompactState_AllHeld_AssemblesWithoutGapRequest(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)
@@ -423,7 +423,7 @@ func TestCompactState_PrefilledIndexOutOfRange(t *testing.T) {
 }
 
 // TestCompactState_IndexCollision_IsMissingNotFailed is
-// blockencodings.cpp:181-190: the slot is cleared and requested, not failed.
+// blockencodings.cpp:174-183: the slot is cleared and requested, not failed.
 func TestCompactState_IndexCollision_IsMissingNotFailed(t *testing.T) {
 	blk := compactFixtureBlock(t, compactFixtureTxCount)
 	msg := compactMsgFor(t, blk, 0)

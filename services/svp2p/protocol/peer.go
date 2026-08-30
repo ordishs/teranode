@@ -292,7 +292,7 @@ type addrDispatcher interface {
 // SyncEnabled()).
 type compactDispatcher interface {
 	// SendCmpct dispatches NetMsgType::SENDCMPCT
-	// (net_processing.cpp ProcessSendCompactMessage:2417-2437). It cannot end
+	// (net_processing.cpp ProcessSendCompactMessage:2390-2411). It cannot end
 	// the connection: SVNode scores nothing here, whatever the version.
 	SendCmpct(sp *SyncPeer, msg *wire.MsgSendcmpct)
 

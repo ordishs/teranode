@@ -624,7 +624,7 @@ func TestOrphanPool_ReleaseHandlesLongChainWithUnboundedCap(t *testing.T) {
 // succeeded — one round trip instead of a wasted one plus a full block.
 //
 // SVNode's vExtraTxnForCompact keeps the transaction BYTES
-// (blockencodings.cpp:201-215), so its equivalent buffer can serve what it
+// (blockencodings.cpp:194-215), so its equivalent buffer can serve what it
 // names. This port copied the feed but not the bytes; carrying them is a
 // possible follow-up, and until then the honest thing is not to name what we
 // cannot serve.

@@ -29,7 +29,7 @@ func compactBlocksManager(t *testing.T, tweak func(*settings.Settings)) *PeerMan
 }
 
 // TestSendCmpct_SentOnceToInboundPeerWhenEnabled is SVNode's
-// ProcessVerAckMessage (net_processing.cpp:1961-1972): once the handshake
+// ProcessVerAckMessage (net_processing.cpp:1942-1953): once the handshake
 // completes, and compact blocks are enabled, the node sends
 // sendcmpct(announce=false, version=1) — here to a peer that dialled IN.
 func TestSendCmpct_SentOnceToInboundPeerWhenEnabled(t *testing.T) {
@@ -136,7 +136,7 @@ func TestSendCmpct_NeverSentWithoutTxIndex(t *testing.T) {
 }
 
 // TestSendCmpct_InboundVersion1RecordsFlags is ProcessSendCompactMessage
-// (net_processing.cpp:2417-2437): a version-1 sendcmpct locks in
+// (net_processing.cpp:2390-2411): a version-1 sendcmpct locks in
 // fProvidesHeaderAndIDs and records fPreferHeaderAndIDs as the announce bit.
 func TestSendCmpct_InboundVersion1RecordsFlags(t *testing.T) {
 	m := startedManagerWith(t, nil, nil)

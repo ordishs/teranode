@@ -373,7 +373,7 @@ func (p *orphanPool) add(tx *bt.Tx) {
 	// is a gap the getblocktxn fills and the reconstruction succeeds.
 	//
 	// SVNode can afford the opposite choice because vExtraTxnForCompact holds
-	// the transaction BYTES (blockencodings.cpp:201-215), not just the hash, so
+	// the transaction BYTES (blockencodings.cpp:194-215), not just the hash, so
 	// what it names it can serve. Carrying those bytes here is a possible
 	// follow-up; naming what we cannot serve is not.
 	prometheusSvp2pBridgeOrphans.Inc()
