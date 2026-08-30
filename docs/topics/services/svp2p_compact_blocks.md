@@ -232,6 +232,13 @@ Three further points of the fallback:
    `MSG_CMPCT_BLOCK`. svp2p answers that entry with nothing. An inbound
    `getblocktxn` is refused with nothing for the same reason
    (`services/svp2p/protocol/peer.go:843-849`).
+7. **svp2p never requests a compact block either.** In low-bandwidth mode SVNode
+   asks for one by rewriting a single-block direct fetch to `getdata
+   MSG_CMPCT_BLOCK` (`net_processing.cpp:3553-3560`). BIP152 makes that request
+   optional, and the decision for this port is not to support `MSG_CMPCT_BLOCK`
+   in either direction. So a stock SVNode peer, which announces in low-bandwidth
+   mode by default, sends this node full blocks. The receive path in this page
+   is exercised only by a peer that pushes `cmpctblock` unasked.
 
 ## 8. Test harness note
 
