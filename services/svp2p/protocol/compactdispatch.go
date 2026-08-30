@@ -157,14 +157,24 @@ func (m *PeerManager) CompactBlock(ctx context.Context, sp *SyncPeer, msg *wire.
 	// net_processing.cpp:3864-3869 collects every slot the index could not
 	// fill; :3870-3881 either asks for them or completes the block at once.
 	if req := state.gapRequest(); req != nil {
-		m.holdCompactBlock(sp, state)
+		if !m.holdCompactBlock(sp, state) {
+			m.logger.Debugf("[svp2p] dropping compact block %s from %s: the claim ended while it was reconstructed",
+				hash, peerAddrOf(sp))
+
+			return nil, nil, 0, nil
+		}
 
 		return []wire.Message{req}, nil, 0, nil
 	}
 
 	// No blocktxn was asked for, so this partial block goes straight to the
 	// ingesting state: nothing may fill it again.
-	m.handOffCompactBlock(sp, state)
+	if !m.handOffCompactBlock(sp, state) {
+		m.logger.Debugf("[svp2p] dropping compact block %s from %s: the claim ended while it was reconstructed",
+			hash, peerAddrOf(sp))
+
+		return nil, nil, 0, nil
+	}
 
 	return nil, readyFrom(ctx, state, idx, nil), 0, nil
 }
@@ -273,12 +283,28 @@ func (m *PeerManager) claimCompactBlock(sp *SyncPeer, header *wire.BlockHeader, 
 	return nil, 0, true, nil
 }
 
-// holdCompactBlock records a partial block that is WAITING on a blocktxn.
-func (m *PeerManager) holdCompactBlock(sp *SyncPeer, state *compactState) {
+// holdCompactBlock records a partial block that is WAITING on a blocktxn. It
+// reports false when the claim it belongs to has gone, in which case nothing is
+// held and the announcement ends here.
+//
+// The re-check is not defensive noise. CompactBlock releases syncMu to run
+// newCompactState, because TxIndex.Match hashes every entry the index holds and
+// must not run under the lock. A disconnect, a sync-peer rotation, or another
+// peer delivering the block inside that window ends the claim through clearPeer
+// or removeFromFlight; writing the partial block afterwards would resurrect it
+// for a claim that no longer exists, and a stranded partial block refuses every
+// later cmpctblock from this peer for the life of the connection.
+func (m *PeerManager) holdCompactBlock(sp *SyncPeer, state *compactState) bool {
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
 
+	if m.blockDownloader == nil || !m.blockDownloader.IsInFlightFrom(sp, state.hash) {
+		return false
+	}
+
 	sp.State.compact = state
+
+	return true
 }
 
 // handOffCompactBlock moves a partial block from "waiting on a blocktxn" to
@@ -286,12 +312,21 @@ func (m *PeerManager) holdCompactBlock(sp *SyncPeer, state *compactState) {
 // second time. It is this port's stand-in for the MarkBlockAsReceived at
 // net_processing.cpp:3646, which destroys the QueuedBlock the partial block
 // hangs off before the block is processed. See peerSyncState.compactIngest.
-func (m *PeerManager) handOffCompactBlock(sp *SyncPeer, state *compactState) {
+// It reports false for the same reason holdCompactBlock does, and on the same
+// window: the no-gaps path reaches it straight from newCompactState, with the
+// lock released in between.
+func (m *PeerManager) handOffCompactBlock(sp *SyncPeer, state *compactState) bool {
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
 
+	if m.blockDownloader == nil || !m.blockDownloader.IsInFlightFrom(sp, state.hash) {
+		return false
+	}
+
 	sp.State.compact = nil
 	sp.State.compactIngest = state
+
+	return true
 }
 
 // failCompactBlock releases a claim the reconstruction could not use, which is

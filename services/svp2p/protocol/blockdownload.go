@@ -938,6 +938,29 @@ func (bd *BlockDownloader) removeFromFlight(peer *SyncPeer, hash chainhash.Hash,
 		}
 
 		state.nStallingSince = 0
+
+		// The partial block hangs off the QueuedBlock in C++ (node_state.h:80,
+		// QueuedBlock::partialBlock) and dies with it, so the reconstruction
+		// ends wherever the claim ends — not only on a disconnect or a rotation
+		// (clearPeer), which is all the compact path released it on before.
+		//
+		// A claim also ends by DELIVERY, with the peer still connected: it sent
+		// the block whole, or another peer did, or the block was released back
+		// on offer. Leaving the partial block behind strands it, and a stranded
+		// one is not inert — it refuses every later cmpctblock from that peer
+		// as "already reconstructing" for the life of the connection, and it
+		// lets a late blocktxn assemble a block we already hold.
+		//
+		// Only the entry for THIS hash goes. A peer waiting on a blocktxn for
+		// one block while another of its claims is released keeps its
+		// reconstruction.
+		if state.compact != nil && state.compact.hash == hash {
+			state.compact = nil
+		}
+
+		if state.compactIngest != nil && state.compactIngest.hash == hash {
+			state.compactIngest = nil
+		}
 	}
 
 	return true

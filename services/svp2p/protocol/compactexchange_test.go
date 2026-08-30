@@ -1209,3 +1209,142 @@ func TestBlockTxn_DribbledUnsolicitedPayloadDoesNotWedgeThePeerLoop(t *testing.T
 	require.Eventually(t, func() bool { return m.ConnectedCount() == 0 }, 20*time.Second, 50*time.Millisecond,
 		"the peer loop must stay responsive while an undelivered blocktxn payload is released")
 }
+
+// TestCompactBlock_ClaimEndingByDeliveryReleasesThePartialBlock is F3.
+//
+// A partial block hangs off the QueuedBlock in C++ (node_state.h:80) and dies
+// with it, so every path that ends the claim must end the reconstruction. Round
+// 1 released it only through the dispatcher's own paths and clearPeer, which
+// misses the claim ending by DELIVERY: removeFromFlight runs, the peer stays
+// connected, and the partial block is stranded.
+//
+// The sequence here is entirely peer-driven and needs no parallel fetch: the
+// peer announces a compact block, we ask for its gaps, and the peer then sends
+// the same block whole. That is a legal thing for it to do, and BlockReceived
+// releases the claim while the partial block is still waiting on a blocktxn.
+//
+// Stranded, it costs two things, both asserted below: every later cmpctblock
+// from that peer is refused as "already reconstructing" for the life of the
+// connection, and a late blocktxn is accepted and assembles a block we hold.
+func TestCompactBlock_ClaimEndingByDeliveryReleasesThePartialBlock(t *testing.T) {
+	genesis := syncGenesis()
+	first := minedRun(genesis, 1, 41)[0]
+	second := minedRun(genesis, 1, 42)[0]
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	firstTxs := testTxs(4, 0x21)
+	secondTxs := testTxs(3, 0x22)
+
+	txIdx := newTestTxIndex(firstTxs[1], secondTxs[1], secondTxs[2])
+
+	ingestor := &recordingBodyIngestor{}
+	m := compactSyncManager(t, idx, ingestor, txIdx)
+
+	far := connectCompactPeer(t, m)
+	far.write(t, compactBlockFor(t, first, firstTxs, 0))
+
+	req, ok := far.readUntil(t, wire.CmdGetBlockTxn).(*wire.MsgGetBlockTxn)
+	require.True(t, ok)
+	require.Equal(t, first.BlockHash(), req.BlockHash)
+
+	state := onlySyncPeerState(t, m)
+
+	m.syncMu.Lock()
+	held := state.compact != nil
+	m.syncMu.Unlock()
+	require.True(t, held, "the partial block must be outstanding before the claim ends")
+
+	// The peer answers the whole block instead. It is in flight from this peer,
+	// so the ingest is accepted and BlockDone releases the claim.
+	far.write(t, blockFor(first))
+
+	require.Eventually(t, func() bool { return ingestor.count() == 1 }, 10*time.Second, 20*time.Millisecond,
+		"the whole block must be ingested")
+
+	require.Eventually(t, func() bool {
+		m.syncMu.Lock()
+		defer m.syncMu.Unlock()
+
+		return state.compact == nil && state.compactIngest == nil
+	}, 10*time.Second, 20*time.Millisecond,
+		"a claim that ends by delivery must release the partial block with it")
+
+	// Consequence one: the compact path must still work for this peer.
+	far.write(t, compactBlockFor(t, second, secondTxs, 0))
+
+	require.Eventually(t, func() bool { return ingestor.count() == 2 }, 10*time.Second, 20*time.Millisecond,
+		"a later compact block from the same peer must still be reconstructed")
+
+	require.Equal(t, []chainhash.Hash{first.BlockHash(), second.BlockHash()}, ingestor.hashes())
+
+	// Consequence two: the blocktxn we asked for, arriving late, is now
+	// unsolicited — it must not assemble a block we already hold.
+	far.write(t, blockTxnFor(t, first.BlockHash(), firstTxs, req.Indexes))
+
+	require.Never(t, func() bool { return ingestor.count() > 2 }, 2*time.Second, 50*time.Millisecond,
+		"a blocktxn for a claim that has ended must be treated as unsolicited")
+
+	require.Equal(t, int32(1), m.ConnectedCount())
+
+	snaps := m.Snapshots()
+	require.Len(t, snaps, 1)
+	require.Equal(t, 0, snaps[0].MisbehaviorScore, "none of this is the peer's fault")
+}
+
+// TestCompactBlock_HoldIsRefusedWhenTheClaimIsGone is F3's second half.
+//
+// CompactBlock releases syncMu to run newCompactState, because TxIndex.Match
+// hashes every entry the index holds and must not run under the lock. A
+// disconnect, a rotation or another peer's delivery inside that window ends the
+// claim, and the write that follows would otherwise resurrect a partial block
+// for a claim that no longer exists — stranding the peer exactly as F3
+// describes, but with no delivery involved.
+func TestCompactBlock_HoldIsRefusedWhenTheClaimIsGone(t *testing.T) {
+	genesis := syncGenesis()
+	header := minedRun(genesis, 1, 43)[0]
+
+	idx, err := NewHeaderIndex(genesis)
+	require.NoError(t, err)
+
+	txs := testTxs(3, 0x23)
+	txIdx := newTestTxIndex(txs[1])
+
+	ingestor := &recordingBodyIngestor{}
+	m := compactSyncManager(t, idx, ingestor, txIdx)
+
+	far := connectCompactPeer(t, m)
+	far.write(t, compactBlockFor(t, header, txs, 0))
+
+	_, ok := far.readUntil(t, wire.CmdGetBlockTxn).(*wire.MsgGetBlockTxn)
+	require.True(t, ok)
+
+	sp := onlySyncPeer(t, m)
+	state := onlySyncPeerState(t, m)
+
+	hash := header.BlockHash()
+
+	// Build a second partial block for the same announcement, standing in for
+	// the one CompactBlock holds while the lock is released.
+	msg := compactBlockFor(t, header, txs, 0)
+
+	fresh, status, err := newCompactState(msg, txIdx)
+	require.NoError(t, err)
+	require.Equal(t, readOK, status)
+
+	// The claim ends while that work is in flight.
+	m.syncMu.Lock()
+	m.blockDownloader.BlockFailed(sp, hash, time.Now().UnixMicro())
+	state.compact = nil
+	m.syncMu.Unlock()
+
+	require.False(t, m.holdCompactBlock(sp, fresh),
+		"a partial block must not be held for a claim that has ended")
+
+	m.syncMu.Lock()
+	stranded := state.compact
+	m.syncMu.Unlock()
+
+	require.Nil(t, stranded, "nothing may be left on the peer after a refused hold")
+}
