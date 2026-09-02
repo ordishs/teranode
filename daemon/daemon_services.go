@@ -1284,6 +1284,14 @@ func (d *Daemon) startSvp2pService(
 
 	d.daemonStores.retainClient(blockassemblyClient)
 
+	peerRegistryClient, err := d.daemonStores.GetPeerRegistryClient(ctx, createLogger(serviceSvp2p), appSettings, "")
+	if err != nil {
+		// Non-fatal: the svp2p service runs without dashboard peer visibility.
+		createLogger(serviceSvp2p).Warnf("[svp2p] peer registry client unavailable: %v", err)
+
+		peerRegistryClient = nil
+	}
+
 	// Add the svp2p service to the ServiceManager
 	return d.ServiceManager.AddService(serviceSvp2pFormal, svp2p.NewWithDeps(
 		createLogger(serviceSvp2p),
@@ -1297,6 +1305,7 @@ func (d *Daemon) startSvp2pService(
 			SubtreeValidation: subtreeValidationClient,
 			BlockValidation:   blockValidationClient,
 			BlockAssembly:     blockassemblyClient,
+			PeerRegistry:      peerRegistryClient,
 		},
 	))
 }
