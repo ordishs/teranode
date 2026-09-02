@@ -299,7 +299,11 @@ func (sc *SyncCoordinator) boundedRPCContext() (context.Context, context.CancelF
 func (sc *SyncCoordinator) registryListPeers() ([]*blockchain.PeerInfo, error) {
 	ctx, cancel := sc.boundedRPCContext()
 	defer cancel()
-	return sc.registry.ListPeers(ctx, nil, 0, 0, false, false)
+
+	// libp2p peers only. A wire-protocol peer cannot serve a DataHub, so it is
+	// never a catchup candidate; filter on transport rather than relying on an
+	// empty DataHubURL.
+	return sc.registry.ListPeers(ctx, transportHTTPFilter(), 0, 0, false, false)
 }
 
 func (sc *SyncCoordinator) registryGetPeer(peerID string) (*blockchain.PeerInfo, bool, error) {
@@ -809,9 +813,15 @@ func (sc *SyncCoordinator) checkFSMState() {
 		return // Transition handled, no further action needed
 	}
 
-	// When FSM is RUNNING, we need to find a new sync peer and trigger catchup
-	if *currentState == blockchain_api.FSMStateType_RUNNING {
-		// Check if we should attempt reputation recovery
+	// Proactively drive sync whenever the node is catching up or running.
+	//   CATCHINGBLOCKS: fresh boot or restart-while-behind — pick the best peer
+	//     ahead and trigger a pull. blockvalidation dedups overlapping catchups
+	//     via its isCatchingUp CAS, so triggering here is safe.
+	//   RUNNING: steady state — keep following the best peer.
+	// The coordinator never fires RUN; promotion to RUNNING stays with
+	// blockvalidation catchup completion / legacy, both checkpoint-gated.
+	if *currentState == blockchain_api.FSMStateType_RUNNING ||
+		*currentState == blockchain_api.FSMStateType_CATCHINGBLOCKS {
 		sc.considerReputationRecovery()
 
 		sc.handleRunningState()
