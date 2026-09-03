@@ -19,6 +19,10 @@ const legacyPeerIDPrefix = "legacy:"
 // missing or not positive.
 const defaultPeerRegistrySyncInterval = 10 * time.Second
 
+// defaultRegistryRPCTimeout bounds a single registry call. It matches the p2p
+// sync coordinator's rpcTimeout, which bounds the identical RPCs.
+const defaultRegistryRPCTimeout = 5 * time.Second
+
 // legacyRegistryID builds the registry key for a wire-protocol peer address.
 // The address is stable across reconnects, so ban state and history survive a
 // peer that flaps.
@@ -54,11 +58,12 @@ func (s peerSnapshot) registrationEqual(other peerSnapshot) bool {
 // read-only visibility path: nothing here feeds a sync, catchup or
 // peer-selection decision.
 type peerRegistrySync struct {
-	logger   ulogger.Logger
-	registry blockchain.PeerRegistryClientI
-	interval time.Duration
-	snapshot func() []peerSnapshot
-	lastSeen map[string]peerSnapshot
+	logger     ulogger.Logger
+	registry   blockchain.PeerRegistryClientI
+	interval   time.Duration
+	rpcTimeout time.Duration
+	snapshot   func() []peerSnapshot
+	lastSeen   map[string]peerSnapshot
 }
 
 // newPeerRegistrySync builds the reconcile loop. The snapshot function must
@@ -72,12 +77,22 @@ func newPeerRegistrySync(logger ulogger.Logger, tSettings *settings.Settings,
 	}
 
 	return &peerRegistrySync{
-		logger:   logger,
-		registry: registry,
-		interval: interval,
-		snapshot: snapshot,
-		lastSeen: make(map[string]peerSnapshot),
+		logger:     logger,
+		registry:   registry,
+		interval:   interval,
+		rpcTimeout: defaultRegistryRPCTimeout,
+		snapshot:   snapshot,
+		lastSeen:   make(map[string]peerSnapshot),
 	}
+}
+
+// boundedContext derives a per-RPC deadline. The registry client adds no
+// deadline of its own, so without this an unresponsive blockchain service
+// stalls a tick for as long as the gRPC connection takes to give up — a visible
+// gap in the dashboard at a 10 second cadence. The p2p sync coordinator bounds
+// the identical calls the same way.
+func (p *peerRegistrySync) boundedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, p.rpcTimeout)
 }
 
 // run reconciles on every tick until ctx is cancelled.
@@ -133,14 +148,22 @@ func (p *peerRegistrySync) reconcile(ctx context.Context) {
 				Legacy:           &legacyCopy,
 			}
 
-			if err := p.registry.RegisterPeer(ctx, info); err != nil {
+			rpcCtx, cancel := p.boundedContext(ctx)
+			err := p.registry.RegisterPeer(rpcCtx, info)
+			cancel()
+
+			if err != nil {
 				p.logger.Warnf("[LegacyPeerRegistry] RegisterPeer %s failed: %v", snap.id, err)
 				continue
 			}
 		}
 
 		if !known {
-			if err := p.registry.UpdateConnectionState(ctx, snap.id, true); err != nil {
+			rpcCtx, cancel := p.boundedContext(ctx)
+			err := p.registry.UpdateConnectionState(rpcCtx, snap.id, true)
+			cancel()
+
+			if err != nil {
 				p.logger.Warnf("[LegacyPeerRegistry] connect %s failed: %v", snap.id, err)
 				continue
 			}
@@ -155,7 +178,10 @@ func (p *peerRegistrySync) reconcile(ctx context.Context) {
 		haveBaseline := known
 
 		if !known {
-			stored, found, err := p.registry.GetPeer(ctx, snap.id)
+			rpcCtx, cancel := p.boundedContext(ctx)
+			stored, found, err := p.registry.GetPeer(rpcCtx, snap.id)
+			cancel()
+
 			switch {
 			case err != nil:
 				p.logger.Warnf("[LegacyPeerRegistry] byte baseline %s failed: %v", snap.id, err)
@@ -169,14 +195,22 @@ func (p *peerRegistrySync) reconcile(ctx context.Context) {
 		recvDelta := byteDelta(snap.bytesReceived, recvBaseline, haveBaseline)
 
 		if sentDelta > 0 || recvDelta > 0 {
-			if err := p.registry.UpdatePeerMetrics(ctx, snap.id, 0, sentDelta, recvDelta,
-				false, false, false, 0); err != nil {
+			rpcCtx, cancel := p.boundedContext(ctx)
+			err := p.registry.UpdatePeerMetrics(rpcCtx, snap.id, 0, sentDelta, recvDelta,
+				false, false, false, 0)
+			cancel()
+
+			if err != nil {
 				p.logger.Warnf("[LegacyPeerRegistry] metrics %s failed: %v", snap.id, err)
 			}
 		}
 
 		if snap.lastRecv.After(previous.lastRecv) {
-			if err := p.registry.UpdateLastMessageTime(ctx, snap.id); err != nil {
+			rpcCtx, cancel := p.boundedContext(ctx)
+			err := p.registry.UpdateLastMessageTime(rpcCtx, snap.id)
+			cancel()
+
+			if err != nil {
 				p.logger.Warnf("[LegacyPeerRegistry] last message %s failed: %v", snap.id, err)
 			}
 		}
@@ -189,7 +223,11 @@ func (p *peerRegistrySync) reconcile(ctx context.Context) {
 			continue
 		}
 
-		if err := p.registry.UpdateConnectionState(ctx, id, false); err != nil {
+		rpcCtx, cancel := p.boundedContext(ctx)
+		err := p.registry.UpdateConnectionState(rpcCtx, id, false)
+		cancel()
+
+		if err != nil {
 			p.logger.Warnf("[LegacyPeerRegistry] disconnect %s failed: %v", id, err)
 			continue
 		}

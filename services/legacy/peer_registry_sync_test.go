@@ -367,3 +367,63 @@ func TestReconcile_BaselineLookupFailureStillReports(t *testing.T) {
 	require.Equal(t, uint64(500), got.BytesReceived,
 		"without a baseline the whole total is reported")
 }
+
+// hangingRegistry blocks every RegisterPeer until its context is done, standing
+// in for an unresponsive blockchain service.
+type hangingRegistry struct {
+	blockchain.PeerRegistryClientI
+	waited time.Duration
+}
+
+func (h *hangingRegistry) RegisterPeer(ctx context.Context, _ *blockchain.PeerInfo) error {
+	started := time.Now()
+	<-ctx.Done()
+	h.waited = time.Since(started)
+
+	return ctx.Err()
+}
+
+// TestReconcile_BoundsEachRegistryCall checks a stalled registry costs one
+// bounded wait rather than hanging the tick for as long as gRPC takes to give
+// up. The reconcile loop is a goroutine, so an unbounded call would also delay
+// the shutdown path that only runs between ticks.
+func TestReconcile_BoundsEachRegistryCall(t *testing.T) {
+	reg := blockchain.NewCentralizedPeerRegistry(blockchain.DefaultBanConfig())
+	hanging := &hangingRegistry{PeerRegistryClientI: blockchain.NewLocalPeerRegistryClient(reg)}
+
+	snap := testSnapshot("203.0.113.7:8333", 500, time.Unix(1750000100, 0))
+	sync := newPeerRegistrySync(ulogger.TestLogger{}, testSyncSettings(), hanging,
+		func() []peerSnapshot { return []peerSnapshot{snap} })
+	sync.rpcTimeout = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		sync.reconcile(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconcile did not return: a registry call was not bounded")
+	}
+
+	require.Less(t, hanging.waited, time.Second,
+		"the call must be cut off at the RPC timeout, not left to the transport")
+
+	// A peer whose registration failed must not be recorded as pushed, so the
+	// next tick retries it.
+	_, ok := reg.Get("legacy:203.0.113.7:8333")
+	require.False(t, ok)
+}
+
+// TestReconcile_DefaultRPCTimeoutIsSet guards the wiring: an unset timeout would
+// make context.WithTimeout fire immediately and every call fail.
+func TestReconcile_DefaultRPCTimeoutIsSet(t *testing.T) {
+	reg := blockchain.NewCentralizedPeerRegistry(blockchain.DefaultBanConfig())
+	sync := newPeerRegistrySync(ulogger.TestLogger{}, testSyncSettings(),
+		blockchain.NewLocalPeerRegistryClient(reg), func() []peerSnapshot { return nil })
+
+	require.Equal(t, defaultRegistryRPCTimeout, sync.rpcTimeout)
+	require.Positive(t, sync.rpcTimeout)
+}
