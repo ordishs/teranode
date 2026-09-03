@@ -1179,15 +1179,17 @@ func (d *Daemon) startLegacyService(
 	return d.ServiceManager.AddService(serviceLegacyFormal, legacy.New(
 		createLogger(serviceLegacy),
 		appSettings,
-		blockchainClient,
-		validatorClient,
-		subtreeStore,
-		tempStore,
-		utxoStore,
-		subtreeValidationClient,
-		blockValidationClient,
-		blockassemblyClient,
-		peerRegistryClient,
+		legacy.Dependencies{
+			BlockchainClient:    blockchainClient,
+			ValidationClient:    validatorClient,
+			SubtreeStore:        subtreeStore,
+			TempStore:           tempStore,
+			UtxoStore:           utxoStore,
+			SubtreeValidation:   subtreeValidationClient,
+			BlockValidation:     blockValidationClient,
+			BlockAssemblyClient: blockassemblyClient,
+			PeerRegistry:        peerRegistryClient,
+		},
 	))
 }
 

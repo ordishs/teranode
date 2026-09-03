@@ -123,6 +123,41 @@ type Server struct {
 	peerRegistry blockchain.PeerRegistryClientI
 }
 
+// Dependencies holds the service clients and stores the legacy server needs.
+// It exists so New keeps a manageable parameter list as the server grows.
+//
+// Every field is required unless its own comment says otherwise.
+type Dependencies struct {
+	// BlockchainClient queries blockchain state and submits new blocks.
+	BlockchainClient blockchain.ClientI
+
+	// ValidationClient validates incoming transactions before relay.
+	ValidationClient validator.Interface
+
+	// SubtreeStore holds merkle subtree data.
+	SubtreeStore blob.Store
+
+	// TempStore holds ephemeral data produced during processing.
+	TempStore blob.Store
+
+	// UtxoStore is the UTXO set, used for validation and queries.
+	UtxoStore utxo.Store
+
+	// SubtreeValidation verifies merkle proofs and block structure.
+	SubtreeValidation subtreevalidation.Interface
+
+	// BlockValidation validates incoming blocks before acceptance.
+	BlockValidation blockvalidation.Interface
+
+	// BlockAssemblyClient serves mining and block template generation.
+	BlockAssemblyClient *blockassembly.Client
+
+	// PeerRegistry mirrors connected legacy peers into the centralized peer
+	// registry for dashboard visibility. It may be nil, which disables the
+	// mirror without otherwise affecting the service.
+	PeerRegistry blockchain.PeerRegistryClientI
+}
+
 // New creates and returns a new Server instance with the provided dependencies.
 // It initializes Prometheus metrics and returns a configured server ready for use.
 //
@@ -133,44 +168,25 @@ type Server struct {
 // Parameters:
 //   - logger: Provides structured logging capabilities for the server
 //   - tSettings: Contains all configuration settings for the server and its components
-//   - blockchainClient: Interface to the blockchain service for querying and submitting blocks
-//   - validationClient: Interface to the transaction validation service
-//   - subtreeStore: Blob storage interface for merkle subtree data
-//   - tempStore: Temporary blob storage for ephemeral data
-//   - utxoStore: Interface to the UTXO (Unspent Transaction Output) database
-//   - subtreeValidation: Interface to the subtree validation service
-//   - blockValidation: Interface to the block validation service
-//   - blockAssemblyClient: Client for the block assembly service (used for mining)
-//   - peerRegistry: Client for the centralized peer registry (dashboard visibility; may be nil)
+//   - deps: The service clients and stores the server depends on; see Dependencies
 //
 // Returns a properly configured Server instance that is ready to be initialized and started.
-func New(logger ulogger.Logger,
-	tSettings *settings.Settings,
-	blockchainClient blockchain.ClientI,
-	validationClient validator.Interface,
-	subtreeStore blob.Store,
-	tempStore blob.Store,
-	utxoStore utxo.Store,
-	subtreeValidation subtreevalidation.Interface,
-	blockValidation blockvalidation.Interface,
-	blockAssemblyClient *blockassembly.Client,
-	peerRegistry blockchain.PeerRegistryClientI,
-) *Server {
+func New(logger ulogger.Logger, tSettings *settings.Settings, deps Dependencies) *Server {
 	initPrometheusMetrics()
 
 	return &Server{
 		logger:              logger,
 		settings:            tSettings,
 		stats:               gocore.NewStat("legacy"),
-		blockchainClient:    blockchainClient,
-		validationClient:    validationClient,
-		subtreeStore:        subtreeStore,
-		tempStore:           tempStore,
-		utxoStore:           utxoStore,
-		subtreeValidation:   subtreeValidation,
-		blockValidation:     blockValidation,
-		blockAssemblyClient: blockAssemblyClient,
-		peerRegistry:        peerRegistry,
+		blockchainClient:    deps.BlockchainClient,
+		validationClient:    deps.ValidationClient,
+		subtreeStore:        deps.SubtreeStore,
+		tempStore:           deps.TempStore,
+		utxoStore:           deps.UtxoStore,
+		subtreeValidation:   deps.SubtreeValidation,
+		blockValidation:     deps.BlockValidation,
+		blockAssemblyClient: deps.BlockAssemblyClient,
+		peerRegistry:        deps.PeerRegistry,
 	}
 }
 
