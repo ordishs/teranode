@@ -121,12 +121,25 @@ test.describe('smoke: /peers legacy card', () => {
     const legacyTable = smokePage.locator('.legacy-table')
     await expect(legacyTable).toBeVisible()
 
-    // Both legacy fixture peers appear, and the libp2p peer does not.
+    // The connected peer and the recently disconnected one appear. The libp2p
+    // peer does not: it belongs to the Teranode table.
     const rows = legacyTable.locator('tbody tr')
     await expect(rows).toHaveCount(2)
     await expect(legacyTable).toContainText('203.0.113.7:8333')
     await expect(legacyTable).toContainText('198.51.100.9:8333')
     await expect(legacyTable).not.toContainText('12D3KooW')
+
+    // The recency bound drops a peer that is both disconnected and stale, so a
+    // flapping inbound peer cannot accumulate rows indefinitely. The fixture
+    // serves this one two hours old.
+    await expect(legacyTable).not.toContainText('198.51.100.55:8333')
+
+    // The libp2p peer still reaches the Teranode table, which shares the same
+    // payload. This guards the transport split from the other side. Match on
+    // its client name, not its ID: that table's cell renderer shows
+    // client_name when present and keeps the ID in the tooltip.
+    await expect(smokePage.locator(PAGE_ROOT)).toContainText('teranode/1.0')
+    await expect(legacyTable).not.toContainText('teranode/1.0')
 
     // The sync peer is badged, and the disconnected peer's cells are dimmed.
     await expect(legacyTable.locator('.badge.sync')).toHaveCount(1)
