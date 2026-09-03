@@ -1375,7 +1375,12 @@ func (s *Server) reconcileConnectionStates(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
 
-	peers, err := s.peerRegistry.ListPeers(ctx, nil, 0, 0, false, false)
+	// libp2p peers only. Liveness comes from P2PClient.GetPeers(), which
+	// reports libp2p IDs, so a wire-protocol peer could never be a member of
+	// live and every one of them would take the "flagged but not live" arm
+	// below. Those entries are owned by the legacy service's own mirror, which
+	// is the only thing that knows whether a Bitcoin p2p connection is open.
+	peers, err := s.peerRegistry.ListPeers(ctx, transportHTTPFilter(), 0, 0, false, false)
 	if err != nil {
 		s.logger.Warnf("[reconcileConnectionStates] ListPeers failed: %v", err)
 		return
