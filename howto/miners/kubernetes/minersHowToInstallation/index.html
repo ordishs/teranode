@@ -944,6 +944,8 @@
       
         
       
+        
+      
     
     
     
@@ -1423,6 +1425,34 @@
     <span class="md-ellipsis">
       
         Production Considerations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Production Considerations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#scaling-the-propagation-service" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scaling the Propagation Service
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#related-documentation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Related Documentation
       
     </span>
   </a>
@@ -2478,6 +2508,34 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../../minersHowToMonitoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Monitoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
     
     
       
@@ -2504,10 +2562,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_9" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_10" >
         
           
-          <label class="md-nav__link" for="__nav_2_11_9" id="__nav_2_11_9_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_11_10" id="__nav_2_11_10_label" tabindex="0">
             
   
   
@@ -2525,8 +2583,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_9_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_2_11_9">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_11_10">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7212,6 +7270,34 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Production Considerations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#scaling-the-propagation-service" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scaling the Propagation Service
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#related-documentation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Related Documentation
+      
+    </span>
+  </a>
+  
 </li>
       
         <li class="md-nav__item">
@@ -7371,7 +7457,10 @@
 </ul>
 </li>
 <li><a href="#verifying-the-deployment">Verifying the Deployment</a></li>
-<li><a href="#production-considerations">Production Considerations</a></li>
+<li><a href="#production-considerations">Production Considerations</a><ul>
+<li><a href="#scaling-the-propagation-service">Scaling the Propagation Service</a></li>
+</ul>
+</li>
 <li><a href="#other-resources">Other Resources</a></li>
 </ul>
 <h2 id="introduction">Introduction<a class="headerlink" href="#introduction" title="Permanent link">&para;</a></h2>
@@ -7431,7 +7520,7 @@
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
 </span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span>--name<span class="w"> </span>nfs-server<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span>-e<span class="w"> </span><span class="nv">NFS_EXPORT_0</span><span class="o">=</span><span class="s1">&#39;/minikube-storage *(rw,no_subtree_check,fsid=0,no_root_squash)&#39;</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span>-e<span class="w"> </span><span class="nv">NFS_EXPORT_0</span><span class="o">=</span><span class="s1">'/minikube-storage *(rw,no_subtree_check,fsid=0,no_root_squash)'</span><span class="w"> </span><span class="se">\</span>
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">    </span>-v<span class="w"> </span>nfs-volume:/minikube-storage<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">    </span>--cap-add<span class="w"> </span>SYS_ADMIN<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="w">    </span>-p<span class="w"> </span><span class="m">2049</span>:2049<span class="w"> </span><span class="se">\</span>
@@ -7478,10 +7567,18 @@
 </span></code></pre></div>
 <h4 id="create-the-teranode-secret">Create the Teranode Secret<a class="headerlink" href="#create-the-teranode-secret" title="Permanent link">&para;</a></h4>
 <p>Sensitive settings (<code>blockchain_store</code> and <code>utxostore</code> — they contain database
-credentials and connection strings) are <strong>not</strong> stored in the ConfigMap. They are
-supplied through a Kubernetes Secret named <code>teranode-operator-secrets</code>, which the
-Cluster CR references via <code>spec.envFrom</code>. This Secret is intentionally not committed
-to the repository — you must create it yourself.</p>
+credentials and connection strings — plus <code>grpc_admin_api_key</code>) are <strong>not</strong> stored in
+the ConfigMap. They are supplied through a Kubernetes Secret named
+<code>teranode-operator-secrets</code>, which the Cluster CR references via <code>spec.envFrom</code>. This
+Secret is intentionally not committed to the repository — you must create it yourself.</p>
+<p><code>grpc_admin_api_key</code> is <strong>required</strong> for a working node. It authenticates every
+state-mutating P2P <code>PeerService</code> RPC, including the peer-reputation and
+validated-chain-progress reports that decide which peer this node syncs from, and the
+<code>operator</code> context binds that gRPC port on all interfaces. It is deliberately not
+committed to this repository, and well-known placeholders such as <code>testkey</code> are
+rejected and ignored — the server then uses a random key, so every protected RPC,
+including the internal reporters, fails with <code>Unauthenticated</code>. Generate a strong
+random value, for example <code>openssl rand -hex 32</code>.</p>
 <p>Create it with a manifest (replace the example values with your own credentials):</p>
 <div class="language-yaml highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># teranode-secret.yaml — DO NOT commit this file</span>
 </span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
@@ -7491,8 +7588,11 @@ to the repository — you must create it yourself.</p>
 </span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">teranode-operator</span>
 </span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Opaque</span>
 </span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="nt">stringData</span><span class="p">:</span>
-</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="w">  </span><span class="nt">blockchain_store</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;postgres://POSTGRES_EXAMPLE_URI_CHANGE_ME&quot;</span>
-</span><span id="__span-8-10"><a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a><span class="w">  </span><span class="nt">utxostore</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;aerospike://AEROSPIKE_EXAMPLE_URI_CHANGE_ME&quot;</span>
+</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="w">  </span><span class="nt">blockchain_store</span><span class="p">:</span><span class="w"> </span><span class="s">"postgres://POSTGRES_EXAMPLE_URI_CHANGE_ME"</span>
+</span><span id="__span-8-10"><a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a><span class="w">  </span><span class="nt">utxostore</span><span class="p">:</span><span class="w"> </span><span class="s">"aerospike://AEROSPIKE_EXAMPLE_URI_CHANGE_ME"</span>
+</span><span id="__span-8-11"><a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a><span class="w">  </span><span class="c1"># Required. Authenticates the state-mutating P2P PeerService RPCs.</span>
+</span><span id="__span-8-12"><a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a><span class="w">  </span><span class="c1"># Generate with: openssl rand -hex 32</span>
+</span><span id="__span-8-13"><a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a><span class="w">  </span><span class="nt">grpc_admin_api_key</span><span class="p">:</span><span class="w"> </span><span class="s">"GRPC_ADMIN_API_KEY_CHANGE_ME"</span>
 </span></code></pre></div>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>kubectl<span class="w"> </span>apply<span class="w"> </span>-f<span class="w"> </span>teranode-secret.yaml<span class="w"> </span>-n<span class="w"> </span>teranode-operator
 </span></code></pre></div>
@@ -7528,6 +7628,12 @@ rotate the database credentials for production deployments.</p>
 </span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">          </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">100m</span>
 </span><span id="__span-11-10"><a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a><span class="w">          </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256Mi</span>
 </span></code></pre></div>
+<p>The <code>imagePullPolicy: Never</code> and <code>cpu: 100m</code> / <code>memory: 256Mi</code> values above
+are Minikube/local-dev defaults — the legacy service scans the full
+historical chain and needs far more than that in practice. For testnet or
+mainnet, size resources from the shipped mainnet CR instead, which requests
+<code>cpu: 2</code> / <code>memory: 64Gi</code> for legacy: see
+<a href="https://github.com/bsv-blockchain/teranode/blob/main/deploy/kubernetes/teranode/teranode-cr-mainnet.yaml">teranode-cr-mainnet.yaml</a>.</p>
 </li>
 <li>
 <p>Apply the updated configuration:</p>
@@ -7538,14 +7644,14 @@ rotate the database credentials for production deployments.</p>
 </ol>
 <h4 id="start-syncing-process">Start Syncing Process<a class="headerlink" href="#start-syncing-process" title="Permanent link">&para;</a></h4>
 <p>A fresh Teranode starts up in IDLE state by default. To start syncing from the network, you can run:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>kubectl<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span><span class="k">$(</span>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>blockchain<span class="w"> </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.items[0].metadata.name}&#39;</span><span class="k">)</span><span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>-fsmstate<span class="w"> </span>running
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>kubectl<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span><span class="k">$(</span>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>blockchain<span class="w"> </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">'{.items[0].metadata.name}'</span><span class="k">)</span><span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>-fsmstate<span class="w"> </span>running
 </span></code></pre></div>
 <p>To know more about the syncing process, please refer to the <a href="../minersHowToSyncTheNode/">Teranode Sync Guide</a></p>
 <h2 id="verifying-the-deployment">Verifying the Deployment<a class="headerlink" href="#verifying-the-deployment" title="Permanent link">&para;</a></h2>
 <p><img alt="kubernetesOperatorVerification.svg" src="../img/mermaid/kubernetesOperatorVerification.svg" /></p>
 <p>To verify your deployment:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="c1"># Check all pods are running</span>
-</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;aerospike|postgres|kafka|teranode-operator&#39;</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">'aerospike|postgres|kafka|teranode-operator'</span>
 </span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>
 </span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="c1"># Check Teranode services are ready</span>
 </span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>kubectl<span class="w"> </span><span class="nb">wait</span><span class="w"> </span>--for<span class="o">=</span><span class="nv">condition</span><span class="o">=</span>ready<span class="w"> </span>pod<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>blockchain<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--timeout<span class="o">=</span>300s
@@ -7558,11 +7664,47 @@ rotate the database credentials for production deployments.</p>
 <ul>
 <li>Deploying dependencies (Aerospike, PostgreSQL, Kafka) in separate clusters or using managed services</li>
 <li>Implementing proper security measures (network policies, RBAC, etc.)</li>
-<li>Setting up monitoring and alerting</li>
+<li>Setting up <a href="../../minersHowToMonitoring/">monitoring and alerting</a></li>
 <li>Configuring appropriate resource requests and limits</li>
 <li>Setting up proper backup and disaster recovery procedures</li>
 </ul>
 <p>An example CR for a mainnet deployment is available in <a href="https://github.com/bsv-blockchain/teranode/blob/main/deploy/kubernetes/teranode/teranode-cr-mainnet.yaml">kubernetes/teranode/teranode-cr-mainnet.yaml</a>.</p>
+<h3 id="scaling-the-propagation-service">Scaling the Propagation Service<a class="headerlink" href="#scaling-the-propagation-service" title="Permanent link">&para;</a></h3>
+<p>The propagation service is stateless and horizontally scalable: set
+<code>propagation.enabled: true</code> (both shipped example CRs ship it disabled) and
+<code>propagation.spec.deploymentOverrides.replicas</code> in <code>teranode-cr.yaml</code> (or
+<code>teranode-cr-mainnet.yaml</code>) to the desired pod count, then re-apply the CR. If
+the propagation spec has no <code>deploymentOverrides</code> block yet — as in
+<code>teranode-cr.yaml</code> — add one.</p>
+<p>Not every service in the Cluster CR can be scaled this way. The validator can:
+<code>teranode-cr-mainnet.yaml</code> runs it with 8 replicas (<code>teranode-cr.yaml</code> ships the
+validator disabled, with an empty spec). Services such as block assembly and
+blockchain are single-instance — block assembly holds the mining jobs handed to
+miners and its assembler state per process, so a second replica would lose
+solved blocks and clobber that state. That is why every
+<code>deploymentOverrides.replicas</code> entry in both example CRs is <code>1</code>, the one
+exception being the validator in <code>teranode-cr-mainnet.yaml</code>.</p>
+<p>A <code>HorizontalPodAutoscaler</code> that targets the <code>Propagation</code> custom resource's
+<code>/scale</code> endpoint will not work. The Teranode Operator's <code>Propagation</code> CR does
+declare a Kubernetes <code>/scale</code> subresource, with its <code>specReplicasPath</code> pointing
+at <code>.spec.deploymentOverrides.replicas</code>, which is the mechanism an HPA would
+normally use to target a custom resource directly. In practice this doesn't hold
+up: the parent <code>Cluster</code> controller reconciles every child resource, including
+<code>Propagation</code>, both on a fixed one-minute timer and whenever the <code>Propagation</code>
+object's spec changes (which an HPA writing to <code>/scale</code> would trigger). On each
+of those reconciles it overwrites the entire <code>Propagation</code> spec — including the
+replica count — with whatever is stored in the <code>Cluster</code> CR itself. Any replica
+count an HPA writes to <code>/scale</code> gets reverted within at most a minute, so
+autoscaling against that endpoint silently flaps rather than converging.</p>
+<p>Until the operator changes this reconcile behavior (e.g. by leaving
+externally-managed replica counts alone), manual scaling via
+<code>deploymentOverrides.replicas</code> in the <code>Cluster</code> CR remains the supported way to
+size the propagation service.</p>
+<h2 id="related-documentation">Related Documentation<a class="headerlink" href="#related-documentation" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="../../minersHowToMonitoring/">Monitoring Teranode</a></li>
+<li><a href="../../../../references/prometheusMetrics/">Prometheus Metrics Reference</a></li>
+</ul>
 <h2 id="resetting-teranode">Resetting Teranode<a class="headerlink" href="#resetting-teranode" title="Permanent link">&para;</a></h2>
 <p>If you need to reset your Teranode deployment, see the <a href="../minersHowToResetTeranode/">How to Reset Teranode</a> guide for complete instructions on cleaning up Aerospike, PostgreSQL, and persistent volumes.</p>
 <h2 id="other-resources">Other Resources<a class="headerlink" href="#other-resources" title="Permanent link">&para;</a></h2>

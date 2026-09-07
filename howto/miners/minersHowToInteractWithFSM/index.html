@@ -944,6 +944,8 @@
       
         
       
+        
+      
     
     
     
@@ -1543,6 +1545,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Valid FSM States">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-a-transition-is-refused" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When a transition is refused
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2401,6 +2420,34 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../minersHowToMonitoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Monitoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
     
     
       
@@ -2427,10 +2474,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_9" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_10" >
         
           
-          <label class="md-nav__link" for="__nav_2_11_9" id="__nav_2_11_9_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_11_10" id="__nav_2_11_10_label" tabindex="0">
             
   
   
@@ -2448,8 +2495,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_9_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_2_11_9">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_11_10">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7008,6 +7055,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Valid FSM States">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-a-transition-is-refused" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When a transition is refused
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -7203,7 +7267,7 @@
 
 
 <h1 id="how-to-manage-teranode-states">How to Manage Teranode States<a class="headerlink" href="#how-to-manage-teranode-states" title="Permanent link">&para;</a></h1>
-<p>This guide explains how to change and monitor Teranode's state. Note that Teranode instances start in IDLE state and require manual state transitions.</p>
+<p>This guide explains how to change and monitor Teranode's state. Note that a fresh Teranode instance starts in CATCHINGBLOCKS state and begins catching up on its own; it reaches RUNNING once catch-up completes above the network's highest checkpoint. A restarted instance resumes whatever state it last persisted.</p>
 <h2 id="prerequisites">Prerequisites<a class="headerlink" href="#prerequisites" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Access to a running Teranode instance</li>
@@ -7256,11 +7320,11 @@
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>kubectl<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>&lt;pod-name&gt;<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--<span class="w"> </span>teranode-cli<span class="w"> </span>getfsmstate
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
 </span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="c1"># Alternative one-liner</span>
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>kubectl<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span><span class="k">$(</span>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>blockchain<span class="w"> </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.items[0].metadata.name}&#39;</span><span class="k">)</span><span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--<span class="w"> </span>teranode-cli<span class="w"> </span>getfsmstate
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>kubectl<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span><span class="k">$(</span>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>blockchain<span class="w"> </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">'{.items[0].metadata.name}'</span><span class="k">)</span><span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--<span class="w"> </span>teranode-cli<span class="w"> </span>getfsmstate
 </span></code></pre></div>
 <h4 id="2-set-new-state_1">2. Set New State<a class="headerlink" href="#2-set-new-state_1" title="Permanent link">&para;</a></h4>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Change state to RUNNING</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>kubectl<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span><span class="k">$(</span>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>blockchain<span class="w"> </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.items[0].metadata.name}&#39;</span><span class="k">)</span><span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>--fsmstate<span class="w"> </span>RUNNING
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>kubectl<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span><span class="k">$(</span>kubectl<span class="w"> </span>get<span class="w"> </span>pods<span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>-l<span class="w"> </span><span class="nv">app</span><span class="o">=</span>blockchain<span class="w"> </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">'{.items[0].metadata.name}'</span><span class="k">)</span><span class="w"> </span>-n<span class="w"> </span>teranode-operator<span class="w"> </span>--<span class="w"> </span>teranode-cli<span class="w"> </span>setfsmstate<span class="w"> </span>--fsmstate<span class="w"> </span>RUNNING
 </span></code></pre></div>
 <h2 id="valid-fsm-states">Valid FSM States<a class="headerlink" href="#valid-fsm-states" title="Permanent link">&para;</a></h2>
 <p>The following states are valid for all environments:</p>
@@ -7269,6 +7333,43 @@
 <li>RUNNING</li>
 <li>CATCHINGBLOCKS</li>
 </ul>
+<h3 id="when-a-transition-is-refused">When a transition is refused<a class="headerlink" href="#when-a-transition-is-refused" title="Permanent link">&para;</a></h3>
+<p>Two rules constrain which transitions are accepted, and both surface as errors
+rather than silent no-ops:</p>
+<ul>
+<li><strong>Only RUN may leave CATCHINGBLOCKS.</strong> A node that is catching up cannot be
+  moved to IDLE; it must finish catching up first.</li>
+<li><strong>RUN is refused while the chain tip is below the network's highest hard-coded
+  checkpoint.</strong> Mainnet and testnet both have checkpoints; regtest has none. The
+  error names both your tip height and the checkpoint it must reach. From IDLE,
+  the node remains parked so you can inspect or rewind it; use
+  <code>setfsmstate --fsmstate catchingblocks</code> when you deliberately want to start
+  synchronization.
+  A node already in CATCHINGBLOCKS remains there and will move to RUNNING once it
+  catches up.</li>
+</ul>
+<p>Why the rule exists: going to RUNNING mid-initial-sync lets the mempool and
+validator operate under pre-Genesis output rules, and lets the legacy service
+relay tx invs that post-Genesis peers ban on sight
+(<code>bad-txns-vout-p2sh BAN THRESHOLD EXCEEDED</code>).</p>
+<blockquote>
+<p><strong>Behaviour change:</strong> the checkpoint rule used to exempt <code>IDLE -&gt; RUNNING</code>
+entirely, on the reasoning that a fresh node boots into CATCHINGBLOCKS and so
+could never be in IDLE below the checkpoint. That is not exhaustive — a node
+stopped from RUNNING, or one whose store was persisted in IDLE by an older
+version, both land there — so the rule now applies to every RUN and the IDLE
+case is refused as described above. Out-of-tree boot tooling that forces
+RUNNING on a below-checkpoint mainnet or testnet node will now receive an error
+and leave the FSM unchanged. Regtest has no checkpoints and is unaffected —
+<code>setfsmstate --fsmstate running</code> still goes straight to RUNNING there.</p>
+<p><strong>There is no longer a manual route to RUNNING below the checkpoint.</strong> From
+IDLE, explicitly enter CATCHINGBLOCKS to start synchronization. From
+CATCHINGBLOCKS, RUN is refused until catchup completes. If you are looking for
+an override to force a below-checkpoint node into RUNNING, it no longer exists
+— that was the hole this rule closes. Let the node catch up.</p>
+<p><strong>Getting back to IDLE:</strong> there is no <code>CATCHINGBLOCKS -&gt; IDLE</code> transition. Once
+a node is catching up, the only way out is RUN.</p>
+</blockquote>
 <h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
 <p>After each state change, verify the new state:</p>
 <ol>
@@ -7303,9 +7404,10 @@
 <p><strong>Check Current State:</strong></p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>grpcurl<span class="w"> </span>-plaintext<span class="w"> </span>localhost:18087<span class="w"> </span>blockchain_api.BlockchainAPI.GetFSMCurrentState
 </span></code></pre></div>
-<p>Expected output:</p>
+<p>Expected output (a fresh node reports <code>CATCHINGBLOCKS</code>; a restarted node reports
+whatever state it last persisted):</p>
 <div class="language-json highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="p">{</span>
-</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="nt">&quot;state&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Idle&quot;</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="nt">"state"</span><span class="p">:</span><span class="w"> </span><span class="s2">"CATCHINGBLOCKS"</span>
 </span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="p">}</span>
 </span></code></pre></div>
 <p><strong>Trigger State Transitions:</strong></p>
@@ -7322,7 +7424,7 @@
 <p>There is no blocking "wait" endpoint. To wait for a specific state, poll the current state until it matches:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># Poll until the FSM reaches RUNNING</span>
 </span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="k">until</span><span class="w"> </span>grpcurl<span class="w"> </span>-plaintext<span class="w"> </span>localhost:18087<span class="w"> </span>blockchain_api.BlockchainAPI.GetFSMCurrentState<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s1">&#39;&quot;state&quot;: &quot;RUNNING&quot;&#39;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s1">'"state": "RUNNING"'</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
 </span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">  </span>sleep<span class="w"> </span><span class="m">1</span>
 </span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="k">done</span>
 </span></code></pre></div>

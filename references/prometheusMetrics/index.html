@@ -932,6 +932,8 @@
       
         
       
+        
+      
     
     
     
@@ -2109,6 +2111,34 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Monitoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
     
     
       
@@ -2135,10 +2165,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_9" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_10" >
         
           
-          <label class="md-nav__link" for="__nav_2_11_9" id="__nav_2_11_9_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_11_10" id="__nav_2_11_10_label" tabindex="0">
             
   
   
@@ -2156,8 +2186,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_9_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_2_11_9">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_11_10">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7406,6 +7436,11 @@
 <td>Number of subtrees currently in the block assembler subtree processor</td>
 </tr>
 <tr>
+<td><code>teranode_blockassembly_dequeue_staleness_seconds</code></td>
+<td>Gauge</td>
+<td>Seconds since the subtree processor's consumer goroutine last passed through its dequeue branch; growing alongside a non-zero <code>queued_transactions</code> means intake is queuing unboundedly because the consumer is stuck elsewhere</td>
+</tr>
+<tr>
 <td><code>teranode_blockassembly_tx_meta_get</code></td>
 <td>Histogram</td>
 <td>Histogram of reading tx meta data from txmeta store in block assembler</td>
@@ -8028,6 +8063,18 @@
 <td><code>topic</code>, <code>fsm_state</code>, <code>stage</code></td>
 <td>Outbound P2P messages suppressed by the per-FSM-state allow-list; <code>stage="precheck"</code> is an expected skip, <code>stage="chokepoint"</code> is a publish that leaked past the pre-checks</td>
 </tr>
+<tr>
+<td><code>teranode_p2p_websocket_notifications_dropped_total</code></td>
+<td>Counter</td>
+<td><code>type</code></td>
+<td>WebSocket notifications dropped because the shared notification channel was full, by notification type (<code>block</code>, <code>subtree</code>, <code>node_status</code>)</td>
+</tr>
+<tr>
+<td><code>teranode_p2p_websocket_clients_evicted_total</code></td>
+<td>Counter</td>
+<td></td>
+<td>WebSocket clients evicted from the broadcast fan-out because their send buffer was full when a broadcast reached them</td>
+</tr>
 </tbody>
 </table>
 <h2 id="legacy-peer-server-metrics">Legacy Peer Server Metrics<a class="headerlink" href="#legacy-peer-server-metrics" title="Permanent link">&para;</a></h2>
@@ -8605,6 +8652,16 @@
 <td><code>teranode_validator_set_tx_meta</code></td>
 <td>Histogram</td>
 <td>Histogram of validator set tx meta</td>
+</tr>
+<tr>
+<td><code>teranode_validator_parent_commit_retries</code></td>
+<td>Counter</td>
+<td>Retries spent waiting for a parent transaction to finish committing, by <code>condition</code> (<code>TX_LOCKED</code>, <code>TX_CREATING</code>)</td>
+</tr>
+<tr>
+<td><code>teranode_validator_parent_commit_exhausted</code></td>
+<td>Counter</td>
+<td>Transactions rejected because the parent-commit retry budget ran out, by <code>condition</code> (<code>TX_LOCKED</code>, <code>TX_CREATING</code>)</td>
 </tr>
 </tbody>
 </table>

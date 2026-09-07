@@ -932,6 +932,8 @@
       
         
       
+        
+      
     
     
     
@@ -2109,6 +2111,34 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../../../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Monitoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
     
     
       
@@ -2135,10 +2165,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_9" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_10" >
         
           
-          <label class="md-nav__link" for="__nav_2_11_9" id="__nav_2_11_9_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_11_10" id="__nav_2_11_10_label" tabindex="0">
             
   
   
@@ -2156,8 +2186,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_9_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_2_11_9">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_11_10">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7384,6 +7414,13 @@
 <td>Bound on one detached subtree_data fetch (download + parse + store)</td>
 </tr>
 <tr>
+<td>SubtreeMetaPeerFetchTimeout</td>
+<td>time.Duration</td>
+<td>30s</td>
+<td>blockvalidation_subtree_meta_peer_fetch_timeout</td>
+<td>Whole-peer budget for one subtree meta regeneration fetch (all 503 retries + body stream)</td>
+</tr>
+<tr>
 <td>CheckSubtreeFromBlockRetries</td>
 <td>int</td>
 <td>5</td>
@@ -7409,7 +7446,7 @@
 <td>uint64</td>
 <td>100</td>
 <td>blockvalidation_previous_block_header_count</td>
-<td><strong>CRITICAL</strong> - Header chain cache size</td>
+<td><strong>CRITICAL</strong> - Header chain cache size. Floored at 11 (<code>settings.MedianTimeSpan</code>): the run is what median-time-past is measured over, so a lower value would compute the median over fewer blocks than consensus requires and accept blocks the rest of the network rejects. Anything below 11 is raised to it, with a warning on stderr</td>
 </tr>
 <tr>
 <td>CatchupMaxRetries</td>
