@@ -113,6 +113,38 @@ func TestNewRejectsMissingPath(t *testing.T) {
 // TestPageSizeIsImmutable pins the guard that stops a store being reopened under a page
 // size other than the one its records were written with — slot addressing depends on it,
 // so a silent mismatch would misread every spend slot.
+func TestSyncModeFromStoreURL(t *testing.T) {
+	tSettings := settings.NewSettings()
+
+	for _, tc := range []struct {
+		name     string
+		rawQuery string
+		wantSync bool
+	}{
+		{name: "default is durable", rawQuery: "", wantSync: true},
+		{name: "sync=true is durable", rawQuery: "sync=true", wantSync: true},
+		{name: "sync=false disables the wal fsync", rawQuery: "sync=false", wantSync: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storeURL := &url.URL{Scheme: "pebble", Path: t.TempDir(), RawQuery: tc.rawQuery}
+
+			store, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
+			require.NoError(t, err)
+
+			t.Cleanup(func() { _ = store.Close(context.Background()) })
+
+			require.Equal(t, tc.wantSync, store.sync.Sync)
+
+			// The selected mode must survive a real commit round trip.
+			tx := newExtendedTx(t, 1, 70_000)
+			mustCreate(t, store, tx, 100)
+
+			_, err = store.Get(context.Background(), tx.TxIDChainHash())
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestPageSizeIsImmutable(t *testing.T) {
 	dir := t.TempDir()
 	storeURL := &url.URL{Scheme: "pebble", Path: dir}
@@ -464,6 +496,17 @@ func TestDeleteRemovesEveryKey(t *testing.T) {
 	tx := newExtendedTx(t, int(store.pageSize)+1, 110_000)
 	mustCreate(t, store, tx, 100)
 
+	// A conflicting child gives the transaction a forward edge k|tx|child, and the
+	// child a paired reverse edge K|child|tx. Deleting the parent must take both.
+	child := newSpendingTx(t, tx, 0)
+	mustCreate(t, store, child, 101, utxo.WithConflicting(true))
+
+	forwardPrefix := append([]byte{prefixChildren}, tx.TxIDChainHash()[:]...)
+	reversePrefix := append([]byte{prefixChildrenRev}, child.TxIDChainHash()[:]...)
+
+	require.Equal(t, 1, countPrefix(t, store, forwardPrefix), "precondition: forward edge exists")
+	require.Equal(t, 1, countPrefix(t, store, reversePrefix), "precondition: reverse edge exists")
+
 	utxoHash0, err := util.UTXOHashFromOutput(tx.TxIDChainHash(), tx.Outputs[0], 0)
 	require.NoError(t, err)
 
@@ -475,10 +518,15 @@ func TestDeleteRemovesEveryKey(t *testing.T) {
 	_, err = store.Get(context.Background(), tx.TxIDChainHash())
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 
-	for _, prefix := range []byte{prefixMaster, prefixPage, prefixHashes, prefixPayload, prefixOverride} {
+	for _, prefix := range []byte{prefixMaster, prefixPage, prefixHashes, prefixPayload, prefixOverride, prefixChildren} {
 		require.Zero(t, countPrefix(t, store, append([]byte{prefix}, tx.TxIDChainHash()[:]...)),
 			"prefix %q should have no keys left", string(prefix))
 	}
+
+	// The reverse edge is keyed under the child, so it survives a range delete
+	// scoped to the parent's hash unless stageDelete removes it explicitly.
+	require.Zero(t, countPrefix(t, store, reversePrefix),
+		"reverse conflicting-child edge K|child|parent should have no keys left")
 
 	// Deleting an absent transaction is a no-op.
 	require.NoError(t, store.Delete(context.Background(), tx.TxIDChainHash()))

@@ -1,3 +1,10 @@
+//go:build pebble
+
+// The pebble store is an experimental spike. This registration sits behind a
+// build tag so that neither Pebble nor its transitive dependency tree links
+// into a default Teranode binary; build with -tags pebble to select
+// utxostore = pebble:///path/to/dir.
+
 package factory
 
 import (

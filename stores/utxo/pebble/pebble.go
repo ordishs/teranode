@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/cockroachdb/pebble/v2"
 )
 
@@ -58,12 +59,22 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, errors.NewStorageError("pebble: failed to open database at %s", storeURL.Path, err)
 	}
 
+	// Commits fsync the WAL by default. sync=false trades that durability for
+	// throughput and loses recent commits on an unclean shutdown, so it is
+	// opt-in per store URL rather than the default.
+	writeOpts := pebble.Sync
+	if !util.GetQueryParamBool(storeURL, "sync", true) {
+		writeOpts = pebble.NoSync
+
+		logger.Warnf("[pebble] WAL fsync disabled via sync=false: recent commits are lost on an unclean shutdown")
+	}
+
 	s := &Store{
 		logger:   logger,
 		settings: tSettings,
 		db:       db,
 		pageSize: spikePageSizeSlots,
-		sync:     pebble.Sync,
+		sync:     writeOpts,
 	}
 
 	if err = s.validateMeta(); err != nil {
