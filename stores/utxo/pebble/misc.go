@@ -56,24 +56,47 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, v
 	affectedParentSpends := make([]*utxo.Spend, 0, len(txHashes))
 	spendingTxHashes := make([]chainhash.Hash, 0, len(txHashes))
 
+	// Discover the lock set first. A transaction's inputs never change once it is
+	// created, so the parent hashes read here are stable; everything the batch
+	// actually depends on is re-read under the lock below.
+	lockHashes := make([][]byte, 0, len(txHashes)*2)
+
+	for i := range txHashes {
+		lockHashes = append(lockHashes, txHashes[i][:])
+
+		md, err := s.Get(ctx, &txHashes[i], fields.Tx)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		for _, input := range md.Tx.Inputs {
+			lockHashes = append(lockHashes, input.PreviousTxIDChainHash()[:])
+		}
+	}
+
+	unlock := s.lockStripes(lockHashes...)
+	defer unlock()
+
+	// One batch for every hash. Committing per hash left a partially applied
+	// cascade behind on the first failure, with the conflicting flag and the DAH
+	// stamped on some transactions and not others, and nothing to unwind it.
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+
 	for i := range txHashes {
 		txHash := txHashes[i]
 
+		// Re-read under the lock. The BFS in MarkConflictingRecursively is driven
+		// purely by spendingTxHashes below, so deriving it from a pre-lock snapshot
+		// silently drops a spender committed in the window and terminates the
+		// traversal early.
 		md, err := s.Get(ctx, &txHash, fields.Tx, fields.Utxos)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		unlock := s.lockStripes(txHash[:])
-
-		batch := s.db.NewBatch()
-
 		m, err := s.getMaster(&txHash)
 		if err != nil {
-			_ = batch.Close()
-
-			unlock()
-
 			return nil, nil, err
 		}
 
@@ -91,10 +114,6 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, v
 		}
 
 		if err = s.stageMaster(batch, txHash[:], &old, m); err != nil {
-			_ = batch.Close()
-
-			unlock()
-
 			return nil, nil, err
 		}
 
@@ -107,16 +126,6 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, v
 				_ = batch.Set(childrenKey(parent[:], txHash[:]), createdAt, nil)
 				_ = batch.Set(childrenRevKey(txHash[:], parent[:]), nil, nil)
 			}
-		}
-
-		err = batch.Commit(s.sync)
-
-		_ = batch.Close()
-
-		unlock()
-
-		if err != nil {
-			return nil, nil, errors.NewStorageError("pebble: failed to commit SetConflicting", err)
 		}
 
 		for vin, input := range md.Tx.Inputs {
@@ -140,6 +149,10 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, v
 		}
 	}
 
+	if err := s.commit(batch); err != nil {
+		return nil, nil, errors.NewStorageError("pebble: failed to commit SetConflicting", err)
+	}
+
 	return affectedParentSpends, spendingTxHashes, nil
 }
 
@@ -160,7 +173,7 @@ func (s *Store) RemoveFromConflictingChildren(ctx context.Context, removals []ut
 		_ = batch.Delete(childrenRevKey(r.ChildHash[:], r.ParentHash[:]), nil)
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit RemoveFromConflictingChildren", err)
 	}
 
@@ -205,7 +218,7 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value 
 		}
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit SetLocked", err)
 	}
 
@@ -254,7 +267,7 @@ func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemo
 		}
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit RemoveBlockIDs", err)
 	}
 
@@ -319,7 +332,7 @@ func decodeIntent(b []byte) (utxo.ConflictIntent, error) {
 func (s *Store) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
 	id := intent.IntentID()
 
-	if err := s.db.Set(intentKey(id[:]), encodeIntent(intent), pebbledb.Sync); err != nil {
+	if err := s.setDirect(intentKey(id[:]), encodeIntent(intent)); err != nil {
 		return errors.NewStorageError("pebble: failed to record conflict intent %s", id, err)
 	}
 
@@ -327,7 +340,7 @@ func (s *Store) BeginConflictIntent(ctx context.Context, intent utxo.ConflictInt
 }
 
 func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
-	if err := s.db.Delete(intentKey(intentID[:]), pebbledb.Sync); err != nil {
+	if err := s.deleteDirect(intentKey(intentID[:])); err != nil {
 		return errors.NewStorageError("pebble: failed to remove conflict intent %s", intentID, err)
 	}
 
@@ -337,12 +350,12 @@ func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.H
 func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
 	lower, upper := prefixBounds([]byte{prefixIntent})
 
-	iter, err := s.db.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := s.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, errors.NewStorageError("pebble: pending intents query failed", err)
 	}
 
-	defer func() { _ = iter.Close() }()
+	defer release()
 
 	var intents []utxo.ConflictIntent
 
@@ -370,7 +383,24 @@ func (s *Store) setOverridesFlag(batch *pebbledb.Batch, hash []byte, m *masterRe
 	return s.stageMaster(batch, hash, &old, m)
 }
 
+// spendLockHashes returns the distinct parent hashes a spend set touches.
+func spendLockHashes(spends []*utxo.Spend) [][]byte {
+	hashes := make([][]byte, 0, len(spends))
+	for _, sp := range spends {
+		hashes = append(hashes, sp.TxID[:])
+	}
+
+	return hashes
+}
+
 func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, tSettings *settings.Settings) error {
+	// Validate and write under one lock set. The precondition pass used to run
+	// unlocked, so a spend committing between the passes left the slot both spent
+	// and frozen — and the frozen sentinel then hid the real spender from the
+	// conflict machinery for good. GetSpend acquires no locks, so it is safe here.
+	unlock := s.lockStripes(spendLockHashes(spends)...)
+	defer unlock()
+
 	for _, sp := range spends {
 		resp, err := s.GetSpend(ctx, sp)
 		if err != nil {
@@ -382,7 +412,12 @@ func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, tSettings
 		}
 
 		if resp.SpendingData != nil && !resp.SpendingData.TxID.IsEqual(&subtree.FrozenBytesTxHash) {
-			return errors.NewUtxoSpentError(*sp.TxID, sp.Vout, *sp.UTXOHash, resp.SpendingData)
+			var utxoHash chainhash.Hash
+			if sp.UTXOHash != nil {
+				utxoHash = *sp.UTXOHash
+			}
+
+			return errors.NewUtxoSpentError(*sp.TxID, sp.Vout, utxoHash, resp.SpendingData)
 		}
 
 		if resp.Status == int(utxo.Status_FROZEN) {
@@ -390,41 +425,45 @@ func (s *Store) FreezeUTXOs(ctx context.Context, spends []*utxo.Spend, tSettings
 		}
 	}
 
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+
+	// getMaster reads the database rather than the batch, so cache each master to
+	// keep repeated vouts of one transaction building on the same record.
+	masters := make(map[chainhash.Hash]*masterRecord, len(spends))
+
 	for _, sp := range spends {
-		unlock := s.lockStripes(sp.TxID[:])
+		m, ok := masters[*sp.TxID]
+		if !ok {
+			var err error
 
-		batch := s.db.NewBatch()
-
-		err := func() error {
-			m, err := s.getMaster(sp.TxID)
-			if err != nil {
+			if m, err = s.getMaster(sp.TxID); err != nil {
 				return err
 			}
 
-			if err = batch.Set(overrideKey(sp.TxID[:], sp.Vout), encodeOverride(&overrideRecord{frozen: true}), nil); err != nil {
-				return errors.NewStorageError("pebble: failed to stage freeze for %s:%d", sp.TxID, sp.Vout, err)
-			}
-
-			return s.setOverridesFlag(batch, sp.TxID[:], m, true)
-		}()
-
-		if err == nil {
-			err = batch.Commit(s.sync)
+			masters[*sp.TxID] = m
 		}
 
-		_ = batch.Close()
+		if err := batch.Set(overrideKey(sp.TxID[:], sp.Vout), encodeOverride(&overrideRecord{frozen: true}), nil); err != nil {
+			return errors.NewStorageError("pebble: failed to stage freeze for %s:%d", sp.TxID, sp.Vout, err)
+		}
 
-		unlock()
-
-		if err != nil {
+		if err := s.setOverridesFlag(batch, sp.TxID[:], m, true); err != nil {
 			return err
 		}
+	}
+
+	if err := s.commit(batch); err != nil {
+		return errors.NewStorageError("pebble: failed to commit FreezeUTXOs", err)
 	}
 
 	return nil
 }
 
 func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, tSettings *settings.Settings) error {
+	unlock := s.lockStripes(spendLockHashes(spends)...)
+	defer unlock()
+
 	for _, sp := range spends {
 		resp, err := s.GetSpend(ctx, sp)
 		if err != nil {
@@ -436,61 +475,66 @@ func (s *Store) UnFreezeUTXOs(ctx context.Context, spends []*utxo.Spend, tSettin
 		}
 	}
 
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
+
+	// Track the vouts this call clears so the remaining-override count reflects
+	// the whole batch, not just the one entry being deleted.
+	cleared := make(map[chainhash.Hash]map[uint32]struct{}, len(spends))
+
 	for _, sp := range spends {
-		unlock := s.lockStripes(sp.TxID[:])
-
-		batch := s.db.NewBatch()
-
-		err := func() error {
-			m, err := s.getMaster(sp.TxID)
-			if err != nil {
-				return err
-			}
-
-			_ = batch.Delete(overrideKey(sp.TxID[:], sp.Vout), nil)
-
-			remaining, err := s.countOverrides(sp.TxID[:], sp.Vout)
-			if err != nil {
-				return err
-			}
-
-			if remaining == 0 {
-				return s.setOverridesFlag(batch, sp.TxID[:], m, false)
-			}
-
-			return nil
-		}()
-
-		if err == nil {
-			err = batch.Commit(s.sync)
+		if cleared[*sp.TxID] == nil {
+			cleared[*sp.TxID] = make(map[uint32]struct{})
 		}
 
-		_ = batch.Close()
+		cleared[*sp.TxID][sp.Vout] = struct{}{}
 
-		unlock()
+		_ = batch.Delete(overrideKey(sp.TxID[:], sp.Vout), nil)
+	}
 
+	for txID, vouts := range cleared {
+		hash := txID
+
+		remaining, err := s.countOverridesExcluding(hash[:], vouts)
 		if err != nil {
 			return err
 		}
+
+		if remaining > 0 {
+			continue
+		}
+
+		m, err := s.getMaster(&hash)
+		if err != nil {
+			return err
+		}
+
+		if err = s.setOverridesFlag(batch, hash[:], m, false); err != nil {
+			return err
+		}
+	}
+
+	if err := s.commit(batch); err != nil {
+		return errors.NewStorageError("pebble: failed to commit UnFreezeUTXOs", err)
 	}
 
 	return nil
 }
 
-func (s *Store) countOverrides(hash []byte, excludeVout uint32) (int, error) {
+func (s *Store) countOverridesExcluding(hash []byte, excludeVouts map[uint32]struct{}) (int, error) {
 	lower, upper := prefixBounds(append([]byte{prefixOverride}, hash...))
 
-	iter, err := s.db.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := s.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return 0, errors.NewStorageError("pebble: override count failed", err)
 	}
 
-	defer func() { _ = iter.Close() }()
+	defer release()
 
 	count := 0
 
 	for iter.First(); iter.Valid(); iter.Next() {
-		if binaryBEUint32(iter.Key()[33:]) == excludeVout {
+		if _, skip := excludeVouts[binaryBEUint32(iter.Key()[33:])]; skip {
 			continue
 		}
 
@@ -501,6 +545,21 @@ func (s *Store) countOverrides(hash []byte, excludeVout uint32) (int, error) {
 }
 
 func (s *Store) ReAssignUTXO(ctx context.Context, oldUtxo *utxo.Spend, newUtxo *utxo.Spend, tSettings *settings.Settings) error {
+	if newUtxo == nil || newUtxo.UTXOHash == nil {
+		return errors.NewInvalidArgumentError("pebble: reassignment requires the new utxo hash")
+	}
+
+	reassignBlocks := uint32(utxo.ReAssignedUtxoSpendableAfterBlocks)
+	if tSettings != nil && tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks > 0 {
+		reassignBlocks = tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks
+	}
+
+	// Take the stripe before the precondition read. GetSpend acquires no locks,
+	// so checking it here closes the window where a concurrent UnFreezeUTXOs
+	// clears flagHasOverrides between the check and the write.
+	unlock := s.lockStripes(oldUtxo.TxID[:])
+	defer unlock()
+
 	resp, err := s.GetSpend(ctx, oldUtxo)
 	if err != nil {
 		return err
@@ -510,13 +569,13 @@ func (s *Store) ReAssignUTXO(ctx context.Context, oldUtxo *utxo.Spend, newUtxo *
 		return errors.NewUtxoFrozenError("pebble: transaction %s:%d is not frozen", oldUtxo.TxID, oldUtxo.Vout)
 	}
 
-	reassignBlocks := uint32(utxo.ReAssignedUtxoSpendableAfterBlocks)
-	if tSettings != nil && tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks > 0 {
-		reassignBlocks = tSettings.UtxoStore.ReAssignedUtxoSpendableAfterBlocks
+	m, err := s.getMaster(oldUtxo.TxID)
+	if err != nil {
+		return err
 	}
 
-	unlock := s.lockStripes(oldUtxo.TxID[:])
-	defer unlock()
+	batch := s.db.NewBatch()
+	defer func() { _ = batch.Close() }()
 
 	rec := &overrideRecord{
 		frozen:         false,
@@ -524,7 +583,18 @@ func (s *Store) ReAssignUTXO(ctx context.Context, oldUtxo *utxo.Spend, newUtxo *
 		reassignedHash: newUtxo.UTXOHash[:],
 	}
 
-	if err := s.db.Set(overrideKey(oldUtxo.TxID[:], oldUtxo.Vout), encodeOverride(rec), s.sync); err != nil {
+	if err := batch.Set(overrideKey(oldUtxo.TxID[:], oldUtxo.Vout), encodeOverride(rec), nil); err != nil {
+		return errors.NewStorageError("pebble: failed to stage reassignment for %s:%d", oldUtxo.TxID, oldUtxo.Vout, err)
+	}
+
+	// Both readers gate the override lookup on flagHasOverrides (spend.go and
+	// GetSpend), so without this the reassigned hash and spendableIn are dead
+	// bytes and the reassignment reports success while changing nothing.
+	if err := s.setOverridesFlag(batch, oldUtxo.TxID[:], m, true); err != nil {
+		return err
+	}
+
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to reassign %s:%d", oldUtxo.TxID, oldUtxo.Vout, err)
 	}
 
@@ -546,6 +616,23 @@ func ResetPrunerServiceForTests() {
 }
 
 func (s *Store) GetPrunerService() (pruner.Service, error) {
+	// Matches aerospike/pruner_provider.go: with the DAH cleaner disabled there is
+	// no phase-2 service at all, which is the operator's escape hatch when the
+	// pruner is deleting records it should not.
+	if s.settings.UtxoStore.DisableDAHCleaner {
+		return nil, nil
+	}
+
+	// Defensive pruning is not implemented on this backend. The SQL store swaps in
+	// a delete that refuses to remove a parent while any spending child is unmined
+	// or shallower than the safety window; here there is no equivalent, so
+	// accepting the setting would silently give an operator less safety than they
+	// asked for. Fail loudly instead.
+	if s.settings.Pruner.UTXODefensiveEnabled {
+		return nil, errors.NewConfigurationError(
+			"pebble: pruner_utxoDefensiveEnabled is not supported by the pebble utxo store")
+	}
+
 	prunerServiceMutex.Lock()
 	defer prunerServiceMutex.Unlock()
 
@@ -579,7 +666,7 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 	lower := []byte{prefixDAHIdx}
 	upper := heightIndexKey(prefixDAHIdx, int64(height)+1, nil)
 
-	iter, err := p.store.db.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := p.store.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return 0, errors.NewStorageError("pebble: pruner query failed", err)
 	}
@@ -591,11 +678,12 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 	}
 
 	if err = iter.Error(); err != nil {
-		_ = iter.Close()
+		release()
+
 		return 0, errors.NewStorageError("pebble: pruner iteration failed", err)
 	}
 
-	_ = iter.Close()
+	release()
 
 	var deleted int64
 
@@ -604,11 +692,34 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 
 		unlock := p.store.lockStripes(h[:])
 
+		// The victim list came from an unlocked index scan, and the whole pass
+		// takes one fsync per victim. Anything that clears delete-at-height in
+		// that window — a reorg's Unspend or SetMinedMulti(UnsetMined), or
+		// SetLocked(true) — must win, so re-evaluate the condition under the
+		// lock. stageDelete itself stays unconditional, because the public
+		// Delete must still delete on demand.
+		m, err := p.store.getMaster(&h)
+		if err != nil {
+			unlock()
+
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return deleted, err
+		}
+
+		if m.deleteAtHeight == 0 || m.deleteAtHeight > int64(height) {
+			unlock()
+
+			continue
+		}
+
 		batch := p.store.db.NewBatch()
 
-		err := p.store.stageDelete(batch, h[:])
+		err = p.store.stageDelete(batch, h[:])
 		if err == nil {
-			err = batch.Commit(p.store.sync)
+			err = p.store.commit(batch)
 		}
 
 		_ = batch.Close()

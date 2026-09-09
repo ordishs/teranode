@@ -113,9 +113,28 @@ func TestNewRejectsMissingPath(t *testing.T) {
 // TestPageSizeIsImmutable pins the guard that stops a store being reopened under a page
 // size other than the one its records were written with — slot addressing depends on it,
 // so a silent mismatch would misread every spend slot.
-func TestSyncModeFromStoreURL(t *testing.T) {
+func TestPageSizeIsImmutable(t *testing.T) {
+	storeURL := &url.URL{Scheme: "pebble", Path: "/utxostore"}
 	tSettings := settings.NewSettings()
+	tSettings.DataFolder = t.TempDir()
 
+	store, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+	require.NoError(t, store.Close(context.Background()))
+
+	reopened, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
+	require.NoError(t, err)
+
+	reopened.pageSize = spikePageSizeSlots * 2
+
+	err = reopened.validateMeta()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "immutable")
+
+	require.NoError(t, reopened.Close(context.Background()))
+}
+
+func TestSyncModeFromStoreURL(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		rawQuery string
@@ -126,7 +145,10 @@ func TestSyncModeFromStoreURL(t *testing.T) {
 		{name: "sync=false disables the wal fsync", rawQuery: "sync=false", wantSync: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			storeURL := &url.URL{Scheme: "pebble", Path: t.TempDir(), RawQuery: tc.rawQuery}
+			storeURL := &url.URL{Scheme: "pebble", Path: "/utxostore", RawQuery: tc.rawQuery}
+
+			tSettings := settings.NewSettings()
+			tSettings.DataFolder = t.TempDir()
 
 			store, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
 			require.NoError(t, err)
@@ -143,27 +165,6 @@ func TestSyncModeFromStoreURL(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
-}
-
-func TestPageSizeIsImmutable(t *testing.T) {
-	dir := t.TempDir()
-	storeURL := &url.URL{Scheme: "pebble", Path: dir}
-	tSettings := settings.NewSettings()
-
-	store, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
-	require.NoError(t, err)
-	require.NoError(t, store.Close(context.Background()))
-
-	reopened, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
-	require.NoError(t, err)
-
-	reopened.pageSize = spikePageSizeSlots * 2
-
-	err = reopened.validateMeta()
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "immutable")
-
-	require.NoError(t, reopened.Close(context.Background()))
 }
 
 func TestCreateDirectAndDuplicate(t *testing.T) {
@@ -338,7 +339,9 @@ func TestConsistencyScanFindsMinedButUnmined(t *testing.T) {
 	require.NoError(t, err)
 
 	m.blockRefs = packBlockRefs([]utxo.MinedBlockInfo{{BlockID: 9, BlockHeight: 100}})
-	require.NoError(t, store.db.Set(masterKey(inconsistent.TxIDChainHash()[:]), encodeMaster(m), store.sync))
+	encoded, err := encodeMaster(m)
+	require.NoError(t, err)
+	require.NoError(t, store.db.Set(masterKey(inconsistent.TxIDChainHash()[:]), encoded, store.sync))
 
 	clean := newExtendedTx(t, 1, 61_000)
 	mustCreate(t, store, clean, 100)

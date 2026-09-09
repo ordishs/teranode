@@ -64,7 +64,12 @@ func (s *Store) stageMaster(batch *pebble.Batch, hash []byte, old, updated *mast
 		}
 	}
 
-	if err := batch.Set(masterKey(hash), encodeMaster(updated), nil); err != nil {
+	encoded, err := encodeMaster(updated)
+	if err != nil {
+		return err
+	}
+
+	if err := batch.Set(masterKey(hash), encoded, nil); err != nil {
 		return errors.NewStorageError("pebble: failed to stage master update", err)
 	}
 
@@ -149,7 +154,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		return spends, errors.NewUtxoError("pebble: spend failed", firstErr)
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return spends, errors.NewStorageError("pebble: failed to commit spend", err)
 	}
 
@@ -319,20 +324,33 @@ func (s *Store) stageSpendSlot(m *masterRecord, pages map[uint32]*pageRecord, pa
 		}
 	}
 
-	if !skipHashCheck && expectedHash != nil {
-		hashes, err := s.getValue(hashesKey(hash[:], page))
-		if err != nil {
-			return errors.NewStorageError("pebble: failed to read hashes page %d for %s", page, hash, err)
-		}
+	// The stored hash is the only per-slot record of whether an output was ever a
+	// UTXO: buildTx leaves the slot zero for an output that
+	// utxo.ShouldStoreOutputAsUTXO rejected, and leaves that output out of
+	// page0Count and spendableCount. So read it on every spend, including the
+	// outpoint-only path. Skip it there and a spend of a data output writes a
+	// phantom spend, drives spentCount to page0Count while real outputs are still
+	// unspent, and the pruner then deletes the record with its live UTXOs. It
+	// costs one read per spend on the outpoint-only path, which is the price of
+	// not trusting the caller to prove the outpoint exists.
+	hashes, err := s.getValue(hashesKey(hash[:], page))
+	if err != nil {
+		return errors.NewStorageError("pebble: failed to read hashes page %d for %s", page, hash, err)
+	}
 
-		hOff := int(slot) * slotHashSize
-		if hOff+slotHashSize > len(hashes) {
-			return errors.NewProcessingError("pebble: vout %d hash out of range for %s", sp.Vout, hash)
-		}
+	hOff := int(slot) * slotHashSize
+	if hOff+slotHashSize > len(hashes) {
+		return errors.NewProcessingError("pebble: vout %d hash out of range for %s", sp.Vout, hash)
+	}
 
-		if !bytes.Equal(hashes[hOff:hOff+slotHashSize], expectedHash) {
-			return errors.NewUtxoHashMismatchError("pebble: utxo hash mismatch for %s:%d", hash, sp.Vout)
-		}
+	storedHash := hashes[hOff : hOff+slotHashSize]
+
+	if isZeroHash(storedHash) {
+		return errors.NewTxNotFoundError("pebble: utxo %s:%d not found (output was never spendable)", hash, sp.Vout)
+	}
+
+	if !skipHashCheck && expectedHash != nil && !bytes.Equal(storedHash, expectedHash) {
+		return errors.NewUtxoHashMismatchError("pebble: utxo hash mismatch for %s:%d", hash, sp.Vout)
 	}
 
 	newSpend := packSpendingData(sp.SpendingData)
@@ -383,7 +401,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		}
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit unspend", err)
 	}
 
@@ -518,6 +536,13 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		lockHashes = append(lockHashes, g.hash[:])
 	}
 
+	// A conflicting create writes childrenKey under each parent's hash, which sits
+	// on the parent's stripe. With CreateOnly there are no spend groups to cover
+	// them, so add them explicitly.
+	if built != nil {
+		lockHashes = append(lockHashes, built.children...)
+	}
+
 	unlock := s.lockStripes(lockHashes...)
 	defer unlock()
 
@@ -537,7 +562,7 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	}
 
 	if options.SpendOnly {
-		if err := batch.Commit(s.sync); err != nil {
+		if err := s.commit(batch); err != nil {
 			return nil, spends, errors.NewStorageError("pebble: failed to commit spend-only", err)
 		}
 
@@ -547,7 +572,7 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	if err := s.stageCreate(batch, built); err != nil {
 		if errors.Is(err, errors.ErrTxExists) {
 			if len(spends) > 0 {
-				if commitErr := batch.Commit(s.sync); commitErr != nil {
+				if commitErr := s.commit(batch); commitErr != nil {
 					return nil, spends, errors.NewStorageError("pebble: failed to commit spends on tx-exists", commitErr)
 				}
 			}
@@ -558,7 +583,7 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		return nil, nil, err
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return nil, spends, errors.NewStorageError("pebble: failed to commit SpendAndCreate", err)
 	}
 

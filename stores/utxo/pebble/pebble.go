@@ -5,7 +5,11 @@ import (
 	"encoding/binary"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -39,14 +43,92 @@ const (
 )
 
 type Store struct {
-	logger     ulogger.Logger
-	settings   *settings.Settings
-	db         *pebble.DB
-	pageSize   uint32
-	sync       *pebble.WriteOptions
+	logger   ulogger.Logger
+	settings *settings.Settings
+	db       *pebble.DB
+	pageSize uint32
+	sync     *pebble.WriteOptions
+	// inFlight is held for reading around every database access and for writing
+	// by Close, so the drain below cannot overlap live work.
+	inFlight   sync.RWMutex
 	blockState atomic.Uint64
 	stripes    [numStripes]sync.Mutex
 	closed     atomic.Bool
+}
+
+// enter registers a database access. pebble panics rather than erroring on any
+// use after Close (getInternal, applyInternal and newIter all begin with a
+// closed check that panics), so every access must pass through here or a
+// shutdown races the validator into a process crash.
+func (s *Store) enter() error {
+	s.inFlight.RLock()
+
+	if s.closed.Load() {
+		s.inFlight.RUnlock()
+
+		return errors.NewStorageError("pebble: store is closed")
+	}
+
+	return nil
+}
+
+func (s *Store) leave() {
+	s.inFlight.RUnlock()
+}
+
+// commit applies a staged batch under the close guard.
+func (s *Store) commit(batch *pebble.Batch) error {
+	if err := s.enter(); err != nil {
+		return err
+	}
+
+	defer s.leave()
+
+	return batch.Commit(s.sync)
+}
+
+// setDirect and deleteDirect are for the few writes that are deliberately their
+// own durable operation rather than part of a batch, such as the conflict WAL.
+func (s *Store) setDirect(key, value []byte) error {
+	if err := s.enter(); err != nil {
+		return err
+	}
+
+	defer s.leave()
+
+	return s.db.Set(key, value, s.sync)
+}
+
+func (s *Store) deleteDirect(key []byte) error {
+	if err := s.enter(); err != nil {
+		return err
+	}
+
+	defer s.leave()
+
+	return s.db.Delete(key, s.sync)
+}
+
+// newIter returns an iterator and a release function. The close guard is held
+// for the iterator's whole lifetime, because iterating after Close panics just
+// as a direct read does. Callers must defer the returned release.
+func (s *Store) newIter(opts *pebble.IterOptions) (*pebble.Iterator, func(), error) {
+	if err := s.enter(); err != nil {
+		return nil, nil, err
+	}
+
+	iter, err := s.db.NewIter(opts)
+	if err != nil {
+		s.leave()
+
+		return nil, nil, err
+	}
+
+	return iter, func() {
+		_ = iter.Close()
+
+		s.leave()
+	}, nil
 }
 
 func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, storeURL *url.URL) (*Store, error) {
@@ -54,9 +136,14 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		return nil, errors.NewInvalidArgumentError("pebble: store URL with a directory path is required")
 	}
 
-	db, err := pebble.Open(storeURL.Path, &pebble.Options{})
+	dir, err := storeDir(tSettings, storeURL)
 	if err != nil {
-		return nil, errors.NewStorageError("pebble: failed to open database at %s", storeURL.Path, err)
+		return nil, err
+	}
+
+	db, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		return nil, errors.NewStorageError("pebble: failed to open database at %s", dir, err)
 	}
 
 	// Commits fsync the WAL by default. sync=false trades that durability for
@@ -85,6 +172,35 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	return s, nil
 }
 
+// storeDir resolves the store directory from the URL. url.Host carries the first
+// path component whenever the URL has only two leading slashes, so
+// pebble://data/utxostore parses as Host="data", Path="/utxostore"; using Path
+// alone drops "data" and opens the store at the filesystem root. The joined path
+// is resolved under tSettings.DataFolder, matching util.InitSQLiteDB, so
+// pebble:///utxostore and sqlite:///utxostore land in the same place.
+func storeDir(tSettings *settings.Settings, storeURL *url.URL) (string, error) {
+	joined := path.Join(storeURL.Host, strings.TrimPrefix(storeURL.Path, "/"))
+	if joined == "" || joined == "." {
+		return "", errors.NewInvalidArgumentError("pebble: store URL with a directory path is required")
+	}
+
+	folder := "."
+	if tSettings != nil && tSettings.DataFolder != "" {
+		folder = tSettings.DataFolder
+	}
+
+	dir, err := filepath.Abs(filepath.Join(folder, joined))
+	if err != nil {
+		return "", errors.NewStorageError("pebble: failed to resolve store directory %q", joined, err)
+	}
+
+	if err = os.MkdirAll(dir, 0o755); err != nil {
+		return "", errors.NewStorageError("pebble: failed to create store directory %s", dir, err)
+	}
+
+	return dir, nil
+}
+
 func (s *Store) validateMeta() error {
 	key := []byte{prefixMeta}
 
@@ -100,6 +216,12 @@ func (s *Store) validateMeta() error {
 		return errors.NewStorageError("pebble: failed to read store meta", err)
 	}
 
+	if len(val) < 4 {
+		_ = closer.Close()
+
+		return errors.NewConfigurationError("pebble: store meta record is truncated (%d bytes)", len(val))
+	}
+
 	stored := binary.LittleEndian.Uint32(val)
 	_ = closer.Close()
 
@@ -110,10 +232,20 @@ func (s *Store) validateMeta() error {
 	return nil
 }
 
+// Close drains in-flight database work before closing the database.
+// stores/utxo/Interface.go requires an implementation to wait for outstanding
+// batched writes, because returning early risks silently losing UTXO state, so
+// the drain is unconditional rather than bounded by ctx: a caller that gave up
+// waiting would still be handing pebble a database with live readers on it.
 func (s *Store) Close(ctx context.Context) error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+
+	// Every database access holds inFlight for reading, so taking it for writing
+	// returns only once none is in progress. New accesses already see closed.
+	s.inFlight.Lock()
+	defer s.inFlight.Unlock()
 
 	return s.db.Close()
 }
@@ -247,6 +379,12 @@ func (s *Store) lockStripes(hashes ...[]byte) func() {
 }
 
 func (s *Store) getValue(key []byte) ([]byte, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+
+	defer s.leave()
+
 	val, closer, err := s.db.Get(key)
 	if err != nil {
 		return nil, err

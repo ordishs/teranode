@@ -33,7 +33,11 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		return nil, err
 	}
 
-	unlock := s.lockStripes(built.hash[:])
+	// built.children holds the parent hashes whose conflicting-child keyspace this
+	// create writes into (childrenKey is keyed under the parent). Those keys live
+	// on the parents' stripes, not this transaction's, so lock them too or a
+	// concurrent Delete(parent) range-deletes the keyspace underneath us.
+	unlock := s.lockStripes(append([][]byte{built.hash[:]}, built.children...)...)
 	defer unlock()
 
 	batch := s.db.NewBatch()
@@ -43,7 +47,7 @@ func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts 
 		return nil, err
 	}
 
-	if err = batch.Commit(s.sync); err != nil {
+	if err = s.commit(batch); err != nil {
 		return nil, errors.NewStorageError("pebble: failed to commit create", err)
 	}
 
@@ -57,7 +61,12 @@ func (s *Store) stageCreate(batch *pebble.Batch, built *builtTx) error {
 		return errors.NewStorageError("pebble: create existence check failed for %s", built.hash, err)
 	}
 
-	if err := batch.Set(masterKey(built.hash[:]), encodeMaster(built.master), nil); err != nil {
+	encoded, err := encodeMaster(built.master)
+	if err != nil {
+		return err
+	}
+
+	if err := batch.Set(masterKey(built.hash[:]), encoded, nil); err != nil {
 		return errors.NewStorageError("pebble: failed to stage master for %s", built.hash, err)
 	}
 
@@ -247,8 +256,16 @@ func (s *Store) buildTx(tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptio
 		}
 	}
 
+	// Outputs can arrive nil-padded (transaction outputs received before inputs),
+	// and (*Output).Bytes() dereferences its receiver unconditionally. The hash
+	// loop above already tolerates this; so must the payload.
 	outputItems := make([][]byte, len(tx.Outputs))
+
 	for i, output := range tx.Outputs {
+		if output == nil {
+			continue
+		}
+
 		outputItems[i] = output.Bytes()
 	}
 

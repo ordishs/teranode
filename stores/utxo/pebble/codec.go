@@ -1,11 +1,13 @@
 // Package pebble is a SPIKE implementation of the utxo.Store interface over an
-// embedded Pebble LSM. The slot/blob codec is duplicated from stores/utxo/packedsql
-// while both implementations are in flight; extraction into a shared package is a
-// promotion-time task, not a spike task.
+// embedded Pebble LSM. The slot/blob codec is the packed transaction-centric
+// layout also used by the packedsql store proposed in PR 1594, which is not in
+// this repo; the two are kept separate while both are in flight, and extraction
+// into a shared package is a promotion-time task, not a spike task.
 package pebble
 
 import (
 	"encoding/binary"
+	"math"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -67,6 +69,18 @@ func unpackSpendingData(b []byte) *spend.SpendingData {
 	}
 }
 
+// isZeroHash reports whether a utxo-hash slot is unset. buildTx writes a zero
+// slot for an output that was never a spendable UTXO.
+func isZeroHash(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
 func packOffsetBlob(items [][]byte) []byte {
 	n := len(items)
 	headerLen := 4 + 4*(n+1)
@@ -104,6 +118,13 @@ func offsetBlobItem(blob []byte, i int) ([]byte, error) {
 	n := offsetBlobCount(blob)
 	if i < 0 || i >= n {
 		return nil, errors.NewProcessingError("pebble: offset blob index %d out of range (count %d)", i, n)
+	}
+
+	// The count comes from the blob's own header, so a truncated value can claim
+	// more entries than it carries. Validate the offset pair is present before
+	// reading it, or a bit-rotted payload panics instead of erroring.
+	if len(blob) < 4+4*(i+2) {
+		return nil, errors.NewProcessingError("pebble: offset blob truncated at index %d (%d bytes, count %d)", i, len(blob), n)
 	}
 
 	start := binary.LittleEndian.Uint32(blob[4+4*i:])
@@ -200,7 +221,14 @@ type masterRecord struct {
 
 const masterFixedLen = 2 + 4*9 + 8*2 + 8*4 + 2
 
-func encodeMaster(m *masterRecord) []byte {
+func encodeMaster(m *masterRecord) ([]byte, error) {
+	// decodeMaster splits blockRefs from spends at this length, so a truncated
+	// value misaligns the page-0 spend slots rather than merely losing a block
+	// reference — silent corruption of the counters every DAH decision reads.
+	if len(m.blockRefs) > math.MaxUint16 {
+		return nil, errors.NewStorageError("pebble: block refs too large to encode (%d bytes)", len(m.blockRefs))
+	}
+
 	b := make([]byte, masterFixedLen, masterFixedLen+len(m.blockRefs)+len(m.spends))
 
 	binary.LittleEndian.PutUint16(b[0:], m.flags)
@@ -224,7 +252,7 @@ func encodeMaster(m *masterRecord) []byte {
 	b = append(b, m.blockRefs...)
 	b = append(b, m.spends...)
 
-	return b
+	return b, nil
 }
 
 func decodeMaster(b []byte) (*masterRecord, error) {

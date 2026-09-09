@@ -172,12 +172,12 @@ func (s *Store) recordToMeta(hash *chainhash.Hash, m *masterRecord, bins []field
 func (s *Store) conflictingChildrenOf(hash []byte) ([]chainhash.Hash, error) {
 	lower, upper := prefixBounds(append([]byte{prefixChildren}, hash...))
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := s.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, errors.NewStorageError("pebble: failed to iterate conflicting children", err)
 	}
 
-	defer func() { _ = iter.Close() }()
+	defer release()
 
 	children := make([]chainhash.Hash, 0, 16)
 
@@ -192,12 +192,12 @@ func (s *Store) conflictingChildrenOf(hash []byte) ([]chainhash.Hash, error) {
 func (s *Store) frozenVouts(hash []byte) (map[uint32]bool, error) {
 	lower, upper := prefixBounds(append([]byte{prefixOverride}, hash...))
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := s.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, errors.NewStorageError("pebble: failed to iterate overrides", err)
 	}
 
-	defer func() { _ = iter.Close() }()
+	defer release()
 
 	frozen := make(map[uint32]bool)
 
@@ -291,6 +291,13 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 		}
 
 		return nil, err
+	}
+
+	// A vout past the transaction's output count is a caller error, not a store
+	// failure. The asset handlers do not pre-validate vout, so returning a hard
+	// error here turns an arbitrary request into a 500.
+	if sp.Vout >= m.outputCount {
+		return &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}, nil
 	}
 
 	storedHash, storedSpend, err := s.readSlot(sp.TxID, m, sp.Vout)
@@ -401,7 +408,7 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 		return err
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit delete for %s", hash, err)
 	}
 
@@ -465,10 +472,12 @@ func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
 
 	lower, upper := prefixBounds(append([]byte{prefixChildrenRev}, hash...))
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := s.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return errors.NewStorageError("pebble: failed to iterate reverse children", err)
 	}
+
+	defer release()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		parent := append([]byte(nil), iter.Key()[33:]...)
@@ -477,11 +486,10 @@ func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
 	}
 
 	if err := iter.Error(); err != nil {
-		_ = iter.Close()
 		return errors.NewStorageError("pebble: reverse children iteration failed", err)
 	}
 
-	return iter.Close()
+	return nil
 }
 
 func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, f ...fields.FieldName) error {
@@ -491,6 +499,14 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 	}
 
 	for _, item := range items {
+		if item == nil {
+			continue
+		}
+
+		if err := ctx.Err(); err != nil {
+			return errors.NewContextCanceledError("pebble: batch decorate canceled", err)
+		}
+
 		bins := defaultBins
 		if len(item.Fields) > 0 {
 			bins = item.Fields
@@ -515,23 +531,55 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 }
 
 func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
-	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(8)
+	// Group by parent so each parent payload is fetched and heap-copied once.
+	// Reading it per input made a large parent plus a many-input child quadratic
+	// in memcpy, on a path that runs before script validation — so the inputs
+	// need not verify for the work to be done.
+	byParent := make(map[chainhash.Hash][]*bt.Input)
 
 	for _, tx := range txs {
+		if tx == nil {
+			continue
+		}
+
+		for _, input := range tx.Inputs {
+			if input == nil || input.PreviousTxScript != nil {
+				continue
+			}
+
+			parent := *input.PreviousTxIDChainHash()
+			byParent[parent] = append(byParent[parent], input)
+		}
+	}
+
+	if len(byParent) == 0 {
+		return nil
+	}
+
+	parents := make([]chainhash.Hash, 0, len(byParent))
+	for parent := range byParent {
+		parents = append(parents, parent)
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
+
+	for i := range parents {
+		parent := parents[i]
+
 		g.Go(func() error {
-			for _, input := range tx.Inputs {
-				if input.PreviousTxScript != nil {
-					continue
-				}
+			// Each input belongs to exactly one parent, so the goroutines write to
+			// disjoint inputs.
+			if err := gCtx.Err(); err != nil {
+				return errors.NewContextCanceledError("pebble: previous outputs decorate canceled", err)
+			}
 
-				parent := input.PreviousTxIDChainHash()
+			_, outputsBlob, err := s.payloadBlobs(&parent)
+			if err != nil {
+				return errors.NewTxNotFoundError("pebble: previous outputs for %s not found", parent, err)
+			}
 
-				_, outputsBlob, err := s.payloadBlobs(parent)
-				if err != nil {
-					return errors.NewTxNotFoundError("pebble: previous output %s:%d not found", parent, input.PreviousTxOutIndex, err)
-				}
-
+			for _, input := range byParent[parent] {
 				item, err := offsetBlobItem(outputsBlob, int(input.PreviousTxOutIndex))
 				if err != nil {
 					return errors.NewTxNotFoundError("pebble: previous output %s:%d not found", parent, input.PreviousTxOutIndex, err)

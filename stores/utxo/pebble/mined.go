@@ -25,6 +25,13 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, inf
 	defer func() { _ = batch.Close() }()
 
 	for _, h := range hashes {
+		// getMaster reads the database, not the staged batch, so a hash repeated
+		// in one call would re-read pre-batch state and overwrite the earlier
+		// staged update. Process each hash once.
+		if _, done := result[*h]; done {
+			continue
+		}
+
 		m, err := s.getMaster(h)
 		if err != nil {
 			if errors.Is(err, errors.ErrTxNotFound) && info.UnsetMined {
@@ -52,14 +59,16 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, inf
 				m.unminedSince = 0
 
 				if s.retention() > 0 {
-					fullySpent := m.spentCount >= m.page0Count && m.pagesSpent >= m.pagesTotal
 					newDAH := int64(info.BlockHeight) + s.retention()
 
+					// dahEligible rather than a local fullySpent check: the
+					// hand-written version dropped its flagConflicting == 0 guard,
+					// so a conflicting transaction could be stamped for deletion.
 					switch {
 					case m.preserveUntil > 0:
 					case m.deleteAtHeight > 0 && m.deleteAtHeight < newDAH:
 						m.deleteAtHeight = newDAH
-					case m.deleteAtHeight == 0 && fullySpent:
+					case m.deleteAtHeight == 0 && s.dahEligible(m):
 						m.deleteAtHeight = newDAH
 					}
 				}
@@ -76,7 +85,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, inf
 		result[*h] = ids
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return nil, errors.NewStorageError("pebble: failed to commit SetMinedMulti", err)
 	}
 
@@ -116,7 +125,7 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		}
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit MarkTransactionsOnLongestChain", err)
 	}
 
@@ -152,18 +161,21 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 
 	lower := []byte{it.prefix}
 	if it.lastKey != nil {
-		lower = append(it.lastKey, 0)
+		// Copy: append(it.lastKey, 0) reuses lastKey's spare capacity, and the
+		// scan loop below rewrites that same array while the iterator still
+		// holds this slice as its LowerBound.
+		lower = append(append([]byte(nil), it.lastKey...), 0)
 	}
 
 	_, upper := prefixBounds([]byte{it.prefix})
 
-	iter, err := it.store.db.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := it.store.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		it.err = errors.NewStorageError("pebble: iterator open failed", err)
 		return nil, it.err
 	}
 
-	defer func() { _ = iter.Close() }()
+	defer release()
 
 	batch := make([]*utxo.UnminedTransaction, 0, 1000)
 
@@ -281,18 +293,18 @@ func (it *consistencyIterator) Next(ctx context.Context) ([]*utxo.InconsistentTx
 
 	lower := []byte{prefixMaster}
 	if it.lastKey != nil {
-		lower = append(it.lastKey, 0)
+		lower = append(append([]byte(nil), it.lastKey...), 0)
 	}
 
 	_, upper := prefixBounds([]byte{prefixMaster})
 
-	iter, err := it.store.db.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := it.store.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		it.err = errors.NewStorageError("pebble: consistency scan open failed", err)
 		return nil, it.err
 	}
 
-	defer func() { _ = iter.Close() }()
+	defer release()
 
 	records := make([]*utxo.InconsistentTxRecord, 0, 8)
 	rowCount := 0
@@ -344,12 +356,12 @@ func (s *Store) QueryOldUnminedTransactions(ctx context.Context, cutoffBlockHeig
 	lower := []byte{prefixUnminedIdx}
 	upper := heightIndexKey(prefixUnminedIdx, int64(cutoffBlockHeight)+1, nil)
 
-	iter, err := s.db.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := s.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, errors.NewStorageError("pebble: old unmined query failed", err)
 	}
 
-	defer func() { _ = iter.Close() }()
+	defer release()
 
 	var out []chainhash.Hash
 
@@ -397,7 +409,7 @@ func (s *Store) PreserveTransactions(ctx context.Context, txIDs []chainhash.Hash
 		}
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit PreserveTransactions", err)
 	}
 
@@ -408,7 +420,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	lower := []byte{prefixPreserveIdx}
 	upper := heightIndexKey(prefixPreserveIdx, int64(currentHeight)+1, nil)
 
-	iter, err := s.db.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, release, err := s.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return errors.NewStorageError("pebble: expired preservations query failed", err)
 	}
@@ -420,11 +432,12 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 	}
 
 	if err = iter.Error(); err != nil {
-		_ = iter.Close()
+		release()
+
 		return errors.NewStorageError("pebble: expired preservations iteration failed", err)
 	}
 
-	_ = iter.Close()
+	release()
 
 	if len(expired) == 0 {
 		return nil
@@ -446,7 +459,15 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 
 		m, err := s.getMaster(&h)
 		if err != nil {
-			continue
+			// Only a genuine miss is benign. Swallowing a read error would leave
+			// preserveUntil set and the index entry in place, so the same hash is
+			// rescanned and re-failed on every later call and the transaction can
+			// never be pruned.
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return err
 		}
 
 		old := *m
@@ -466,7 +487,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 		}
 	}
 
-	if err := batch.Commit(s.sync); err != nil {
+	if err := s.commit(batch); err != nil {
 		return errors.NewStorageError("pebble: failed to commit ProcessExpiredPreservations", err)
 	}
 
