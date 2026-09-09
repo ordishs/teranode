@@ -409,9 +409,10 @@ func (s *Store) Delete(ctx context.Context, hash *chainhash.Hash) error {
 }
 
 // DeleteComplete removes a transaction and all its associated data. stageDelete
-// already removes the master record, the payload, and every page, hash, override
-// and conflicting-child record in one atomic batch, so Delete leaves nothing
-// behind; DeleteComplete is therefore equivalent to Delete here.
+// removes the master record, the payload, and every page, hash, override and
+// conflicting-child record — both edge directions — in one atomic batch, so
+// Delete already leaves nothing behind and never half-completes; DeleteComplete
+// is therefore equivalent to Delete here.
 func (s *Store) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error {
 	return s.Delete(ctx, hash)
 }
@@ -441,6 +442,19 @@ func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
 	_ = batch.Delete(conflictIdxKey(hash), nil)
 	_ = batch.Delete(masterKey(hash), nil)
 	_ = batch.Delete(payloadKey(hash), nil)
+
+	// Collect the forward edges where this hash is the parent before the range
+	// delete below removes them, so each paired reverse edge goes too. Without
+	// this, deleting a parent leaves K|child|parent behind for as long as the
+	// child outlives it.
+	children, err := s.conflictingChildrenOf(hash)
+	if err != nil {
+		return err
+	}
+
+	for i := range children {
+		_ = batch.Delete(childrenRevKey(children[i][:], hash), nil)
+	}
 
 	for _, prefix := range []byte{prefixPage, prefixHashes, prefixOverride, prefixChildren} {
 		lower, upper := prefixBounds(append([]byte{prefix}, hash...))
