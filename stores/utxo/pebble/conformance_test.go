@@ -12,14 +12,11 @@ import (
 )
 
 func newTestStore(t testing.TB) *Store {
-	dir := t.TempDir()
-
-	storeURL, err := url.Parse("pebble://" + dir)
-	require.NoError(t, err)
-
-	storeURL.Path = dir
-
 	tSettings := settings.NewSettings()
+	tSettings.DataFolder = t.TempDir()
+
+	storeURL, err := url.Parse("pebble:///utxostore")
+	require.NoError(t, err)
 
 	store, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
 	require.NoError(t, err)
@@ -64,6 +61,20 @@ func TestConformance(t *testing.T) {
 		tests.SpendAndCreateInvalidOptions(t, newTestStore(t))
 	})
 	t.Run("set mined with spent", func(t *testing.T) { tests.SetMinedWithSpent(t, newTestStore(t)) })
+	t.Run("mined then spend all prunes", func(t *testing.T) {
+		ResetPrunerServiceForTests()
+		t.Cleanup(ResetPrunerServiceForTests)
+
+		store := newTestStore(t)
+
+		prunerSvc, err := store.GetPrunerService()
+		require.NoError(t, err)
+		require.NotNil(t, prunerSvc)
+
+		prunerSvc.Start(context.Background())
+
+		tests.MinedThenSpendAllPrunes(t, store, prunerSvc)
+	})
 	t.Run("delete then unspend restores parent", func(t *testing.T) {
 		tests.DeleteThenUnspendRestoresParent(t, newTestStore(t))
 	})
