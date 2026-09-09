@@ -51,6 +51,10 @@ type Peer struct {
 	Banscore         int32                  `protobuf:"varint,25,opt,name=banscore,proto3" json:"banscore,omitempty"`
 	Whitelisted      bool                   `protobuf:"varint,26,opt,name=whitelisted,proto3" json:"whitelisted,omitempty"`
 	FeeFilter        int64                  `protobuf:"varint,27,opt,name=feeFilter,proto3" json:"feeFilter,omitempty"`
+	// Raw height the peer advertised, before the unvalidated-lead cap that
+	// produces currentHeight. Telemetry only; currentHeight still drives sync
+	// decisions. 0 for peers on older versions that do not report it.
+	AdvertisedHeight uint32 `protobuf:"varint,28,opt,name=advertisedHeight,proto3" json:"advertisedHeight,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -270,6 +274,13 @@ func (x *Peer) GetWhitelisted() bool {
 func (x *Peer) GetFeeFilter() int64 {
 	if x != nil {
 		return x.FeeFilter
+	}
+	return 0
+}
+
+func (x *Peer) GetAdvertisedHeight() uint32 {
+	if x != nil {
+		return x.AdvertisedHeight
 	}
 	return 0
 }
@@ -2873,7 +2884,7 @@ var File_services_p2p_p2p_api_p2p_api_proto protoreflect.FileDescriptor
 
 const file_services_p2p_p2p_api_p2p_api_proto_rawDesc = "" +
 	"\n" +
-	"\"services/p2p/p2p_api/p2p_api.proto\x12\ap2p_api\x1a\x1bgoogle/protobuf/empty.proto\"\xb0\x06\n" +
+	"\"services/p2p/p2p_api/p2p_api.proto\x12\ap2p_api\x1a\x1bgoogle/protobuf/empty.proto\"\xdc\x06\n" +
 	"\x04Peer\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04addr\x18\x02 \x01(\tR\x04addr\x12\x1c\n" +
@@ -2906,7 +2917,8 @@ const file_services_p2p_p2p_api_p2p_api_proto_rawDesc = "" +
 	"\rcurrentHeight\x18\x18 \x01(\rR\rcurrentHeight\x12\x1a\n" +
 	"\bbanscore\x18\x19 \x01(\x05R\bbanscore\x12 \n" +
 	"\vwhitelisted\x18\x1a \x01(\bR\vwhitelisted\x12\x1c\n" +
-	"\tfeeFilter\x18\x1b \x01(\x03R\tfeeFilter\"7\n" +
+	"\tfeeFilter\x18\x1b \x01(\x03R\tfeeFilter\x12*\n" +
+	"\x10advertisedHeight\x18\x1c \x01(\rR\x10advertisedHeight\"7\n" +
 	"\x10GetPeersResponse\x12#\n" +
 	"\x05peers\x18\x01 \x03(\v2\r.p2p_api.PeerR\x05peers\":\n" +
 	"\x0eBanPeerRequest\x12\x12\n" +

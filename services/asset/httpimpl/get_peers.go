@@ -33,9 +33,10 @@ type PeerInfoResponse struct {
 	Transport  string `json:"transport"`
 	ClientName string `json:"client_name"`
 	// Height is capped against local progress and is what sync decisions use.
-	// AdvertisedHeight is the peer's raw claim. The two differ only while this
-	// node is catching up.
-	Height           uint32 `json:"height"`
+	Height uint32 `json:"height"`
+	// AdvertisedHeight is the peer's raw claim. It differs from Height only
+	// while this node is catching up, and is 0 for peers on older versions
+	// that do not report it.
 	AdvertisedHeight uint32 `json:"advertised_height"`
 	BlockHash        string `json:"block_hash"`
 	DataHubURL       string `json:"data_hub_url"`

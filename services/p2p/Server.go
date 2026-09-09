@@ -2679,11 +2679,12 @@ func (s *Server) GetPeers(ctx context.Context, _ *emptypb.Empty) (*p2p_api.GetPe
 			addr := addrByPeerID[p.ID]
 
 			resp.Peers = append(resp.Peers, &p2p_api.Peer{
-				Id:            p.ID,
-				Addr:          addr,
-				Banscore:      p.BanScore,
-				CurrentHeight: p.Height,
-				BytesReceived: p.BytesReceived,
+				Id:               p.ID,
+				Addr:             addr,
+				Banscore:         p.BanScore,
+				CurrentHeight:    p.Height,
+				AdvertisedHeight: p.AdvertisedHeight,
+				BytesReceived:    p.BytesReceived,
 			})
 		}
 

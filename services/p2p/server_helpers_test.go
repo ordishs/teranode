@@ -1389,12 +1389,13 @@ func TestServerGetPeersReturnsConnectedPeersWithHeight(t *testing.T) {
 	connectedPID := mustNewPeerID(t)
 	disconnectedPID := mustNewPeerID(t)
 
-	s.addConnectedPeer(connectedPID, "client/1.0", peerHeightClaim{Height: 123, AdvertisedHeight: 123}, nil, "")
+	s.addConnectedPeer(connectedPID, "client/1.0", peerHeightClaim{Height: 123, AdvertisedHeight: 962710}, nil, "")
 	s.addPeer(disconnectedPID, "client/1.0", peerHeightClaim{Height: 99, AdvertisedHeight: 99}, nil, "")
 
 	resp, err := s.GetPeers(context.Background(), &emptypb.Empty{})
 	require.NoError(t, err)
 	require.Len(t, resp.Peers, 1, "disconnected peers must be excluded")
 	require.Equal(t, connectedPID.String(), resp.Peers[0].Id)
-	require.Equal(t, uint32(123), resp.Peers[0].CurrentHeight)
+	require.Equal(t, uint32(123), resp.Peers[0].CurrentHeight, "sync-decision height stays capped")
+	require.Equal(t, uint32(962710), resp.Peers[0].AdvertisedHeight, "raw advertised claim must reach the GetPeers contract too")
 }
