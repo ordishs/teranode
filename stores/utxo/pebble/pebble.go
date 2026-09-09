@@ -51,10 +51,65 @@ type Store struct {
 	sync     *pebble.WriteOptions
 	// inFlight is held for reading around every database access and for writing
 	// by Close, so the drain below cannot overlap live work.
-	inFlight   sync.RWMutex
-	blockState atomic.Uint64
-	stripes    [numStripes]sync.Mutex
-	closed     atomic.Bool
+	inFlight sync.RWMutex
+
+	// utxo.BlockStateFields supplies the chain-tip height and median block time
+	// from one atomic holder, so GetBlockHeight and GetBlockState cannot
+	// disagree. It was extracted for exactly that reason; reimplementing it here
+	// reintroduced the torn pair it fixed.
+	utxo.BlockStateFields
+
+	stripes [numStripes]sync.Mutex
+	closed  atomic.Bool
+
+	// scanSnaps tracks the snapshots long-running iterators hold. pebble's
+	// Close reports "leaked snapshots" if any are still open, and an iterator
+	// the caller abandons must not be able to block shutdown, so the store owns
+	// them rather than the close guard.
+	scanSnapsMu sync.Mutex
+	scanSnaps   map[*pebble.Snapshot]struct{}
+}
+
+// newScanSnapshot pins a snapshot for a long-running scan and tracks it. The
+// caller must already hold the close guard; unlike snapshot(), the guard is
+// deliberately not held for the snapshot's lifetime, because an iterator that
+// is never closed would then block Close forever.
+func (s *Store) newScanSnapshot() *pebble.Snapshot {
+	snap := s.db.NewSnapshot()
+
+	s.scanSnapsMu.Lock()
+	defer s.scanSnapsMu.Unlock()
+
+	if s.scanSnaps == nil {
+		s.scanSnaps = make(map[*pebble.Snapshot]struct{})
+	}
+
+	s.scanSnaps[snap] = struct{}{}
+
+	return snap
+}
+
+// releaseScanSnapshot closes a tracked scan snapshot. It is a no-op once the
+// store is closed, because Close owns and has already closed every tracked
+// snapshot at that point.
+func (s *Store) releaseScanSnapshot(snap *pebble.Snapshot) {
+	if err := s.enter(); err != nil {
+		return
+	}
+
+	defer s.leave()
+
+	// enter succeeded, so Close cannot be running and the map is authoritative.
+	s.scanSnapsMu.Lock()
+	defer s.scanSnapsMu.Unlock()
+
+	if _, tracked := s.scanSnaps[snap]; !tracked {
+		return
+	}
+
+	delete(s.scanSnaps, snap)
+
+	_ = snap.Close()
 }
 
 // enter registers a database access. pebble panics rather than erroring on any
@@ -248,12 +303,30 @@ func (s *Store) Close(ctx context.Context) error {
 	s.inFlight.Lock()
 	defer s.inFlight.Unlock()
 
+	// Close the scan snapshots of any iterator the caller abandoned; pebble's
+	// Close reports them as leaked otherwise.
+	s.scanSnapsMu.Lock()
+
+	for snap := range s.scanSnaps {
+		_ = snap.Close()
+		delete(s.scanSnaps, snap)
+	}
+
+	s.scanSnapsMu.Unlock()
+
 	return s.db.Close()
 }
 
 func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, error) {
 	if s.closed.Load() {
 		return http.StatusServiceUnavailable, "pebble store closed", errors.NewStorageError("pebble: store closed")
+	}
+
+	// Actually read, the way the SQL store runs SELECT 1. Reporting 200 purely
+	// from a flag meant a store whose files were unreadable still looked healthy.
+	// The meta key is written on first open, so it is always present.
+	if _, err := s.getValue([]byte{prefixMeta}); err != nil {
+		return http.StatusServiceUnavailable, "pebble store unreadable", errors.NewStorageError("pebble: store read check failed", err)
 	}
 
 	return http.StatusOK, "pebble embedded store", nil
@@ -466,57 +539,4 @@ func (s *Store) retention() int64 {
 	}
 
 	return 0
-}
-
-func packBlockState(height, medianTime uint32) uint64 {
-	return uint64(height)<<32 | uint64(medianTime)
-}
-
-func (s *Store) SetBlockHeight(height uint32) error {
-	if height == 0 {
-		return errors.NewInvalidArgumentError("pebble: block height must be non-zero")
-	}
-
-	for {
-		old := s.blockState.Load()
-		if s.blockState.CompareAndSwap(old, packBlockState(height, uint32(old))) { //nolint:gosec
-			return nil
-		}
-	}
-}
-
-func (s *Store) GetBlockHeight() uint32 {
-	return uint32(s.blockState.Load() >> 32) //nolint:gosec
-}
-
-func (s *Store) SetMedianBlockTime(medianTime uint32) error {
-	for {
-		old := s.blockState.Load()
-		if s.blockState.CompareAndSwap(old, old&0xFFFFFFFF00000000|uint64(medianTime)) {
-			return nil
-		}
-	}
-}
-
-func (s *Store) GetMedianBlockTime() uint32 {
-	return uint32(s.blockState.Load()) //nolint:gosec
-}
-
-func (s *Store) SetBlockState(height, medianTime uint32) error {
-	if height == 0 {
-		return errors.NewInvalidArgumentError("pebble: block height must be non-zero")
-	}
-
-	s.blockState.Store(packBlockState(height, medianTime))
-
-	return nil
-}
-
-func (s *Store) GetBlockState() utxo.BlockState {
-	v := s.blockState.Load()
-
-	return utxo.BlockState{
-		Height:     uint32(v >> 32), //nolint:gosec
-		MedianTime: uint32(v),       //nolint:gosec
-	}
 }

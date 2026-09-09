@@ -5,7 +5,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/stretchr/testify/require"
 )
@@ -95,4 +97,79 @@ func TestReadsAreIsolatedFromConcurrentSpend(t *testing.T) {
 
 	close(stop)
 	wg.Wait()
+}
+
+// TestUnminedAtHeightZeroIsVisible pins the unminedSince sentinel overload. The
+// store used unminedSince == 0 to mean "mined", so a transaction created before
+// the first FSM height notification recorded as mined-and-on-longest-chain with
+// no block reference: invisible to every unmined iterator, and prunable. A
+// reorg during startup dropped those permanently from block assembly.
+func TestUnminedAtHeightZeroIsVisible(t *testing.T) {
+	ctx := context.Background()
+	// A fresh store, as it exists before the first FSM height notification. The
+	// factory logs "skipping block height initialization (height is 0)" and
+	// leaves it here, and SetBlockState refuses height 0 by contract, so this is
+	// the only way the state occurs — and the only way to reproduce it.
+	store := openStoreAt(t, t.TempDir())
+	t.Cleanup(func() { _ = store.Close(context.Background()) })
+
+	require.Zero(t, store.GetBlockHeight())
+
+	tx := newExtendedTx(t, 2, 94_000)
+
+	_, err := store.Create(ctx, tx, 0)
+	require.NoError(t, err)
+
+	md, err := store.Get(ctx, tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Empty(t, md.BlockIDs, "precondition: the tx has no block reference")
+
+	drain := func(it interface {
+		Next(context.Context) ([]*utxo.UnminedTransaction, error)
+	},
+	) int {
+		count := 0
+
+		for {
+			batch, err := it.Next(ctx)
+			require.NoError(t, err)
+
+			if batch == nil {
+				return count
+			}
+
+			count += len(batch)
+		}
+	}
+
+	it, err := store.GetUnminedTxIterator()
+	require.NoError(t, err)
+	require.Equal(t, 1, drain(it), "a tx created at height 0 must be visible as unmined")
+
+	prunable, err := store.GetPrunableUnminedTxIterator(10)
+	require.NoError(t, err)
+	require.Equal(t, 1, drain(prunable), "and to the prunable-unmined iterator")
+
+	old, err := store.QueryOldUnminedTransactions(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, old, 1, "and to QueryOldUnminedTransactions")
+
+	// It must not be eligible for deletion while it is unmined.
+	m, err := store.getMaster(tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.True(t, m.unmined())
+	require.False(t, store.dahEligible(m), "an unmined tx must never be DAH-eligible")
+
+	// MarkTransactionsOnLongestChain(false) at height 0 has the same shape.
+	require.NoError(t, store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, true))
+
+	m, err = store.getMaster(tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.False(t, m.unmined(), "marking on the longest chain clears the unmined flag")
+
+	require.NoError(t, store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*tx.TxIDChainHash()}, false))
+
+	it2, err := store.GetUnminedTxIterator()
+	require.NoError(t, err)
+	require.Equal(t, 1, drain(it2), "demoting at height 0 must make it unmined again")
 }

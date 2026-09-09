@@ -17,7 +17,7 @@ func (s *Store) dahEligible(m *masterRecord) bool {
 		m.spentCount >= m.page0Count &&
 		m.pagesSpent >= m.pagesTotal &&
 		len(m.blockRefs) > 0 &&
-		m.unminedSince == 0 &&
+		!m.unmined() &&
 		m.preserveUntil == 0 &&
 		m.flags&flagConflicting == 0
 }
@@ -33,12 +33,12 @@ func (s *Store) stageMaster(batch *pebble.Batch, hash []byte, old, updated *mast
 		}
 	}
 
-	if old.unminedSince != updated.unminedSince {
-		if old.unminedSince > 0 {
+	if old.unmined() != updated.unmined() || old.unminedSince != updated.unminedSince {
+		if old.unmined() {
 			_ = batch.Delete(heightIndexKey(prefixUnminedIdx, old.unminedSince, hash), nil)
 		}
 
-		if updated.unminedSince > 0 {
+		if updated.unmined() {
 			_ = batch.Set(heightIndexKey(prefixUnminedIdx, updated.unminedSince, hash), nil, nil)
 		}
 	}
@@ -150,6 +150,8 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		}
 	}
 
+	firstErr = s.clearBlessedNotFound(spends, tx.TxIDChainHash(), firstErr)
+
 	if firstErr != nil {
 		return spends, errors.NewUtxoError("pebble: spend failed", firstErr)
 	}
@@ -203,11 +205,14 @@ func (s *Store) stageSpendGroup(batch *pebble.Batch, g *parentGroup, blockHeight
 	old := *m
 	pages := map[uint32]*pageRecord{}
 	pageWasComplete := map[uint32]bool{}
+	// The hash pages are immutable once written, so read each at most once per
+	// group rather than once per input, as `pages` already does.
+	hashPages := map[uint32][]byte{}
 
 	var firstErr error
 
 	for _, sp := range g.spends {
-		if err := s.stageSpendSlot(m, pages, pageWasComplete, &g.hash, sp, blockHeight, ig); err != nil {
+		if err := s.stageSpendSlot(m, pages, pageWasComplete, hashPages, &g.hash, sp, blockHeight, ig); err != nil {
 			sp.Err = err
 
 			if firstErr == nil {
@@ -243,6 +248,43 @@ func setAll(spends []*utxo.Spend, err error) {
 	}
 }
 
+// clearBlessedNotFound absorbs ErrTxNotFound when the spending transaction is
+// already in the store. A parent that has been DAH-pruned is the normal state
+// when block validation or catchup re-validates a transaction that was already
+// blessed, so treating it as a hard failure wedges the node at that height: the
+// transaction never validates, its subtree never validates, and the block never
+// finalises. Mirrors aerospike/spend.go and sql/sql.go, which both do this.
+//
+// selfHash is the spending transaction. Returns the error to report, which is
+// nil when every remaining failure was an absorbed not-found.
+func (s *Store) clearBlessedNotFound(spends []*utxo.Spend, selfHash *chainhash.Hash, firstErr error) error {
+	if firstErr == nil || selfHash == nil || !errors.Is(firstErr, errors.ErrTxNotFound) {
+		return firstErr
+	}
+
+	// One lookup for the whole set, as both mature stores do.
+	if _, err := s.getMaster(selfHash); err != nil {
+		return firstErr
+	}
+
+	s.logger.Warnf("[pebble][%s] parent tx not found, but tx already exists in store, assuming already blessed", selfHash)
+
+	var remaining error
+
+	for _, sp := range spends {
+		if sp.Err != nil && errors.Is(sp.Err, errors.ErrTxNotFound) {
+			sp.Err = nil
+			continue
+		}
+
+		if sp.Err != nil && remaining == nil {
+			remaining = sp.Err
+		}
+	}
+
+	return remaining
+}
+
 func pageFullySpent(rec *pageRecord) bool {
 	spent := uint32(0)
 
@@ -256,7 +298,7 @@ func pageFullySpent(rec *pageRecord) bool {
 }
 
 func (s *Store) stageSpendSlot(m *masterRecord, pages map[uint32]*pageRecord, pageWasComplete map[uint32]bool,
-	hash *chainhash.Hash, sp *utxo.Spend, blockHeight uint32, ig utxo.IgnoreFlags,
+	hashPages map[uint32][]byte, hash *chainhash.Hash, sp *utxo.Spend, blockHeight uint32, ig utxo.IgnoreFlags,
 ) error {
 	page := pageOfVout(sp.Vout, s.pageSize)
 	slot := slotOfVout(sp.Vout, s.pageSize)
@@ -333,9 +375,15 @@ func (s *Store) stageSpendSlot(m *masterRecord, pages map[uint32]*pageRecord, pa
 	// unspent, and the pruner then deletes the record with its live UTXOs. It
 	// costs one read per spend on the outpoint-only path, which is the price of
 	// not trusting the caller to prove the outpoint exists.
-	hashes, err := s.getValue(hashesKey(hash[:], page))
-	if err != nil {
-		return errors.NewStorageError("pebble: failed to read hashes page %d for %s", page, hash, err)
+	hashes, cached := hashPages[page]
+	if !cached {
+		var err error
+
+		if hashes, err = s.getValue(hashesKey(hash[:], page)); err != nil {
+			return errors.NewStorageError("pebble: failed to read hashes page %d for %s", page, hash, err)
+		}
+
+		hashPages[page] = hashes
 	}
 
 	hOff := int(slot) * slotHashSize
@@ -381,7 +429,14 @@ func (s *Store) stageSpendSlot(m *masterRecord, pages map[uint32]*pageRecord, pa
 }
 
 func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) error {
-	setLocked := len(flagAsLocked) > 0 && flagAsLocked[0]
+	// flagAsLocked is tri-state, as the SQL store treats it: absent leaves the
+	// locked flag alone, true sets it, false clears it. utxo.ProcessConflicting
+	// locks affected parents with true and ReverseProcessConflicting unlocks them
+	// with false, so collapsing it to "set or do nothing" left a reorg's demoted
+	// parents locked forever and wedged block assembly on the restored chain.
+	lockedProvided := len(flagAsLocked) > 0
+	setLocked := lockedProvided && flagAsLocked[0]
+
 	groups := groupByParent(spends)
 	hashes := make([][]byte, len(groups))
 
@@ -396,7 +451,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	defer func() { _ = batch.Close() }()
 
 	for _, g := range groups {
-		if err := s.stageUnspendGroup(batch, g, setLocked); err != nil {
+		if err := s.stageUnspendGroup(batch, g, lockedProvided, setLocked); err != nil {
 			return err
 		}
 	}
@@ -408,7 +463,7 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 	return nil
 }
 
-func (s *Store) stageUnspendGroup(batch *pebble.Batch, g *parentGroup, setLocked bool) error {
+func (s *Store) stageUnspendGroup(batch *pebble.Batch, g *parentGroup, lockedProvided, setLocked bool) error {
 	m, err := s.getMaster(&g.hash)
 	if err != nil {
 		if errors.Is(err, errors.ErrTxNotFound) {
@@ -485,8 +540,16 @@ func (s *Store) stageUnspendGroup(batch *pebble.Batch, g *parentGroup, setLocked
 		m.deleteAtHeight = 0
 	}
 
-	if setLocked {
-		m.flags |= flagLocked
+	if lockedProvided {
+		if setLocked {
+			m.flags |= flagLocked
+		} else {
+			m.flags &^= flagLocked
+
+			if s.dahEligible(m) {
+				m.deleteAtHeight = int64(s.GetBlockHeight()) + 1 + s.retention()
+			}
+		}
 	}
 
 	return s.stageMaster(batch, g.hash[:], &old, m)
@@ -556,6 +619,8 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 			firstErr = err
 		}
 	}
+
+	firstErr = s.clearBlessedNotFound(spends, selfHash, firstErr)
 
 	if firstErr != nil {
 		return nil, spends, errors.NewUtxoError("pebble: spend failed", firstErr)

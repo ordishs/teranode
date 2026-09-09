@@ -2,6 +2,9 @@ package pebble
 
 import (
 	"context"
+	"encoding/binary"
+	"sync"
+	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
@@ -34,7 +37,13 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, inf
 
 		m, err := s.getMaster(h)
 		if err != nil {
-			if errors.Is(err, errors.ErrTxNotFound) && info.UnsetMined {
+			// A pruned or absent record must not discard the updates already
+			// staged for every other hash in the call. Callers pass whole-block
+			// and whole-mempool hash sets (SetMinedMultiChunked,
+			// fixUnminedSinceInconsistencies) where a record vanishing between
+			// scan and update is routine; SQL absorbs it as a zero-row UPDATE and
+			// aerospike reports per-record failures.
+			if errors.Is(err, errors.ErrTxNotFound) {
 				continue
 			}
 
@@ -50,13 +59,13 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, inf
 			m.deleteAtHeight = 0
 
 			if len(m.blockRefs) == 0 {
-				m.unminedSince = int64(s.GetBlockHeight()) + 1
+				m.setUnmined(int64(s.GetBlockHeight()) + 1)
 			}
 		} else {
 			m.blockRefs = appendBlockRef(m.blockRefs, info)
 
 			if info.OnLongestChain {
-				m.unminedSince = 0
+				m.setMined()
 
 				if s.retention() > 0 {
 					newDAH := int64(info.BlockHeight) + s.retention()
@@ -109,15 +118,19 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 		m, err := s.getMaster(&h)
 		if err != nil {
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
 			return err
 		}
 
 		old := *m
 
 		if onLongestChain {
-			m.unminedSince = 0
+			m.setMined()
 		} else {
-			m.unminedSince = int64(s.GetBlockHeight())
+			m.setUnmined(int64(s.GetBlockHeight()))
 		}
 
 		if err = s.stageMaster(batch, h[:], &old, m); err != nil {
@@ -137,9 +150,12 @@ type heightIndexIterator struct {
 	prefix   byte
 	cutoff   int64
 	skipConf bool
-	lastKey  []byte
-	done     bool
-	err      error
+
+	mu      sync.Mutex
+	snap    *pebbledb.Snapshot
+	lastKey []byte
+	done    bool
+	err     error
 }
 
 func (s *Store) GetUnminedTxIterator() (utxo.UnminedTxIterator, error) {
@@ -155,8 +171,39 @@ func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
 }
 
 func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransaction, error) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
 	if it.done || it.err != nil {
 		return nil, it.err
+	}
+
+	if err := ctx.Err(); err != nil {
+		it.err = errors.NewContextCanceledError("pebble: unmined iteration canceled", err)
+		return nil, it.err
+	}
+
+	// One snapshot for the whole scan, taken on the first Next and held until
+	// Close. The resume cursor is prefix||BE(height)||txid, and a reorg moves a
+	// row *within* this index: SetMinedMulti{UnsetMined} and
+	// MarkTransactionsOnLongestChain(false) both rewrite unminedSince. Against
+	// live data a row re-keyed past the cursor is emitted twice — block assembly
+	// then adds the same transaction to the subtree processor twice — and a row
+	// re-keyed behind the cursor is never emitted at all and silently vanishes
+	// from the mempool. A snapshot makes the index immutable for the scan, which
+	// is the immunity aerospike gets from partitioning its scan by txid.
+	// The close guard is taken per Next rather than for the iterator's lifetime,
+	// so an abandoned iterator cannot block shutdown. Inside the guard, Close
+	// cannot be running, so the tracked snapshot is still open.
+	if err := it.store.enter(); err != nil {
+		it.err = err
+		return nil, it.err
+	}
+
+	defer it.store.leave()
+
+	if it.snap == nil {
+		it.snap = it.store.newScanSnapshot()
 	}
 
 	lower := []byte{it.prefix}
@@ -169,15 +216,7 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 
 	_, upper := prefixBounds([]byte{it.prefix})
 
-	snap, release, err := it.store.snapshot()
-	if err != nil {
-		it.err = err
-		return nil, it.err
-	}
-
-	defer release()
-
-	iter, err := snap.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, err := it.snap.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		it.err = errors.NewStorageError("pebble: iterator open failed", err)
 		return nil, it.err
@@ -196,7 +235,7 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 		if it.prefix == prefixConflictIdx {
 			hashBytes = key[1:]
 		} else {
-			height := int64(binaryBEUint64(key[1:9])) //nolint:gosec
+			height := int64(binary.BigEndian.Uint64(key[1:9])) //nolint:gosec
 			if it.cutoff >= 0 && height > it.cutoff {
 				break
 			}
@@ -206,9 +245,18 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 
 		hash := chainhash.Hash(hashBytes)
 
-		m, err := getMasterFrom(snap, &hash)
+		m, err := getMasterFrom(it.snap, &hash)
 		if err != nil {
+			// A dangling index entry must not latch a permanent error: latching
+			// meant every later Next returned it, and loadUnminedTransactions
+			// turned that into a hard abort, so block assembly could not start or
+			// reset while the pruner ran. Skip the entry instead.
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
 			it.err = err
+
 			return nil, it.err
 		}
 
@@ -221,9 +269,14 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 			continue
 		}
 
-		u, err := it.store.recordToUnmined(snap, &hash, m)
+		u, err := it.store.recordToUnmined(it.snap, &hash, m)
 		if err != nil {
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
 			it.err = err
+
 			return nil, it.err
 		}
 
@@ -237,15 +290,11 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 
 	if len(batch) == 0 {
 		it.done = true
+
 		return nil, nil
 	}
 
 	return batch, nil
-}
-
-func binaryBEUint64(b []byte) uint64 {
-	return uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
-		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
 }
 
 func (s *Store) recordToUnmined(r reader, hash *chainhash.Hash, m *masterRecord) (*utxo.UnminedTransaction, error) {
@@ -275,17 +324,35 @@ func (s *Store) recordToUnmined(r reader, hash *chainhash.Hash, m *masterRecord)
 	}, nil
 }
 
-func (it *heightIndexIterator) Err() error { return it.err }
+func (it *heightIndexIterator) Err() error {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	return it.err
+}
 
 func (it *heightIndexIterator) Close() error {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
 	it.done = true
+
+	if it.snap != nil {
+		it.store.releaseScanSnapshot(it.snap)
+		it.snap = nil
+	}
+
 	return nil
 }
 
 type consistencyIterator struct {
-	store   *Store
+	store *Store
+
+	mu      sync.Mutex
 	lastKey []byte
-	scanned int64
+	// scanned is read by the caller's progress goroutine while Next writes it
+	// (fixUnminedSinceInconsistencies does exactly that), so it is atomic.
+	scanned atomic.Int64
 	done    bool
 	err     error
 }
@@ -295,7 +362,15 @@ func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, erro
 }
 
 func (it *consistencyIterator) Next(ctx context.Context) ([]*utxo.InconsistentTxRecord, error) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
 	if it.done || it.err != nil {
+		return nil, it.err
+	}
+
+	if err := ctx.Err(); err != nil {
+		it.err = errors.NewContextCanceledError("pebble: consistency scan canceled", err)
 		return nil, it.err
 	}
 
@@ -321,7 +396,7 @@ func (it *consistencyIterator) Next(ctx context.Context) ([]*utxo.InconsistentTx
 		key := iter.Key()
 		it.lastKey = append(it.lastKey[:0], key...)
 		rowCount++
-		it.scanned++
+		it.scanned.Add(1)
 
 		m, err := decodeMaster(iter.Value())
 		if err != nil {
@@ -329,7 +404,7 @@ func (it *consistencyIterator) Next(ctx context.Context) ([]*utxo.InconsistentTx
 			return nil, it.err
 		}
 
-		if m.unminedSince > 0 && len(m.blockRefs) > 0 {
+		if m.unmined() && len(m.blockRefs) > 0 {
 			blockIDs, _, _ := unpackBlockRefs(m.blockRefs)
 			records = append(records, &utxo.InconsistentTxRecord{
 				Hash:         chainhash.Hash(key[1:]),
@@ -352,11 +427,20 @@ func (it *consistencyIterator) Next(ctx context.Context) ([]*utxo.InconsistentTx
 	return records, nil
 }
 
-func (it *consistencyIterator) TotalScanned() int64 { return it.scanned }
-func (it *consistencyIterator) Err() error          { return it.err }
+func (it *consistencyIterator) TotalScanned() int64 { return it.scanned.Load() }
+func (it *consistencyIterator) Err() error {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	return it.err
+}
 
 func (it *consistencyIterator) Close() error {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
 	it.done = true
+
 	return nil
 }
 
@@ -485,7 +569,7 @@ func (s *Store) ProcessExpiredPreservations(ctx context.Context, currentHeight u
 			fullySpent := m.spentCount >= m.page0Count && m.pagesSpent >= m.pagesTotal
 
 			if m.flags&flagConflicting != 0 ||
-				(m.unminedSince == 0 && len(m.blockRefs) > 0 && fullySpent) {
+				(!m.unmined() && len(m.blockRefs) > 0 && fullySpent) {
 				m.deleteAtHeight = int64(currentHeight) + s.retention()
 			}
 		}

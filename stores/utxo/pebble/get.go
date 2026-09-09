@@ -3,6 +3,8 @@ package pebble
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"slices"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -17,13 +19,7 @@ import (
 )
 
 func containsField(slice []fields.FieldName, item fields.FieldName) bool {
-	for _, v := range slice {
-		if v == item {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(slice, item)
 }
 
 func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
@@ -98,7 +94,7 @@ func (s *Store) recordToMeta(r reader, hash *chainhash.Hash, m *masterRecord, bi
 		CreatedAt:   m.createdAt,
 	}
 
-	if m.unminedSince > 0 {
+	if m.unmined() {
 		data.UnminedSince = uint32(m.unminedSince) //nolint:gosec
 	}
 
@@ -223,16 +219,12 @@ func (s *Store) frozenVouts(r reader, hash []byte) (map[uint32]bool, error) {
 		}
 
 		if o.frozen {
-			vout := binaryBEUint32(iter.Key()[33:])
+			vout := binary.BigEndian.Uint32(iter.Key()[33:])
 			frozen[vout] = true
 		}
 	}
 
 	return frozen, iter.Error()
-}
-
-func binaryBEUint32(b []byte) uint32 {
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
 func (s *Store) spendSlots(r reader, hash *chainhash.Hash, m *masterRecord) ([][]byte, error) {
@@ -463,7 +455,7 @@ func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
 		return err
 	}
 
-	if m.unminedSince > 0 {
+	if m.unmined() {
 		_ = batch.Delete(heightIndexKey(prefixUnminedIdx, m.unminedSince, hash), nil)
 	}
 
@@ -563,6 +555,12 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 		hash := item.Hash
 
 		item.Data, item.Err = s.decorateOne(&hash, bins)
+
+		// Callers treat a nil Data as "not resolved". Leaving a stale or partial
+		// Data behind alongside an error breaks that contract.
+		if item.Err != nil {
+			item.Data = nil
+		}
 	}
 
 	return nil

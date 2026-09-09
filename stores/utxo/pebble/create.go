@@ -86,7 +86,7 @@ func (s *Store) stageCreate(batch *pebble.Batch, built *builtTx) error {
 		return errors.NewStorageError("pebble: failed to stage payload for %s", built.hash, err)
 	}
 
-	if built.master.unminedSince > 0 {
+	if built.master.unmined() {
 		if err := batch.Set(heightIndexKey(prefixUnminedIdx, built.master.unminedSince, built.hash[:]), nil, nil); err != nil {
 			return errors.NewStorageError("pebble: failed to stage unmined index for %s", built.hash, err)
 		}
@@ -236,7 +236,7 @@ func (s *Store) buildTx(tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptio
 	if len(options.MinedBlockInfos) > 0 {
 		m.blockRefs = packBlockRefs(options.MinedBlockInfos)
 	} else {
-		m.unminedSince = int64(blockHeight)
+		m.setUnmined(int64(blockHeight))
 	}
 
 	if !options.Conflicting && len(options.MinedBlockInfos) > 0 && m.totalCount == 0 && s.retention() > 0 {

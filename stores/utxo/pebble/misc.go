@@ -197,6 +197,14 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, value 
 
 		m, err := s.getMaster(&h)
 		if err != nil {
+			// unlockConflictParents passes the union of every winner's parents and
+			// already expects some to be pruned. Failing the whole call means the
+			// step-5 unlock never lands and setLockedWithRetry burns its retries
+			// on the same deterministic error.
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
 			return err
 		}
 
@@ -534,7 +542,7 @@ func (s *Store) countOverridesExcluding(hash []byte, excludeVouts map[uint32]str
 	count := 0
 
 	for iter.First(); iter.Valid(); iter.Next() {
-		if _, skip := excludeVouts[binaryBEUint32(iter.Key()[33:])]; skip {
+		if _, skip := excludeVouts[binary.BigEndian.Uint32(iter.Key()[33:])]; skip {
 			continue
 		}
 
@@ -671,10 +679,26 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 		return 0, errors.NewStorageError("pebble: pruner query failed", err)
 	}
 
-	var victims []chainhash.Hash
+	// Keep the scanned index key, not just the hash. stageDelete removes the key
+	// at the master's *current* deleteAtHeight, so deriving it from the master
+	// orphans the scanned key whenever the DAH moved after the scan — and the
+	// orphan is then rescanned, re-locked and re-counted on every later block.
+	type victim struct {
+		key    []byte
+		height int64
+		hash   chainhash.Hash
+	}
+
+	var victims []victim
 
 	for iter.First(); iter.Valid(); iter.Next() {
-		victims = append(victims, chainhash.Hash(iter.Key()[9:]))
+		key := iter.Key()
+
+		victims = append(victims, victim{
+			key:    append([]byte(nil), key...),
+			height: int64(binary.BigEndian.Uint64(key[1:9])), //nolint:gosec
+			hash:   chainhash.Hash(key[9:]),
+		})
 	}
 
 	if err = iter.Error(); err != nil {
@@ -685,12 +709,12 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 
 	release()
 
-	var deleted int64
+	var deleted, zombies int64
 
 	for i := range victims {
-		h := victims[i]
+		v := victims[i]
 
-		unlock := p.store.lockStripes(h[:])
+		unlock := p.store.lockStripes(v.hash[:])
 
 		// The victim list came from an unlocked index scan, and the whole pass
 		// takes one fsync per victim. Anything that clears delete-at-height in
@@ -698,18 +722,42 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 		// SetLocked(true) — must win, so re-evaluate the condition under the
 		// lock. stageDelete itself stays unconditional, because the public
 		// Delete must still delete on demand.
-		m, err := p.store.getMaster(&h)
-		if err != nil {
-			unlock()
+		m, err := p.store.getMaster(&v.hash)
 
-			if errors.Is(err, errors.ErrTxNotFound) {
-				continue
+		switch {
+		case err != nil && errors.Is(err, errors.ErrTxNotFound):
+			// The record is already gone, so this index key leads nowhere. Reclaim
+			// it and do not count it: counting drove OnPruneComplete's metrics and
+			// backpressure off phantom deletions.
+			if dErr := p.store.deleteDirect(v.key); dErr != nil {
+				unlock()
+
+				return deleted, dErr
 			}
 
-			return deleted, err
-		}
+			zombies++
 
-		if m.deleteAtHeight == 0 || m.deleteAtHeight > int64(height) {
+			unlock()
+
+			continue
+
+		case err != nil:
+			unlock()
+
+			return deleted, err
+
+		case m.deleteAtHeight != v.height:
+			// The master moved on (a DAH extension) or was revived. Either way this
+			// key no longer describes the record, so drop the key and leave the
+			// record alone.
+			if dErr := p.store.deleteDirect(v.key); dErr != nil {
+				unlock()
+
+				return deleted, dErr
+			}
+
+			zombies++
+
 			unlock()
 
 			continue
@@ -717,7 +765,7 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 
 		batch := p.store.db.NewBatch()
 
-		err = p.store.stageDelete(batch, h[:])
+		err = p.store.stageDelete(batch, v.hash[:])
 		if err == nil {
 			err = p.store.commit(batch)
 		}
@@ -733,8 +781,9 @@ func (p *prunerService) Prune(ctx context.Context, height uint32, blockHashStr s
 		deleted++
 	}
 
-	if deleted > 0 {
-		p.store.logger.Infof("[pebble pruner][%s:%d] deleted %d transactions in %s", blockHashStr, height, deleted, time.Since(startTime))
+	if deleted > 0 || zombies > 0 {
+		p.store.logger.Infof("[pebble pruner][%s:%d] deleted %d transactions, reclaimed %d stale index entries in %s",
+			blockHashStr, height, deleted, zombies, time.Since(startTime))
 	}
 
 	p.observersMu.Lock()

@@ -21,10 +21,21 @@ func newTestStore(t testing.TB) *Store {
 	store, err := New(context.Background(), ulogger.TestLogger{}, tSettings, storeURL)
 	require.NoError(t, err)
 
+	// Start at a realistic height. Left at 0 every height-keyed branch in the
+	// store (DAH stamps, unminedSince, spendableIn, CalculateUtxoStatus and the
+	// IMMATURE comparison) is only ever exercised against zero, so a
+	// wrong-direction comparison would pass.
+	require.NoError(t, store.SetBlockState(testStoreHeight, testStoreMedianTime))
+
 	t.Cleanup(func() { _ = store.Close(context.Background()) })
 
 	return store
 }
+
+const (
+	testStoreHeight     = uint32(800_000)
+	testStoreMedianTime = uint32(1_700_000_000)
+)
 
 func TestConformance(t *testing.T) {
 	t.Run("store", func(t *testing.T) { tests.Store(t, newTestStore(t)) })

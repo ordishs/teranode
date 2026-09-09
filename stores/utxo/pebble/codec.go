@@ -26,7 +26,30 @@ const (
 	flagConflicting  = uint16(4)
 	flagLocked       = uint16(8)
 	flagHasOverrides = uint16(16)
+	// flagUnmined records "this transaction is not on the longest chain" as its
+	// own bit. Overloading unminedSince == 0 as the mined sentinel made height 0
+	// unrepresentable, so a transaction created before the first FSM height
+	// notification read back as mined-and-on-longest-chain with no block
+	// reference: invisible to every unmined iterator, and prunable. SQL and
+	// aerospike use a nullable column and can represent 0.
+	flagUnmined = uint16(32)
 )
+
+// unmined reports whether the record is flagged as not on the longest chain.
+func (m *masterRecord) unmined() bool {
+	return m.flags&flagUnmined != 0
+}
+
+// setUnmined marks the record unmined since the given height, or mined.
+func (m *masterRecord) setUnmined(since int64) {
+	m.flags |= flagUnmined
+	m.unminedSince = since
+}
+
+func (m *masterRecord) setMined() {
+	m.flags &^= flagUnmined
+	m.unminedSince = 0
+}
 
 func packSpendingData(sd *spend.SpendingData) []byte {
 	b := make([]byte, slotSpendSize)
