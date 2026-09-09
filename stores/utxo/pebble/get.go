@@ -32,12 +32,19 @@ func (s *Store) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.Field
 		bins = f
 	}
 
-	m, err := s.getMaster(hash)
+	snap, release, err := s.snapshot()
 	if err != nil {
 		return nil, err
 	}
 
-	return s.recordToMeta(hash, m, bins)
+	defer release()
+
+	m, err := getMasterFrom(snap, hash)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.recordToMeta(snap, hash, m, bins)
 }
 
 func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
@@ -53,9 +60,17 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 	return nil
 }
 
-func (s *Store) payloadBlobs(hash *chainhash.Hash) ([]byte, []byte, error) {
-	payload, err := s.getValue(payloadKey(hash[:]))
+func (s *Store) payloadBlobs(r reader, hash *chainhash.Hash) ([]byte, []byte, error) {
+	payload, err := readValue(r, payloadKey(hash[:]))
 	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			// The master and the payload are written and deleted in the same batch,
+			// so an absent payload means the record is gone, not that the store is
+			// broken. The validator's DAH-evicted-parent branch keys off
+			// ErrTxNotFound; a storage error there rejects a valid transaction.
+			return nil, nil, errors.NewTxNotFoundError("pebble: transaction %s not found", hash)
+		}
+
 		return nil, nil, errors.NewStorageError("pebble: failed to read payload for %s", hash, err)
 	}
 
@@ -72,7 +87,7 @@ func (s *Store) payloadBlobs(hash *chainhash.Hash) ([]byte, []byte, error) {
 	return inputsBlob, outputsBlob, nil
 }
 
-func (s *Store) recordToMeta(hash *chainhash.Hash, m *masterRecord, bins []fields.FieldName) (*meta.Data, error) {
+func (s *Store) recordToMeta(r reader, hash *chainhash.Hash, m *masterRecord, bins []fields.FieldName) (*meta.Data, error) {
 	data := &meta.Data{
 		Fee:         m.fee,
 		SizeInBytes: m.sizeInBytes,
@@ -94,7 +109,7 @@ func (s *Store) recordToMeta(hash *chainhash.Hash, m *masterRecord, bins []field
 	needOutputs := containsField(bins, fields.Tx) || containsField(bins, fields.Outputs) || containsField(bins, fields.Utxos)
 
 	if needInputs || needOutputs {
-		inputsBlob, outputsBlob, err := s.payloadBlobs(hash)
+		inputsBlob, outputsBlob, err := s.payloadBlobs(r, hash)
 		if err != nil {
 			return nil, err
 		}
@@ -139,7 +154,7 @@ func (s *Store) recordToMeta(hash *chainhash.Hash, m *masterRecord, bins []field
 	}
 
 	if containsField(bins, fields.ConflictingChildren) {
-		children, err := s.conflictingChildrenOf(hash[:])
+		children, err := s.conflictingChildrenOf(r, hash[:])
 		if err != nil {
 			return nil, err
 		}
@@ -148,7 +163,7 @@ func (s *Store) recordToMeta(hash *chainhash.Hash, m *masterRecord, bins []field
 	}
 
 	if containsField(bins, fields.Utxos) {
-		if err := s.fillSpendingDatas(hash, m, data); err != nil {
+		if err := s.fillSpendingDatas(r, hash, m, data); err != nil {
 			return nil, err
 		}
 	}
@@ -169,15 +184,15 @@ func (s *Store) recordToMeta(hash *chainhash.Hash, m *masterRecord, bins []field
 	return data, nil
 }
 
-func (s *Store) conflictingChildrenOf(hash []byte) ([]chainhash.Hash, error) {
+func (s *Store) conflictingChildrenOf(r reader, hash []byte) ([]chainhash.Hash, error) {
 	lower, upper := prefixBounds(append([]byte{prefixChildren}, hash...))
 
-	iter, release, err := s.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, err := r.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, errors.NewStorageError("pebble: failed to iterate conflicting children", err)
 	}
 
-	defer release()
+	defer func() { _ = iter.Close() }()
 
 	children := make([]chainhash.Hash, 0, 16)
 
@@ -189,15 +204,15 @@ func (s *Store) conflictingChildrenOf(hash []byte) ([]chainhash.Hash, error) {
 	return children, iter.Error()
 }
 
-func (s *Store) frozenVouts(hash []byte) (map[uint32]bool, error) {
+func (s *Store) frozenVouts(r reader, hash []byte) (map[uint32]bool, error) {
 	lower, upper := prefixBounds(append([]byte{prefixOverride}, hash...))
 
-	iter, release, err := s.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, err := r.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, errors.NewStorageError("pebble: failed to iterate overrides", err)
 	}
 
-	defer release()
+	defer func() { _ = iter.Close() }()
 
 	frozen := make(map[uint32]bool)
 
@@ -220,11 +235,11 @@ func binaryBEUint32(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
-func (s *Store) spendSlots(hash *chainhash.Hash, m *masterRecord) ([][]byte, error) {
+func (s *Store) spendSlots(r reader, hash *chainhash.Hash, m *masterRecord) ([][]byte, error) {
 	blobs := [][]byte{m.spends}
 
 	for page := uint32(1); page <= m.pagesTotal; page++ {
-		val, err := s.getValue(pageKey(hash[:], page))
+		val, err := readValue(r, pageKey(hash[:], page))
 		if err != nil {
 			return nil, errors.NewStorageError("pebble: failed to read page %d for %s", page, hash, err)
 		}
@@ -240,8 +255,8 @@ func (s *Store) spendSlots(hash *chainhash.Hash, m *masterRecord) ([][]byte, err
 	return blobs, nil
 }
 
-func (s *Store) fillSpendingDatas(hash *chainhash.Hash, m *masterRecord, data *meta.Data) error {
-	blobs, err := s.spendSlots(hash, m)
+func (s *Store) fillSpendingDatas(r reader, hash *chainhash.Hash, m *masterRecord, data *meta.Data) error {
+	blobs, err := s.spendSlots(r, hash, m)
 	if err != nil {
 		return err
 	}
@@ -249,7 +264,7 @@ func (s *Store) fillSpendingDatas(hash *chainhash.Hash, m *masterRecord, data *m
 	var frozen map[uint32]bool
 
 	if m.flags&flagHasOverrides != 0 {
-		if frozen, err = s.frozenVouts(hash[:]); err != nil {
+		if frozen, err = s.frozenVouts(r, hash[:]); err != nil {
 			return err
 		}
 	}
@@ -284,7 +299,14 @@ func (s *Store) fillSpendingDatas(hash *chainhash.Hash, m *masterRecord, data *m
 }
 
 func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendResponse, error) {
-	m, err := s.getMaster(sp.TxID)
+	snap, release, err := s.snapshot()
+	if err != nil {
+		return nil, err
+	}
+
+	defer release()
+
+	m, err := getMasterFrom(snap, sp.TxID)
 	if err != nil {
 		if errors.Is(err, errors.ErrTxNotFound) {
 			return &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}, nil
@@ -300,7 +322,7 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 		return &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}, nil
 	}
 
-	storedHash, storedSpend, err := s.readSlot(sp.TxID, m, sp.Vout)
+	storedHash, storedSpend, err := s.readSlot(snap, sp.TxID, m, sp.Vout)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +333,7 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 	var spendableIn int64
 
 	if m.flags&flagHasOverrides != 0 {
-		val, oErr := s.getValue(overrideKey(sp.TxID[:], sp.Vout))
+		val, oErr := readValue(snap, overrideKey(sp.TxID[:], sp.Vout))
 		if oErr == nil {
 			o, dErr := decodeOverride(val)
 			if dErr != nil {
@@ -360,7 +382,7 @@ func (s *Store) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendRespon
 	}, nil
 }
 
-func (s *Store) readSlot(hash *chainhash.Hash, m *masterRecord, vout uint32) ([]byte, []byte, error) {
+func (s *Store) readSlot(r reader, hash *chainhash.Hash, m *masterRecord, vout uint32) ([]byte, []byte, error) {
 	page := pageOfVout(vout, s.pageSize)
 	slot := slotOfVout(vout, s.pageSize)
 
@@ -369,7 +391,7 @@ func (s *Store) readSlot(hash *chainhash.Hash, m *masterRecord, vout uint32) ([]
 	if page == 0 {
 		spends = m.spends
 	} else {
-		val, err := s.getValue(pageKey(hash[:], page))
+		val, err := readValue(r, pageKey(hash[:], page))
 		if err != nil {
 			return nil, nil, errors.NewStorageError("pebble: failed to read page %d for %s", page, hash, err)
 		}
@@ -382,7 +404,7 @@ func (s *Store) readSlot(hash *chainhash.Hash, m *masterRecord, vout uint32) ([]
 		spends = rec.spends
 	}
 
-	hashes, err := s.getValue(hashesKey(hash[:], page))
+	hashes, err := readValue(r, hashesKey(hash[:], page))
 	if err != nil {
 		return nil, nil, errors.NewStorageError("pebble: failed to read hashes page %d for %s", page, hash, err)
 	}
@@ -425,7 +447,14 @@ func (s *Store) DeleteComplete(ctx context.Context, hash *chainhash.Hash) error 
 }
 
 func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
-	m, err := s.getMaster((*chainhash.Hash)(hash))
+	snap, release, err := s.snapshot()
+	if err != nil {
+		return err
+	}
+
+	defer release()
+
+	m, err := getMasterFrom(snap, (*chainhash.Hash)(hash))
 	if err != nil {
 		if errors.Is(err, errors.ErrTxNotFound) {
 			return nil
@@ -454,7 +483,7 @@ func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
 	// delete below removes them, so each paired reverse edge goes too. Without
 	// this, deleting a parent leaves K|child|parent behind for as long as the
 	// child outlives it.
-	children, err := s.conflictingChildrenOf(hash)
+	children, err := s.conflictingChildrenOf(snap, hash)
 	if err != nil {
 		return err
 	}
@@ -472,12 +501,12 @@ func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
 
 	lower, upper := prefixBounds(append([]byte{prefixChildrenRev}, hash...))
 
-	iter, release, err := s.newIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, err := snap.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return errors.NewStorageError("pebble: failed to iterate reverse children", err)
 	}
 
-	defer release()
+	defer func() { _ = iter.Close() }()
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		parent := append([]byte(nil), iter.Key()[33:]...)
@@ -490,6 +519,25 @@ func (s *Store) stageDelete(batch *pebble.Batch, hash []byte) error {
 	}
 
 	return nil
+}
+
+// decorateOne reads one record under its own snapshot. BatchDecorate resolves
+// many independent transactions, so consistency is required per record rather
+// than across the batch.
+func (s *Store) decorateOne(hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
+	snap, release, err := s.snapshot()
+	if err != nil {
+		return nil, err
+	}
+
+	defer release()
+
+	m, err := getMasterFrom(snap, hash)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.recordToMeta(snap, hash, m, bins)
 }
 
 func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, f ...fields.FieldName) error {
@@ -514,13 +562,7 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 
 		hash := item.Hash
 
-		m, err := s.getMaster(&hash)
-		if err != nil {
-			item.Err = err
-			continue
-		}
-
-		item.Data, item.Err = s.recordToMeta(&hash, m, bins)
+		item.Data, item.Err = s.decorateOne(&hash, bins)
 	}
 
 	return nil
@@ -561,6 +603,13 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 		parents = append(parents, parent)
 	}
 
+	snap, release, err := s.snapshot()
+	if err != nil {
+		return err
+	}
+
+	defer release()
+
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(8)
 
@@ -574,7 +623,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 				return errors.NewContextCanceledError("pebble: previous outputs decorate canceled", err)
 			}
 
-			_, outputsBlob, err := s.payloadBlobs(&parent)
+			_, outputsBlob, err := s.payloadBlobs(snap, &parent)
 			if err != nil {
 				return errors.NewTxNotFoundError("pebble: previous outputs for %s not found", parent, err)
 			}

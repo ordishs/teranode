@@ -3,6 +3,7 @@ package pebble
 import (
 	"context"
 	"encoding/binary"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -378,14 +379,41 @@ func (s *Store) lockStripes(hashes ...[]byte) func() {
 	}
 }
 
-func (s *Store) getValue(key []byte) ([]byte, error) {
+// reader is the read surface shared by *pebble.DB and *pebble.Snapshot, so a
+// read path can be pointed at either without duplicating it.
+type reader interface {
+	Get(key []byte) ([]byte, io.Closer, error)
+	NewIter(o *pebble.IterOptions) (*pebble.Iterator, error)
+}
+
+// snapshot pins one consistent view for a multi-key read. Every read API
+// assembles a logical record from three to six keys (master, payload, pages,
+// hashes, overrides, conflicting children). Read straight from the database
+// those land at different sequence numbers, so a reader can observe half of an
+// atomically committed Spend batch and report a spend state that never existed,
+// or read a master whose payload a concurrent Delete has already removed.
+//
+// The close guard is held for the snapshot's lifetime, because an open snapshot
+// over a closed database panics exactly as a direct read does.
+func (s *Store) snapshot() (*pebble.Snapshot, func(), error) {
 	if err := s.enter(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	defer s.leave()
+	snap := s.db.NewSnapshot()
 
-	val, closer, err := s.db.Get(key)
+	return snap, func() {
+		_ = snap.Close()
+
+		s.leave()
+	}, nil
+}
+
+// readValue reads one key from r. The caller must already hold the close guard,
+// which is why this does not take it: sync.RWMutex read locks are not safely
+// re-entrant when a writer is waiting.
+func readValue(r reader, key []byte) ([]byte, error) {
+	val, closer, err := r.Get(key)
 	if err != nil {
 		return nil, err
 	}
@@ -396,8 +424,31 @@ func (s *Store) getValue(key []byte) ([]byte, error) {
 	return out, nil
 }
 
+// getValue reads one key from the database under the close guard. A single key
+// is atomic on its own, so callers that need only one key do not need a
+// snapshot.
+func (s *Store) getValue(key []byte) ([]byte, error) {
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+
+	defer s.leave()
+
+	return readValue(s.db, key)
+}
+
 func (s *Store) getMaster(hash *chainhash.Hash) (*masterRecord, error) {
-	val, err := s.getValue(masterKey(hash[:]))
+	if err := s.enter(); err != nil {
+		return nil, err
+	}
+
+	defer s.leave()
+
+	return getMasterFrom(s.db, hash)
+}
+
+func getMasterFrom(r reader, hash *chainhash.Hash) (*masterRecord, error) {
+	val, err := readValue(r, masterKey(hash[:]))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return nil, errors.NewTxNotFoundError("pebble: transaction %s not found", hash)
