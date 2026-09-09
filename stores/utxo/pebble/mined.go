@@ -169,13 +169,21 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 
 	_, upper := prefixBounds([]byte{it.prefix})
 
-	iter, release, err := it.store.newIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
+	snap, release, err := it.store.snapshot()
+	if err != nil {
+		it.err = err
+		return nil, it.err
+	}
+
+	defer release()
+
+	iter, err := snap.NewIter(&pebbledb.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		it.err = errors.NewStorageError("pebble: iterator open failed", err)
 		return nil, it.err
 	}
 
-	defer release()
+	defer func() { _ = iter.Close() }()
 
 	batch := make([]*utxo.UnminedTransaction, 0, 1000)
 
@@ -198,7 +206,7 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 
 		hash := chainhash.Hash(hashBytes)
 
-		m, err := it.store.getMaster(&hash)
+		m, err := getMasterFrom(snap, &hash)
 		if err != nil {
 			it.err = err
 			return nil, it.err
@@ -213,7 +221,7 @@ func (it *heightIndexIterator) Next(ctx context.Context) ([]*utxo.UnminedTransac
 			continue
 		}
 
-		u, err := it.store.recordToUnmined(&hash, m)
+		u, err := it.store.recordToUnmined(snap, &hash, m)
 		if err != nil {
 			it.err = err
 			return nil, it.err
@@ -240,8 +248,8 @@ func binaryBEUint64(b []byte) uint64 {
 		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
 }
 
-func (s *Store) recordToUnmined(hash *chainhash.Hash, m *masterRecord) (*utxo.UnminedTransaction, error) {
-	inputsBlob, _, err := s.payloadBlobs(hash)
+func (s *Store) recordToUnmined(r reader, hash *chainhash.Hash, m *masterRecord) (*utxo.UnminedTransaction, error) {
+	inputsBlob, _, err := s.payloadBlobs(r, hash)
 	if err != nil {
 		return nil, err
 	}
