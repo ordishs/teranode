@@ -10,31 +10,27 @@
       
       
       
-        <link rel="canonical" href="https://bsv-blockchain.github.io/teranode/references/settings/services/blockvalidation_settings/">
+        <link rel="canonical" href="https://bsv-blockchain.github.io/teranode/topics/commands/recoverReplayedTransactions/">
       
       
-        <link rel="prev" href="../blockpersister_settings/">
-      
-      
-        <link rel="next" href="../legacy_settings/">
       
       
         
       
       
-      <link rel="icon" href="../../../../assets/favicon.png">
+      <link rel="icon" href="../../../assets/favicon.png">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>Block Validation - Teranode</title>
+        <title>Recover replayed confirmed transactions - Teranode</title>
       
     
     
-      <link rel="stylesheet" href="../../../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
       
         
-        <link rel="stylesheet" href="../../../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../../assets/stylesheets/palette.ab4e12ef.min.css">
       
       
 
@@ -48,14 +44,14 @@
         
         
         
-        <link rel="stylesheet" href="../../../../assets/external/fonts.googleapis.com/css.56f7ac64.css">
+        <link rel="stylesheet" href="../../../assets/external/fonts.googleapis.com/css.56f7ac64.css">
         <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
       
     
     
-      <link rel="stylesheet" href="../../../../overrides/custom.css?v=8cf07571">
+      <link rel="stylesheet" href="../../../overrides/custom.css?v=8cf07571">
     
-    <script>__md_scope=new URL("../../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -80,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#block-validation-service-settings" class="md-skip">
+        <a href="#recover-replayed-confirmed-transactions" class="md-skip">
           Skip to content
         </a>
       
@@ -96,9 +92,9 @@
 
 <header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href="../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../../assets/bsv-logo.png" alt="logo">
+  <img src="../../../assets/bsv-logo.png" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -115,7 +111,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Block Validation
+              Recover replayed confirmed transactions
             
           </span>
         </div>
@@ -227,7 +223,7 @@
   
   
     <li class="md-tabs__item">
-      <a href="../../../.." class="md-tabs__link">
+      <a href="../../.." class="md-tabs__link">
         
   
   
@@ -255,7 +251,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../../howto/developerSetup/" class="md-tabs__link">
+        <a href="../../../howto/developerSetup/" class="md-tabs__link">
           
   
   
@@ -280,7 +276,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../../topics/teranodeIntro/" class="md-tabs__link">
+        <a href="../../teranodeIntro/" class="md-tabs__link">
           
   
   
@@ -298,13 +294,11 @@
   
   
   
-    
-  
   
     
     
-      <li class="md-tabs__item md-tabs__item--active">
-        <a href="../../../projectStructure/" class="md-tabs__link">
+      <li class="md-tabs__item">
+        <a href="../../../references/projectStructure/" class="md-tabs__link">
           
   
   
@@ -346,9 +340,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href="../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../../assets/bsv-logo.png" alt="logo">
+  <img src="../../../assets/bsv-logo.png" alt="logo">
 
     </a>
     Teranode
@@ -375,7 +369,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../.." class="md-nav__link">
+      <a href="../../.." class="md-nav__link">
         
   
   
@@ -540,7 +534,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/developerSetup/" class="md-nav__link">
+      <a href="../../../howto/developerSetup/" class="md-nav__link">
         
   
   
@@ -568,7 +562,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/forkAndPullRequestGuidelines/" class="md-nav__link">
+      <a href="../../../howto/forkAndPullRequestGuidelines/" class="md-nav__link">
         
   
   
@@ -596,7 +590,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/locallyRunningServices/" class="md-nav__link">
+      <a href="../../../howto/locallyRunningServices/" class="md-nav__link">
         
   
   
@@ -624,7 +618,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+      <a href="../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
         
   
   
@@ -660,7 +654,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/generatingProtobuf/" class="md-nav__link">
+      <a href="../../../howto/generatingProtobuf/" class="md-nav__link">
         
   
   
@@ -688,7 +682,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/addingNewProtobufServices/" class="md-nav__link">
+      <a href="../../../howto/addingNewProtobufServices/" class="md-nav__link">
         
   
   
@@ -716,7 +710,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/configuringGrpcLogging/" class="md-nav__link">
+      <a href="../../../howto/configuringGrpcLogging/" class="md-nav__link">
         
   
   
@@ -744,7 +738,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/runningTests/" class="md-nav__link">
+      <a href="../../../howto/runningTests/" class="md-nav__link">
         
   
   
@@ -772,7 +766,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/automatedTestingHowTo/" class="md-nav__link">
+      <a href="../../../howto/automatedTestingHowTo/" class="md-nav__link">
         
   
   
@@ -800,7 +794,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/chain-integrity-testing/" class="md-nav__link">
+      <a href="../../../howto/chain-integrity-testing/" class="md-nav__link">
         
   
   
@@ -828,7 +822,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/makefile/" class="md-nav__link">
+      <a href="../../../howto/makefile/" class="md-nav__link">
         
   
   
@@ -856,7 +850,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/bugReporting/" class="md-nav__link">
+      <a href="../../../howto/bugReporting/" class="md-nav__link">
         
   
   
@@ -884,7 +878,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
         
   
   
@@ -1044,7 +1038,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
         
   
   
@@ -1072,7 +1066,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
         
   
   
@@ -1176,7 +1170,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
         
   
   
@@ -1204,7 +1198,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
         
   
   
@@ -1232,7 +1226,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersHowToExposeP2P/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersHowToExposeP2P/" class="md-nav__link">
         
   
   
@@ -1260,7 +1254,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
         
   
   
@@ -1288,7 +1282,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
         
   
   
@@ -1316,7 +1310,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
         
   
   
@@ -1344,7 +1338,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
         
   
   
@@ -1438,7 +1432,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
         
   
   
@@ -1466,7 +1460,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
         
   
   
@@ -1560,7 +1554,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
         
   
   
@@ -1588,7 +1582,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
         
   
   
@@ -1682,7 +1676,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
         
   
   
@@ -1710,7 +1704,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
         
   
   
@@ -1804,7 +1798,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
         
   
   
@@ -1832,7 +1826,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
         
   
   
@@ -1926,7 +1920,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersHowToResetTeranode/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersHowToResetTeranode/" class="md-nav__link">
         
   
   
@@ -1954,7 +1948,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersHowToResetTeranode/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersHowToResetTeranode/" class="md-nav__link">
         
   
   
@@ -2048,7 +2042,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/docker/minersHowToSyncTheNode/" class="md-nav__link">
+      <a href="../../../howto/miners/docker/minersHowToSyncTheNode/" class="md-nav__link">
         
   
   
@@ -2076,7 +2070,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/kubernetes/minersHowToSyncTheNode/" class="md-nav__link">
+      <a href="../../../howto/miners/kubernetes/minersHowToSyncTheNode/" class="md-nav__link">
         
   
   
@@ -2112,7 +2106,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
         
   
   
@@ -2204,7 +2198,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToBackup/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToBackup/" class="md-nav__link">
         
   
   
@@ -2232,7 +2226,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
         
   
   
@@ -2260,7 +2254,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
         
   
   
@@ -2288,7 +2282,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+      <a href="../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
         
   
   
@@ -2316,7 +2310,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../howto/miners/minersHowToUseListenMode/" class="md-nav__link">
+      <a href="../../../howto/miners/minersHowToUseListenMode/" class="md-nav__link">
         
   
   
@@ -2461,7 +2455,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/teranodeIntro/" class="md-nav__link">
+      <a href="../../teranodeIntro/" class="md-nav__link">
         
   
   
@@ -2489,7 +2483,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/architecture/teranode-overall-system-design/" class="md-nav__link">
+      <a href="../../architecture/teranode-overall-system-design/" class="md-nav__link">
         
   
   
@@ -2517,7 +2511,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/architecture/teranode-architecture-brief/" class="md-nav__link">
+      <a href="../../architecture/teranode-architecture-brief/" class="md-nav__link">
         
   
   
@@ -2545,7 +2539,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/architecture/teranode-microservices-overview/" class="md-nav__link">
+      <a href="../../architecture/teranode-microservices-overview/" class="md-nav__link">
         
   
   
@@ -2573,7 +2567,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/transactionLifecycle/" class="md-nav__link">
+      <a href="../../transactionLifecycle/" class="md-nav__link">
         
   
   
@@ -2601,7 +2595,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/architecture/stateManagement/" class="md-nav__link">
+      <a href="../../architecture/stateManagement/" class="md-nav__link">
         
   
   
@@ -2629,7 +2623,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../state-machine.diagram/" class="md-nav__link">
+      <a href="../../../state-machine.diagram/" class="md-nav__link">
         
   
   
@@ -2657,7 +2651,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/architecture/understandingDoubleSpends/" class="md-nav__link">
+      <a href="../../architecture/understandingDoubleSpends/" class="md-nav__link">
         
   
   
@@ -2685,7 +2679,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/technologyStack/" class="md-nav__link">
+      <a href="../../technologyStack/" class="md-nav__link">
         
   
   
@@ -2713,7 +2707,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/understandingTheTestingFramework/" class="md-nav__link">
+      <a href="../../understandingTheTestingFramework/" class="md-nav__link">
         
   
   
@@ -2741,7 +2735,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/functionalRequirementTests/" class="md-nav__link">
+      <a href="../../functionalRequirementTests/" class="md-nav__link">
         
   
   
@@ -2829,7 +2823,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/features/two_phase_commit/" class="md-nav__link">
+      <a href="../../features/two_phase_commit/" class="md-nav__link">
         
   
   
@@ -2857,7 +2851,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/features/peer_registry_reputation/" class="md-nav__link">
+      <a href="../../features/peer_registry_reputation/" class="md-nav__link">
         
   
   
@@ -2885,7 +2879,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/features/utxo_lock_records/" class="md-nav__link">
+      <a href="../../features/utxo_lock_records/" class="md-nav__link">
         
   
   
@@ -2921,7 +2915,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/dashboard/" class="md-nav__link">
+      <a href="../../dashboard/" class="md-nav__link">
         
   
   
@@ -2949,7 +2943,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/tui_tools/" class="md-nav__link">
+      <a href="../../tui_tools/" class="md-nav__link">
         
   
   
@@ -3047,7 +3041,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/alert/" class="md-nav__link">
+      <a href="../../services/alert/" class="md-nav__link">
         
   
   
@@ -3075,7 +3069,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/assetServer/" class="md-nav__link">
+      <a href="../../services/assetServer/" class="md-nav__link">
         
   
   
@@ -3103,7 +3097,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/blockAssembly/" class="md-nav__link">
+      <a href="../../services/blockAssembly/" class="md-nav__link">
         
   
   
@@ -3131,7 +3125,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/blockValidation/" class="md-nav__link">
+      <a href="../../services/blockValidation/" class="md-nav__link">
         
   
   
@@ -3159,7 +3153,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/blockchain/" class="md-nav__link">
+      <a href="../../services/blockchain/" class="md-nav__link">
         
   
   
@@ -3187,7 +3181,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/propagation/" class="md-nav__link">
+      <a href="../../services/propagation/" class="md-nav__link">
         
   
   
@@ -3215,7 +3209,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/subtreeValidation/" class="md-nav__link">
+      <a href="../../services/subtreeValidation/" class="md-nav__link">
         
   
   
@@ -3243,7 +3237,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/validator/" class="md-nav__link">
+      <a href="../../services/validator/" class="md-nav__link">
         
   
   
@@ -3347,7 +3341,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/blockPersister/" class="md-nav__link">
+      <a href="../../services/blockPersister/" class="md-nav__link">
         
   
   
@@ -3375,7 +3369,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/p2p/" class="md-nav__link">
+      <a href="../../services/p2p/" class="md-nav__link">
         
   
   
@@ -3403,7 +3397,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../P2P_NAT_TRAVERSAL/" class="md-nav__link">
+      <a href="../../../P2P_NAT_TRAVERSAL/" class="md-nav__link">
         
   
   
@@ -3431,7 +3425,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/pruner/" class="md-nav__link">
+      <a href="../../services/pruner/" class="md-nav__link">
         
   
   
@@ -3459,7 +3453,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/legacy/" class="md-nav__link">
+      <a href="../../services/legacy/" class="md-nav__link">
         
   
   
@@ -3487,7 +3481,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/rpc/" class="md-nav__link">
+      <a href="../../services/rpc/" class="md-nav__link">
         
   
   
@@ -3515,7 +3509,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/services/utxoPersister/" class="md-nav__link">
+      <a href="../../services/utxoPersister/" class="md-nav__link">
         
   
   
@@ -3609,7 +3603,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/stores/blob/" class="md-nav__link">
+      <a href="../../stores/blob/" class="md-nav__link">
         
   
   
@@ -3637,7 +3631,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/stores/utxo/" class="md-nav__link">
+      <a href="../../stores/utxo/" class="md-nav__link">
         
   
   
@@ -3737,7 +3731,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/datamodel/block_data_model/" class="md-nav__link">
+      <a href="../../datamodel/block_data_model/" class="md-nav__link">
         
   
   
@@ -3765,7 +3759,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/datamodel/block_header_data_model/" class="md-nav__link">
+      <a href="../../datamodel/block_header_data_model/" class="md-nav__link">
         
   
   
@@ -3793,7 +3787,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/datamodel/subtree_data_model/" class="md-nav__link">
+      <a href="../../datamodel/subtree_data_model/" class="md-nav__link">
         
   
   
@@ -3821,7 +3815,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/datamodel/transaction_data_model/" class="md-nav__link">
+      <a href="../../datamodel/transaction_data_model/" class="md-nav__link">
         
   
   
@@ -3849,7 +3843,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/datamodel/utxo_data_model/" class="md-nav__link">
+      <a href="../../datamodel/utxo_data_model/" class="md-nav__link">
         
   
   
@@ -3941,7 +3935,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/kafka/kafka/" class="md-nav__link">
+      <a href="../../kafka/kafka/" class="md-nav__link">
         
   
   
@@ -4033,7 +4027,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../topics/commands/seeder/" class="md-nav__link">
+      <a href="../seeder/" class="md-nav__link">
         
   
   
@@ -4073,10 +4067,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -4098,22 +4090,19 @@
     
     
       
-        
-        
-      
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
         
           
-          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
             
   
   
@@ -4131,7 +4120,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -4149,7 +4138,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../projectStructure/" class="md-nav__link">
+      <a href="../../../references/projectStructure/" class="md-nav__link">
         
   
   
@@ -4197,20 +4186,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2" >
         
           
-          <label class="md-nav__link" for="__nav_4_2" id="__nav_4_2_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_2" id="__nav_4_2_label" tabindex="0">
             
   
   
@@ -4246,7 +4232,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../errorHandling/" class="md-nav__link">
+      <a href="../../../references/errorHandling/" class="md-nav__link">
         
   
   
@@ -4274,7 +4260,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../glossary/" class="md-nav__link">
+      <a href="../../../references/glossary/" class="md-nav__link">
         
   
   
@@ -4302,7 +4288,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../codingConventions/" class="md-nav__link">
+      <a href="../../../references/codingConventions/" class="md-nav__link">
         
   
   
@@ -4330,7 +4316,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../kafkaMessageFormat/" class="md-nav__link">
+      <a href="../../../references/kafkaMessageFormat/" class="md-nav__link">
         
   
   
@@ -4358,7 +4344,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../networkConsensusRules/" class="md-nav__link">
+      <a href="../../../references/networkConsensusRules/" class="md-nav__link">
         
   
   
@@ -4462,7 +4448,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/alertProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/alertProto/" class="md-nav__link">
         
   
   
@@ -4490,7 +4476,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/assetProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/assetProto/" class="md-nav__link">
         
   
   
@@ -4518,7 +4504,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/blockassemblyProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
         
   
   
@@ -4546,7 +4532,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/blockchainProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
         
   
   
@@ -4574,7 +4560,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/blockvalidationProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
         
   
   
@@ -4602,7 +4588,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/legacyPeerProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/legacyPeerProto/" class="md-nav__link">
         
   
   
@@ -4630,7 +4616,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/p2pProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/p2pProto/" class="md-nav__link">
         
   
   
@@ -4658,7 +4644,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/propagationProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
         
   
   
@@ -4686,7 +4672,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/prunerProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/prunerProto/" class="md-nav__link">
         
   
   
@@ -4714,7 +4700,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
         
   
   
@@ -4742,7 +4728,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../protobuf_docs/validatorProto/" class="md-nav__link">
+      <a href="../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
         
   
   
@@ -4810,20 +4796,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_3" >
         
           
-          <label class="md-nav__link" for="__nav_4_3" id="__nav_4_3_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_3" id="__nav_4_3_label" tabindex="0">
             
   
   
@@ -4859,7 +4842,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/alert_reference/" class="md-nav__link">
+      <a href="../../../references/services/alert_reference/" class="md-nav__link">
         
   
   
@@ -4887,7 +4870,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/asset_reference/" class="md-nav__link">
+      <a href="../../../references/services/asset_reference/" class="md-nav__link">
         
   
   
@@ -4915,7 +4898,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/blockassembly_reference/" class="md-nav__link">
+      <a href="../../../references/services/blockassembly_reference/" class="md-nav__link">
         
   
   
@@ -4943,7 +4926,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/blockvalidation_reference/" class="md-nav__link">
+      <a href="../../../references/services/blockvalidation_reference/" class="md-nav__link">
         
   
   
@@ -4971,7 +4954,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/blockchain_reference/" class="md-nav__link">
+      <a href="../../../references/services/blockchain_reference/" class="md-nav__link">
         
   
   
@@ -4999,7 +4982,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/propagation_reference/" class="md-nav__link">
+      <a href="../../../references/services/propagation_reference/" class="md-nav__link">
         
   
   
@@ -5027,7 +5010,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/subtreevalidation_reference/" class="md-nav__link">
+      <a href="../../../references/services/subtreevalidation_reference/" class="md-nav__link">
         
   
   
@@ -5055,7 +5038,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/validator_reference/" class="md-nav__link">
+      <a href="../../../references/services/validator_reference/" class="md-nav__link">
         
   
   
@@ -5111,20 +5094,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_4" >
         
           
-          <label class="md-nav__link" for="__nav_4_4" id="__nav_4_4_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_4" id="__nav_4_4_label" tabindex="0">
             
   
   
@@ -5160,7 +5140,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/blockpersister_reference/" class="md-nav__link">
+      <a href="../../../references/services/blockpersister_reference/" class="md-nav__link">
         
   
   
@@ -5188,7 +5168,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/p2p_reference/" class="md-nav__link">
+      <a href="../../../references/services/p2p_reference/" class="md-nav__link">
         
   
   
@@ -5216,7 +5196,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/legacy_reference/" class="md-nav__link">
+      <a href="../../../references/services/legacy_reference/" class="md-nav__link">
         
   
   
@@ -5244,7 +5224,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/pruner_reference/" class="md-nav__link">
+      <a href="../../../references/services/pruner_reference/" class="md-nav__link">
         
   
   
@@ -5272,7 +5252,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/rpc_reference/" class="md-nav__link">
+      <a href="../../../references/services/rpc_reference/" class="md-nav__link">
         
   
   
@@ -5300,7 +5280,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../services/utxopersister_reference/" class="md-nav__link">
+      <a href="../../../references/services/utxopersister_reference/" class="md-nav__link">
         
   
   
@@ -5348,20 +5328,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_5" >
         
           
-          <label class="md-nav__link" for="__nav_4_5" id="__nav_4_5_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_5" id="__nav_4_5_label" tabindex="0">
             
   
   
@@ -5397,7 +5374,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../stores/blob_reference/" class="md-nav__link">
+      <a href="../../../references/stores/blob_reference/" class="md-nav__link">
         
   
   
@@ -5425,7 +5402,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../stores/utxo_reference/" class="md-nav__link">
+      <a href="../../../references/stores/utxo_reference/" class="md-nav__link">
         
   
   
@@ -5458,10 +5435,8 @@
                 
   
   
-    
   
   
-  
     
     
       
@@ -5484,21 +5459,18 @@
     
       
       
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
         
           
-          
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" checked>
-        
-          
-          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
             
   
   
@@ -5516,7 +5488,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4_6">
             <span class="md-nav__icon md-icon"></span>
             
@@ -5534,7 +5506,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../" class="md-nav__link">
+      <a href="../../../references/settings/" class="md-nav__link">
         
   
   
@@ -5562,7 +5534,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../settings_reference/" class="md-nav__link">
+      <a href="../../../references/settings_reference/" class="md-nav__link">
         
   
   
@@ -5590,7 +5562,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../global_settings/" class="md-nav__link">
+      <a href="../../../references/settings/global_settings/" class="md-nav__link">
         
   
   
@@ -5618,7 +5590,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../policy_settings/" class="md-nav__link">
+      <a href="../../../references/settings/policy_settings/" class="md-nav__link">
         
   
   
@@ -5646,7 +5618,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../kafka_settings/" class="md-nav__link">
+      <a href="../../../references/settings/kafka_settings/" class="md-nav__link">
         
   
   
@@ -5671,10 +5643,8 @@
                 
   
   
-    
   
   
-  
     
     
       
@@ -5715,11 +5685,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6_6" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6_6" >
         
           
           <label class="md-nav__link" for="__nav_4_6_6" id="__nav_4_6_6_label" tabindex="0">
@@ -5740,7 +5710,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_6_6_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_6_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4_6_6">
             <span class="md-nav__icon md-icon"></span>
             
@@ -5758,7 +5728,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../alert_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/alert_settings/" class="md-nav__link">
         
   
   
@@ -5786,7 +5756,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../asset_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/asset_settings/" class="md-nav__link">
         
   
   
@@ -5814,7 +5784,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../blockassembly_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/blockassembly_settings/" class="md-nav__link">
         
   
   
@@ -5842,7 +5812,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../blockchain_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/blockchain_settings/" class="md-nav__link">
         
   
   
@@ -5870,7 +5840,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../blockpersister_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/blockpersister_settings/" class="md-nav__link">
         
   
   
@@ -5895,37 +5865,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Block Validation
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../../references/settings/services/blockvalidation_settings/" class="md-nav__link">
         
   
   
@@ -5941,236 +5884,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#configuration-settings" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Configuration Settings
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#configuration-dependencies" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Configuration Dependencies
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Configuration Dependencies">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#service-startup" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Service Startup
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#catchup-mode" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Catchup Mode
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#optimistic-mining" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Optimistic Mining
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#corrupt-body-re-download-cap" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Corrupt-body re-download cap
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#quick-validation-pipeline" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Quick Validation Pipeline
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#transaction-metadata-processing" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Transaction Metadata Processing
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#secret-mining-detection" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Secret Mining Detection
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#two-phase-double-spend-detection" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Two-Phase Double-Spend Detection
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#channel-buffer-management" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Channel Buffer Management
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#service-dependencies" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Service Dependencies
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#validation-rules" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Validation Rules
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#configuration-examples" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Configuration Examples
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Configuration Examples">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#basic-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Basic Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#high-performance-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        High Performance Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#catchup-mode-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Catchup Mode Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#pipeline-processing-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Pipeline Processing Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -6183,7 +5896,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../legacy_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/legacy_settings/" class="md-nav__link">
         
   
   
@@ -6211,7 +5924,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../p2p_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/p2p_settings/" class="md-nav__link">
         
   
   
@@ -6239,7 +5952,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../propagation_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/propagation_settings/" class="md-nav__link">
         
   
   
@@ -6267,7 +5980,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../pruner_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/pruner_settings/" class="md-nav__link">
         
   
   
@@ -6295,7 +6008,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../rpc_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/rpc_settings/" class="md-nav__link">
         
   
   
@@ -6323,7 +6036,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../subtreevalidation_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/subtreevalidation_settings/" class="md-nav__link">
         
   
   
@@ -6351,7 +6064,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../utxopersister_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/utxopersister_settings/" class="md-nav__link">
         
   
   
@@ -6379,7 +6092,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../validator_settings/" class="md-nav__link">
+      <a href="../../../references/settings/services/validator_settings/" class="md-nav__link">
         
   
   
@@ -6475,7 +6188,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../stores/aerospike_settings/" class="md-nav__link">
+      <a href="../../../references/settings/stores/aerospike_settings/" class="md-nav__link">
         
   
   
@@ -6503,7 +6216,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../stores/blob_settings/" class="md-nav__link">
+      <a href="../../../references/settings/stores/blob_settings/" class="md-nav__link">
         
   
   
@@ -6531,7 +6244,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../stores/utxo_settings/" class="md-nav__link">
+      <a href="../../../references/settings/stores/utxo_settings/" class="md-nav__link">
         
   
   
@@ -6597,20 +6310,17 @@
       
       
         
-          
-          
-        
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_7" id="__nav_4_7_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_7" id="__nav_4_7_label" tabindex="0">
             
   
   
@@ -6646,7 +6356,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../../misc/BIP-239/" class="md-nav__link">
+      <a href="../../../misc/BIP-239/" class="md-nav__link">
         
   
   
@@ -6674,7 +6384,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../gitCommitSigningSetupGuide/" class="md-nav__link">
+      <a href="../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
         
   
   
@@ -6702,7 +6412,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../licenseInformation/" class="md-nav__link">
+      <a href="../../../references/licenseInformation/" class="md-nav__link">
         
   
   
@@ -6730,7 +6440,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../prometheusMetrics/" class="md-nav__link">
+      <a href="../../../references/prometheusMetrics/" class="md-nav__link">
         
   
   
@@ -6758,7 +6468,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../teranodeDaemonReference/" class="md-nav__link">
+      <a href="../../../references/teranodeDaemonReference/" class="md-nav__link">
         
   
   
@@ -6786,7 +6496,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../testingTechnicalReference/" class="md-nav__link">
+      <a href="../../../references/testingTechnicalReference/" class="md-nav__link">
         
   
   
@@ -6814,7 +6524,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../thirdPartySoftwareRequirements/" class="md-nav__link">
+      <a href="../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
         
   
   
@@ -6877,10 +6587,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#configuration-settings" class="md-nav__link">
+  <a href="#operator-preconditions" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Configuration Settings
+        Operator preconditions
       
     </span>
   </a>
@@ -6888,126 +6598,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#configuration-dependencies" class="md-nav__link">
+  <a href="#invocation" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Configuration Dependencies
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Configuration Dependencies">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#service-startup" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Service Startup
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#catchup-mode" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Catchup Mode
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#optimistic-mining" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Optimistic Mining
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#corrupt-body-re-download-cap" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Corrupt-body re-download cap
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#quick-validation-pipeline" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Quick Validation Pipeline
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#transaction-metadata-processing" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Transaction Metadata Processing
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#secret-mining-detection" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Secret Mining Detection
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#two-phase-double-spend-detection" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Two-Phase Double-Spend Detection
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#channel-buffer-management" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Channel Buffer Management
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#service-dependencies" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Service Dependencies
+        Invocation
       
     </span>
   </a>
@@ -7015,10 +6609,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#validation-rules" class="md-nav__link">
+  <a href="#evidence-and-repair-scope" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Validation Rules
+        Evidence and repair scope
       
     </span>
   </a>
@@ -7026,63 +6620,13 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#configuration-examples" class="md-nav__link">
+  <a href="#interrupted-work-and-results" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Configuration Examples
+        Interrupted work and results
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Configuration Examples">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#basic-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Basic Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#high-performance-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        High Performance Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#catchup-mode-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Catchup Mode Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#pipeline-processing-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Pipeline Processing Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -7104,82 +6648,6 @@
   
 
 
-  <nav class="md-path" aria-label="Navigation" >
-    <ol class="md-path__list">
-      
-        
-  
-  
-    <li class="md-path__item">
-      <a href="../../../.." class="md-path__link">
-        
-  <span class="md-ellipsis">
-    Home
-  </span>
-
-      </a>
-    </li>
-  
-
-      
-      
-        
-  
-  
-    
-    
-      <li class="md-path__item">
-        <a href="../../../projectStructure/" class="md-path__link">
-          
-  <span class="md-ellipsis">
-    Reference
-  </span>
-
-        </a>
-      </li>
-    
-  
-
-      
-        
-  
-  
-    
-    
-      <li class="md-path__item">
-        <a href="../../" class="md-path__link">
-          
-  <span class="md-ellipsis">
-    Configuration
-  </span>
-
-        </a>
-      </li>
-    
-  
-
-      
-        
-  
-  
-    
-    
-      <li class="md-path__item">
-        <a href="../alert_settings/" class="md-path__link">
-          
-  <span class="md-ellipsis">
-    Service Settings
-  </span>
-
-        </a>
-      </li>
-    
-  
-
-      
-    </ol>
-  </nav>
-
               
               <article class="md-content__inner md-typeset">
                 
@@ -7190,673 +6658,181 @@
   
 
 
-<h1 id="block-validation-service-settings">Block Validation Service Settings<a class="headerlink" href="#block-validation-service-settings" title="Permanent link">&para;</a></h1>
-<p><strong>Related Topic</strong>: <a href="../../../../topics/services/blockValidation/">Block Validation Service</a></p>
-<h2 id="configuration-settings">Configuration Settings<a class="headerlink" href="#configuration-settings" title="Permanent link">&para;</a></h2>
+<h1 id="recover-replayed-confirmed-transactions">Recover replayed confirmed transactions<a class="headerlink" href="#recover-replayed-confirmed-transactions" title="Permanent link">&para;</a></h1>
+<p><code>teranode-cli recoverreplayedtransactions</code> audits the persisted Aerospike store
+for confirmed transactions recreated after pruning, and missing replay markers
+on surviving parents. One job inventories the store, authenticates local chain
+evidence, applies proven repairs when requested, and verifies persisted results.
+Audit is the default. It never purges all unmined transactions.</p>
+<p><code>resetblockassembly</code> rebuilds assembly from persisted state. It can reload these
+recreated records; clearing assembly alone does not repair the store.</p>
+<h2 id="operator-preconditions">Operator preconditions<a class="headerlink" href="#operator-preconditions" title="Permanent link">&para;</a></h2>
+<ol>
+<li>Put the node in <strong>IDLE</strong>. Stop/drain every writer sharing the UTXO, blockchain
+   and archive stores, or restart services into an inactive configuration.
+   Include propagation/validator, block/subtree validation, assembly and retries,
+   block persister, pruner/blob deletion, legacy ingestion, other replicas and
+   DAH/background cleanup. Disable automatic restart/resume during recovery.
+   Restarting services alone does not prove that writes have stopped.</li>
+<li>Keep the existing blockchain metadata service reachable in IDLE, plus SQL,
+   Aerospike and retained archives. Prevent external chain/FSM changes. The job
+   uses existing blockchain read RPCs and a direct Aerospike client; it does not
+   start normal UTXO cleaners or construct a blockchain store that runs migrations.</li>
+<li>Preserve backups and incident evidence. Use a private directory on durable
+   storage, owned by the operator, mode <code>0700</code>. Allow enough disk for the complete
+   store census, targeted chain evidence and mutation before-images. Files are
+   private <code>0600</code> files. Keep them out of automatic cleanup paths.</li>
+<li>Run only one recovery job against the store, including across hosts. The work
+   directory lock prevents concurrent use of that directory; it is not a
+   distributed store lease.</li>
+</ol>
+<p>The CLI reads persisted <code>fsm_state</code> through the existing blockchain API and
+accepts only <code>IDLE</code>. Missing state or a failed read stops the job. It checks state
+and the pinned tip throughout scans, before mutations and during verification;
+a watchdog also cancels work if these checks fail. There is no force override
+and no automatic transition to IDLE or RUNNING.</p>
+<p><strong>These checks detect changes; they are not an atomic write lock.</strong> Operators
+must isolate writers. IDLE alone does not stop all already-running background
+workers: for example, the pruner's startup gate and catchup pause do not form a
+maintenance barrier. <code>--maintenance</code> acknowledges the isolation procedure.</p>
+<h2 id="invocation">Invocation<a class="headerlink" href="#invocation" title="Permanent link">&para;</a></h2>
+<p>Use the node's normal settings context, Aerospike namespace/set, output batch
+size, external transaction store and subtree archive configuration.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Read-only audit; no UTXO writes.</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>teranode-cli<span class="w"> </span>recoverreplayedtransactions<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>--work-dir<span class="w"> </span>/var/lib/teranode/recovery-audit
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="c1"># Fresh apply: inventory, evidence, repair and store verification in one job.</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>teranode-cli<span class="w"> </span>recoverreplayedtransactions<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">  </span>--work-dir<span class="w"> </span>/var/lib/teranode/recovery-apply<span class="w"> </span>--apply<span class="w"> </span>--maintenance
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="c1"># Explicitly resume that interrupted apply, while writers remain stopped.</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>teranode-cli<span class="w"> </span>recoverreplayedtransactions<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">  </span>--work-dir<span class="w"> </span>/var/lib/teranode/recovery-apply<span class="w"> </span>--apply<span class="w"> </span>--maintenance<span class="w"> </span>--resume
+</span></code></pre></div>
+<p>These are alternatives, not three mandatory stages. A fresh apply includes its
+own complete audit. A new run requires an empty work directory; an audit's
+artifacts cannot be silently repurposed as an apply. Resume requires the same
+store identity, configuration (including the reorg retention policy), compatible
+artifact version and pinned tip. Artifacts from older versions without the
+retention policy are not accepted by this version; never edit a journal or its
+version fields to bypass that refusal.</p>
+<p>The default timeout is 30 minutes; use <code>--timeout</code> for a longer maintenance
+window. <code>--concurrency</code> limits Aerospike scan node fan-out (default 1, range 1–64).
+Archive parsing remains bounded and sequential. Full history scans can take much
+longer than the default timeout; plan the window before starting and explicitly
+set <code>--timeout</code> to cover it. Mainnet-scale runtime has not been measured. The
+scan uses at most two body passes, expands unresolved ancestry transitively with
+a depth limit of 256 and a shared limit of 10,000 processed records/input edges,
+and batches
+header writes and guard checks. Reaching a limit leaves unresolved evidence;
+it never authorizes a repair. The watchdog still checks maintenance every five
+seconds, and phase boundaries check it synchronously.</p>
+<h2 id="evidence-and-repair-scope">Evidence and repair scope<a class="headerlink" href="#evidence-and-repair-scope" title="Permanent link">&para;</a></h2>
+<p>The census covers masters and pagination records, including unmined records,
+missing/inconsistent mined metadata, locked/conflicting/creating states,
+parent spend references, absent children lacking markers and affected
+dependencies. It does not depend on current assembly membership. Unsupported
+schemas or unknown page owners remain findings; they are never disposable data.</p>
+<p>The evidence source is the node's validated local canonical chain at the pinned
+tip. No external SV Node RPC is required. The job authenticates retained raw
+transactions against subtree and block Merkle commitments and verifies header
+ancestry. A fully-spent classification requires positive canonical inclusion
+and a correctly ordered canonical spending transaction for every spendable
+output, using the existing chain-era burned-output policy. Both confirmation
+and the latest authenticated spend must be outside the reorg retention window:
+<code>max(confirmation height, last spend height) + retention &lt;= pinned tip height</code>.
+Retention is the greater of <code>global_blockHeightRetention</code> and the effective UTXO
+retention including its adjustment. A zero retention policy is refused by the
+command. Discovery seals this policy; apply rechecks it and fresh evidence before
+writing markers or deleting records. Recent fully-spent records remain unresolved
+so a reorg can still recover their transactions. Empty mined metadata,
+a missing UTXO record or local spent flags alone never authorize deletion.</p>
+<p>The history scan starts at genesis to make absence claims conservative. Missing,
+malformed or oversized archives create coverage gaps. Positive inclusion/spend
+proofs may still authorize repairs despite unrelated gaps; missing coverage
+cannot prove that a transaction is unconfirmed or an output is live. The index
+retains targeted evidence and its dependencies, not all historical raw bytes.
+Subtree transaction data is streamed, with bounded individual transaction and
+block parsing; blocks exceeding limits remain unresolved.</p>
+<p>Repairs are limited to positively proven recreated fully-spent records and
+missing markers for absent fully-spent children. A marker on the parent record
+that owns the spent output is sufficient, including a pagination record without
+a master marker; this matches normal pruning and replay validation. Normally mined dependent
+records and legitimate unconfirmed transactions are preserved. Confirmed
+records with live outputs, unexplained flags, unsafe parent ownership or expiry,
+and incomplete evidence remain untouched. This recovers this incident's
+persisted state; it is not general reconstruction of arbitrary UTXO corruption.</p>
+<p>For each repair the job preserves original input spend owners, writes and reads
+back required parent/page replay markers, and conditionally deletes only sealed
+records using their generations. It preserves native bin types and expiration,
+refuses finite-expiry replay guards, does not unspend inputs and does not delete
+retained archive blobs. The durable journal records intent before remote writes
+and verified outcomes afterward. Shared parents and dependency order are tracked.</p>
+<h2 id="interrupted-work-and-results">Interrupted work and results<a class="headerlink" href="#interrupted-work-and-results" title="Permanent link">&para;</a></h2>
+<p>Keep writers stopped on failure and retain the entire work directory. Explicit
+resume reconciles only this job's exact expected before/after states. Interrupted
+read-only phases can be rebuilt; a partial scan is never treated as complete.
+A completed, sealed history index is reused only after a fresh census confirms
+that all its targets are covered; newly discovered targets require rebuilding.
+An unfinished body scan still restarts from its read-only phase boundary, so a
+larger maintenance timeout is essential for large stores. SIGINT, SIGTERM and
+SIGHUP cancel through the job context and attempt to persist the final report;
+SIGKILL and power loss cannot run that cleanup.
+Foreign changes, a different tip or unexplained disappearance stop recovery.
+Do not edit/delete a journal to bypass a failure or restore before-images over
+a chain that has advanced. There is no automatic rollback.</p>
+<p>Mutation journal commits use SQLite <code>synchronous=EXTRA</code> with DELETE journaling,
+including directory synchronization before remote writes. Journal schema and
+identity header are committed together; resume may initialize a provably empty
+journal left before that commit, but refuses existing headerless state or foreign
+schemas. <a href="https://www.sqlite.org/pragma.html#pragma_synchronous">SQLite durability details</a>.</p>
+<p>Progress goes to stderr. The final JSON summary goes to stdout and <code>report.json</code>;
+<code>manifest.sqlite</code>, <code>history.sqlite</code>, <code>journal.sqlite</code> and <code>job.json</code> retain the
+private audit, evidence, mutation journal and phase checkpoint.</p>
 <table>
 <thead>
 <tr>
-<th>Setting</th>
-<th>Type</th>
-<th>Default</th>
-<th>Environment Variable</th>
-<th>Usage</th>
+<th>Exit</th>
+<th>Meaning</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>MaxRetries</td>
-<td>int</td>
-<td>3</td>
-<td>blockValidationMaxRetries</td>
-<td>General retry behavior</td>
-</tr>
-<tr>
-<td>RetrySleep</td>
-<td>time.Duration</td>
-<td>1s</td>
-<td>blockValidationRetrySleep</td>
-<td>Retry delay timing</td>
-</tr>
-<tr>
-<td>GRPCAddress</td>
-<td>string</td>
-<td>"localhost:8088"</td>
-<td>blockvalidation_grpcAddress</td>
-<td>Client connection address</td>
-</tr>
-<tr>
-<td>GRPCListenAddress</td>
-<td>string</td>
-<td>":8088"</td>
-<td>blockvalidation_grpcListenAddress</td>
-<td><strong>CRITICAL</strong> - gRPC server binding (service skipped if empty)</td>
-</tr>
-<tr>
-<td>KafkaWorkers</td>
-<td>int</td>
 <td>0</td>
-<td>blockvalidation_kafkaWorkers</td>
-<td>Kafka consumer parallelism</td>
+<td>Complete audit with no repairable or unresolved findings, or complete store repair; JSON distinguishes <code>applied</code>.</td>
 </tr>
 <tr>
-<td>LocalSetTxMinedConcurrency</td>
-<td>int</td>
-<td>8</td>
-<td>blockvalidation_localSetTxMinedConcurrency</td>
-<td>Transaction mining concurrency</td>
-</tr>
-<tr>
-<td>MaxPreviousBlockHeadersToCheck</td>
-<td>uint64</td>
-<td>100</td>
-<td>blockvalidation_maxPreviousBlockHeadersToCheck</td>
-<td>Block header validation depth</td>
-</tr>
-<tr>
-<td>MissingTransactionsBatchSize</td>
-<td>int</td>
-<td>5000</td>
-<td>blockvalidation_missingTransactionsBatchSize</td>
-<td>Missing transaction batch size</td>
-</tr>
-<tr>
-<td>ProcessTxMetaUsingCacheBatchSize</td>
-<td>int</td>
-<td>1024</td>
-<td>blockvalidation_processTxMetaUsingCache_BatchSize</td>
-<td>Cache processing batch size</td>
-</tr>
-<tr>
-<td>ProcessTxMetaUsingCacheConcurrency</td>
-<td>int</td>
-<td>32</td>
-<td>blockvalidation_processTxMetaUsingCache_Concurrency</td>
-<td>Cache processing concurrency</td>
-</tr>
-<tr>
-<td>ProcessTxMetaUsingCacheMissingTxThreshold</td>
-<td>int</td>
 <td>1</td>
-<td>blockvalidation_processTxMetaUsingCache_MissingTxThreshold</td>
-<td>Cache miss threshold</td>
+<td>Unsafe precondition, interruption, operational failure or failed verification.</td>
 </tr>
 <tr>
-<td>ProcessTxMetaUsingStoreBatchSize</td>
-<td>int</td>
-<td>max(4, CPU/2)</td>
-<td>blockvalidation_processTxMetaUsingStore_BatchSize</td>
-<td>Store processing batch size</td>
-</tr>
-<tr>
-<td>ProcessTxMetaUsingStoreConcurrency</td>
-<td>int</td>
-<td>32</td>
-<td>blockvalidation_processTxMetaUsingStore_Concurrency</td>
-<td>Store processing concurrency</td>
-</tr>
-<tr>
-<td>ProcessTxMetaUsingStoreMissingTxThreshold</td>
-<td>int</td>
-<td>1</td>
-<td>blockvalidation_processTxMetaUsingStore_MissingTxThreshold</td>
-<td>Store miss threshold</td>
-</tr>
-<tr>
-<td>SkipCheckParentMined</td>
-<td>bool</td>
-<td>false</td>
-<td>blockvalidation_skipCheckParentMined</td>
-<td>Parent block mining validation</td>
-</tr>
-<tr>
-<td>SubtreeFoundChConcurrency</td>
-<td>int</td>
-<td>1</td>
-<td>blockvalidation_subtreeFoundChConcurrency</td>
-<td>Subtree processing concurrency</td>
-</tr>
-<tr>
-<td>SubtreeValidationAbandonThreshold</td>
-<td>int</td>
-<td>1</td>
-<td>blockvalidation_subtree_validation_abandon_threshold</td>
-<td>Subtree validation abandonment</td>
-</tr>
-<tr>
-<td>ValidateBlockSubtreesConcurrency</td>
-<td>int</td>
-<td>max(4, CPU/2)</td>
-<td>blockvalidation_validateBlockSubtreesConcurrency</td>
-<td>Block subtree validation concurrency</td>
-</tr>
-<tr>
-<td>ValidationMaxRetries</td>
-<td>int</td>
-<td>3</td>
-<td>blockvalidation_validation_max_retries</td>
-<td>Validation retry attempts</td>
-</tr>
-<tr>
-<td>ValidationRetrySleep</td>
-<td>time.Duration</td>
-<td>5s</td>
-<td>blockvalidation_validation_retry_sleep</td>
-<td>Validation retry delay</td>
-</tr>
-<tr>
-<td>OptimisticMining</td>
-<td>bool</td>
-<td>true</td>
-<td>blockvalidation_optimistic_mining</td>
-<td>Optimistic mining behavior (global; the peer-served path also requires OptimisticMiningPeerBlocks, and catch-up is never optimistic)</td>
-</tr>
-<tr>
-<td>OptimisticMiningPeerBlocks</td>
-<td>bool</td>
-<td>false</td>
-<td>blockvalidation_optimistic_mining_peer_blocks</td>
-<td>Opt in to optimistic mining on the peer-served path (accepts the invalidate-route tradeoff)</td>
-</tr>
-<tr>
-<td>MaxCorruptAttemptsPerBlock</td>
-<td>int</td>
-<td>3</td>
-<td>blockvalidation_max_corrupt_attempts_per_block</td>
-<td>Ban-score-independent per-(block hash, serving peerID) cap on corrupt re-downloads; also sizes the separate local-policy decline cap (0 disables, re-opening the DoS)</td>
-</tr>
-<tr>
-<td>CorruptAttemptCooldown</td>
-<td>time.Duration</td>
-<td>10m</td>
-<td>blockvalidation_corrupt_attempt_cooldown</td>
-<td>Fixed cooldown window after which a capped (hash, peerID) is admitted again, for both caps</td>
-</tr>
-<tr>
-<td>IsParentMinedRetryMaxRetry</td>
-<td>int</td>
-<td>45</td>
-<td>blockvalidation_isParentMined_retry_max_retry</td>
-<td>Parent mining check retries</td>
-</tr>
-<tr>
-<td>IsParentMinedRetryBackoffMultiplier</td>
-<td>int</td>
-<td>4</td>
-<td>blockvalidation_isParentMined_retry_backoff_multiplier</td>
-<td>Parent mining retry backoff multiplier</td>
-</tr>
-<tr>
-<td>IsParentMinedRetryBackoffDuration</td>
-<td>time.Duration</td>
-<td>20ms</td>
-<td>blockvalidation_isParentMined_retry_backoff_duration</td>
-<td>Parent mining retry backoff base duration</td>
-</tr>
-<tr>
-<td>SubtreeGroupConcurrency</td>
-<td>int</td>
-<td>1</td>
-<td>blockvalidation_subtreeGroupConcurrency</td>
-<td>Subtree group processing concurrency</td>
-</tr>
-<tr>
-<td>BlockFoundChBufferSize</td>
-<td>int</td>
-<td>1000</td>
-<td>blockvalidation_blockFoundCh_buffer_size</td>
-<td>Block discovery pipeline buffer</td>
-</tr>
-<tr>
-<td>CatchupChBufferSize</td>
-<td>int</td>
-<td>100</td>
-<td>blockvalidation_catchupCh_buffer_size</td>
-<td>Catchup processing pipeline buffer</td>
-</tr>
-<tr>
-<td>UseCatchupWhenBehind</td>
-<td>bool</td>
-<td>false</td>
-<td>blockvalidation_useCatchupWhenBehind</td>
-<td><strong>CRITICAL</strong> - Catchup mode enablement</td>
-</tr>
-<tr>
-<td>CatchupConcurrency</td>
-<td>int</td>
-<td>max(4, CPU/2)</td>
-<td>blockvalidation_catchupConcurrency</td>
-<td>Catchup processing concurrency</td>
-</tr>
-<tr>
-<td>ValidationWarmupCount</td>
-<td>int</td>
-<td>128</td>
-<td>blockvalidation_validation_warmup_count</td>
-<td>Validation warmup behavior</td>
-</tr>
-<tr>
-<td>BatchMissingTransactions</td>
-<td>bool</td>
-<td>false</td>
-<td>blockvalidation_batch_missing_transactions</td>
-<td>Missing transaction batching</td>
-</tr>
-<tr>
-<td>CheckSubtreeFromBlockTimeout</td>
-<td>time.Duration</td>
-<td>5m</td>
-<td>blockvalidation_check_subtree_from_block_timeout</td>
-<td>Subtree validation timeout</td>
-</tr>
-<tr>
-<td>SubtreeDataFetchTimeout</td>
-<td>time.Duration</td>
-<td>10m</td>
-<td>blockvalidation_subtree_data_fetch_timeout</td>
-<td>Bound on one detached subtree_data fetch (download + parse + store)</td>
-</tr>
-<tr>
-<td>SubtreeMetaPeerFetchTimeout</td>
-<td>time.Duration</td>
-<td>10m</td>
-<td>blockvalidation_subtree_meta_peer_fetch_timeout</td>
-<td>Per-fetch budget for a subtree meta regeneration subtree_data fetch (all 503 retries + body stream); a cache-busting retry gets a fresh budget</td>
-</tr>
-<tr>
-<td>CheckSubtreeFromBlockRetries</td>
-<td>int</td>
-<td>5</td>
-<td>blockvalidation_check_subtree_from_block_retries</td>
-<td>Subtree validation retries</td>
-</tr>
-<tr>
-<td>CheckSubtreeFromBlockRetryBackoffDuration</td>
-<td>time.Duration</td>
-<td>30s</td>
-<td>blockvalidation_check_subtree_from_block_retry_backoff_duration</td>
-<td>Subtree retry backoff</td>
-</tr>
-<tr>
-<td>SecretMiningThreshold</td>
-<td>uint32</td>
-<td>99</td>
-<td>blockvalidation_secret_mining_threshold</td>
-<td><strong>CRITICAL</strong> - Secret mining detection</td>
-</tr>
-<tr>
-<td>PreviousBlockHeaderCount</td>
-<td>uint64</td>
-<td>100</td>
-<td>blockvalidation_previous_block_header_count</td>
-<td><strong>CRITICAL</strong> - Header chain cache size. Floored at 11 (<code>settings.MedianTimeSpan</code>): the run is what median-time-past is measured over, so a lower value would compute the median over fewer blocks than consensus requires and accept blocks the rest of the network rejects. Anything below 11 is raised to it, with a warning on stderr</td>
-</tr>
-<tr>
-<td>CatchupMaxRetries</td>
-<td>int</td>
-<td>3</td>
-<td>blockvalidation_catchup_max_retries</td>
-<td>Catchup operation retries</td>
-</tr>
-<tr>
-<td>CatchupIterationTimeout</td>
-<td>int</td>
-<td>30</td>
-<td>blockvalidation_catchup_iteration_timeout</td>
-<td><strong>CRITICAL</strong> - Catchup iteration timeout</td>
-</tr>
-<tr>
-<td>CatchupOperationTimeout</td>
-<td>int</td>
-<td>300</td>
-<td>blockvalidation_catchup_operation_timeout</td>
-<td><strong>CRITICAL</strong> - Catchup operation timeout</td>
-</tr>
-<tr>
-<td>CatchupMaxAccumulatedHeaders</td>
-<td>int</td>
-<td>100000</td>
-<td>blockvalidation_max_accumulated_headers</td>
-<td><strong>CRITICAL</strong> - Memory protection during catchup</td>
-</tr>
-<tr>
-<td>CircuitBreakerFailureThreshold</td>
-<td>int</td>
-<td>5</td>
-<td>blockvalidation_circuit_breaker_failure_threshold</td>
-<td>Circuit breaker failure detection</td>
-</tr>
-<tr>
-<td>CircuitBreakerSuccessThreshold</td>
-<td>int</td>
 <td>2</td>
-<td>blockvalidation_circuit_breaker_success_threshold</td>
-<td>Circuit breaker recovery</td>
-</tr>
-<tr>
-<td>CircuitBreakerTimeoutSeconds</td>
-<td>int</td>
-<td>30</td>
-<td>blockvalidation_circuit_breaker_timeout_seconds</td>
-<td>Circuit breaker timeout</td>
-</tr>
-<tr>
-<td>MaxBlocksBehindBlockAssembly</td>
-<td>int</td>
-<td>20</td>
-<td>blockvalidation_maxBlocksBehindBlockAssembly</td>
-<td><strong>CRITICAL</strong> - Max blocks behind block assembly</td>
-</tr>
-<tr>
-<td>PeriodicProcessingInterval</td>
-<td>time.Duration</td>
-<td>1m</td>
-<td>blockvalidation_periodic_processing_interval</td>
-<td>Periodic processing interval</td>
-</tr>
-<tr>
-<td>RecentBlockIDsLimit</td>
-<td>uint64</td>
-<td>50000</td>
-<td>blockvalidation_recentBlockIDsLimit</td>
-<td><strong>CRITICAL</strong> - Fast-path double-spend checking window</td>
-</tr>
-<tr>
-<td>MaxParallelForks</td>
-<td>int</td>
-<td>4</td>
-<td>blockvalidation_max_parallel_forks</td>
-<td>Maximum parallel fork processing</td>
-</tr>
-<tr>
-<td>MaxTrackedForks</td>
-<td>int</td>
-<td>1000</td>
-<td>blockvalidation_max_tracked_forks</td>
-<td>Maximum total forks tracked</td>
-</tr>
-<tr>
-<td>NearForkThreshold</td>
-<td>int</td>
-<td>0</td>
-<td>blockvalidation_near_fork_threshold</td>
-<td>Near fork detection (0=coinbase maturity/2)</td>
-</tr>
-<tr>
-<td>FetchLargeBatchSize</td>
-<td>int</td>
-<td>100</td>
-<td>blockvalidation_fetch_large_batch_size</td>
-<td>Block fetch batch size</td>
-</tr>
-<tr>
-<td>FetchNumWorkers</td>
-<td>int</td>
-<td>1</td>
-<td>blockvalidation_fetch_num_workers</td>
-<td>Block fetch worker goroutines</td>
-</tr>
-<tr>
-<td>FetchBufferSize</td>
-<td>int</td>
-<td>50</td>
-<td>blockvalidation_fetch_buffer_size</td>
-<td>Block fetch channel buffer</td>
-</tr>
-<tr>
-<td>SubtreeFetchConcurrency</td>
-<td>int</td>
-<td>8</td>
-<td>blockvalidation_subtree_fetch_concurrency</td>
-<td>Concurrent subtree fetches per block</td>
-</tr>
-<tr>
-<td>SubtreeBatchSize</td>
-<td>int</td>
-<td>16</td>
-<td>blockvalidation_subtree_batch_size</td>
-<td>Subtrees processed per batch in quick validation</td>
-</tr>
-<tr>
-<td>SubtreeBatchPrefetchDepth</td>
-<td>int</td>
-<td>2</td>
-<td>blockvalidation_subtree_batch_prefetch_depth</td>
-<td>Batches to prefetch ahead in pipeline (0=sequential)</td>
-</tr>
-<tr>
-<td>GetBlockTransactionsConcurrency</td>
-<td>int</td>
-<td>64</td>
-<td>blockvalidation_get_block_transactions_concurrency</td>
-<td>Block transaction fetch concurrency</td>
-</tr>
-<tr>
-<td>ExtendTransactionTimeout</td>
-<td>time.Duration</td>
-<td>120s</td>
-<td>blockvalidation_extend_transaction_timeout</td>
-<td>Timeout for extending transaction inputs</td>
-</tr>
-<tr>
-<td>SubtreeBatchWriteConcurrency</td>
-<td>int</td>
-<td>64</td>
-<td>blockvalidation_subtree_batch_write_concurrency</td>
-<td>Concurrent subtree file writes per batch</td>
-</tr>
-<tr>
-<td>CatchupMinThroughputKBps</td>
-<td>int</td>
-<td>100</td>
-<td>blockvalidation_catchup_min_throughput_kbps</td>
-<td>Minimum throughput (KB/s) before switching peers</td>
-</tr>
-<tr>
-<td>CatchupParallelFetchEnabled</td>
-<td>bool</td>
-<td>true</td>
-<td>blockvalidation_catchup_parallel_fetch_enabled</td>
-<td>Enable parallel fetching from multiple peers</td>
-</tr>
-<tr>
-<td>CatchupParallelFetchWorkers</td>
-<td>int</td>
-<td>3</td>
-<td>blockvalidation_catchup_parallel_fetch_workers</td>
-<td>Number of parallel fetch workers</td>
+<td>Audit found repairable records, or unresolved findings remain even if independent components were repaired.</td>
 </tr>
 </tbody>
 </table>
-<h2 id="configuration-dependencies">Configuration Dependencies<a class="headerlink" href="#configuration-dependencies" title="Permanent link">&para;</a></h2>
-<h3 id="service-startup">Service Startup<a class="headerlink" href="#service-startup" title="Permanent link">&para;</a></h3>
-<ul>
-<li>Service skipped (not added to ServiceManager) if <code>GRPCListenAddress</code> is empty</li>
-<li>Kafka consumer created for block processing</li>
-</ul>
-<h3 id="catchup-mode">Catchup Mode<a class="headerlink" href="#catchup-mode" title="Permanent link">&para;</a></h3>
-<ul>
-<li>When <code>UseCatchupWhenBehind = true</code>, all catchup settings control behavior</li>
-<li><code>CatchupMaxAccumulatedHeaders</code> prevents memory exhaustion</li>
-<li>Timeout settings control iteration and operation limits</li>
-<li>Catchup automatically engages when node falls behind</li>
-</ul>
-<h3 id="optimistic-mining">Optimistic Mining<a class="headerlink" href="#optimistic-mining" title="Permanent link">&para;</a></h3>
-<ul>
-<li><code>OptimisticMining = true</code>: enables background validation for performance on paths that opt in</li>
-<li>Block validation proceeds while subtree validation runs in the background</li>
-<li>Can be overridden per-validation via the <code>DisableOptimisticMining</code> option</li>
-<li><strong>On the peer-served validation path optimistic mining is OFF unless BOTH
-  <code>blockvalidation_optimistic_mining</code> AND <code>blockvalidation_optimistic_mining_peer_blocks</code> are set</strong>
-  (default <code>(true, false)</code> = off). The global flag being false always wins, so the peer-blocks flag
-  can never bypass it (bitcoin-sv/teranode#4692). Revalidation of an already-stored block is always
-  non-optimistic regardless of these flags.</li>
-<li><strong>The catch-up path is always non-optimistic</strong>, whatever these two flags are set to. It validates
-  against a cached header run holding only the block's in-batch predecessors, which cannot carry the
-  median-time-past window the optimistic branch checks synchronously; lifting this requires the
-  header cache to top up short windows from the store first (issue 1499).</li>
-<li><strong>Opt-in tradeoff:</strong> with both flags set, a corrupt body on the optimistic-background path is
-  already added before background validation runs, so it takes the <em>invalidate route</em> (it is
-  invalidated/poisoned rather than re-downloaded) until the <code>block.Valid</code> integrity-floor split lands
-  and removes that path. With the default (peer-blocks off) a corrupt body is never added and is
-  re-downloaded, not poisoned.</li>
-</ul>
-<h3 id="corrupt-body-re-download-cap">Corrupt-body re-download cap<a class="headerlink" href="#corrupt-body-re-download-cap" title="Permanent link">&para;</a></h3>
-<ul>
-<li>Independently of the per-peer ban score, corrupt-body re-downloads are bounded per
-  (block hash, serving peerID) on the RUNNING and legacy netsync paths by
-  <code>MaxCorruptAttemptsPerBlock</code> (default 3) within a fixed <code>CorruptAttemptCooldown</code> window
-  (default 10m), then dropped before the expensive download/validate work until the window lapses
-  (bitcoin-sv/teranode#4692). Keying on the pair rather than the hash alone is deliberate: one peer's
-  corruption can never consume the budget for a hash an honest peer can still serve, so a bad peer
-  cannot wedge the honest tip. The residual aggregate per-hash bound is therefore
-  (concurrent distinct serving peers) × this cap per window.</li>
-<li>The cap never poisons a hash: once the window lapses an honest body is admitted again, and the
-  counter is cleared by a successful validation. Setting <code>MaxCorruptAttemptsPerBlock</code> to 0 disables
-  the cap and re-opens the corrupt-body bandwidth DoS, so it is strongly discouraged.</li>
-<li>A separate per-(hash, peerID) counter, sized by the same two settings, bounds repeat deliveries of
-  a block this node declines on local <code>excessiveblocksize</code> policy, so an oversized block is not
-  re-fetched from the same peer indefinitely. A policy decline is not a corrupt body: it never
-  strikes the peer, never marks the hash invalid, and spends a budget of its own rather than the
-  corrupt one.</li>
-</ul>
-<h3 id="quick-validation-pipeline">Quick Validation Pipeline<a class="headerlink" href="#quick-validation-pipeline" title="Permanent link">&para;</a></h3>
-<p>For checkpoint-verified blocks, a fan-in pipeline overlaps I/O with processing:</p>
-<ul>
-<li><code>SubtreeBatchPrefetchDepth</code> controls how many batches to prefetch ahead (default: 2)</li>
-<li>Setting to 0 disables the pipeline and uses sequential processing</li>
-<li>Three pipeline stages:</li>
-<li><strong>Reader</strong>: Prefetches subtree batches from disk</li>
-<li><strong>Extender</strong>: Extends transactions with UTXO data (sequential for map dependency)</li>
-<li><strong>Processor</strong>: Creates/spends UTXOs and writes files in parallel per batch</li>
-</ul>
-<h3 id="transaction-metadata-processing">Transaction Metadata Processing<a class="headerlink" href="#transaction-metadata-processing" title="Permanent link">&para;</a></h3>
-<ul>
-<li>Cache and store processing work together with threshold-based fallback</li>
-<li>Batch sizes and concurrency settings control performance</li>
-</ul>
-<h3 id="secret-mining-detection">Secret Mining Detection<a class="headerlink" href="#secret-mining-detection" title="Permanent link">&para;</a></h3>
-<ul>
-<li><code>SecretMiningThreshold</code> uses <code>PreviousBlockHeaderCount</code> for analysis</li>
-<li>Detection triggers when block difference exceeds threshold</li>
-</ul>
-<h3 id="two-phase-double-spend-detection">Two-Phase Double-Spend Detection<a class="headerlink" href="#two-phase-double-spend-detection" title="Permanent link">&para;</a></h3>
-<ul>
-<li><code>RecentBlockIDsLimit</code> controls the size of the fast-path in-memory block ID window</li>
-<li>Transactions mined in blocks within this window are detected immediately (fast path)</li>
-<li>Transactions mined in older blocks trigger a blockchain service query (slow path)</li>
-<li>Larger values use more memory but reduce slow-path queries</li>
-<li>Default of 50,000 covers approximately 347 days of blocks at 10-minute intervals</li>
-</ul>
-<h3 id="channel-buffer-management">Channel Buffer Management<a class="headerlink" href="#channel-buffer-management" title="Permanent link">&para;</a></h3>
-<ul>
-<li><code>BlockFoundChBufferSize</code> and <code>CatchupChBufferSize</code> must accommodate processing loads</li>
-</ul>
-<h2 id="service-dependencies">Service Dependencies<a class="headerlink" href="#service-dependencies" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Dependency</th>
-<th>Interface</th>
-<th>Usage</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>UTXOStore</td>
-<td>utxo.Store</td>
-<td><strong>CRITICAL</strong> - UTXO operations and validation</td>
-</tr>
-<tr>
-<td>TxStore</td>
-<td>blob.Store</td>
-<td><strong>CRITICAL</strong> - Transaction data access</td>
-</tr>
-<tr>
-<td>SubtreeStore</td>
-<td>blob.Store</td>
-<td><strong>CRITICAL</strong> - Subtree validation</td>
-</tr>
-<tr>
-<td>BlockchainClient</td>
-<td>blockchain.ClientI</td>
-<td><strong>CRITICAL</strong> - Blockchain operations and header retrieval</td>
-</tr>
-<tr>
-<td>SubtreeValidationClient</td>
-<td>subtreevalidation.ClientI</td>
-<td><strong>CRITICAL</strong> - Subtree validation operations</td>
-</tr>
-<tr>
-<td>ValidatorClient</td>
-<td>validator.ClientI</td>
-<td><strong>CRITICAL</strong> - Block validation operations</td>
-</tr>
-</tbody>
-</table>
-<h2 id="validation-rules">Validation Rules<a class="headerlink" href="#validation-rules" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Setting</th>
-<th>Validation</th>
-<th>Impact</th>
-<th>When Checked</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>GRPCListenAddress</td>
-<td>Must not be empty</td>
-<td>Service skipped if empty</td>
-<td>During daemon startup</td>
-</tr>
-<tr>
-<td>UseCatchupWhenBehind</td>
-<td>Controls catchup mode activation</td>
-<td>Chain synchronization</td>
-<td></td>
-</tr>
-<tr>
-<td>CatchupMaxAccumulatedHeaders</td>
-<td>Limits memory usage</td>
-<td>Memory protection</td>
-<td></td>
-</tr>
-<tr>
-<td>SecretMiningThreshold</td>
-<td>Enables attack detection</td>
-<td>Security</td>
-<td></td>
-</tr>
-</tbody>
-</table>
-<h2 id="configuration-examples">Configuration Examples<a class="headerlink" href="#configuration-examples" title="Permanent link">&para;</a></h2>
-<h3 id="basic-configuration">Basic Configuration<a class="headerlink" href="#basic-configuration" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nv">blockvalidation_grpcListenAddress</span><span class="o">=</span>:8088
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nv">blockvalidation_useCatchupWhenBehind</span><span class="o">=</span><span class="nb">false</span>
-</span></code></pre></div>
-<h3 id="high-performance-configuration">High Performance Configuration<a class="headerlink" href="#high-performance-configuration" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">blockvalidation_validateBlockSubtreesConcurrency</span><span class="o">=</span><span class="m">16</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nv">blockvalidation_processTxMetaUsingStoreBatchSize</span><span class="o">=</span><span class="m">2048</span>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nv">blockvalidation_catchupConcurrency</span><span class="o">=</span><span class="m">8</span>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="nv">blockvalidation_fetch_num_workers</span><span class="o">=</span><span class="m">32</span>
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="nv">blockvalidation_subtree_batch_size</span><span class="o">=</span><span class="m">32</span>
-</span></code></pre></div>
-<h3 id="catchup-mode-configuration">Catchup Mode Configuration<a class="headerlink" href="#catchup-mode-configuration" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">blockvalidation_useCatchupWhenBehind</span><span class="o">=</span><span class="nb">true</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nv">blockvalidation_catchup_max_retries</span><span class="o">=</span><span class="m">5</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="nv">blockvalidation_catchup_iteration_timeout</span><span class="o">=</span><span class="m">60</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="nv">blockvalidation_max_accumulated_headers</span><span class="o">=</span><span class="m">50000</span>
-</span></code></pre></div>
-<h3 id="pipeline-processing-configuration">Pipeline Processing Configuration<a class="headerlink" href="#pipeline-processing-configuration" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># Enable pipeline with larger prefetch depth for high-latency storage</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">blockvalidation_subtree_batch_prefetch_depth</span><span class="o">=</span><span class="m">4</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="nv">blockvalidation_subtree_batch_size</span><span class="o">=</span><span class="m">32</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="c1"># Disable pipeline (sequential processing)</span>
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="nv">blockvalidation_subtree_batch_prefetch_depth</span><span class="o">=</span><span class="m">0</span>
-</span></code></pre></div>
+<p><code>complete</code> describes whether classification/verification finished; a complete
+audit with repairable records returns exit 2 and performs no mutations.</p>
+<p>A complete graph allows independent proven repairs while unknown components
+remain untouched. Unresolvable ownership prevents safe apply. Read the counts,
+classifications and reasons; an empty assembly is not proof of recovery.</p>
+<p>After successful store repair, <strong>restart assembly and the other writers through
+the normal operational procedure</strong> so stale in-memory state cannot survive.
+Then resume the FSM and verify a fresh valid mining candidate and the next tip
+transition. <code>restart_required</code> is explicit after mutations, including interrupted
+attempts. The CLI finishes store verification while IDLE; it cannot prove those
+later runtime observations and never resumes the node itself.</p>
+<p>The restart step above refers to assembly and the other application writers.
+The recovery backend currently uses generation-guarded Aerospike deletes without
+<code>DurableDelete</code>. On persistent namespaces, an Aerospike cold restart can resurrect
+older deleted record versions. Durable deletes prevent that using tombstones,
+but Community Edition rejects that policy, so it is not enabled unconditionally.
+Keep the mutation journal and backups. After an Aerospike cold restart, keep
+writers isolated and run a fresh audit in a new work directory before resuming;
+a completed journal cannot certify newly resurrected records. See
+<a href="https://aerospike.com/docs/database/learn/architecture/durable-deletes">Aerospike durable deletes</a>
+and <a href="https://aerospike.com/docs/database/manage/database/cold-start">cold restart behavior</a>.</p>
 
 
 
@@ -7890,44 +6866,6 @@
         <footer class="md-footer">
   
     
-      
-      <nav class="md-footer__inner md-grid" aria-label="Footer" >
-        
-          
-          <a href="../blockpersister_settings/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Block Persister">
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-            </div>
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Previous
-              </span>
-              <div class="md-ellipsis">
-                Block Persister
-              </div>
-            </div>
-          </a>
-        
-        
-          
-          <a href="../legacy_settings/" class="md-footer__link md-footer__link--next" aria-label="Next: Legacy">
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Next
-              </span>
-              <div class="md-ellipsis">
-                Legacy
-              </div>
-            </div>
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
-            </div>
-          </a>
-        
-      </nav>
-    
   
   <div class="md-footer-meta md-typeset">
     <div class="md-footer-meta__inner md-grid">
@@ -7949,10 +6887,10 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "navigation.indexes", "navigation.top", "navigation.instant", "navigation.footer", "search.suggest", "search.highlight", "search.share", "toc.follow", "content.code.copy", "content.code.annotate", "content.tabs.link"], "search": "../../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "navigation.indexes", "navigation.top", "navigation.instant", "navigation.footer", "search.suggest", "search.highlight", "search.share", "toc.follow", "content.code.copy", "content.code.annotate", "content.tabs.link"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>
