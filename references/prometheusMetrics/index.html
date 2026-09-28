@@ -7441,6 +7441,11 @@
 <td>Seconds since the subtree processor's consumer goroutine last passed through its dequeue branch; growing alongside a non-zero <code>queued_transactions</code> means intake is queuing unboundedly because the consumer is stuck elsewhere</td>
 </tr>
 <tr>
+<td><code>teranode_blockassembly_liveness_heartbeat_age_seconds</code></td>
+<td>Gauge</td>
+<td>Seconds since the main select loop last beat its liveness heartbeat (0 before the loop starts and after it stops); the value <code>blockassembly_livenessStallTimeout</code> is compared against</td>
+</tr>
+<tr>
 <td><code>teranode_blockassembly_tx_meta_get</code></td>
 <td>Histogram</td>
 <td>Histogram of reading tx meta data from txmeta store in block assembler</td>
@@ -7970,6 +7975,21 @@
 <td>Number of active catchup operations (0 or 1)</td>
 </tr>
 <tr>
+<td><code>teranode_blockvalidation_catchup_prefetch_budget_parked_total</code></td>
+<td>Counter</td>
+<td>Total times a prewarm worker parked waiting for prefetch budget</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_catchup_prefetch_oversized_blocks_total</code></td>
+<td>Counter</td>
+<td>Total blocks declaring a size over the budget, parsed one subtree at a time</td>
+</tr>
+<tr>
+<td><code>teranode_blockvalidation_catchup_prefetch_undeclared_size_blocks_total</code></td>
+<td>Counter</td>
+<td>Total blocks declaring no size, parsed one subtree at a time</td>
+</tr>
+<tr>
 <td><code>teranode_blockvalidation_priority_queue_size</code></td>
 <td>GaugeVec</td>
 <td>Current size of the block priority queue by priority level</td>
@@ -8089,6 +8109,42 @@
 <td>Counter</td>
 <td></td>
 <td>WebSocket clients evicted from the broadcast fan-out because their send buffer was full when a broadcast reached them</td>
+</tr>
+<tr>
+<td><code>teranode_p2p_connected_peers</code></td>
+<td>Gauge</td>
+<td>-</td>
+<td>Number of peers currently connected to this node over the p2p network (directly connected only, matching <code>node_status.connected_peers_count</code>)</td>
+</tr>
+<tr>
+<td><code>teranode_p2p_ban_events_total</code></td>
+<td>Counter</td>
+<td><code>reason</code></td>
+<td>Total number of peer ban events; <code>reason</code> is one of <code>protocol_violation</code>, <code>invalid_subtree</code>, <code>invalid_block</code>, <code>spam</code>, <code>operator_ban</code> (BanPeer RPC), or <code>unknown</code></td>
+</tr>
+<tr>
+<td><code>teranode_p2p_catchup_attempts_total</code></td>
+<td>Counter</td>
+<td>-</td>
+<td>Total number of catchup attempts made against peers</td>
+</tr>
+<tr>
+<td><code>teranode_p2p_catchup_successes_total</code></td>
+<td>Counter</td>
+<td>-</td>
+<td>Total number of successful catchups completed from peers</td>
+</tr>
+<tr>
+<td><code>teranode_p2p_catchup_failures_total</code></td>
+<td>Counter</td>
+<td><code>kind</code></td>
+<td>Total number of failed catchup attempts against peers; <code>kind</code> is one of <code>generic</code> or <code>block_incomplete</code></td>
+</tr>
+<tr>
+<td><code>teranode_p2p_websocket_connections</code></td>
+<td>Gauge</td>
+<td>-</td>
+<td>Number of currently connected websocket notification subscribers</td>
 </tr>
 </tbody>
 </table>
