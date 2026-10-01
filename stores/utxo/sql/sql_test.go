@@ -1065,6 +1065,24 @@ func Test_SmokeTests(t *testing.T) {
 		tests.SetConflictingBehavior(t, db)
 	})
 
+	t.Run("quick path create spend mined semantics", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.QuickPathCreateSpendMinedSemantics(t, db)
+	})
+
+	t.Run("absent record observables", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.AbsentRecordObservables(t, db)
+	})
+
 	t.Run("set mined unmined since", func(t *testing.T) {
 		db, _ := setup(ctx, t)
 
@@ -1135,6 +1153,24 @@ func Test_SmokeTests(t *testing.T) {
 		require.NoError(t, err)
 
 		tests.SpendAndCreateInvalidOptions(t, db)
+	})
+
+	t.Run("delete then unspend restores parent", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.DeleteThenUnspendRestoresParent(t, db)
+	})
+
+	t.Run("delete then unspend restores parent paginated", func(t *testing.T) {
+		db, _ := setup(ctx, t)
+
+		err := db.Delete(ctx, tests.TXHash)
+		require.NoError(t, err)
+
+		tests.DeleteThenUnspendRestoresParentPaginated(t, db, test.CreateBaseTestSettings(t).UtxoStore.UtxoBatchSize)
 	})
 
 	t.Run("set mined with spent", func(t *testing.T) {

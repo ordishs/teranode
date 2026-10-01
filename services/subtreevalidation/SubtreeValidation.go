@@ -39,7 +39,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -263,17 +262,21 @@ func (u *Server) DelTxMetaCacheMulti(ctx context.Context, hash *chainhash.Hash) 
 //   - subtreeHash: Hash of the subtree containing the transactions
 //   - txHashes: Slice of transaction hashes to retrieve
 //   - baseURL: URL of the network source for transactions
+//   - peerID: ID of the peer that owns baseURL, for invalid-subtree attribution (may be empty)
 //
 // Returns:
 //   - []*bt.Tx: Slice of retrieved transactions
 //   - error: Any error encountered during retrieval
-func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash chainhash.Hash, txHashes []utxo.UnresolvedMetaData, baseURL string) ([]*bt.Tx, error) {
-	// Validate that baseURL is a proper HTTP/HTTPS URL and not a peer ID
-	parsedURL, err := url.Parse(baseURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
-		u.logger.Errorf("[getMissingTransactionsBatch][%s] Invalid baseURL '%s' - must be valid http/https URL, not peer ID",
-			subtreeHash.String(), baseURL)
-		return nil, errors.NewExternalError("[getMissingTransactionsBatch][%s] invalid baseURL - not a valid http/https URL", subtreeHash.String())
+func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash chainhash.Hash, txHashes []utxo.UnresolvedMetaData, baseURL, peerID string) ([]*bt.Tx, error) {
+	// Build the POST URL from parsed parts. baseURL must be a proper HTTP/HTTPS URL, not a
+	// peer ID, and it must not carry a query or fragment: with string concatenation a base
+	// ending in "?x=" sent this POST, whose body is peer-chosen hashes, to whatever path the
+	// peer named (issue 4843).
+	txsURL, err := util.JoinPeerURL(baseURL, "subtree", subtreeHash.String(), "txs")
+	if err != nil {
+		u.logger.Errorf("[getMissingTransactionsBatch][%s] Invalid baseURL - must be a valid http/https base URL, not peer ID: %v",
+			subtreeHash.String(), err)
+		return nil, errors.NewExternalError("[getMissingTransactionsBatch][%s] invalid baseURL - not a valid http/https base URL", subtreeHash.String(), err)
 	}
 
 	log := false
@@ -295,13 +298,12 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 	}
 
 	// do a POST http request to baseUrl + subtree hash + txs endpoint
-	url := fmt.Sprintf("%s/subtree/%s/txs", baseURL, subtreeHash.String())
-	u.logger.Debugf("[getMissingTransactionsBatch][%s] getting %d txs from peer %s", subtreeHash.String(), len(txHashes), url)
+	u.logger.Debugf("[getMissingTransactionsBatch][%s] getting %d txs from peer %s", subtreeHash.String(), len(txHashes), txsURL)
 
-	body, err := util.DoHTTPRequestBodyReader(ctx, url, txIDBytes)
+	body, err := util.DoHTTPRequestBodyReader(ctx, txsURL, txIDBytes)
 	if err != nil {
 		// Peer cannot provide requested transactions - report as invalid subtree
-		u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "peer_cannot_provide_transactions")
+		u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_transactions")
 		return nil, errors.NewExternalError("[getMissingTransactionsBatch][%s] failed to do http request", subtreeHash.String(), err)
 	}
 
@@ -319,7 +321,7 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 				break
 			}
 			// Malformed transaction data from peer - report as invalid subtree
-			u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "malformed_transaction_data")
+			u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "malformed_transaction_data")
 			// Not recoverable, returning processing error
 			return nil, errors.NewProcessingError("[getMissingTransactionsBatch][%s] failed to read transaction from body", subtreeHash.String(), err)
 		}
@@ -329,7 +331,7 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 
 	if len(missingTxs) != len(txHashes) {
 		// Peer sent wrong number of transactions - report as invalid subtree
-		u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "transaction_count_mismatch")
+		u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "transaction_count_mismatch")
 		return nil, errors.NewProcessingError("[getMissingTransactionsBatch][%s] missing tx count mismatch: missing=%d, txHashes=%d", subtreeHash.String(), len(missingTxs), len(txHashes))
 	}
 
@@ -656,7 +658,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			return nil, nil
 		}
 
-		txHashes, err = u.getSubtreeTxHashes(ctx, stat, &v.SubtreeHash, v.BaseURL)
+		txHashes, err = u.getSubtreeTxHashes(ctx, stat, &v.SubtreeHash, v.BaseURL, v.PeerID)
 		if err != nil {
 			return nil, errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get subtree from network", v.SubtreeHash.String(), err)
 		}
@@ -740,7 +742,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			batched := u.settings.SubtreeValidation.BatchMissingTransactions
 
 			// 2. ...then attempt to load the txMeta from the store (i.e - aerospike in production)
-			missed, err = u.processTxMetaUsingStore(ctx, txHashes, txMetaSlice, blockIds, batched, failFast)
+			missed, err = u.processTxMetaUsingStore(ctx, txHashes, txMetaSlice, blockIds, batched, failFast, false)
 			if err != nil {
 				// Don't wrap the error again, processTxMetaUsingStore returns the correctly formatted error.
 				return nil, err
@@ -773,6 +775,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 				missingTxHashesCompacted,
 				txHashes,
 				v.BaseURL,
+				v.PeerID,
 				txMetaSlice,
 				blockHeight,
 				blockIds,
@@ -808,7 +811,10 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		}
 
 		if _, dup := seen[txHash]; dup {
-			return nil, errors.NewBlockInvalidError("[ValidateSubtreeInternal][%s] duplicate transaction in subtree at index %d: %s", v.SubtreeHash.String(), idx, txHash.String())
+			// Body-derived (CVE-2012-2459 duplicate in the received tx set) and detected before
+			// the body is bound to the header: classify corrupt so the block is re-downloaded and
+			// the serving peer struck, never persisted invalid=true (bitcoin-sv/teranode#4692).
+			return nil, errors.NewBlockCorruptError("[ValidateSubtreeInternal][%s] duplicate transaction in subtree at index %d: %s", v.SubtreeHash.String(), idx, txHash.String())
 		}
 
 		seen[txHash] = struct{}{}
@@ -971,7 +977,8 @@ func (u *Server) storeSubtreeFiles(ctx context.Context, stat *gocore.Stat, subtr
 }
 
 // getSubtreeTxHashes retrieves transaction hashes for a subtree from a remote source.
-func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, subtreeHash *chainhash.Hash, baseURL string) ([]chainhash.Hash, error) {
+// peerID identifies the peer that owns baseURL, for invalid-subtree attribution (may be empty).
+func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, subtreeHash *chainhash.Hash, baseURL, peerID string) ([]chainhash.Hash, error) {
 	if baseURL == "" {
 		return nil, errors.NewInvalidArgumentError("[getSubtreeTxHashes][%s] baseUrl for subtree is empty", subtreeHash.String())
 	}
@@ -1011,7 +1018,10 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 	}
 
 	// do http request to baseUrl + subtreeHash.String()
-	url := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
+	url, err := util.JoinPeerURL(baseURL, "subtree", subtreeHash.String())
+	if err != nil {
+		return nil, errors.NewExternalError("[getSubtreeTxHashes][%s] invalid peer base URL", subtreeHash.String(), err)
+	}
 	u.logger.Debugf("[getSubtreeTxHashes][%s] getting subtree from %s", subtreeHash.String(), url)
 
 	// Bound the body at the receive-side policy cap (MaxIncomingSubtreeBytes). A peer that
@@ -1027,7 +1037,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 		// check whether this is a 404 error
 		if errors.Is(err, errors.ErrNotFound) {
 			// Peer cannot provide subtree data - report as invalid subtree
-			u.publishInvalidSubtree(spanCtx, subtreeHash.String(), baseURL, "peer_cannot_provide_subtree")
+			u.publishInvalidSubtree(spanCtx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_subtree")
 
 			return nil, errors.NewSubtreeNotFoundError("[getSubtreeTxHashes][%s] subtree not found on host %s", subtreeHash.String(), baseURL, err)
 		}
@@ -1130,7 +1140,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 // path is best-effort by design — the block-validation path in
 // CheckBlockSubtrees is the authoritative backstop.
 func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
-	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL string, txMetaSlice []metaSliceItem, blockHeight uint32,
+	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL, peerID string, txMetaSlice []metaSliceItem, blockHeight uint32,
 	blockIds map[uint32]bool, validationOptions ...validator.Option) (err error) {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "SubtreeValidation:processMissingTransactions",
 		tracing.WithDebugLogMessage(u.logger, "[processMissingTransactions][%s] processing %d missing txs", subtreeHash.String(), len(missingTxHashes)),
@@ -1141,7 +1151,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		deferFn(err)
 	}()
 
-	missingTxs, err := u.getSubtreeMissingTxs(ctx, subtreeHash, subtree, missingTxHashes, allTxs, baseURL)
+	missingTxs, err := u.getSubtreeMissingTxs(ctx, subtreeHash, subtree, missingTxHashes, allTxs, baseURL, peerID)
 	if err != nil {
 		return err
 	}
@@ -1214,7 +1224,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 						u.logger.Debugf("[validateSubtree][%s] transaction %s is missing parent", subtreeHash.String(), tx.TxIDChainHash().String())
 					} else if errors.Is(err, errors.ErrTxInvalid) && !errors.Is(err, errors.ErrTxPolicy) {
 						// Report invalid subtree - contains truly invalid transaction
-						u.publishInvalidSubtree(gCtx, subtreeHash.String(), baseURL, "contains_invalid_transaction")
+						u.publishInvalidSubtree(gCtx, subtreeHash.String(), baseURL, peerID, "contains_invalid_transaction")
 
 						return err
 					} else {
@@ -1302,12 +1312,13 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 //   - missingTxHashes: List of transaction hashes that need to be retrieved
 //   - allTxs: Complete list of all transaction hashes in the subtree
 //   - baseURL: Base URL for network-based transaction retrieval
+//   - peerID: ID of the peer that owns baseURL, for invalid-subtree attribution (may be empty)
 //
 // Returns:
 //   - []missingTx: Slice of retrieved transactions paired with their indices
 //   - error: Any error encountered during the retrieval process
 func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
-	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL string) ([]missingTx, error) {
+	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL, peerID string) ([]missingTx, error) {
 	// first check whether we have the subtreeData file for this subtree and use that for the missing transactions
 	subtreeDataExists, err := u.subtreeStore.Exists(ctx,
 		subtreeHash[:],
@@ -1324,15 +1335,27 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 
 		if percentageMissing > u.settings.SubtreeValidation.PercentageMissingGetFullData {
 			// get the whole subtree from the other peer
-			url := fmt.Sprintf("%s/subtree_data/%s", baseURL, subtreeHash.String())
+			url, subtreeDataErr := util.JoinPeerURL(baseURL, "subtree_data", subtreeHash.String())
 
 			// Retry on 503 — peer's asset service may be admission-rejecting under load
 			// (asset_concurrency_subtree_data_create cap). Other errors fail through immediately.
-			body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
+			var body io.ReadCloser
+			if subtreeDataErr == nil {
+				body, subtreeDataErr = util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
+			}
 			if subtreeDataErr != nil {
 				// Peer cannot provide subtree data - report as invalid subtree
-				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, "peer_cannot_provide_subtree_data")
-				u.logger.Errorf("[validateSubtree][%s] failed to get subtree data from %s: %v", subtreeHash.String(), url, subtreeDataErr)
+				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_subtree_data")
+
+				if url == "" {
+					// The join failed, so there is no target to name. Saying "from " with
+					// nothing after it reads like a formatting bug rather than a peer whose
+					// announced base URL is unusable. The base is not echoed: it may carry
+					// credentials, which is one of the shapes JoinPeerURL refuses.
+					u.logger.Errorf("[validateSubtree][%s] invalid peer base URL for subtree data: %v", subtreeHash.String(), subtreeDataErr)
+				} else {
+					u.logger.Errorf("[validateSubtree][%s] failed to get subtree data from %s: %v", subtreeHash.String(), url, subtreeDataErr)
+				}
 			} else {
 				// Build subtree structure from allTxs for deserialization
 				// We cannot use the empty 'subtree' parameter as it has no nodes yet
@@ -1455,7 +1478,7 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 		if len(remainingHashes) > 0 {
 			u.logger.Debugf("[validateSubtree][%s] fetching %d missing txs from peer", subtreeHash.String(), len(remainingHashes))
 
-			peerTxs, peerErr := u.getMissingTransactionsFromPeer(ctx, subtreeHash, remainingHashes, baseURL)
+			peerTxs, peerErr := u.getMissingTransactionsFromPeer(ctx, subtreeHash, remainingHashes, baseURL, peerID)
 			if peerErr != nil {
 				return nil, errors.NewProcessingError("[validateSubtree][%s] failed to get missing transactions", subtreeHash.String(), peerErr)
 			}
@@ -1906,7 +1929,7 @@ func (u *Server) getMissingTransactionsFromFile(ctx context.Context, subtreeHash
 }
 
 func (u *Server) getMissingTransactionsFromPeer(ctx context.Context, subtreeHash chainhash.Hash, missingTxHashes []utxo.UnresolvedMetaData,
-	baseURL string) (missingTxs []missingTx, err error) {
+	baseURL, peerID string) (missingTxs []missingTx, err error) {
 	// transactions have to be returned in the same order as they were requested
 	missingTxsMap := make(map[chainhash.Hash]*bt.Tx, len(missingTxHashes))
 	missingTxsMu := sync.Mutex{}
@@ -1923,7 +1946,7 @@ func (u *Server) getMissingTransactionsFromPeer(ctx context.Context, subtreeHash
 		missingTxHashesBatch := missingTxHashes[i:subtreepkg.Min(i+batchSize, len(missingTxHashes))]
 
 		g.Go(func() error {
-			missingTxsBatch, err := u.getMissingTransactionsBatch(gCtx, subtreeHash, missingTxHashesBatch, baseURL)
+			missingTxsBatch, err := u.getMissingTransactionsBatch(gCtx, subtreeHash, missingTxHashesBatch, baseURL, peerID)
 			if err != nil {
 				return errors.NewProcessingError("[getMissingTransactionsFromPeer][%s] failed to get missing transactions batch", subtreeHash.String(), err)
 			}

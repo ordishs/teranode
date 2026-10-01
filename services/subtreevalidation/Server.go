@@ -718,6 +718,11 @@ func (u *Server) CheckSubtreeFromBlock(ctx context.Context, request *subtreevali
 // This method is called internally by CheckSubtreeFromBlock after acquiring the
 // appropriate locks to prevent duplicate processing.
 func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevalidation_api.CheckSubtreeFromBlockRequest) (ok bool, err error) {
+	// INFO, not DEBUG: this span passes its error to deferFn, and an INFO span
+	// with a non-nil error logs at ERROR (util/tracing, logTraceMessage). The
+	// only production caller is cross-process over gRPC, so demoting this to
+	// DEBUG would leave a failing subtreevalidation replica logging nothing at
+	// all about its own failure.
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "checkSubtree",
 		tracing.WithParentStat(u.stats),
 		tracing.WithHistogram(prometheusSubtreeValidationCheckSubtree),
@@ -917,7 +922,8 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		// assembly: bulk-history txs do not belong in our template. In
 		// RUNNING, assembly stays enabled so txs from a legacy-bridge tip
 		// block survive in the mempool if the block loses a reorg.
-		if *currentState == blockchain.FSMStateCATCHINGBLOCKS {
+		// IDLE is included: an operator STOP can land while catchup is running.
+		if *currentState != blockchain.FSMStateRUNNING {
 			validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
 		}
 
@@ -1005,8 +1011,10 @@ func initialiseInvalidSubtreeKafkaProducer(ctx context.Context, logger ulogger.L
 	return invalidSubtreeKafkaProducer, nil
 }
 
-// publishInvalidSubtree publishes an invalid subtree event to Kafka
-func (u *Server) publishInvalidSubtree(ctx context.Context, subtreeHash, peerURL, reason string) {
+// publishInvalidSubtree publishes an invalid subtree event to Kafka. peerID
+// identifies the peer whose DataHub (peerURL) served the offending bytes and
+// may be empty when the caller only knows the URL.
+func (u *Server) publishInvalidSubtree(ctx context.Context, subtreeHash, peerURL, peerID, reason string) {
 	ctxLogger := u.logger.WithTraceContext(ctx)
 	if u.invalidSubtreeKafkaProducer == nil {
 		return
@@ -1024,8 +1032,8 @@ func (u *Server) publishInvalidSubtree(ctx context.Context, subtreeHash, peerURL
 			return
 		}
 
-		if *state == blockchain_api.FSMStateType_CATCHINGBLOCKS {
-			// ignore notifications while syncing or catching up
+		if *state != blockchain_api.FSMStateType_RUNNING {
+			// ignore notifications unless caught up (IDLE can follow a STOP mid-catchup)
 			return
 		}
 	}
@@ -1035,18 +1043,19 @@ func (u *Server) publishInvalidSubtree(ctx context.Context, subtreeHash, peerURL
 
 	// de-duplicate the subtree hash to avoid flooding Kafka with the same message
 	if _, ok := u.invalidSubtreeDeDuplicateMap.Get(subtreeHash); ok {
-		ctxLogger.Debugf("[publishInvalidSubtree] Skipping duplicate invalid subtree %s from peer %s to Kafka: %s", subtreeHash, peerURL, reason)
+		ctxLogger.Debugf("[publishInvalidSubtree] Skipping duplicate invalid subtree %s from peer %s (url %s) to Kafka: %s", subtreeHash, peerID, peerURL, reason)
 
 		return
 	}
 
 	u.invalidSubtreeDeDuplicateMap.Set(subtreeHash, struct{}{})
 
-	ctxLogger.Infof("[publishInvalidSubtree] publishing invalid subtree %s from peer %s to Kafka: %s", subtreeHash, peerURL, reason)
+	ctxLogger.Infof("[publishInvalidSubtree] publishing invalid subtree %s from peer %s (url %s) to Kafka: %s", subtreeHash, peerID, peerURL, reason)
 
 	msg := &kafkamessage.KafkaInvalidSubtreeTopicMessage{
 		SubtreeHash: subtreeHash,
 		PeerUrl:     peerURL,
+		PeerId:      peerID,
 		Reason:      reason,
 	}
 
