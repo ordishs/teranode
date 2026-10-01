@@ -783,6 +783,25 @@ impl UtxoStore for AeroUtxoStore {
         Ok((affected_parent_spends, spending_child_txs))
     }
 
+    async fn tx_exists(&self, hash: &Hash) -> Result<bool, StoreError> {
+        let key = self.key(hash)?;
+
+        match self
+            .client
+            .get(&ReadPolicy::default(), &key, Bins::None)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(aerospike::Error::ServerError(aerospike::ResultCode::KeyNotFoundError, _, _)) => {
+                Ok(false)
+            }
+            Err(e) => Err(StoreError::Backend(format!(
+                "tx_exists {}: {e}",
+                hex::encode(hash)
+            ))),
+        }
+    }
+
     async fn get_tx_meta(&self, hash: &Hash) -> Result<Option<TxMeta>, StoreError> {
         // Mirrors Go `Get(hash, fields.Tx, fields.Conflicting, fields.BlockIDs)`.
         // The `tx` bin holds the EXTENDED serialized tx body (fields.go:14-15),

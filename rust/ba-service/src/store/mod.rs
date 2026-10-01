@@ -224,6 +224,9 @@ pub trait UtxoStore: Send + Sync {
     /// Fetch a tx's stored metadata (Go `Get(hash, fields.Tx, fields.Conflicting,
     /// fields.BlockIDs)`). `Ok(None)` when the record is absent.
     async fn get_tx_meta(&self, hash: &Hash) -> Result<Option<TxMeta>, StoreError>;
+    /// Whether a record exists for `hash`, reading no bins. Unlike `get_tx_meta`
+    /// this works for records without a `tx` bin (coinbases created by `create`).
+    async fn tx_exists(&self, hash: &Hash) -> Result<bool, StoreError>;
     /// The tx's per-output spender list (`utxos`/`SpendingDatas` bin); index = vout,
     /// `None` = unspent. Go reads this via `fields.Utxos`.
     async fn get_spending_datas(

@@ -478,6 +478,55 @@ pub(crate) async fn resolve_block_id(
     }
 }
 
+/// Boot-time catch-up (Go replays every missed block through `moveForward`, which
+/// runs `processCoinbaseUtxos`). Walks back from `tip` until it reaches a block whose
+/// coinbase UTXO record already exists (or genesis), then creates the missing
+/// coinbase records oldest-first. `create` is CREATE_ONLY, so a repeat is benign.
+/// Returns how many coinbases were created. Without this a restart mid-sync leaves
+/// permanent holes: a later spend of a skipped block's coinbase fails TX_NOT_FOUND.
+pub async fn backfill_coinbase_utxos(
+    chain: &dyn BlockchainClient,
+    utxo: &dyn UtxoStore,
+    tip: &Hash,
+) -> Result<usize, StoreError> {
+    let mut missing: Vec<(Hash, u32, u32, Vec<u8>)> = Vec::new();
+    let mut cur = *tip;
+
+    loop {
+        let (height, id, coinbase) = chain.block_coinbase(&cur).await?;
+        if height == 0 || coinbase.is_empty() {
+            break;
+        }
+
+        let tx = Tx::from_bytes(&coinbase)
+            .map_err(|e| StoreError::Decode(format!("coinbase of {}: {e:?}", hex::encode(cur))))?;
+        if utxo.tx_exists(&tx.txid()).await? {
+            break;
+        }
+
+        missing.push((cur, height, id, coinbase));
+        cur = chain.block_header(&cur).await?.prev_hash;
+    }
+
+    let created = missing.len();
+    if created > 0 {
+        println!(
+            "ba-service: backfilling {created} missing coinbase UTXO(s) up to height {}",
+            missing[0].1
+        );
+    }
+
+    for (n, (hash, height, id, coinbase)) in missing.into_iter().rev().enumerate() {
+        let block_id = resolve_block_id(chain, &hash, id, height).await;
+        create_block_coinbase_utxo(utxo, &coinbase, height, block_id, &hash).await;
+        if n > 0 && n % 10_000 == 0 {
+            println!("ba-service: backfilled {n}/{created} coinbase UTXOs");
+        }
+    }
+
+    Ok(created)
+}
+
 /// Create a block's coinbase UTXO record (Go SubtreeProcessor.processCoinbaseUtxos).
 /// Parses the raw coinbase bytes, then writes a single-record UTXO with the
 /// block's mined info. Non-fatal: every failure is logged and swallowed, exactly
@@ -1378,5 +1427,115 @@ mod tests {
             .flat_map(|(hs, _)| hs.iter().copied())
             .collect();
         assert!(!winners.contains(&d), "evicted D must not be marked winner");
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use crate::store::chain_mem::MemBlockchainClient;
+    use crate::store::utxo_mem::MemUtxoStore;
+
+    fn cb(height: u32) -> Vec<u8> {
+        crate::coinbase::create_coinbase(
+            height,
+            5_000_000_000,
+            b"",
+            &["1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2".to_string()],
+            [0u8; 12],
+        )
+        .unwrap()
+    }
+
+    fn txid_of(height: u32) -> Hash {
+        Tx::from_bytes(&cb(height)).unwrap().txid()
+    }
+
+    /// Linear chain 0..=n (genesis h0 has an empty-skip coinbase). Block hash = [h; 32].
+    fn chain_of(n: u32) -> MemBlockchainClient {
+        let mut m = MemBlockchainClient::new(ChainTip {
+            hash: [n as u8; 32],
+            height: n,
+            n_bits: 0x207f_ffff,
+            version: 0x2000_0000,
+            median_time: 1_700_000_000,
+        });
+        for h in 0..=n {
+            let prev = if h == 0 { [0u8; 32] } else { [(h - 1) as u8; 32] };
+            m.set_header([h as u8; 32], prev, h);
+            m.set_block_coinbase([h as u8; 32], h, 100 + h, cb(h));
+        }
+        m
+    }
+
+    #[tokio::test]
+    async fn creates_every_missing_coinbase_oldest_first_on_empty_store() {
+        let chain = chain_of(6);
+        let utxo = MemUtxoStore::default();
+
+        let n = backfill_coinbase_utxos(&chain, &utxo, &[6u8; 32]).await.unwrap();
+
+        assert_eq!(n, 6, "heights 1..=6; genesis is skipped");
+        let calls = utxo.create_calls();
+        let heights: Vec<u32> = calls.iter().map(|(_, h, _, _)| *h).collect();
+        assert_eq!(heights, vec![1, 2, 3, 4, 5, 6], "oldest first");
+        for (txid, h, mined, locked) in calls {
+            assert_eq!(txid, txid_of(h));
+            assert_eq!(mined.unwrap().block_id, 100 + h, "real block id, not height");
+            assert!(!locked);
+        }
+    }
+
+    #[tokio::test]
+    async fn stops_at_the_first_existing_coinbase() {
+        let chain = chain_of(8);
+        let utxo = MemUtxoStore::default();
+        // Heights 1..=5 already present; 6..=8 were missed.
+        for h in 1..=5 {
+            let tx = Tx::from_bytes(&cb(h)).unwrap();
+            utxo.create(&tx, h, None, false).await.unwrap();
+        }
+        let before = utxo.create_calls().len();
+
+        let n = backfill_coinbase_utxos(&chain, &utxo, &[8u8; 32]).await.unwrap();
+
+        assert_eq!(n, 3);
+        let heights: Vec<u32> = utxo.create_calls()[before..]
+            .iter()
+            .map(|(_, h, _, _)| *h)
+            .collect();
+        assert_eq!(heights, vec![6, 7, 8]);
+    }
+
+    #[tokio::test]
+    async fn is_a_no_op_when_the_tip_coinbase_exists() {
+        let chain = chain_of(4);
+        let utxo = MemUtxoStore::default();
+        let tx = Tx::from_bytes(&cb(4)).unwrap();
+        utxo.create(&tx, 4, None, false).await.unwrap();
+        let before = utxo.create_calls().len();
+
+        let n = backfill_coinbase_utxos(&chain, &utxo, &[4u8; 32]).await.unwrap();
+
+        assert_eq!(n, 0);
+        assert_eq!(utxo.create_calls().len(), before);
+    }
+
+    #[tokio::test]
+    async fn genesis_only_chain_creates_nothing() {
+        let chain = chain_of(0);
+        let utxo = MemUtxoStore::default();
+        let n = backfill_coinbase_utxos(&chain, &utxo, &[0u8; 32]).await.unwrap();
+        assert_eq!(n, 0);
+        assert!(utxo.create_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_coinbase_is_an_error_not_a_silent_skip() {
+        let mut chain = chain_of(3);
+        chain.set_block_coinbase([3u8; 32], 3, 103, vec![0xde, 0xad]);
+        let utxo = MemUtxoStore::default();
+        let e = backfill_coinbase_utxos(&chain, &utxo, &[3u8; 32]).await.expect_err("bad coinbase");
+        assert!(e.to_string().contains("coinbase of"), "{e}");
     }
 }

@@ -338,6 +338,10 @@ impl UtxoStore for MemUtxoStore {
         Ok((affected, children))
     }
 
+    async fn tx_exists(&self, hash: &Hash) -> Result<bool, StoreError> {
+        Ok(self.records.lock().unwrap().contains_key(hash))
+    }
+
     async fn get_tx_meta(&self, hash: &Hash) -> Result<Option<TxMeta>, StoreError> {
         let recs = self.records.lock().unwrap();
         Ok(recs.get(hash).map(|r| TxMeta {

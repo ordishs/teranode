@@ -117,6 +117,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hex::encode(tip.hash)
     );
 
+    // 1b. Catch-up: create the coinbase UTXO of every block this service did not
+    //     see (restart mid-sync, notification gap). Go gets this by replaying the
+    //     missed blocks; here we backfill from the tip down to the last block whose
+    //     coinbase record exists. Fatal on failure — spends of skipped coinbases
+    //     would otherwise fail TX_NOT_FOUND later.
+    let backfilled =
+        ba_service::store::chain_grpc::backfill_coinbase_utxos(chain.as_ref(), utxo.as_ref(), &tip.hash).await?;
+    println!("ba-service: coinbase catch-up complete — created={backfilled}");
+
     // 2. Load unmined txs, THEN flip ready. If the load fails we deliberately do
     //    NOT flip ready: the service stays Unavailable rather than serve a
     //    half-initialised assembly (a candidate missing the mempool would be
