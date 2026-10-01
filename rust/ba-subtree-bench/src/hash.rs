@@ -5,6 +5,11 @@ use sha2::{Digest, Sha256};
 /// A 32-byte hash (txid / merkle node), matching `chainhash.Hash`'s byte layout.
 pub type Hash = [u8; 32];
 
+/// Hash as Go `chainhash.Hash.String()` prints it: byte-reversed hex.
+pub fn display_hex(hash: &Hash) -> String {
+    hash.iter().rev().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Bitcoin double-SHA256: `sha256(sha256(data))`.
 pub fn sha256d(data: &[u8]) -> Hash {
     let first = Sha256::digest(data);
@@ -32,6 +37,26 @@ pub fn hash_pair(left: &Hash, right: &Hash) -> Hash {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn display_hex_reverses_bytes_like_chainhash_string() {
+        // Mainnet genesis: stored little-endian, printed big-endian.
+        let mut h = [0u8; 32];
+        hex_decode(
+            "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000",
+            &mut h,
+        );
+        assert_eq!(
+            super::display_hex(&h),
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
+    }
+
+    fn hex_decode(s: &str, out: &mut [u8]) {
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+    }
+
     use super::sha256d;
 
     #[test]

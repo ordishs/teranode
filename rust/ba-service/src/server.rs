@@ -35,6 +35,10 @@ const DEFAULT_SUBSIDY_HALVING_INTERVAL: u32 = 210_000;
 /// matches `config::DEFAULT_COINBASE_ADDRESS`. Capability A scope only.
 const DEFAULT_COINBASE_ADDRESS: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
 
+/// Coinbase address and nBits Go hard-codes in GetBlockAssemblyBlockCandidate.
+const TEMPLATE_COINBASE_ADDRESS: &str = "1MUMxUTXcPQ1kAqB7MtJWneeAwVW4cHzzp";
+const TEMPLATE_N_BITS: u32 = 0xffff_ffff;
+
 /// Fixed extranonce for the service-built coinbase path. The published coinbase is
 /// only required to be a valid, height-committing coinbase that satisfies the
 /// header PoW; the extranonce search space is not exercised here (Capability A),
@@ -527,6 +531,33 @@ fn hash32(bytes: &[u8]) -> Result<Hash, Status> {
     })
 }
 
+/// Builds the coinbase for a candidate and the block merkle root over `subtrees`
+/// (cloned; the engine substitutes the coinbase placeholder in subtree 0). Shared by
+/// the generate, proposal and template paths. `label` prefixes errors.
+#[allow(clippy::result_large_err)]
+fn coinbase_and_merkle(
+    label: &str,
+    height: u32,
+    coinbase_value: u64,
+    arbitrary: &[u8],
+    addresses: &[String],
+    extranonce: [u8; 12],
+    subtrees: &[Subtree],
+) -> Result<(Vec<u8>, Hash), Status> {
+    let coinbase_tx =
+        crate::coinbase::create_coinbase(height, coinbase_value, arbitrary, addresses, extranonce)
+            .map_err(|e| Status::internal(format!("{label}: build coinbase: {e}")))?;
+
+    let mut subtrees = subtrees.to_vec();
+    let merkle_root = ba_subtree_bench::block_merkle::try_block_merkle_root(
+        &mut subtrees,
+        &sha256d(&coinbase_tx),
+    )
+    .map_err(|e| Status::internal(format!("{label}: block merkle: {e}")))?;
+
+    Ok((coinbase_tx, merkle_root))
+}
+
 macro_rules! todo_rpc {
     ($name:literal) => {
         Err(Status::unimplemented(concat!(
@@ -534,6 +565,129 @@ macro_rules! todo_rpc {
             " not implemented (Gate 2 stage 3+)"
         )))
     };
+}
+
+impl BaService {
+    /// Builds the next mining candidate and its job from the live assembly
+    /// (Go `BlockAssembler.GetMiningCandidate`). Does NOT FSM-gate and does NOT
+    /// cache the job — the RPC wrapper does both.
+    async fn build_candidate(&self) -> Result<(MiningCandidate, Job), Status> {
+        // Wall-clock "now" (Go BlockAssembler.go:1190-1196): `time.Now()` is BOTH
+        // the candidate's Time and the currentBlockTime handed to the DAA below.
+        let time_now = self.unix_now();
+
+        // Read the parent hash under a BRIEF lock and release it before awaiting
+        // the difficulty RPC — the std-Mutex guard must not cross `.await` (same
+        // rule as the FSM gate above).
+        let best_hash = {
+            let st = self.state.lock().unwrap();
+            st.chain.best_hash
+        };
+
+        // Next-block difficulty from the blockchain service (Go `getNextNbits` →
+        // `GetNextWorkRequired`). The candidate carries THIS nBits (not the tip's),
+        // and the job stores it so `submit`'s `meets_target` validates against the
+        // difficulty handed to the miner. A failure fails the candidate (Go errors
+        // too — a candidate cannot be built without a target).
+        let next_n_bits = self
+            .chain
+            .get_next_work_required(&best_hash, time_now as i64)
+            .await
+            .map_err(Status::from)?;
+
+        let st = self.state.lock().unwrap();
+        // Read chain context first (copies), then take the subtree roots.
+        let previous_hash = st.chain.best_hash.to_vec();
+        let height = st.chain.height + 1;
+        let version = st.chain.version;
+        let n_bits_raw = next_n_bits;
+        let n_bits = next_n_bits.to_le_bytes().to_vec();
+        let time = time_now;
+        let size_without_coinbase = st.total_size;
+        let previous_best_hash = st.chain.best_hash;
+
+        // Candidate subtree set — XOR selection, mirroring Go
+        // `BlockAssembler.GetMiningCandidate` (`:1115-1134`):
+        //   - completed (chained) subtrees exist → publish those (the leftover
+        //     partial txs wait for the current subtree to fill);
+        //   - else the current subtree holds real txs → publish a copy of it
+        //     (the incomplete subtree, placeholder at node 0, carried fees), via
+        //     `GetIncompleteSubtreeMiningData` / `createIncompleteSubtreeCopy`;
+        //   - else nothing → empty candidate (`generateEmptyBlockCandidate`).
+        let mut candidate_subtrees: Vec<Subtree> = if st.num_chained() > 0 {
+            st.chained_subtrees_clone()
+        } else if let Some(inc) = st.current_subtree_clone() {
+            vec![inc]
+        } else {
+            vec![]
+        };
+
+        // CONSENSUS: coinbase value reconciles with the PUBLISHED subtrees —
+        // subsidy + Σ(per-subtree fees) over exactly the candidate set, NOT the
+        // running `total_fees` (which would overclaim when the incomplete subtree
+        // holds fees that are not published). Mirrors Go `:1158`/`:1217`.
+        let published_fees: u64 = candidate_subtrees.iter().map(|s| s.fees).sum();
+        let coinbase_value =
+            crate::coinbase::block_subsidy(height, self.subsidy_interval) + published_fees;
+
+        // num_txs = Σ(node counts over published subtrees) − 1 (the single coinbase
+        // placeholder at subtree-0 node-0), saturating to 0 for the empty case.
+        let total_nodes: usize = candidate_subtrees.iter().map(|s| s.len()).sum();
+        let num_txs = total_nodes.saturating_sub(1) as u32;
+
+        // Published subtree roots = each candidate subtree's root (the exact hashes
+        // that go on the block as subtree_hashes).
+        let roots: Vec<Hash> = candidate_subtrees
+            .iter_mut()
+            .map(|s| s.root_hash().expect("non-empty candidate subtree"))
+            .collect();
+        let subtree_hashes: Vec<Vec<u8>> = roots.iter().map(|h| h.to_vec()).collect();
+
+        // Deterministic id from prev-hash + published subtree roots + time. (Stage-3
+        // parity tests use ≥cap completed sets → identical roots/derivation. The id
+        // may now fold the incomplete root in the fallback case — that is fine.)
+        let mut id_input = previous_hash.clone();
+        for h in &roots {
+            id_input.extend_from_slice(h);
+        }
+        id_input.extend_from_slice(&time.to_le_bytes());
+        let id = sha256d(&id_input).to_vec();
+
+        // Coinbase merkle proof over the candidate set's RAW roots (empty vec when
+        // there are no subtrees — `coinbase_merkle_proof` returns `[]` for empty).
+        let merkle_proof: Vec<Vec<u8>> =
+            ba_subtree_bench::block_merkle::coinbase_merkle_proof(&mut candidate_subtrees)
+                .iter()
+                .map(|h| h.to_vec())
+                .collect();
+
+        let job = Job {
+            previous_hash: previous_best_hash,
+            subtrees: candidate_subtrees,
+            coinbase_value,
+            height,
+            n_bits: n_bits_raw,
+            version,
+            time,
+        };
+
+        let candidate = MiningCandidate {
+            id,
+            previous_hash,
+            coinbase_value,
+            version,
+            n_bits,
+            time,
+            height,
+            merkle_proof,
+            subtree_count: subtree_hashes.len() as u32,
+            num_txs,
+            size_without_coinbase,
+            subtree_hashes,
+        };
+
+        Ok((candidate, job))
+    }
 }
 
 #[tonic::async_trait]
@@ -645,122 +799,9 @@ impl BlockAssemblyApi for BaService {
             ));
         }
 
-        // Wall-clock "now" (Go BlockAssembler.go:1190-1196): `time.Now()` is BOTH
-        // the candidate's Time and the currentBlockTime handed to the DAA below.
-        let time_now = self.unix_now();
-
-        // Read the parent hash under a BRIEF lock and release it before awaiting
-        // the difficulty RPC — the std-Mutex guard must not cross `.await` (same
-        // rule as the FSM gate above).
-        let best_hash = {
-            let st = self.state.lock().unwrap();
-            st.chain.best_hash
-        };
-
-        // Next-block difficulty from the blockchain service (Go `getNextNbits` →
-        // `GetNextWorkRequired`). The candidate carries THIS nBits (not the tip's),
-        // and the job stores it so `submit`'s `meets_target` validates against the
-        // difficulty handed to the miner. A failure fails the candidate (Go errors
-        // too — a candidate cannot be built without a target).
-        let next_n_bits = self
-            .chain
-            .get_next_work_required(&best_hash, time_now as i64)
-            .await
-            .map_err(Status::from)?;
-
-        let st = self.state.lock().unwrap();
-        // Read chain context first (copies), then take the subtree roots.
-        let previous_hash = st.chain.best_hash.to_vec();
-        let height = st.chain.height + 1;
-        let version = st.chain.version;
-        let n_bits_raw = next_n_bits;
-        let n_bits = next_n_bits.to_le_bytes().to_vec();
-        let time = time_now;
-        let size_without_coinbase = st.total_size;
-        let previous_best_hash = st.chain.best_hash;
-
-        // Candidate subtree set — XOR selection, mirroring Go
-        // `BlockAssembler.GetMiningCandidate` (`:1115-1134`):
-        //   - completed (chained) subtrees exist → publish those (the leftover
-        //     partial txs wait for the current subtree to fill);
-        //   - else the current subtree holds real txs → publish a copy of it
-        //     (the incomplete subtree, placeholder at node 0, carried fees), via
-        //     `GetIncompleteSubtreeMiningData` / `createIncompleteSubtreeCopy`;
-        //   - else nothing → empty candidate (`generateEmptyBlockCandidate`).
-        let mut candidate_subtrees: Vec<Subtree> = if st.num_chained() > 0 {
-            st.chained_subtrees_clone()
-        } else if let Some(inc) = st.current_subtree_clone() {
-            vec![inc]
-        } else {
-            vec![]
-        };
-
-        // CONSENSUS: coinbase value reconciles with the PUBLISHED subtrees —
-        // subsidy + Σ(per-subtree fees) over exactly the candidate set, NOT the
-        // running `total_fees` (which would overclaim when the incomplete subtree
-        // holds fees that are not published). Mirrors Go `:1158`/`:1217`.
-        let published_fees: u64 = candidate_subtrees.iter().map(|s| s.fees).sum();
-        let coinbase_value =
-            crate::coinbase::block_subsidy(height, self.subsidy_interval) + published_fees;
-
-        // num_txs = Σ(node counts over published subtrees) − 1 (the single coinbase
-        // placeholder at subtree-0 node-0), saturating to 0 for the empty case.
-        let total_nodes: usize = candidate_subtrees.iter().map(|s| s.len()).sum();
-        let num_txs = total_nodes.saturating_sub(1) as u32;
-
-        // Published subtree roots = each candidate subtree's root (the exact hashes
-        // that go on the block as subtree_hashes).
-        let roots: Vec<Hash> = candidate_subtrees
-            .iter_mut()
-            .map(|s| s.root_hash().expect("non-empty candidate subtree"))
-            .collect();
-        let subtree_hashes: Vec<Vec<u8>> = roots.iter().map(|h| h.to_vec()).collect();
-
-        // Deterministic id from prev-hash + published subtree roots + time. (Stage-3
-        // parity tests use ≥cap completed sets → identical roots/derivation. The id
-        // may now fold the incomplete root in the fallback case — that is fine.)
-        let mut id_input = previous_hash.clone();
-        for h in &roots {
-            id_input.extend_from_slice(h);
-        }
-        id_input.extend_from_slice(&time.to_le_bytes());
-        let id = sha256d(&id_input).to_vec();
-
-        // Coinbase merkle proof over the candidate set's RAW roots (empty vec when
-        // there are no subtrees — `coinbase_merkle_proof` returns `[]` for empty).
-        let merkle_proof: Vec<Vec<u8>> =
-            ba_subtree_bench::block_merkle::coinbase_merkle_proof(&mut candidate_subtrees)
-                .iter()
-                .map(|h| h.to_vec())
-                .collect();
-
-        self.jobs.insert(
-            id.clone(),
-            Job {
-                previous_hash: previous_best_hash,
-                subtrees: candidate_subtrees,
-                coinbase_value,
-                height,
-                n_bits: n_bits_raw,
-                version,
-                time,
-            },
-        );
-
-        Ok(Response::new(MiningCandidate {
-            id,
-            previous_hash,
-            coinbase_value,
-            version,
-            n_bits,
-            time,
-            height,
-            merkle_proof,
-            subtree_count: subtree_hashes.len() as u32,
-            num_txs,
-            size_without_coinbase,
-            subtree_hashes,
-        }))
+        let (candidate, job) = self.build_candidate().await?;
+        self.jobs.insert(candidate.id.clone(), job);
+        Ok(Response::new(candidate))
     }
 
     async fn get_current_difficulty(
@@ -828,7 +869,8 @@ impl BlockAssemblyApi for BaService {
         // blockchain store, so `block_header_ids` resolves its real ID. `create`
         // is CREATE_ONLY so a later notification-path create is a benign no-op.
         if let Some(utxo) = &self.utxo {
-            let block_id = resolve_block_id(self.chain.as_ref(), &built.block_hash, 0, built.height).await;
+            let block_id =
+                resolve_block_id(self.chain.as_ref(), &built.block_hash, 0, built.height).await;
             create_block_coinbase_utxo(
                 utxo.as_ref(),
                 &built.coinbase_tx,
@@ -886,13 +928,28 @@ impl BlockAssemblyApi for BaService {
         _r: Request<EmptyMessage>,
     ) -> Result<Response<StateMessage>, Status> {
         self.check_ready()?;
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        let subtrees: Vec<String> = st
+            .processor
+            .subtree_hashes()
+            .iter()
+            .map(ba_subtree_bench::hash::display_hex)
+            .collect();
+        // Go `SubtreeCount()` = chained + 1 (the current subtree) and `TxCount()`
+        // counts every node incl. the coinbase placeholder. The Rust ingest is
+        // synchronous under the assembly lock, so there is no queue (0) and no
+        // removeMap (RemoveTx applies immediately; 0).
         Ok(Response::new(StateMessage {
             block_assembly_state: "running".to_string(),
             subtree_processor_state: "running".to_string(),
-            subtree_count: st.processor.num_chained() as u32,
-            tx_count: st.num_txs(),
-            ..Default::default()
+            subtree_count: st.num_chained() as u32 + 1,
+            subtree_size: st.cap() as u32,
+            tx_count: st.processor.total_nodes() as u64,
+            queue_count: 0,
+            current_height: st.chain.height,
+            current_hash: ba_subtree_bench::hash::display_hex(&st.chain.best_hash),
+            remove_map_count: 0,
+            subtrees,
         }))
     }
 
@@ -951,23 +1008,15 @@ impl BlockAssemblyApi for BaService {
                 Some(a) if !a.is_empty() => vec![a.clone()],
                 _ => self.coinbase_addresses.clone(),
             };
-            let coinbase_tx = crate::coinbase::create_coinbase(
+            let (coinbase_tx, merkle_root) = coinbase_and_merkle(
+                "generate",
                 job.height,
                 job.coinbase_value,
                 b"",
                 &addresses,
                 extranonce,
-            )
-            .map_err(|e| Status::internal(format!("generate: build coinbase: {e}")))?;
-            let coinbase_txid = sha256d(&coinbase_tx);
-
-            // 3. Block merkle root for this coinbase (engine, guarded).
-            let mut subtrees = job.subtrees.clone();
-            let merkle_root = ba_subtree_bench::block_merkle::try_block_merkle_root(
-                &mut subtrees,
-                &coinbase_txid,
-            )
-            .map_err(|e| Status::internal(format!("generate: block merkle: {e}")))?;
+                &job.subtrees,
+            )?;
 
             // 4. Nonce search: regtest 0x207fffff is met almost immediately. Bounded
             //    by u32::MAX; error out rather than loop forever.
@@ -1008,19 +1057,83 @@ impl BlockAssemblyApi for BaService {
         &self,
         _r: Request<EmptyMessage>,
     ) -> Result<Response<OkResponse>, Status> {
-        todo_rpc!("CheckBlockAssembly")
+        self.check_ready()?;
+        self.state
+            .lock()
+            .unwrap()
+            .processor
+            .check()
+            .map_err(|e| Status::internal(format!("error found in block assembly: {e}")))?;
+        Ok(Response::new(OkResponse { ok: true }))
     }
     async fn get_block_assembly_block_candidate(
         &self,
         _r: Request<EmptyMessage>,
     ) -> Result<Response<GetBlockAssemblyBlockCandidateResponse>, Status> {
-        todo_rpc!("GetBlockAssemblyBlockCandidate")
+        // Mirrors Go GetBlockAssemblyBlockCandidate (Server.go:2125): a template
+        // block over the current candidate with a "block template" coinbase paying a
+        // fixed address, nBits 0xffffffff and nonce 0. Uses the candidate builder
+        // directly: like Go's BlockAssembler.GetMiningCandidate it neither FSM-gates
+        // nor caches a job.
+        self.check_ready()?;
+        let (candidate, job) = self.build_candidate().await?;
+
+        let (coinbase_tx, merkle_root) = coinbase_and_merkle(
+            "block template",
+            candidate.height,
+            candidate.coinbase_value,
+            b"block template",
+            &[TEMPLATE_COINBASE_ADDRESS.to_string()],
+            FIXED_EXTRANONCE,
+            &job.subtrees,
+        )?;
+
+        let subtree_hashes: Vec<Hash> = candidate
+            .subtree_hashes
+            .iter()
+            .map(|h| hash32(h))
+            .collect::<Result<_, _>>()?;
+
+        let header = build_header(
+            candidate.version,
+            &job.previous_hash,
+            &merkle_root,
+            candidate.time,
+            TEMPLATE_N_BITS,
+            0,
+        );
+
+        let block = crate::block::block_bytes(
+            &header,
+            u64::from(candidate.num_txs),
+            candidate.size_without_coinbase + coinbase_tx.len() as u64,
+            &subtree_hashes,
+            &coinbase_tx,
+            candidate.height,
+            &[],
+        );
+        Ok(Response::new(GetBlockAssemblyBlockCandidateResponse {
+            block,
+        }))
     }
     async fn get_block_assembly_txs(
         &self,
         _r: Request<EmptyMessage>,
     ) -> Result<Response<GetBlockAssemblyTxsResponse>, Status> {
-        todo_rpc!("GetBlockAssemblyTxs")
+        self.check_ready()?;
+        let txs: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .processor
+            .tx_hashes()
+            .iter()
+            .map(ba_subtree_bench::hash::display_hex)
+            .collect();
+        Ok(Response::new(GetBlockAssemblyTxsResponse {
+            tx_count: txs.len() as u64,
+            txs,
+        }))
     }
     async fn get_candidate_block(
         &self,
@@ -1041,22 +1154,15 @@ impl BlockAssemblyApi for BaService {
         // Default coinbase paying the configured address(es) (Go:
         // CreateCoinbaseTxCandidate). Deterministic extranonce is fine — this is a
         // proposal, not a submitted block.
-        let coinbase_tx = crate::coinbase::create_coinbase(
+        let (coinbase_tx, merkle_root) = coinbase_and_merkle(
+            "get_candidate_block",
             job.height,
             job.coinbase_value,
             b"",
             &self.coinbase_addresses,
             FIXED_EXTRANONCE,
-        )
-        .map_err(|e| Status::internal(format!("get_candidate_block: build coinbase: {e}")))?;
-        let coinbase_txid = sha256d(&coinbase_tx);
-
-        // Merkle root over the coinbase-replaced subtrees (clone; the engine
-        // substitutes the coinbase placeholder in subtree[0]).
-        let mut subtrees = job.subtrees.clone();
-        let merkle_root =
-            ba_subtree_bench::block_merkle::try_block_merkle_root(&mut subtrees, &coinbase_txid)
-                .map_err(|e| Status::internal(format!("get_candidate_block: block merkle: {e}")))?;
+            &job.subtrees,
+        )?;
 
         // ORIGINAL subtree roots (before coinbase replacement) — the asset service
         // streams the block's txs from the subtree store by these hashes.
@@ -2396,5 +2502,231 @@ mod submit_tests {
         svc.get_mining_candidate(Request::new(GetMiningCandidateRequest::default()))
             .await
             .expect("RUNNING FSM -> candidate produced");
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use ba_subtree_bench::block_merkle::block_merkle_root;
+    use ba_subtree_bench::hash::sha256d;
+    use ba_subtree_bench::hash::display_hex as display;
+    use ba_subtree_bench::subtree::COINBASE_PLACEHOLDER;
+    use tonic::Request;
+
+    fn leaf(i: u32) -> Hash {
+        sha256d(&i.to_le_bytes())
+    }
+
+    fn ready_with_txs(n: u32) -> BaService {
+        let svc = BaService::new(4);
+        svc.set_ready();
+        {
+            let mut st = svc.state.lock().unwrap();
+            for i in 0..n {
+                st.add(leaf(i), i as u64, 1);
+            }
+        }
+        svc
+    }
+
+    #[tokio::test]
+    async fn state_reports_go_fields() {
+        // cap 4, 8 txs + placeholder = 9 nodes -> 2 chained + current of 1 node.
+        let svc = ready_with_txs(8);
+        {
+            let mut st = svc.state.lock().unwrap();
+            st.chain
+                .apply_block([0xab; 32], 42, 0x207f_ffff, 1_700_000_001);
+        }
+        let s = svc
+            .get_block_assembly_state(Request::new(EmptyMessage {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(s.subtree_count, 3, "chained + the current subtree");
+        assert_eq!(s.subtree_size, 4);
+        assert_eq!(
+            s.tx_count, 9,
+            "Go TxCount includes the coinbase placeholder"
+        );
+        assert_eq!(s.queue_count, 0);
+        assert_eq!(s.current_height, 42);
+        assert_eq!(s.current_hash, display(&[0xab; 32]));
+        assert_eq!(s.remove_map_count, 0);
+        assert_eq!(s.subtrees.len(), 3);
+
+        let mut st = svc.state.lock().unwrap();
+        let want: Vec<String> = st.processor.subtree_hashes().iter().map(display).collect();
+        assert_eq!(s.subtrees, want);
+        let first_chained = st.chained_roots()[0];
+        assert_eq!(s.subtrees[0], display(&first_chained));
+    }
+
+    #[tokio::test]
+    async fn state_on_fresh_assembly_has_one_subtree_and_placeholder() {
+        let svc = ready_with_txs(0);
+        let s = svc
+            .get_block_assembly_state(Request::new(EmptyMessage {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(s.subtree_count, 1);
+        assert_eq!(s.tx_count, 1);
+        assert_eq!(s.subtrees.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn txs_lists_placeholder_then_txs_in_display_order() {
+        let svc = ready_with_txs(6);
+        let r = svc
+            .get_block_assembly_txs(Request::new(EmptyMessage {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(r.tx_count, 7);
+        assert_eq!(r.txs.len(), 7);
+        assert_eq!(r.txs[0], display(&COINBASE_PLACEHOLDER));
+        for i in 0..6u32 {
+            assert_eq!(r.txs[i as usize + 1], display(&leaf(i)));
+        }
+    }
+
+    #[tokio::test]
+    async fn check_ok_on_consistent_assembly() {
+        let svc = ready_with_txs(9);
+        let r = svc
+            .check_block_assembly(Request::new(EmptyMessage {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r.ok);
+    }
+
+    #[tokio::test]
+    async fn check_fails_when_a_chained_tx_loses_its_map_entry() {
+        let svc = ready_with_txs(9);
+        // RemoveTx drops the dedup entry but leaves a tx in a COMPLETED subtree,
+        // the exact inconsistency Go's CheckSubtreeProcessor reports.
+        svc.remove_tx(Request::new(RemoveTxRequest {
+            txid: leaf(0).to_vec(),
+        }))
+        .await
+        .unwrap();
+        let e = svc
+            .check_block_assembly(Request::new(EmptyMessage {}))
+            .await
+            .expect_err("inconsistent assembly must fail the check");
+        assert_eq!(e.code(), tonic::Code::Internal);
+        assert!(
+            e.message().contains("error found in block assembly"),
+            "{}",
+            e.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn block_candidate_is_a_go_shaped_template_block() {
+        let svc = ready_with_txs(8);
+        let resp = svc
+            .get_block_assembly_block_candidate(Request::new(EmptyMessage {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let b = resp.block;
+
+        // Independently rebuild the expected parts.
+        let published_fees: u64 = (0u32..7).map(u64::from).sum();
+        let value =
+            crate::coinbase::block_subsidy(1, DEFAULT_SUBSIDY_HALVING_INTERVAL) + published_fees;
+        let coinbase = crate::coinbase::create_coinbase(
+            1,
+            value,
+            b"block template",
+            &[TEMPLATE_COINBASE_ADDRESS.to_string()],
+            FIXED_EXTRANONCE,
+        )
+        .unwrap();
+        let txid = sha256d(&coinbase);
+
+        let (mut subtrees, roots) = {
+            let mut st = svc.state.lock().unwrap();
+            let subs = st.chained_subtrees_clone();
+            let roots = st.chained_roots();
+            (subs, roots)
+        };
+        let merkle = block_merkle_root(&mut subtrees, &txid);
+
+        assert_eq!(&b[0..4], &0x2000_0000u32.to_le_bytes(), "version");
+        assert_eq!(&b[4..36], &[0u8; 32], "prev = genesis tip");
+        assert_eq!(
+            &b[36..68],
+            &merkle,
+            "merkle root over the template coinbase"
+        );
+        assert_eq!(&b[72..76], &[0xff; 4], "nBits is 0xffffffff");
+        assert_eq!(&b[76..80], &[0u8; 4], "nonce 0");
+
+        let mut o = 80;
+        assert_eq!(b[o], 7, "tx count = NumTxs, no coinbase");
+        o += 1;
+        let size = u64::from(b[o]);
+        assert_eq!(
+            size,
+            8 + coinbase.len() as u64,
+            "size = total_size + coinbase"
+        );
+        o += 1;
+        assert_eq!(b[o], 2, "two subtrees");
+        o += 1;
+        assert_eq!(&b[o..o + 32], &roots[0]);
+        assert_eq!(&b[o + 32..o + 64], &roots[1]);
+        o += 64;
+        assert_eq!(&b[o..o + coinbase.len()], &coinbase[..]);
+        o += coinbase.len();
+        assert_eq!(&b[o..], &[1u8, 0u8], "height 1, empty BUMP");
+    }
+
+    #[tokio::test]
+    async fn block_candidate_works_when_fsm_not_running_and_caches_no_job() {
+        let mem = std::sync::Arc::new(
+            MemBlockchainClient::new(ChainTip {
+                hash: [0u8; 32],
+                height: 0,
+                n_bits: 0x207f_ffff,
+                version: 0x2000_0000,
+                median_time: 1_700_000_000,
+            })
+            .with_fsm_running(false),
+        );
+        let svc = BaService::with_chain(4, mem, vec![DEFAULT_COINBASE_ADDRESS.to_string()]);
+        svc.set_ready();
+
+        svc.get_block_assembly_block_candidate(Request::new(EmptyMessage {}))
+            .await
+            .expect("Go BlockAssembler path is not FSM-gated");
+        assert_eq!(svc.jobs.len(), 0, "template must not cache a job");
+    }
+
+    #[tokio::test]
+    async fn metadata_rpcs_require_ready() {
+        let svc = BaService::new(4);
+        for e in [
+            svc.get_block_assembly_state(Request::new(EmptyMessage {}))
+                .await
+                .err(),
+            svc.get_block_assembly_txs(Request::new(EmptyMessage {}))
+                .await
+                .err(),
+            svc.check_block_assembly(Request::new(EmptyMessage {}))
+                .await
+                .err(),
+            svc.get_block_assembly_block_candidate(Request::new(EmptyMessage {}))
+                .await
+                .err(),
+        ] {
+            assert_eq!(e.expect("not ready").code(), tonic::Code::Unavailable);
+        }
     }
 }

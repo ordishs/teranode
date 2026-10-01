@@ -99,7 +99,7 @@ pub fn create_coinbase(
     Ok(tx)
 }
 
-fn push_varint(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn push_varint(out: &mut Vec<u8>, v: u64) {
     if v < 0xfd {
         out.push(v as u8);
     } else if v <= 0xffff {

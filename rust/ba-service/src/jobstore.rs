@@ -38,6 +38,12 @@ impl JobStore {
         self.jobs.lock().unwrap().get(id).cloned()
     }
 
+    #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+
     pub fn clear(&self) {
         self.jobs.lock().unwrap().clear();
     }

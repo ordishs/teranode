@@ -119,6 +119,79 @@ impl SubtreeProcessor {
         was_seen
     }
 
+    /// Roots of every chained subtree plus the current subtree when it is
+    /// non-empty — Go `getSubtreeHashesChan` (`SubtreeProcessor.go:713-726`).
+    pub fn subtree_hashes(&mut self) -> Vec<Hash> {
+        let mut v = self.chained_roots();
+        if !self.current.is_empty() {
+            if let Some(r) = self.current.root_hash() {
+                v.push(r);
+            }
+        }
+        v
+    }
+
+    /// Every node hash (chained then current), INCLUDING the coinbase placeholder
+    /// — Go `getTransactionHashesChan` (`SubtreeProcessor.go:771-783`).
+    pub fn tx_hashes(&self) -> Vec<Hash> {
+        let mut v = Vec::with_capacity(self.total_nodes());
+        for st in &self.chained {
+            v.extend(st.nodes.iter().map(|n| n.hash));
+        }
+        v.extend(self.current.nodes.iter().map(|n| n.hash));
+        v
+    }
+
+    /// Consistency check — Go `checkSubtreeProcessor` (`SubtreeProcessor.go:2926`).
+    /// Returns the first inconsistency: a node missing from the dedup set, a
+    /// misplaced coinbase placeholder, or a dedup-set size that differs from the
+    /// node count minus the placeholder.
+    pub fn check(&self) -> Result<(), String> {
+        for (si, st) in self.chained.iter().enumerate() {
+            for (ni, n) in st.nodes.iter().enumerate() {
+                if n.hash == crate::subtree::COINBASE_PLACEHOLDER {
+                    if si != 0 || ni != 0 {
+                        return Err(format!("coinbase placeholder not in first subtree {si}"));
+                    }
+                    continue;
+                }
+                if !self.seen.contains(&n.hash) {
+                    return Err(format!(
+                        "tx {} from subtree {si} not in tx map",
+                        crate::hash::display_hex(&n.hash)
+                    ));
+                }
+            }
+        }
+
+        for (ni, n) in self.current.nodes.iter().enumerate() {
+            if self.seen.contains(&n.hash) {
+                continue;
+            }
+            if n.hash == crate::subtree::COINBASE_PLACEHOLDER {
+                if !self.chained.is_empty() || ni != 0 {
+                    return Err(format!(
+                        "coinbase placeholder not in first node of subtree {ni}"
+                    ));
+                }
+                continue;
+            }
+            return Err(format!(
+                "tx {} from current subtree not in tx map",
+                crate::hash::display_hex(&n.hash)
+            ));
+        }
+
+        let expected = self.total_nodes().saturating_sub(1);
+        if self.seen.len() != expected {
+            return Err(format!(
+                "tx map size {} does not match tx count {expected}",
+                self.seen.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// Roots of all completed (chained) subtrees, in order.
     pub fn chained_roots(&mut self) -> Vec<Hash> {
         self.chained
@@ -220,7 +293,10 @@ mod tests {
             "drained subtree carries the completed root"
         );
         // Aggregate fees accumulate (placeholder 0 + 1 + 2 + 3 = 6).
-        assert_eq!(drained[0].fees, 6, "drained subtree carries accumulated fees");
+        assert_eq!(
+            drained[0].fees, 6,
+            "drained subtree carries accumulated fees"
+        );
 
         // Second drain is empty until another subtree fills.
         assert!(
@@ -253,8 +329,13 @@ mod tests {
         p.add(sha256d(&2u32.to_le_bytes()), 7, 1);
         assert_eq!(p.current_len(), 3, "placeholder + 2 real txs");
 
-        let inc = p.current_subtree_clone().expect("incomplete subtree present");
-        assert_eq!(inc.nodes[0].hash, COINBASE_PLACEHOLDER, "node 0 placeholder");
+        let inc = p
+            .current_subtree_clone()
+            .expect("incomplete subtree present");
+        assert_eq!(
+            inc.nodes[0].hash, COINBASE_PLACEHOLDER,
+            "node 0 placeholder"
+        );
         assert_eq!(inc.fees, 10, "carried fees == sum of the 2 real-tx fees");
     }
 
@@ -267,5 +348,85 @@ mod tests {
         // placeholder + one real tx (the duplicate is dropped).
         assert_eq!(p.current_len(), 2);
         assert_eq!(p.num_txs(), 1);
+    }
+
+    #[test]
+    fn tx_hashes_lists_placeholder_then_txs_in_order() {
+        let mut p = SubtreeProcessor::new(4);
+        let hs: Vec<_> = (0..5u32).map(|i| sha256d(&i.to_le_bytes())).collect();
+        for h in &hs {
+            p.add(*h, 1, 1);
+        }
+        let got = p.tx_hashes();
+        assert_eq!(got.len(), 6);
+        assert_eq!(got[0], COINBASE_PLACEHOLDER);
+        assert_eq!(&got[1..], &hs[..]);
+    }
+
+    #[test]
+    fn subtree_hashes_chained_roots_plus_nonempty_current() {
+        let mut p = SubtreeProcessor::new(4);
+        assert_eq!(
+            p.subtree_hashes().len(),
+            1,
+            "placeholder-only current counts"
+        );
+        for i in 0..4u32 {
+            p.add(sha256d(&i.to_le_bytes()), 1, 1);
+        }
+        let hashes = p.subtree_hashes();
+        assert_eq!(p.num_chained(), 1);
+        assert_eq!(p.current_len(), 1);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0], p.chained_roots()[0]);
+        assert_eq!(hashes[1], p.current_root().unwrap());
+    }
+
+    #[test]
+    fn check_passes_on_consistent_state() {
+        let mut p = SubtreeProcessor::new(4);
+        assert!(p.check().is_ok(), "fresh processor");
+        for i in 0..10u32 {
+            p.add(sha256d(&i.to_le_bytes()), 1, 1);
+        }
+        assert!(p.check().is_ok());
+    }
+
+    #[test]
+    fn check_detects_node_missing_from_tx_map() {
+        let mut p = SubtreeProcessor::new(4);
+        let h = sha256d(b"x");
+        p.add(h, 1, 1);
+        p.seen.remove(&h);
+        let e = p.check().expect_err("current-subtree tx missing from map");
+        assert!(e.contains("current subtree"), "{e}");
+
+        let mut p = SubtreeProcessor::new(4);
+        let hs: Vec<_> = (0..3u32).map(|i| sha256d(&i.to_le_bytes())).collect();
+        for h in &hs {
+            p.add(*h, 1, 1);
+        }
+        assert_eq!(p.num_chained(), 1);
+        p.seen.remove(&hs[0]);
+        let e = p.check().expect_err("chained tx missing from map");
+        assert!(e.contains("subtree 0"), "{e}");
+    }
+
+    #[test]
+    fn check_detects_stale_tx_map_entry() {
+        let mut p = SubtreeProcessor::new(4);
+        p.add(sha256d(b"a"), 1, 1);
+        p.seen.insert(sha256d(b"ghost"));
+        let e = p.check().expect_err("extra tx-map entry");
+        assert!(e.contains("does not match"), "{e}");
+    }
+
+    #[test]
+    fn check_detects_misplaced_placeholder() {
+        let mut p = SubtreeProcessor::new(8);
+        p.add(sha256d(b"a"), 1, 1);
+        p.current.add_node(COINBASE_PLACEHOLDER, 0, 0);
+        let e = p.check().expect_err("placeholder at node 2");
+        assert!(e.contains("coinbase placeholder"), "{e}");
     }
 }

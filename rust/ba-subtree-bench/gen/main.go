@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	base58 "github.com/bsv-blockchain/go-sdk/compat/base58"
 	subtree "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/util/bump"
 )
 
@@ -94,6 +95,9 @@ func main() {
 	case "bump":
 		writeBumpVectors()
 		fmt.Println("wrote coinbase BUMP golden vectors")
+	case "blockbytes":
+		writeBlockBytesVectors()
+		fmt.Println("wrote block bytes golden vectors")
 	case "coinbase":
 		writeCoinbaseVectors()
 		fmt.Println("wrote coinbase golden vectors")
@@ -1158,5 +1162,98 @@ func writeSpendsForTxVectors() {
 	out = append(out, '\n')
 	if err := os.WriteFile("../fixtures/golden/spendsfortx.json", out, 0o644); err != nil {
 		panic(err)
+	}
+}
+
+// Fixture format (fixtures/golden/blockbytes.txt):
+//
+//	blockbytes <numCases>
+//	<headerHex> <txCount> <sizeInBytes> <height> <bumpHex|-> <coinbaseHex> <subtreeHashesCsvHex|-> <blockHex>
+//
+// blockHex is the real model.Block.Bytes() output.
+func writeBlockBytesVectors() {
+	cbBytes, err := os.ReadFile("../fixtures/golden/coinbase.txt")
+	if err != nil {
+		panic(err)
+	}
+
+	cbHex := string(bytes.TrimSpace(bytes.Split(cbBytes, []byte("\n"))[1]))
+
+	coinbaseTx, err := bt.NewTxFromString(cbHex)
+	if err != nil {
+		panic(err)
+	}
+
+	type bcase struct {
+		nSubtrees int
+		txCount   uint64
+		size      uint64
+		height    uint32
+		bump      []byte
+	}
+
+	cases := []bcase{
+		{0, 1, 200, 7, nil},
+		{1, 3, 1234, 100, nil},
+		{3, 300, 70000, 70000, []byte{0x01, 0x02, 0x03, 0xfd}},
+		{2, 70000, 5_000_000_000, 16_777_216, nil},
+	}
+
+	f, err := os.Create("../fixtures/golden/blockbytes.txt")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "blockbytes %d\n", len(cases))
+
+	for ci, c := range cases {
+		prev := leaf(1000 + ci)
+		merkle := leaf(2000 + ci)
+
+		hdr := &model.BlockHeader{
+			Version:        0x20000000,
+			HashPrevBlock:  &prev,
+			HashMerkleRoot: &merkle,
+			Timestamp:      1_700_000_000 + uint32(ci),
+			Bits:           model.NBit([4]byte{0xff, 0xff, 0xff, 0xff}),
+			Nonce:          0,
+		}
+
+		subtrees := make([]*chainhash.Hash, c.nSubtrees)
+		subtreesHex := "-"
+
+		for i := range subtrees {
+			h := leaf(3000 + ci*10 + i)
+			subtrees[i] = &h
+
+			if i == 0 {
+				subtreesHex = hex.EncodeToString(h[:])
+			} else {
+				subtreesHex += "," + hex.EncodeToString(h[:])
+			}
+		}
+
+		blk := &model.Block{
+			Header:           hdr,
+			CoinbaseTx:       coinbaseTx,
+			TransactionCount: c.txCount,
+			SizeInBytes:      c.size,
+			Subtrees:         subtrees,
+			Height:           c.height,
+			CoinbaseBUMP:     c.bump,
+		}
+
+		out, err := blk.Bytes()
+		if err != nil {
+			panic(err)
+		}
+
+		bumpHex := "-"
+		if len(c.bump) > 0 {
+			bumpHex = hex.EncodeToString(c.bump)
+		}
+
+		fmt.Fprintf(f, "%s %d %d %d %s %s %s %s\n", hex.EncodeToString(hdr.Bytes()), c.txCount, c.size, c.height, bumpHex, cbHex, subtreesHex, hex.EncodeToString(out))
 	}
 }

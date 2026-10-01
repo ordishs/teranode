@@ -34,6 +34,11 @@ impl AssemblyState {
         }
     }
 
+    /// Items per subtree (the configured subtree size).
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
     pub fn add(&mut self, hash: Hash, fee: u64, size: u64) {
         if self.conflicting.contains(&hash) {
             return;

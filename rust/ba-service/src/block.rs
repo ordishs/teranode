@@ -25,6 +25,35 @@ pub fn build_header(
     h
 }
 
+/// Serialise a block exactly as Go `model.Block.Bytes()`: header ‖ varint(tx count) ‖
+/// varint(size) ‖ varint(#subtrees) ‖ subtree hashes ‖ coinbase tx ‖ varint(height) ‖
+/// varint(len(bump)) ‖ bump.
+pub fn block_bytes(
+    header: &[u8; 80],
+    tx_count: u64,
+    size_in_bytes: u64,
+    subtree_hashes: &[Hash],
+    coinbase_tx: &[u8],
+    height: u32,
+    coinbase_bump: &[u8],
+) -> Vec<u8> {
+    use crate::coinbase::push_varint;
+
+    let mut out = Vec::with_capacity(80 + 32 * subtree_hashes.len() + coinbase_tx.len() + 64);
+    out.extend_from_slice(header);
+    push_varint(&mut out, tx_count);
+    push_varint(&mut out, size_in_bytes);
+    push_varint(&mut out, subtree_hashes.len() as u64);
+    for h in subtree_hashes {
+        out.extend_from_slice(h);
+    }
+    out.extend_from_slice(coinbase_tx);
+    push_varint(&mut out, u64::from(height));
+    push_varint(&mut out, coinbase_bump.len() as u64);
+    out.extend_from_slice(coinbase_bump);
+    out
+}
+
 /// Block hash = double-SHA256 of the 80-byte header.
 pub fn header_hash(header: &[u8; 80]) -> Hash {
     sha256d(header)
