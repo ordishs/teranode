@@ -124,16 +124,17 @@ func TestGetBlockIsMined(t *testing.T) {
 	}
 }
 
-// A negative answer must not be served from the response cache once the
-// mined_set column has changed underneath it.
-func TestGetBlockIsMined_NegativeAnswerIsNotCached(t *testing.T) {
+func storeUnminedTestBlock(t *testing.T) (*SQL, *model.Block) {
+	t.Helper()
+
 	logger := ulogger.TestLogger{}
 	dbURL, err := url.Parse("sqlitememory:///")
 	require.NoError(t, err)
 
 	store, err := New(logger, dbURL, settings.NewSettings())
 	require.NoError(t, err)
-	defer store.Close(context.Background())
+
+	t.Cleanup(func() { store.Close(context.Background()) })
 
 	genesisBlock, err := store.GetBlockByID(context.Background(), 0)
 	require.NoError(t, err)
@@ -168,14 +169,50 @@ func TestGetBlockIsMined_NegativeAnswerIsNotCached(t *testing.T) {
 	_, _, err = store.StoreBlock(context.Background(), testBlock, "test", options.WithMinedSet(false))
 	require.NoError(t, err)
 
+	return store, testBlock
+}
+
+func setMinedSetDirectly(t *testing.T, store *SQL, blockHash *chainhash.Hash, minedSet bool) {
+	t.Helper()
+
+	_, err := store.db.ExecContext(context.Background(), "UPDATE blocks SET mined_set = $1 WHERE hash = $2", minedSet, blockHash.CloneBytes())
+	require.NoError(t, err)
+}
+
+// A negative answer must not be served from the response cache once the
+// mined_set column has changed underneath it.
+func TestGetBlockIsMined_NegativeAnswerIsNotCached(t *testing.T) {
+	store, testBlock := storeUnminedTestBlock(t)
+
 	isMined, err := store.GetBlockIsMined(context.Background(), testBlock.Hash())
 	require.NoError(t, err)
 	require.False(t, isMined)
 
-	_, err = store.db.ExecContext(context.Background(), "UPDATE blocks SET mined_set = true WHERE hash = $1", testBlock.Hash().CloneBytes())
-	require.NoError(t, err)
+	setMinedSetDirectly(t, store, testBlock.Hash(), true)
 
 	isMined, err = store.GetBlockIsMined(context.Background(), testBlock.Hash())
 	require.NoError(t, err)
 	require.True(t, isMined, "a stale negative answer was served from the response cache")
+}
+
+func TestGetBlockIsMined_PositiveAnswerIsCached(t *testing.T) {
+	store, testBlock := storeUnminedTestBlock(t)
+
+	setMinedSetDirectly(t, store, testBlock.Hash(), true)
+
+	isMined, err := store.GetBlockIsMined(context.Background(), testBlock.Hash())
+	require.NoError(t, err)
+	require.True(t, isMined)
+
+	setMinedSetDirectly(t, store, testBlock.Hash(), false)
+
+	isMined, err = store.GetBlockIsMined(context.Background(), testBlock.Hash())
+	require.NoError(t, err)
+	require.True(t, isMined, "a positive answer was not served from the response cache")
+
+	store.ResetResponseCache()
+
+	isMined, err = store.GetBlockIsMined(context.Background(), testBlock.Hash())
+	require.NoError(t, err)
+	require.False(t, isMined, "a reset response cache still served the old positive answer")
 }
