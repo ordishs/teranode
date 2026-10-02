@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
@@ -135,4 +136,53 @@ func TestGetCounterConflictingTxHashes_DoesNotTolerateNonNotFoundWalkError(t *te
 	require.False(t, errors.Is(err, errors.ErrTxNotFound))
 	// the tip height must never be read on a non-tolerable path
 	mockStore.AssertNotCalled(t, "GetBlockHeight")
+}
+
+// Height zero is the unset value of a store that was never given a tip. Recency
+// cannot be proven against it, so the guard must fail closed instead of
+// tolerating every absent spender.
+func TestGetCounterConflictingTxHashes_FailsClosedWhenTipHeightUnset(t *testing.T) {
+	notFound := errors.NewTxNotFoundError("no record for spender")
+
+	mockStore, ctx, txHash, _ := danglingCase(t,
+		&meta.Data{BlockHeights: []uint32{900}}, notFound)
+	mockStore.On("GetBlockHeight").Return(uint32(0))
+
+	_, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0, 288)
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+}
+
+// A present spender with a missing descendant also surfaces ErrTxNotFound from
+// the walk. The spender itself may be mined on our chain, so only an absent
+// spender record may be tolerated, never an absent descendant.
+func TestGetCounterConflictingTxHashes_FailsClosedOnMissingDescendantOfPresentSpender(t *testing.T) {
+	mockStore := &MockUtxostore{}
+
+	txHash := createTestHash("descendant-test-tx")
+	parentTxHash := createTestHash("descendant-parent-tx")
+	presentSpender := createTestHash("descendant-present-spender")
+	missingChild := createTestHash("descendant-missing-child")
+
+	testTx := createTestTransactionWithInputs(parentTxHash, 0)
+
+	mockStore.On("Get", mock.Anything, &txHash, mock.Anything).
+		Return(&meta.Data{Tx: testTx}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, mock.Anything).
+		Return(&meta.Data{
+			BlockHeights:  []uint32{900},
+			SpendingDatas: []*spend.SpendingData{{TxID: &presentSpender}},
+		}, nil)
+	mockStore.On("Get", mock.Anything, &presentSpender, mock.Anything).
+		Return(&meta.Data{ConflictingChildren: []chainhash.Hash{missingChild}}, nil)
+	mockStore.On("Get", mock.Anything, &missingChild, mock.Anything).
+		Return(nil, errors.NewTxNotFoundError("no record for descendant"))
+	mockStore.On("GetBlockHeight").Return(uint32(1000))
+
+	result, err := GetCounterConflictingTxHashes(context.Background(), mockStore, txHash, 0, 288)
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 }

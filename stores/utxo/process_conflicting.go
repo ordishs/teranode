@@ -1386,6 +1386,12 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 			// a mined-then-pruned counter, so we fail closed: SVNode would reject a
 			// block double-spending a confirmed output.
 			if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+				// the walk also reports a missing descendant of a present spender;
+				// tolerate only when the spender record itself is the absent one
+				if !spenderRecordAbsent(ctx, s, spendingTxID) {
+					return nil, err
+				}
+
 				// the tip height is read only on this path, so a store that never
 				// carries a dangling reference is never asked for it
 				if tipHeight == nil {
@@ -1393,9 +1399,15 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 					tipHeight = &h
 				}
 
-				tolerable := true
+				// height zero is the unset value of a store that was never given a
+				// tip, so recency cannot be proven against it
+				tolerable := *tipHeight != 0
 
 				for _, parentHash := range spenderParents[spendingTxID] {
+					if !tolerable {
+						break
+					}
+
 					if !parentDepth[parentHash].withinRetention(*tipHeight, retention) {
 						tolerable = false
 						break
@@ -1433,6 +1445,18 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 	// fmt.Printf("counterConflicting: %v\n", counterConflicting)
 
 	return counterConflicting, nil
+}
+
+// spenderRecordAbsent reports whether the store holds no record for the spender
+// itself. Any other outcome, including a read error, reports false so the caller
+// fails closed.
+func spenderRecordAbsent(ctx context.Context, s Store, spendingTxID chainhash.Hash) bool {
+	txMeta, err := s.Get(ctx, &spendingTxID, fields.Utxos)
+	if err != nil {
+		return errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound)
+	}
+
+	return txMeta == nil
 }
 
 // parentDepthInfo captures a parent tx's confirmation depth relative to the
