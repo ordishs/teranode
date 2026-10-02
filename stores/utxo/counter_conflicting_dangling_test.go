@@ -186,3 +186,91 @@ func TestGetCounterConflictingTxHashes_FailsClosedOnMissingDescendantOfPresentSp
 	require.Nil(t, result)
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 }
+
+// demotionCounterStore routes GetCounterConflicting through the real
+// GetCounterConflictingTxHashes, as the SQL and Aerospike stores do, so
+// ProcessConflicting exercises the dangling-spender guard end to end.
+type demotionCounterStore struct {
+	*MockUtxostore
+	retention uint32
+}
+
+func (d demotionCounterStore) GetCounterConflicting(ctx context.Context, hash chainhash.Hash) ([]chainhash.Hash, error) {
+	return GetCounterConflictingTxHashes(ctx, d, hash, 0, d.retention)
+}
+
+func demotionCase(t *testing.T, parentHeight, tip uint32) (demotionCounterStore, chainhash.Hash, chainhash.Hash) {
+	t.Helper()
+
+	mockStore := &MockUtxostore{}
+
+	winnerHash := createTestHash("demotion-winner-tx")
+	parentTxHash := createTestHash("demotion-parent-tx")
+	absentLoser := createTestHash("demotion-absent-loser")
+
+	winnerTx := createTestTransactionWithInputs(parentTxHash, 0)
+
+	mockStore.On("Get", mock.Anything, &winnerHash, mock.Anything).
+		Return(&meta.Data{Tx: winnerTx, Conflicting: true}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, mock.Anything).
+		Return(&meta.Data{
+			BlockHeights:  []uint32{parentHeight},
+			SpendingDatas: []*spend.SpendingData{{TxID: &absentLoser}},
+		}, nil)
+	mockStore.On("Get", mock.Anything, &absentLoser, mock.Anything).
+		Return(nil, errors.NewTxNotFoundError("no record for loser"))
+	mockStore.On("GetBlockHeight").Return(tip)
+
+	return demotionCounterStore{MockUtxostore: mockStore, retention: 288}, winnerHash, absentLoser
+}
+
+// The demotion path shares the counter-conflicting walk, so an absent loser
+// under a recent parent must not abort it. The absent loser has no record to
+// mark conflicting, so it must never reach SetConflicting.
+func TestProcessConflicting_ToleratesAbsentLoserUnderRecentParent(t *testing.T) {
+	store, winnerHash, absentLoser := demotionCase(t, 900, 1000)
+
+	store.On("SetConflicting", mock.Anything, mock.Anything, mock.Anything).
+		Return([]*Spend{}, []chainhash.Hash{}, nil)
+	store.On("Unspend", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	store.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(nil, []*Spend{}, nil)
+	store.On("SetLocked", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	losers, _, err := ProcessConflicting(context.Background(), store, 1000, chainhash.Hash{},
+		[]chainhash.Hash{winnerHash}, map[chainhash.Hash]struct{}{}, NoAncestryGuard)
+
+	require.NoError(t, err)
+	require.False(t, losers.Exists(absentLoser))
+
+	var setConflictingCalls int
+
+	for _, call := range store.Calls {
+		if call.Method != "SetConflicting" {
+			continue
+		}
+
+		setConflictingCalls++
+
+		require.NotContains(t, call.Arguments.Get(1).([]chainhash.Hash), absentLoser,
+			"an absent loser has no record and must not be marked conflicting")
+	}
+
+	require.NotZero(t, setConflictingCalls, "the demotion must have reached the marking step")
+}
+
+// Below the retention window the absent loser could be a mined-then-pruned
+// counter, so the demotion must fail closed and mutate nothing.
+func TestProcessConflicting_FailsClosedOnAbsentLoserBelowRetention(t *testing.T) {
+	store, winnerHash, _ := demotionCase(t, 100, 1000)
+
+	losers, _, err := ProcessConflicting(context.Background(), store, 1000, chainhash.Hash{},
+		[]chainhash.Hash{winnerHash}, map[chainhash.Hash]struct{}{}, NoAncestryGuard)
+
+	require.Error(t, err)
+	require.Nil(t, losers)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+	store.AssertNotCalled(t, "SetConflicting", mock.Anything, mock.Anything, mock.Anything)
+	store.AssertNotCalled(t, "Unspend", mock.Anything, mock.Anything, mock.Anything)
+	store.AssertNotCalled(t, "SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
