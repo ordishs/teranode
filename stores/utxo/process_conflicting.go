@@ -1494,6 +1494,13 @@ func newParentDepthInfo(parent *meta.Data) parentDepthInfo {
 	}
 
 	if len(parent.BlockHeights) == 0 {
+		// BlockIDs without heights is a mined record from an older node version or a
+		// restore: mined at an unknown height, so recency cannot be proven even if a
+		// reorg later stamped UnminedSince
+		if len(parent.BlockIDs) > 0 {
+			return parentDepthInfo{}
+		}
+
 		if parent.UnminedSince != 0 {
 			return parentDepthInfo{unmined: true}
 		}

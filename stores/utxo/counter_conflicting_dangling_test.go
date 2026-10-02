@@ -286,3 +286,20 @@ func TestGetCounterConflictingTxHashes_FailsClosedOnStorageErrorWrappingNotFound
 	require.Nil(t, result)
 	require.True(t, errors.Is(err, errors.ErrStorageError))
 }
+
+// A mined record from an older node version or a restore can carry BlockIDs but no
+// BlockHeights. It was mined at an unknown height, so even with an UnminedSince
+// stamp from a later reorg the guard cannot prove recency and must fail closed.
+func TestGetCounterConflictingTxHashes_FailsClosedOnMinedParentWithoutHeights(t *testing.T) {
+	notFound := errors.NewTxNotFoundError("no record for spender")
+
+	mockStore, ctx, txHash, _ := danglingCase(t,
+		&meta.Data{BlockIDs: []uint32{7}, UnminedSince: 995}, notFound)
+	mockStore.On("GetBlockHeight").Return(uint32(1000))
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0, 288)
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+}
