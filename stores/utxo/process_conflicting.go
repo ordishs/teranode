@@ -1385,6 +1385,12 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 			// SVNode-following peers accept it. Below that window we cannot rule out
 			// a mined-then-pruned counter, so we fail closed: SVNode would reject a
 			// block double-spending a confirmed output.
+			//
+			// Residual risk, unproven: the premise holds for stamps written under the
+			// store-level floor. A record stamped before the floor existed may carry a
+			// low delete-at-height and be pruned inside the window, and a reaped record
+			// is indistinguishable from a never-created one. Either would be tolerated
+			// here. There is no backfill; the tip lag margin is the only slack.
 			if isRecordAbsent(err) {
 				// the walk also reports a missing descendant of a present spender;
 				// tolerate only when the spender record itself is the absent one
