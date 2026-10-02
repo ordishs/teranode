@@ -1385,7 +1385,7 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 			// SVNode-following peers accept it. Below that window we cannot rule out
 			// a mined-then-pruned counter, so we fail closed: SVNode would reject a
 			// block double-spending a confirmed output.
-			if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+			if isRecordAbsent(err) {
 				// the walk also reports a missing descendant of a present spender;
 				// tolerate only when the spender record itself is the absent one
 				if !spenderRecordAbsent(ctx, s, spendingTxID) {
@@ -1447,13 +1447,26 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 	return counterConflicting, nil
 }
 
+// isRecordAbsent reports whether err itself reports a missing record. It reads
+// only the outermost error code: errors.Is walks the whole wrap chain, so a
+// StorageError wrapping a blob not-found, such as an unreadable external
+// transaction, would pass for an absent record and hide a data-availability fault.
+func isRecordAbsent(err error) bool {
+	var e *errors.Error
+	if !errors.As(err, &e) {
+		return false
+	}
+
+	return e.Code() == errors.ERR_TX_NOT_FOUND || e.Code() == errors.ERR_NOT_FOUND
+}
+
 // spenderRecordAbsent reports whether the store holds no record for the spender
 // itself. Any other outcome, including a read error, reports false so the caller
 // fails closed.
 func spenderRecordAbsent(ctx context.Context, s Store, spendingTxID chainhash.Hash) bool {
 	txMeta, err := s.Get(ctx, &spendingTxID, fields.Utxos)
 	if err != nil {
-		return errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound)
+		return isRecordAbsent(err)
 	}
 
 	return txMeta == nil

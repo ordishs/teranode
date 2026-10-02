@@ -269,3 +269,20 @@ func TestGetCounterConflictingTxHashes_MinedHeightOutranksUnminedSince(t *testin
 		require.NotContains(t, result, absentSpender)
 	})
 }
+
+// errors.Is matches a code anywhere in the wrap chain, so a StorageError that
+// wraps a not-found, such as an unreadable external blob, must not be taken for an
+// absent record. That is a data-availability fault, not a never-created loser.
+func TestGetCounterConflictingTxHashes_FailsClosedOnStorageErrorWrappingNotFound(t *testing.T) {
+	wrapped := errors.NewStorageError("external blob unreadable", errors.NewTxNotFoundError("blob missing"))
+
+	mockStore, ctx, txHash, _ := danglingCase(t,
+		&meta.Data{BlockHeights: []uint32{900}}, wrapped)
+	mockStore.On("GetBlockHeight").Return(uint32(1000))
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0, 288)
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.True(t, errors.Is(err, errors.ErrStorageError))
+}
