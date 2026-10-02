@@ -1472,6 +1472,14 @@ func spenderRecordAbsent(ctx context.Context, s Store, spendingTxID chainhash.Ha
 	return txMeta == nil
 }
 
+// tipLagMargin is the number of blocks the guard assumes the cached tip may trail
+// the height the pruner works from. The validator reads the tip from a cache that
+// refreshes on block notifications, while the pruner runs on its own, so a lagging
+// tip makes a parent look more recent than it is. Counting the tip this many blocks
+// higher shrinks the tolerated window by the same amount, which is the safe
+// direction.
+const tipLagMargin uint32 = 10
+
 // parentDepthInfo captures a parent tx's confirmation depth relative to the
 // pruning horizon, so the counter-conflicting walk can decide whether an absent
 // spender of that parent is provably a never-created loser (safe to tolerate) or
@@ -1540,7 +1548,7 @@ func (d parentDepthInfo) withinRetention(tipHeight, retention uint32) bool {
 		return false
 	}
 
-	// Equivalent to minHeight > tipHeight - retention, written as addition to
-	// avoid unsigned underflow when tipHeight < retention.
-	return d.minHeight+retention > tipHeight
+	// Equivalent to minHeight > tipHeight + tipLagMargin - retention, written as
+	// addition to avoid unsigned underflow when tipHeight < retention.
+	return d.minHeight+retention > tipHeight+tipLagMargin
 }

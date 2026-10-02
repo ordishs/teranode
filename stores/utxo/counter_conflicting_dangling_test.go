@@ -303,3 +303,34 @@ func TestGetCounterConflictingTxHashes_FailsClosedOnMinedParentWithoutHeights(t 
 	require.Nil(t, result)
 	require.True(t, errors.Is(err, errors.ErrTxNotFound))
 }
+
+// The comparison counts the tip ten blocks higher, so a parent that the store's
+// cached tip still shows inside the window is tolerated only while it would remain
+// inside it were the tip ten blocks further on. Parent mined at 900, retention 288:
+// tolerated at tip 1177, failed closed at tip 1178. The heights are literal so the
+// test pins the margin instead of following the constant.
+func TestGetCounterConflictingTxHashes_TipLagMarginNarrowsTheWindow(t *testing.T) {
+	notFound := errors.NewTxNotFoundError("no record for spender")
+	t.Run("tip 1177 is tolerated", func(t *testing.T) {
+		mockStore, ctx, txHash, absentSpender := danglingCase(t,
+			&meta.Data{BlockHeights: []uint32{900}}, notFound)
+		mockStore.On("GetBlockHeight").Return(uint32(1177))
+
+		result, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0, 288)
+
+		require.NoError(t, err)
+		require.NotContains(t, result, absentSpender)
+	})
+
+	t.Run("tip 1178 fails closed", func(t *testing.T) {
+		mockStore, ctx, txHash, _ := danglingCase(t,
+			&meta.Data{BlockHeights: []uint32{900}}, notFound)
+		mockStore.On("GetBlockHeight").Return(uint32(1178))
+
+		result, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0, 288)
+
+		require.Error(t, err)
+		require.Nil(t, result)
+		require.True(t, errors.Is(err, errors.ErrTxNotFound))
+	})
+}

@@ -23,6 +23,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const testRetention = 288
+
 // buildDanglingRef sets up, in a fresh sqlitememory store: parentTx1 mined at
 // parentHeight, its output 0 spent by an ABSENT counter (a double-spend clone of
 // tx1 that is spent but never created), and tx1 created as the conflicting winner.
@@ -32,6 +34,7 @@ func buildDanglingRef(ctx context.Context, t *testing.T, name string, parentHeig
 
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.GlobalBlockHeightRetention = testRetention
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///" + name)
 	require.NoError(t, err)
@@ -133,6 +136,7 @@ func buildMinedCounter(ctx context.Context, t *testing.T, name string, counterBl
 
 	logger := ulogger.NewErrorTestLogger(t)
 	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.GlobalBlockHeightRetention = testRetention
 
 	utxoStoreURL, err := url.Parse("sqlitememory:///" + name)
 	require.NoError(t, err)
@@ -181,11 +185,14 @@ func buildMinedCounter(ctx context.Context, t *testing.T, name string, counterBl
 	return s
 }
 
-// The retention these tests are written against: util/test sets 10, not the
-// production 288, so the heights chosen above are far from the window edge only
-// in the sense this assertion states.
+// The retention these tests are written against. util/test defaults to 10, which
+// the guard's tip-lag margin would consume whole, so the builders set the
+// production default instead.
 func TestDanglingRefTests_RunWithTheRetentionTheyAssume(t *testing.T) {
-	require.EqualValues(t, 10, test.CreateBaseTestSettings(t).GetUtxoStoreBlockHeightRetention())
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.GlobalBlockHeightRetention = testRetention
+
+	require.EqualValues(t, testRetention, tSettings.GetUtxoStoreBlockHeightRetention())
 }
 
 // The branch that decides accept or reject: a counter whose record is present and
