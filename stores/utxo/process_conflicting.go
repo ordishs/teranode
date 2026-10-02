@@ -1480,13 +1480,16 @@ func newParentDepthInfo(parent *meta.Data) parentDepthInfo {
 		return parentDepthInfo{}
 	}
 
-	if parent.UnminedSince != 0 {
-		return parentDepthInfo{unmined: true}
-	}
-
 	if len(parent.BlockHeights) == 0 {
+		if parent.UnminedSince != 0 {
+			return parentDepthInfo{unmined: true}
+		}
+
 		return parentDepthInfo{}
 	}
+
+	// A mined height outranks UnminedSince: a reorg stamps UnminedSince on a
+	// record without clearing its BlockHeights, so a buried parent can carry both.
 
 	minHeight := parent.BlockHeights[0]
 	for _, h := range parent.BlockHeights[1:] {

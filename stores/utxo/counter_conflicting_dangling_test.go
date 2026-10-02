@@ -239,3 +239,33 @@ func TestProcessConflicting_FailsClosedOnAbsentLoser(t *testing.T) {
 		})
 	}
 }
+
+// A reorg stamps UnminedSince on a record without clearing its BlockHeights, so a
+// buried parent can carry both. The mined height must decide, not the stamp: an
+// unmined parent is tolerated at any depth, a parent mined 900 blocks ago is not.
+func TestGetCounterConflictingTxHashes_MinedHeightOutranksUnminedSince(t *testing.T) {
+	notFound := errors.NewTxNotFoundError("no record for spender")
+
+	t.Run("buried parent with a stale unmined stamp fails closed", func(t *testing.T) {
+		mockStore, ctx, txHash, _ := danglingCase(t,
+			&meta.Data{BlockHeights: []uint32{100}, UnminedSince: 95}, notFound)
+		mockStore.On("GetBlockHeight").Return(uint32(1000))
+
+		result, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0, 288)
+
+		require.Error(t, err)
+		require.Nil(t, result)
+		require.True(t, errors.Is(err, errors.ErrTxNotFound))
+	})
+
+	t.Run("recent parent with an unmined stamp is still tolerated", func(t *testing.T) {
+		mockStore, ctx, txHash, absentSpender := danglingCase(t,
+			&meta.Data{BlockHeights: []uint32{900}, UnminedSince: 95}, notFound)
+		mockStore.On("GetBlockHeight").Return(uint32(1000))
+
+		result, err := GetCounterConflictingTxHashes(ctx, mockStore, txHash, 0, 288)
+
+		require.NoError(t, err)
+		require.NotContains(t, result, absentSpender)
+	})
+}
