@@ -4191,6 +4191,8 @@
       
         
       
+        
+      
     
     
     
@@ -4358,6 +4360,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../protoVersioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../networkConsensusRules/" class="md-nav__link">
         
   
@@ -4423,10 +4453,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_2_6" id="__nav_4_2_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2_7" id="__nav_4_2_7_label" tabindex="0">
             
   
   
@@ -4444,8 +4474,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_2_6">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_2_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -8296,7 +8326,7 @@
 <p><strong>Default</strong>: <code>false</code></p>
 <p><strong>Environment Variable</strong>: <code>pruner_skipDuringCatchup</code></p>
 <p><strong>Description</strong>: Skip pruning during blockchain catchup</p>
-<p>When enabled, the pruner checks FSM state and skips all deletion operations during catchup. This prevents race conditions where block validation marks transactions as mined faster than the pruner can preserve their parents.</p>
+<p>When enabled, the pruner checks FSM state and skips all deletion operations unless the node is RUNNING, which covers catchup and IDLE after an operator STOP mid-catchup. This prevents race conditions where block validation marks transactions as mined faster than the pruner can preserve their parents.</p>
 <p><strong>Values:</strong></p>
 <ul>
 <li><code>false</code> (default): Normal pruning during catchup (safe with retention &gt;= 288 blocks)</li>
@@ -8397,7 +8427,7 @@ or replication issues.</p>
 <p><strong>Type</strong>: Integer</p>
 <p><strong>Default</strong>: <code>3</code></p>
 <p><strong>Environment Variable</strong>: <code>pruner_blobDeletionMaxRetries</code></p>
-<p><strong>Description</strong>: Maximum retry attempts for failed blob deletions</p>
+<p><strong>Description</strong>: Maximum retry attempts for failed blob deletions. A deletion refused as a configuration error (for example an HTTP blob store answering 401) is not counted against this limit: it stays queued and is logged as an error until the configuration is fixed. Deletions for other store types keep being processed.</p>
 <h3 id="pruner_skippreserveparents">pruner_skipPreserveParents<a class="headerlink" href="#pruner_skippreserveparents" title="Permanent link">&para;</a></h3>
 <p><strong>Type</strong>: Boolean</p>
 <p><strong>Default</strong>: <code>false</code></p>

@@ -4716,6 +4716,8 @@
       
         
       
+        
+      
     
     
     
@@ -4880,6 +4882,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../references/protoVersioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../references/networkConsensusRules/" class="md-nav__link">
         
   
@@ -4945,10 +4975,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_2_6" id="__nav_4_2_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2_7" id="__nav_4_2_7_label" tabindex="0">
             
   
   
@@ -4966,8 +4996,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_2_6">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_2_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7700,6 +7730,7 @@
 <h2 id="1-description">1. Description<a class="headerlink" href="#1-description" title="Permanent link">&para;</a></h2>
 <p>The Block Assembly Service is responsible for assembling new blocks and adding them to the blockchain.</p>
 <p><strong>No Mempool Design</strong>: Unlike traditional Bitcoin nodes that maintain a mempool (memory pool) to store unconfirmed transactions, Teranode's Block Assembly service processes transactions directly through a validation and subtree assembly pipeline. Transactions are immediately validated and organized into subtrees for efficient block creation, rather than being held in an intermediate memory pool. This design enables higher throughput and more efficient resource utilization for large-scale transaction processing.</p>
+<p><strong>Deployment Model</strong>: Block Assembly does not scale horizontally. It runs as a single stateful instance per Teranode node, with no leader election or standby — every replica that starts is fully active and will serve mining traffic. Its in-memory mining-candidate and subtree-assembler state, and the outstanding mining jobs handed to miners, live in that one process: a mining job exists only where its candidate was issued, so a solution routed anywhere else is rejected with "job not found". A second replica would also write the same persisted <code>BlockAssembler</code> checkpoint, overwriting the first's view of the chain tip. See the <a href="../../architecture/teranode-microservices-overview/#26-block-assembly-service">Teranode Microservices Overview</a> for how this fits the rest of the architecture, and the <a href="../../../howto/miners/kubernetes/minersHowToInstallation/#scaling-the-propagation-service">Kubernetes miners installation guide</a> for why every example Cluster CR pins its replica count to 1, the Validator excepted.</p>
 <p>The block assembly process involves the following steps:</p>
 <ol>
 <li>

@@ -4060,6 +4060,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#topic-reference-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Topic Reference Table
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#propagation-service" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -4131,6 +4142,17 @@
     <span class="md-ellipsis">
       
         Invalid Subtree Notifications
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#policy-rejected-transactions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Policy-Rejected Transactions
       
     </span>
   </a>
@@ -4273,6 +4295,17 @@
         
       </ul>
     </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#trust-model-and-network-isolation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trust Model and Network Isolation
+      
+    </span>
+  </a>
   
 </li>
         
@@ -4812,6 +4845,8 @@
       
         
       
+        
+      
     
     
     
@@ -4976,6 +5011,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../references/protoVersioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../references/networkConsensusRules/" class="md-nav__link">
         
   
@@ -5041,10 +5104,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_2_6" id="__nav_4_2_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2_7" id="__nav_4_2_7_label" tabindex="0">
             
   
   
@@ -5062,8 +5125,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_2_6">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_2_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7253,6 +7316,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#topic-reference-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Topic Reference Table
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#propagation-service" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -7324,6 +7398,17 @@
     <span class="md-ellipsis">
       
         Invalid Subtree Notifications
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#policy-rejected-transactions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Policy-Rejected Transactions
       
     </span>
   </a>
@@ -7466,6 +7551,17 @@
         
       </ul>
     </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#trust-model-and-network-isolation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trust Model and Network Isolation
+      
+    </span>
+  </a>
   
 </li>
         
@@ -7860,6 +7956,7 @@
 <ol>
 <li><a href="#1-description">Description</a></li>
 <li><a href="#2-use-cases">Use Cases</a><ul>
+<li><a href="#topic-reference-table">Topic Reference Table</a></li>
 <li><a href="#propagation-service">Propagation Service</a></li>
 <li><a href="#validator-component">Validator Component</a></li>
 <li><a href="#p2p-service">P2P Service</a></li>
@@ -7873,6 +7970,7 @@
 </li>
 <li><a href="#4-configuration">Configuration</a><ul>
 <li><a href="#tls-and-authentication">TLS and Authentication</a></li>
+<li><a href="#trust-model-and-network-isolation">Trust Model and Network Isolation</a></li>
 </ul>
 </li>
 <li><a href="#5-operational-guidelines">Operational Guidelines</a><ul>
@@ -7901,19 +7999,119 @@
 <p>In the Teranode ecosystem, Kafka plays a crucial role in facilitating communication between various components, such as the Validator, BlockValidation, and Blockchain. It enables these components to exchange messages, notifications, and data reliably and efficiently, ensuring smooth operation of the entire system.</p>
 <p>It's important to note that Kafka is a third-party dependency in Teranode. As such, there is no specific installation or configuration process provided within the Teranode framework. Users are expected to have a properly configured Kafka setup running before initiating the Teranode services. This approach allows for flexibility in Kafka configuration based on specific deployment needs and existing infrastructure.</p>
 <p><strong>Development Mode</strong>: Development and test contexts use in-memory Kafka by default (<code>KAFKA_SCHEMA.dev = memory</code>), requiring no external Kafka setup. For production-like testing with Docker Kafka, see <a href="../../../references/settings/kafka_settings/">Kafka Settings Reference</a>.</p>
+<p><strong>Choosing Kafka vs. gRPC for a new path</strong>: see <a href="../../architecture/teranode-microservices-overview/#61-choosing-grpc-vs-kafka-for-a-new-communication-path">§6.1 Choosing gRPC vs. Kafka for a New Communication Path</a> in the microservices overview.</p>
 <h2 id="2-use-cases">2. Use Cases<a class="headerlink" href="#2-use-cases" title="Permanent link">&para;</a></h2>
+<h3 id="topic-reference-table">Topic Reference Table<a class="headerlink" href="#topic-reference-table" title="Permanent link">&para;</a></h3>
+<p>The table below enumerates every Kafka topic actually wired into Teranode's Go code (as opposed to topics that only appear in documentation). "Consumer group" is the literal value passed to <code>NewKafkaConsumerGroupFromURL</code> / <code>StartKafkaControlledListener</code> in <code>daemon/daemon_kafka.go</code> and <code>services/legacy/netsync/manager.go</code> — <code>&lt;client&gt;</code> stands for the configured <code>ClientName</code>. <code>txmeta</code> and <code>tx-policy-rejected</code> additionally get a random 16-character suffix appended per process (<code>&lt;random&gt;</code> in the table, added by <code>daemon/daemon_kafka.go</code>), so every Subtree Validation pod consumes the full stream independently instead of sharing partitions; this means the group name is not stable across restarts and lag must be monitored by topic, not by group. Retention values are the defaults shipped in <code>settings.conf</code> (<code>kafka_*Config</code> URLs); they can be overridden per-deployment via the <code>retention</code> query parameter. Topic names shown are the base-context defaults — in the <code>.operator</code> context every topic name is suffixed with the client name (<code>blocks-${clientName}</code>, <code>txmeta-${clientName}</code>, …); <code>tx-policy-rejected</code> has no <code>settings.conf</code> entry and keeps its bare name in all contexts.</p>
+<table>
+<thead>
+<tr>
+<th>Topic (setting → default name)</th>
+<th>Producer(s)</th>
+<th>Consumer(s) (consumer group)</th>
+<th>Payload</th>
+<th>Retention (default)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>blocks</code> (<code>KAFKA_BLOCKS</code> → <code>blocks</code>)</td>
+<td>P2P service</td>
+<td>Block Validation service (<code>blockvalidation.&lt;client&gt;</code>)</td>
+<td>Block announcement: block hash, source URL, peer ID</td>
+<td>60,000 ms</td>
+</tr>
+<tr>
+<td><code>blocks-final</code> (<code>KAFKA_BLOCKS_FINAL</code> → <code>blocks-final</code>)</td>
+<td>Blockchain service (after successful validation)</td>
+<td>Legacy P2P service / <code>netsync.SyncManager</code> (<code>blocksfinal.legacy.&lt;client&gt;</code>)</td>
+<td>Block header, height, tx count, size in bytes, <strong>all subtree hashes in the block</strong>, and the full coinbase transaction — not a small notification; the producer warns when the marshalled message crosses 500 KB</td>
+<td>60,000 ms</td>
+</tr>
+<tr>
+<td><code>invalid-blocks</code> (<code>KAFKA_INVALID_BLOCKS</code> → <code>invalid-blocks</code>)</td>
+<td>Block Validation service</td>
+<td>P2P service (<code>p2p.&lt;client&gt;</code>)</td>
+<td>Block hash, failure reason, <code>peer_id</code> (peer that announced the block) and <code>peer_url</code> (DataHub URL it was fetched from). <code>peer_id</code> is the primary ban attribution and is immune to peer-map eviction; <code>peer_url</code> is resolved against registry DataHub URLs as a fallback. Both are cleared for legacy-sourced blocks, and only then does P2P fall back to its in-memory block/peer map (silently dropping with no ban score on a map miss)</td>
+<td>600,000 ms</td>
+</tr>
+<tr>
+<td><code>invalid-subtrees</code> (<code>KAFKA_INVALID_SUBTREES</code> → <code>invalid-subtrees</code>)</td>
+<td>Subtree Validation service</td>
+<td>P2P service (<code>p2p.&lt;client&gt;</code>)</td>
+<td>Subtree hash, peer URL, failure reason — used for peer quality tracking</td>
+<td>60,000 ms</td>
+</tr>
+<tr>
+<td><code>legacy-inv</code> (<code>KAFKA_LEGACY_INV</code> → <code>legacy-inv</code>)</td>
+<td>Legacy P2P service / <code>netsync.SyncManager</code></td>
+<td>Legacy P2P service / <code>netsync.SyncManager</code> (<code>inv.legacy.&lt;client&gt;</code>) — bidirectional, same service on both ends</td>
+<td>Peer address + Bitcoin wire inventory vectors (<code>MSG_TX</code>, <code>MSG_BLOCK</code>)</td>
+<td>6,000 ms</td>
+</tr>
+<tr>
+<td><code>rejectedtx</code> (<code>KAFKA_REJECTEDTX</code> → <code>rejectedtx</code>)</td>
+<td>Validator service</td>
+<td>P2P service (<code>p2p.&lt;client&gt;</code>)</td>
+<td>Tx hash, rejection reason, peer ID</td>
+<td>600,000 ms</td>
+</tr>
+<tr>
+<td><code>subtrees</code> (<code>KAFKA_SUBTREES</code> → <code>subtrees</code>)</td>
+<td>P2P service</td>
+<td>Subtree Validation service (<code>subtreevalidation.&lt;client&gt;</code>)</td>
+<td>Subtree hash, DataHub base URL, originating peer ID</td>
+<td>1,800,000 ms</td>
+</tr>
+<tr>
+<td><code>txmeta</code> (<code>KAFKA_TXMETA</code> → <code>txmeta</code>)</td>
+<td>Validator service</td>
+<td>Subtree Validation service (<code>subtreevalidation.&lt;client&gt;.&lt;random&gt;</code>) <strong>and</strong> Legacy P2P service (<code>txmeta.legacy.&lt;client&gt;</code>, replay disabled)</td>
+<td>Raw-byte batch of up to <code>validator_txmeta_kafka_batchSize</code> entries (default 1024), each <code>[tx hash][ADD/DELETE action][content length][tx meta bytes]</code>. Two layouts selected by <code>validator_txmeta_wireFormat</code>: v1 (default, one record per batch) and v2 (0xFF/0x02 header, per-entry xxhash prefix, one record per partition with the partition set explicitly). Not a protobuf message — <code>KafkaTxMetaTopicMessage</code> in the <code>.proto</code> is generated but unused by any producer or consumer</td>
+<td>60,000 ms</td>
+</tr>
+<tr>
+<td><code>validatortxs</code> (<code>KAFKA_VALIDATORTXS</code> → <code>validatortxs</code>)</td>
+<td>Propagation service</td>
+<td>Validator service (<code>validator.&lt;client&gt;</code>)</td>
+<td>New transaction (raw/extended tx bytes)</td>
+<td>60,000 ms (only when <code>kafka_validatortxsConfig</code> is set — empty by default, non-empty in the <code>.operator</code> context; otherwise Propagation invokes the Validator directly in-process — a local validator, or a gRPC client, depending on configuration)</td>
+</tr>
+<tr>
+<td><code>tx-policy-rejected</code> (<code>KAFKA_TX_POLICY_REJECTED</code> → <code>tx-policy-rejected</code>)</td>
+<td>Validator service</td>
+<td>Subtree Validation service (<code>subtreevalidation.&lt;client&gt;.&lt;random&gt;</code>)</td>
+<td>Full raw transaction bytes for txs that are consensus-valid but fail local mining policy (e.g. zero-fee) — cached but not "blessed", still fully validated on use</td>
+<td>Not set by default (<code>kafka_txPolicyRejectedConfig</code> has no default URL, so the topic is disabled unless explicitly configured); recommended 10-30 min when enabled</td>
+</tr>
+<tr>
+<td><code>unittest</code> (<code>KAFKA_UNITTEST</code> → <code>unittest</code>)</td>
+<td>Test code only</td>
+<td>Test code only</td>
+<td>Arbitrary test payloads</td>
+<td>600,000 ms — <strong>not used in production</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Notes on the table:</p>
+<ul>
+<li>The <code>blocks-final</code> topic is <strong>not</strong> consumed via the <code>getKafkaBlocksFinalConsumerGroup</code> helper in <code>daemon/daemon_kafka.go</code> — that function exists but is commented out/unused. Its only real Kafka consumer is the Legacy P2P service. The Block Persister does <strong>not</strong> consume this topic either — it polls the Blockchain service over gRPC (<code>GetBlocksNotPersisted</code>) on a <code>blockpersister_persistSleep</code> interval (default 10s); see the Blockchain section below. Block Assembly gets finalized-block notifications via a direct gRPC subscription (<code>blockchainClient.Subscribe</code>) to the Blockchain service, not Kafka.</li>
+<li><code>invalid-blocks</code> and <code>invalid-subtrees</code> are both produced and consumed for peer reputation/banning purposes in P2P — Block Validation and Subtree Validation are the producers, P2P is the sole consumer of each.</li>
+<li><code>tx-policy-rejected</code> was previously undocumented; it is real and wired in <code>daemon/daemon_kafka.go</code> (<code>getKafkaTxPolicyRejectedAsyncProducer</code> / <code>getKafkaTxPolicyRejectedConsumerGroup</code>), <code>services/validator/Validator.go</code> (producer), and <code>services/subtreevalidation/Server.go</code> (consumer).</li>
+</ul>
 <h3 id="propagation-service">Propagation Service<a class="headerlink" href="#propagation-service" title="Permanent link">&para;</a></h3>
-<p>After initial sanity check tests, the propagation service endorses transactions to the validator. This is done by sending transaction notifications to the validator via the <code>kafka_validatortxsConfig</code> topic.</p>
+<p>After initial sanity check tests, the propagation service endorses transactions to the validator. When <code>kafka_validatortxsConfig</code> is configured, this is done by publishing a transaction notification to that topic. The topic is empty in the committed <code>settings.conf</code> defaults and populated only in the <code>.operator</code> context; when it is empty, no producer and no consumer group are created and Propagation invokes the Validator directly instead. With <code>useLocalValidator = true</code> — also the committed default — that direct invocation is an in-process call into an embedded <code>*Validator</code>, not a network hop. See <a href="../../architecture/teranode-microservices-overview/#61-choosing-grpc-vs-kafka-for-a-new-communication-path">§6.1 Choosing gRPC vs. Kafka for a New Communication Path</a>.</p>
+<p>The diagram below shows the Kafka form of this handoff, i.e. the <code>.operator</code> configuration:</p>
 <p><img alt="kafka_propagation_validator.svg" src="../img/plantuml/kafka_propagation_validator.svg" /></p>
 <ul>
-<li><strong>kafka_validatortxsConfig</strong>: This Kafka topic is used to transmit new transaction notifications from the Propagation component to the Validator.</li>
+<li><strong>kafka_validatortxsConfig</strong>: When set, this Kafka topic transmits new transaction notifications from the Propagation component to the Validator. Empty by default outside the <code>.operator</code> context.</li>
 </ul>
 <h3 id="validator-component">Validator Component<a class="headerlink" href="#validator-component" title="Permanent link">&para;</a></h3>
 <p><img alt="kafka_validator_to_other_services.svg" src="../img/plantuml/kafka_validator_to_other_services.svg" /></p>
 <p>This diagram illustrates the central role of the Validator in processing new transactions, and how it uses Kafka:</p>
 <ol>
 <li>
-<p>The Validator receives new transactions from the Propagation component via the <code>kafka_validatortxsConfig</code> topic.</p>
+<p>The Validator receives new transactions from the Propagation component via the <code>kafka_validatortxsConfig</code> topic, when that topic is configured. It is empty by default outside the <code>.operator</code> context, in which case Propagation invokes the Validator directly (in-process under the default <code>useLocalValidator = true</code>) and no Kafka leg exists on this hop.</p>
 </li>
 <li>
 <p>Valid transactions are forwarded to the Block Assembly component using <strong>direct gRPC calls</strong> (not Kafka). The Validator uses the <code>blockAssembler.Store()</code> method for synchronous transaction processing required for mining candidate generation.</p>
@@ -7940,28 +8138,41 @@
 </li>
 </ol>
 <h3 id="blockchain">Blockchain<a class="headerlink" href="#blockchain" title="Permanent link">&para;</a></h3>
-<p><img alt="kafka_blockchain_to_others2.svg" src="../img/plantuml/kafka_blockchain_to_others2.svg" /></p>
+<p><img alt="kafka_blockchain_to_others.svg" src="../img/plantuml/kafka_blockchain_to_others.svg" /></p>
 <p>This diagram shows the final stage of block processing:</p>
 <ul>
-<li>The Blockchain component sends newly finalized blocks to the Blockpersister component using the <code>kafka_blocksFinalConfig</code> topic. This ensures that validated and accepted blocks are permanently stored in the blockchain.</li>
+<li>The Blockchain component publishes newly finalized blocks to the <code>kafka_blocksFinalConfig</code> topic (<code>blocks-final</code>). The Block Persister does <strong>not</strong> consume this topic — it polls the Blockchain service over gRPC (<code>GetBlocksNotPersisted</code>), waking every <code>blockpersister_persistSleep</code> (default 10s). The real Kafka consumer of <code>blocks-final</code> is the Legacy P2P service (<code>netsync.SyncManager</code>), which uses it to announce new blocks to legacy (pre-libp2p) peers.</li>
 </ul>
 <h3 id="additional-kafka-topics">Additional Kafka Topics<a class="headerlink" href="#additional-kafka-topics" title="Permanent link">&para;</a></h3>
-<p>Beyond the main processing topics described above, Teranode uses additional Kafka topics for error handling and legacy compatibility:</p>
+<p>Beyond the main processing topics described above, Teranode uses additional Kafka topics for error handling, policy handling, and legacy compatibility. See the <a href="#topic-reference-table">Topic Reference Table</a> above for the authoritative producer/consumer/payload/retention list.</p>
 <h4 id="invalid-block-notifications">Invalid Block Notifications<a class="headerlink" href="#invalid-block-notifications" title="Permanent link">&para;</a></h4>
 <ul>
-<li><strong>kafka_invalid_blocks</strong> (<code>KAFKA_INVALID_BLOCKS</code> in settings): Used to communicate invalid blocks detected during validation<ul>
-<li><strong>Purpose</strong>: Allows services to be notified when a block fails validation</li>
-<li><strong>Consumers</strong>: Services that need to track or respond to invalid block events</li>
-<li><strong>Auto-Commit</strong>: Varies by consumer requirements</li>
+<li><strong>kafka_invalid_blocks</strong> (<code>KAFKA_INVALID_BLOCKS</code> in settings, topic <code>invalid-blocks</code>): Used to communicate invalid blocks detected during validation<ul>
+<li><strong>Purpose</strong>: Allows services to be notified when a block fails validation, for peer reputation management</li>
+<li><strong>Producer</strong>: Block Validation service</li>
+<li><strong>Consumer</strong>: P2P service (consumer group <code>p2p.&lt;client&gt;</code>), which uses it to deprioritize/ban peers sending invalid blocks</li>
+<li><strong>Auto-Commit</strong>: Enabled — set in code when the consumer group is constructed (<code>daemon/daemon_kafka.go</code>), not a URL parameter</li>
 </ul>
 </li>
 </ul>
 <h4 id="invalid-subtree-notifications">Invalid Subtree Notifications<a class="headerlink" href="#invalid-subtree-notifications" title="Permanent link">&para;</a></h4>
 <ul>
-<li><strong>kafka_invalid_subtrees</strong> (<code>KAFKA_INVALID_SUBTREES</code> in settings): Used to communicate invalid subtrees detected during validation<ul>
-<li><strong>Purpose</strong>: Allows services to be notified when a subtree fails validation</li>
-<li><strong>Consumers</strong>: Services that need to track or respond to invalid subtree events</li>
-<li><strong>Auto-Commit</strong>: Varies by consumer requirements</li>
+<li><strong>kafka_invalid_subtrees</strong> (<code>KAFKA_INVALID_SUBTREES</code> in settings, topic <code>invalid-subtrees</code>): Used to communicate invalid subtrees detected during validation<ul>
+<li><strong>Purpose</strong>: Allows services to be notified when a subtree fails validation, for peer quality tracking</li>
+<li><strong>Producer</strong>: Subtree Validation service</li>
+<li><strong>Consumer</strong>: P2P service (consumer group <code>p2p.&lt;client&gt;</code>)</li>
+<li><strong>Auto-Commit</strong>: Enabled — set in code when the consumer group is constructed (<code>daemon/daemon_kafka.go</code>), not a URL parameter</li>
+</ul>
+</li>
+</ul>
+<h4 id="policy-rejected-transactions">Policy-Rejected Transactions<a class="headerlink" href="#policy-rejected-transactions" title="Permanent link">&para;</a></h4>
+<ul>
+<li><strong>kafka_tx_policy_rejected</strong> (<code>KAFKA_TX_POLICY_REJECTED</code> in settings, topic <code>tx-policy-rejected</code>): Distributes raw bytes for transactions that are consensus-valid but rejected by local mining policy (e.g. zero-fee)<ul>
+<li><strong>Purpose</strong>: Lets Subtree Validation resolve a missing transaction referenced by a subtree from a policy-rejected cache instead of re-fetching it from the originating peer; cached transactions still undergo full validation before use</li>
+<li><strong>Producer</strong>: Validator service</li>
+<li><strong>Consumer</strong>: Subtree Validation service (consumer group <code>subtreevalidation.&lt;client&gt;.&lt;random&gt;</code>)</li>
+<li><strong>Disabled by default</strong>: <code>kafka_txPolicyRejectedConfig</code> has no default URL in <code>settings.conf</code> and must be explicitly configured to activate this topic</li>
+<li><strong>Also gated by</strong>: <code>subtreevalidation_txPolicyRejectedCacheEnabled</code> (default <code>true</code>) on the consumer — the consumer only starts when both the Kafka client and the cache are non-nil; on the producer side, <code>publishPolicyRejectedTx</code> stays silent while the FSM is <code>CATCHINGBLOCKS</code>, skips transactions above <code>validator_kafka_maxMessageBytes</code>, and drops the message (non-blocking) rather than stalling validation when its producer buffer is full — all of which fall back to the ordinary HTTP fetch path on a cache miss</li>
 </ul>
 </li>
 </ul>
@@ -8035,14 +8246,116 @@
 </span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="na">KAFKA_TLS_CERT_FILE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">/etc/teranode/certs/client-cert.pem</span>
 </span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="na">KAFKA_TLS_KEY_FILE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">/etc/teranode/certs/client-key.pem</span>
 </span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>
-</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="c1"># Kafka broker URLs (using TLS port)</span>
-</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="na">KAFKA_HOSTS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">kafka1.example.com:9093,kafka2.example.com:9093</span>
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="c1"># Kafka broker URLs. 9093 here is a conventional external TLS listener, not the</span>
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="c1"># deployment shipped in this repository — there, 9093 is pandaproxy and the broker</span>
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="c1"># listens PLAINTEXT-only on 9092. See "Trust Model and Network Isolation" below.</span>
+</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="na">KAFKA_HOSTS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">kafka1.example.com:9093,kafka2.example.com:9093</span>
 </span></code></pre></div>
 <p>Development/testing configuration (skip certificate verification):</p>
 <div class="language-properties highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="na">KAFKA_ENABLE_TLS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">true</span>
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="na">KAFKA_TLS_SKIP_VERIFY</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">true  # Only for testing!</span>
 </span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="na">kafka_enable_debug_logging</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">true  # For troubleshooting</span>
 </span></code></pre></div>
+<h3 id="trust-model-and-network-isolation">Trust Model and Network Isolation<a class="headerlink" href="#trust-model-and-network-isolation" title="Permanent link">&para;</a></h3>
+<p>The manifests and compose files shipped in this repository (<code>deploy/kubernetes/kafka/</code>,
+<code>deploy/docker/base/</code>) run Kafka/Redpanda with <strong>no broker ACLs, no SASL, and a plaintext
+listener by default</strong>. <code>KAFKA_ENABLE_TLS</code> is <code>false</code> out of the box, so client-side mTLS
+(described above) is available but not active until an operator turns it on. Nothing in the
+default deployment restricts <em>who</em> can connect to the broker or <em>which</em> topics a connected
+client may write to.</p>
+<p>This means the security boundary for Kafka, as shipped, is <strong>network isolation, not
+authentication</strong>: any workload with network reach to the Kafka Service can publish or
+consume on any topic, including forging messages onto topics other services trust.</p>
+<ul>
+<li><code>deploy/kubernetes/kafka/kafka-shared-networkpolicy.yaml</code> restricts ingress to the Kafka
+  pods to same-namespace traffic only, as a default-deny boundary against workloads outside
+  the namespace <strong>on clusters whose CNI plugin enforces NetworkPolicy</strong>. This is a real
+  prerequisite, and it fails open silently: any apiserver accepts and stores the object
+  regardless, <code>kubectl get networkpolicy</code> shows it as present either way, and a cluster whose
+  CNI does not implement NetworkPolicy simply ignores it with no error. Verify enforcement
+  before relying on it — the manifest carries a probe command in its header comment. The
+  policy is also intentionally a coarse, same-namespace allowlist rather than a per-service
+  one: there is no consistent pod-label scheme shared across every producer/consumer service
+  and deployment style (docker-compose-derived manifests vs. the operator-managed CRs in
+  <code>deploy/kubernetes/teranode/</code>) to key a tighter selector off. Treat it as a floor, not a
+  substitute for proper multi-tenant segmentation.</li>
+<li>For non-Kubernetes deployments, <code>deploy/docker/base/docker-services.yml</code> already publishes
+  the broker (<code>9092</code>), pandaproxy (<code>9093</code>) and schema registry (host <code>9096</code> → container
+  <code>8081</code>) bound to <code>127.0.0.1</code>, so they are not reachable off-host by default. Two residual
+  gaps: any container on the <code>teranode-network</code> bridge still reaches the broker directly on
+  <code>kafka-shared:9092</code>, and the stacks under <code>compose/</code> do not all have that loopback binding
+  (<code>docker-compose-ss.yml</code> publishes <code>9092</code>/<code>9093</code> on all interfaces). On bare metal, restrict
+  those ports with a firewall rule.</li>
+<li>Not every topic carries the same trust weight if that boundary is breached. The
+  characterisation below covers every topic wired into the Go code, and holds only under the
+  default settings shipped in <code>settings.conf</code>.<ul>
+<li><code>blocks</code>, <code>subtrees</code>, <code>invalid-blocks</code>, <code>invalid-subtrees</code>, <code>rejectedtx</code>,
+  <code>tx-policy-rejected</code> and <code>legacy-inv</code> carry pointers or advisory data that downstream
+  services re-validate or treat as unblessed input, so forged messages cannot inject data.
+  Two qualifications: the <code>URL</code> field on <code>blocks</code> and <code>subtrees</code> is attacker-chosen and
+  only scheme-checked (<code>http</code>/<code>https</code>, plus the literal <code>legacy</code>) with no restriction on
+  the host, so produce access gives an outbound-fetch primitive from the validating pods,
+  aimed at any host and driven at any rate the producer chooses; and <code>legacy-inv</code> messages
+  are dropped unless they name a currently connected peer, in which case they drive
+  getdata requests for attacker-chosen hashes to that peer.</li>
+<li><code>txmeta</code> message contents are written directly into the in-memory tx-metadata cache, and
+  a cache hit makes subtree validation treat the transaction as already known — it is
+  never fetched or validated at all. The cached <code>fee</code>, <code>sizeInBytes</code> and parent inpoints
+  are then written into the subtree and subtree-meta files this node stores and serves,
+  where they feed the block fee/reward check and the order-and-blessed check. Proof-of-work
+  and the authoritative UTXO store still bound what can ultimately get confirmed —
+  forged <code>txmeta</code> entries cannot forge transactions or double-spend — but the reachable
+  surface is wider than a single skipped signature check.</li>
+<li><code>validatortxs</code> (empty by default, populated in the <code>.operator</code> context, i.e. exactly the
+  Kubernetes deployment this NetworkPolicy targets) carries the raw transaction <em>and</em> the
+  validation options applied to it — <code>skipPolicyChecks</code>, <code>skipUtxoCreation</code>,
+  <code>addTXToBlockAssembly</code>, <code>createConflicting</code>. The Validator takes all four from the
+  message as-is, with no check that the producer was entitled to request them, so produce
+  access to this topic means choosing the validation mode a transaction is processed
+  under (<code>skipPolicyChecks</code> maps to consensus-mode validation, bypassing local policy).
+  The <code>options</code> field itself is optional-presence on the wire; a message that omits it
+  falls back to the validator's own defaults (<code>services/validator/Server.go</code>,
+  <code>optionsFromKafkaMessage</code>) — the same defaults the in-tree Propagation producer already
+  sends — rather than crashing or silently becoming more permissive. More generally, the
+  Kafka consumer now recovers a panic in any topic's handler instead of letting it take
+  down the process (<code>util/kafka/kafka_consumer.go</code>), so a malformed message on this or any
+  other topic is a logged, counted event, not an outage.</li>
+<li><code>blocks-final</code> is the one topic whose contents leave the node. The legacy sync manager
+  relays each message's hash and 80-byte header to every connected legacy P2P peer without
+  checking proof-of-work, without consulting the blockchain store, and without verifying
+  that the header hashes to the hash in the message key. The bound on this is real:
+  forged messages cannot get an invalid block accepted anywhere, because receiving peers
+  still check proof-of-work and chain connectivity, and this node cannot serve a block it
+  does not have. What they do is turn this node into a source of junk block announcements,
+  at whatever rate the producer chooses — grounds for peer misbehaviour scoring or a ban.
+  Treat write access to <code>txmeta</code>, <code>validatortxs</code> and <code>blocks-final</code> as the topics that carry
+  real weight.</li>
+</ul>
+</li>
+</ul>
+<p><strong>Operators running Kafka in a shared or multi-tenant cluster, or subject to compliance
+requirements, should not rely on network isolation alone.</strong> On top of the NetworkPolicy:</p>
+<ul>
+<li>Enable <code>KAFKA_ENABLE_TLS</code> (and provide <code>KAFKA_TLS_CA_FILE</code>/<code>KAFKA_TLS_CERT_FILE</code>/
+  <code>KAFKA_TLS_KEY_FILE</code> for mutual TLS) as documented above — the client side is wired into
+  every producer and consumer path already, it is simply off by default. <strong>The client flag on
+  its own is not enough.</strong> The Redpanda instance shipped here starts with
+  <code>--kafka-addr PLAINTEXT://0.0.0.0:9092</code> and nothing else
+  (<code>deploy/kubernetes/kafka/kafka-shared-deployment.yaml</code>, <code>deploy/docker/base/docker-services.yml</code>),
+  so turning client TLS on against it breaks connectivity rather than securing anything.
+  Enabling mTLS also requires configuring a broker TLS listener with broker certificates, and
+  adding that listener's port to <code>kafka-shared-networkpolicy.yaml</code> — the policy hard-codes
+  <code>9092</code>/<code>9093</code>/<code>8081</code>, so a TLS listener on a fourth port is silently blocked by it.</li>
+<li>Configure broker-side ACLs restricting write access to the weighty topics to the identity
+  of their legitimate producer — <code>txmeta</code> and <code>validatortxs</code> to the Validator and Propagation
+  services respectively, <code>blocks-final</code> to the Blockchain service — and, more generally,
+  restricting produce/consume per topic to the services that need it. Teranode does not implement or configure broker ACLs itself —
+  this is a Kafka/Redpanda broker-side configuration and certificate-distribution decision
+  that has to be made per deployment, and is out of scope for the client library to enforce.</li>
+<li>There is currently no SASL/SCRAM support in the Kafka client (<code>util/kafka/</code>). Where broker
+  ACLs require SASL rather than mTLS-based identity, that is a gap requiring further client
+  work, not something enabled by an existing setting.</li>
+</ul>
 <h2 id="5-operational-guidelines">5. Operational Guidelines<a class="headerlink" href="#5-operational-guidelines" title="Permanent link">&para;</a></h2>
 <h3 id="performance-tuning">Performance Tuning<a class="headerlink" href="#performance-tuning" title="Permanent link">&para;</a></h3>
 <ol>
@@ -8090,7 +8403,7 @@
 <p><strong>Error Handling</strong></p>
 <ul>
 <li>Services have different retry policies based on criticality</li>
-<li>Block and subtree validation use manual commits to ensure exactly-once processing</li>
+<li>Block Validation uses manual commits (<code>autoCommit=false</code>); Subtree Validation's <code>subtrees</code> consumer uses auto-commit (<code>autoCommit=true</code>) — see <a href="#auto-commit-behavior-by-service-criticality">Auto-Commit Behavior by Service Criticality</a></li>
 </ul>
 </li>
 </ol>
@@ -8147,13 +8460,7 @@
 <td><code>partitions</code></td>
 <td>int</td>
 <td>1</td>
-<td>Number of topic partitions to consume from</td>
-</tr>
-<tr>
-<td><code>consumer_ratio</code></td>
-<td>int</td>
-<td>1</td>
-<td>Ratio for scaling consumer count (partitions/consumer_ratio)</td>
+<td>Number of topic partitions (used when the topic is auto-created by the producer)</td>
 </tr>
 <tr>
 <td><code>replay</code></td>
@@ -8161,16 +8468,11 @@
 <td>1</td>
 <td>Whether to replay messages from beginning (1=true, 0=false)</td>
 </tr>
-<tr>
-<td><code>group_id</code></td>
-<td>string</td>
-<td>-</td>
-<td>Consumer group identifier for coordination</td>
-</tr>
 </tbody>
 </table>
+<p>The consumer group ID is <strong>not</strong> a URL parameter — it is passed as an argument when the consumer group is constructed in <code>daemon/daemon_kafka.go</code>. A <code>group_id=</code> query parameter in a Kafka URL is ignored.</p>
 <p><strong>Example Consumer URL:</strong></p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>kafka://localhost:9092/transactions?partitions=4&amp;consumer_ratio=2&amp;replay=0&amp;group_id=validator-group
+<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>kafka://localhost:9092/transactions?partitions=4&amp;replay=0
 </span></code></pre></div>
 <h3 id="producer-configuration-parameters">Producer Configuration Parameters<a class="headerlink" href="#producer-configuration-parameters" title="Permanent link">&para;</a></h3>
 <p>When configuring Kafka producers via URL, the following query parameters are supported:</p>
@@ -8282,7 +8584,7 @@
 </ul>
 <h4 id="timeout-configuration-for-slow-processing-services">Timeout Configuration for Slow Processing Services<a class="headerlink" href="#timeout-configuration-for-slow-processing-services" title="Permanent link">&para;</a></h4>
 <p>Services that process messages slowly (e.g., subtree validation with large datasets) need increased timeouts to prevent partition abandonment:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>kafka://localhost:9092/subtrees?partitions=4&amp;consumer_ratio=1&amp;sessionTimeout=90000&amp;heartbeatInterval=20000
+<div class="language-text highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>kafka://localhost:9092/subtrees?partitions=4&amp;sessionTimeout=90000&amp;heartbeatInterval=20000
 </span></code></pre></div>
 <p>This configuration:</p>
 <ul>
@@ -8324,41 +8626,32 @@
 <li>Network efficiency prioritized</li>
 </ul>
 </li>
+<li>
+<p><strong>Subtree Notifications (Subtree Validation)</strong>: <code>autoCommit=true</code> (<code>getKafkaSubtreesConsumerGroup</code>, <code>daemon/daemon_kafka.go</code>)</p>
+<ul>
+<li>Rationale: reprocessing a redelivered subtree announcement is harmless — the handler treats an already-validated/already-stored subtree as a benign no-op, so strict offset tracking isn't required for correctness</li>
+</ul>
+</li>
 </ul>
 <h4 id="auto-commit-disabled-services">Auto-Commit Disabled Services<a class="headerlink" href="#auto-commit-disabled-services" title="Permanent link">&para;</a></h4>
 <p>These services require exactly-once processing guarantees:</p>
 <ul>
-<li>
-<p><strong>Subtree Validation</strong>: <code>autoCommit=false</code></p>
-<ul>
-<li>Rationale: Transaction processing must be atomic</li>
-<li>Manual commit after successful processing</li>
-</ul>
-</li>
-<li>
-<p><strong>Block Persister</strong>: <code>autoCommit=false</code></p>
-<ul>
-<li>Rationale: Block finalization is critical for blockchain integrity</li>
-<li>Manual commit ensures durability</li>
-</ul>
-</li>
-<li>
-<p><strong>Block Validation</strong>: <code>autoCommit=false</code></p>
-<ul>
+<li><strong>Block Validation</strong>: <code>autoCommit=false</code><ul>
 <li>Rationale: Block processing affects consensus</li>
 <li>Manual commit prevents duplicate processing</li>
 </ul>
 </li>
 </ul>
+<p>Note: the Block Persister has no Kafka consumer at all — it polls the Blockchain service over gRPC (see §2 "Blockchain"), so auto-commit does not apply to it.</p>
 <h3 id="kafka-consumer-concurrency">Kafka Consumer Concurrency<a class="headerlink" href="#kafka-consumer-concurrency" title="Permanent link">&para;</a></h3>
-<p><strong>Important</strong>: Unlike what the service-specific <code>kafkaWorkers</code> settings might suggest, Kafka consumer concurrency in Teranode is actually controlled through the <code>consumer_ratio</code> URL parameter for each topic. The actual number of consumers is calculated as:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>consumerCount = partitions / consumer_ratio
-</span></code></pre></div>
-<p>Common consumer ratios in use:</p>
+<p><strong>Partition count is the unit of consumer parallelism.</strong> Each service instance creates exactly one consumer group member per topic (<code>NewKafkaConsumerGroupFromURL</code> in <code>util/kafka/kafka_consumer.go</code>). Kafka assigns each partition to exactly one member of a group, so:</p>
 <ul>
-<li><code>consumer_ratio=1</code>: One consumer per partition (maximum parallelism)</li>
-<li><code>consumer_ratio=4</code>: One consumer per 4 partitions (balanced approach)</li>
+<li>The number of partitions is the hard ceiling on how many instances of a service can consume a topic in parallel. Adding instances beyond the partition count leaves the extra instances idle.</li>
+<li>Within one instance, the consume loop spawns a goroutine per assigned partition per fetch, so a single instance holding N partitions processes up to N partitions concurrently. Handlers run sequentially within a partition's goroutine.</li>
+<li>Raising <code>partitions</code> is therefore the lever for consumer throughput; there is no separate consumer-count parameter.</li>
 </ul>
+<p><strong>There is no <code>consumer_ratio</code> parameter.</strong> It appears in older documentation and example URLs but is not read anywhere in the code — no <code>consumer_ratio</code>, <code>ConsumerRatio</code> or <code>consumerRatio</code> identifier exists, and it is not picked up by the generic URL-parameter helpers (<code>util.GetQueryParam*</code>) that parse every recognised Kafka URL parameter. Unknown query parameters are silently ignored, so leaving it in a URL is inert rather than harmful — but it does not scale consumers.</p>
+<p>Likewise, the service-specific <code>*_kafkaWorkers</code> settings (<code>validator_kafkaWorkers</code>, <code>blockvalidation_kafkaWorkers</code>, <code>block_kafkaWorkers</code>) are loaded into the settings structs but are not read by any consumer code path. They do not currently affect consumer concurrency either.</p>
 <h3 id="service-specific-performance-settings">Service-Specific Performance Settings<a class="headerlink" href="#service-specific-performance-settings" title="Permanent link">&para;</a></h3>
 <h4 id="propagation-service-settings">Propagation Service Settings<a class="headerlink" href="#propagation-service-settings" title="Permanent link">&para;</a></h4>
 <ul>
@@ -8371,27 +8664,25 @@
 </ul>
 <h4 id="validator-service-settings">Validator Service Settings<a class="headerlink" href="#validator-service-settings" title="Permanent link">&para;</a></h4>
 <ul>
-<li><strong><code>validator_kafkaWorkers</code></strong>: Number of concurrent Kafka processing workers<ul>
-<li><strong>Purpose</strong>: Controls parallel transaction processing capacity</li>
-<li><strong>Tuning</strong>: Should match CPU cores and expected transaction volume</li>
-<li><strong>Integration</strong>: Works with Block Assembly via direct gRPC (not Kafka)</li>
+<li><strong><code>validator_kafkaWorkers</code></strong>: declared but inert<ul>
+<li><strong>Status</strong>: The setting is defined and loaded (<code>settings/validator_settings.go</code>, <code>settings/settings.go</code>) but no code reads it, so changing it has no effect. The same applies to <code>blockvalidation_kafkaWorkers</code> and <code>block_kafkaWorkers</code>.</li>
+<li><strong>Use instead</strong>: raise the topic's <code>partitions</code> and/or run more service instances in the same consumer group — see <a href="#kafka-consumer-concurrency">Kafka Consumer Concurrency</a></li>
 </ul>
 </li>
 </ul>
 <h3 id="configuration-examples-by-service">Configuration Examples by Service<a class="headerlink" href="#configuration-examples-by-service" title="Permanent link">&para;</a></h3>
 <h4 id="high-throughput-service-propagation">High-Throughput Service (Propagation)<a class="headerlink" href="#high-throughput-service-propagation" title="Permanent link">&para;</a></h4>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>kafka_validatortxsConfig=kafka://localhost:9092/validator-txs?partitions=8&amp;consumer_ratio=2&amp;flush_frequency=1s
-</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>validator_kafka_maxMessageBytes=1048576  # 1MB threshold
+<div class="language-text highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>kafka_validatortxsConfig=kafka://localhost:9092/validator-txs?partitions=8&amp;flush_frequency=1s
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>validator_kafka_maxMessageBytes=1048576  # 1MB threshold
 </span></code></pre></div>
 <h4 id="critical-processing-service-block-validation">Critical Processing Service (Block Validation)<a class="headerlink" href="#critical-processing-service-block-validation" title="Permanent link">&para;</a></h4>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>kafka_blocksConfig=kafka://localhost:9092/blocks?partitions=4&amp;consumer_ratio=1&amp;replay=0
-</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>blockvalidation_kafkaWorkers=4
-</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>autoCommit=false  # Manual commit for reliability
+<div class="language-text highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>kafka_blocksConfig=kafka://localhost:9092/blocks?partitions=4&amp;replay=0
 </span></code></pre></div>
+<p><code>autoCommit</code> is not a URL parameter and cannot be set via <code>kafka_blocksConfig</code> — Block Validation's consumer group is always constructed with <code>autoCommit=false</code> in code (<code>daemon/daemon_kafka.go</code>).</p>
 <h4 id="metadata-service-subtree-validation">Metadata Service (Subtree Validation)<a class="headerlink" href="#metadata-service-subtree-validation" title="Permanent link">&para;</a></h4>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>kafka_txmetaConfig=kafka://localhost:9092/txmeta?partitions=2&amp;consumer_ratio=1&amp;replay=1
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>autoCommit=true   # Performance over strict guarantees
+<div class="language-text highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>kafka_txmetaConfig=kafka://localhost:9092/txmeta?partitions=2&amp;replay=1
 </span></code></pre></div>
+<p><code>autoCommit</code> is not a URL parameter here either — the txmeta consumer group is always constructed with <code>autoCommit=true</code> in code (<code>daemon/daemon_kafka.go</code>).</p>
 <h2 id="8-other-resources">8. Other Resources<a class="headerlink" href="#8-other-resources" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="../../../references/kafkaMessageFormat/">Kafka Message Format</a></li>

@@ -4191,6 +4191,8 @@
       
         
       
+        
+      
     
     
     
@@ -4358,6 +4360,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../protoVersioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../networkConsensusRules/" class="md-nav__link">
         
   
@@ -4423,10 +4453,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_2_6" id="__nav_4_2_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2_7" id="__nav_4_2_7_label" tabindex="0">
             
   
   
@@ -4444,8 +4474,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_2_6">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_2_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -5031,6 +5061,17 @@
       Table of contents
     </label>
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#authentication" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Authentication
+      
+    </span>
+  </a>
+  
+</li>
       
         <li class="md-nav__item">
   <a href="#types" class="md-nav__link">
@@ -7767,6 +7808,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#authentication" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Authentication
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#types" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -8955,6 +9007,14 @@
 
 
 <h1 id="blockchain-server-reference-documentation">Blockchain Server Reference Documentation<a class="headerlink" href="#blockchain-server-reference-documentation" title="Permanent link">&para;</a></h1>
+<h2 id="authentication">Authentication<a class="headerlink" href="#authentication" title="Permanent link">&para;</a></h2>
+<p>Blockchain refuses startup without a valid <code>grpc_admin_api_key</code>, including in
+development. All BlockchainAPI and PeerRegistryService methods require <code>x-api-key</code>
+except HealthGRPC. This includes read-only calls and Subscribe. HTTP <code>/health</code> is
+public; <code>/invalidate/:hash</code> and <code>/revalidate/:hash</code> require authenticated POST
+requests. Reflection is disabled by default.</p>
+<p>See <a href="../../../topics/services/blockchainAuthentication/">Blockchain authentication</a>
+for credential requirements and the required client-first upgrade order.</p>
 <h2 id="types">Types<a class="headerlink" href="#types" title="Permanent link">&para;</a></h2>
 <h3 id="blockchain">Blockchain<a class="headerlink" href="#blockchain" title="Permanent link">&para;</a></h3>
 <div class="language-go highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">type</span><span class="w"> </span><span class="nx">Blockchain</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
@@ -9264,7 +9324,7 @@ abort startup without writes; <code>LEGACYSYNCING</code> retains its explicit mi
 <h3 id="idle">Idle<a class="headerlink" href="#idle" title="Permanent link">&para;</a></h3>
 <div class="language-go highlight"><pre><span></span><code><span id="__span-60-1"><a id="__codelineno-60-1" name="__codelineno-60-1" href="#__codelineno-60-1"></a><span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">b</span><span class="w"> </span><span class="o">*</span><span class="nx">Blockchain</span><span class="p">)</span><span class="w"> </span><span class="nx">Idle</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">*</span><span class="nx">emptypb</span><span class="p">.</span><span class="nx">Empty</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">emptypb</span><span class="p">.</span><span class="nx">Empty</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
 </span></code></pre></div>
-<p>Transitions the FSM to the IDLE state.</p>
+<p>Transitions the FSM to the IDLE state from RUNNING or CATCHINGBLOCKS. A catchup already in progress is not cancelled; its automatic RUN promotion is refused once the FSM is IDLE.</p>
 <h2 id="legacy-endpoints">Legacy Endpoints<a class="headerlink" href="#legacy-endpoints" title="Permanent link">&para;</a></h2>
 <h3 id="getblocklocator">GetBlockLocator<a class="headerlink" href="#getblocklocator" title="Permanent link">&para;</a></h3>
 <div class="language-go highlight"><pre><span></span><code><span id="__span-61-1"><a id="__codelineno-61-1" name="__codelineno-61-1" href="#__codelineno-61-1"></a><span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">b</span><span class="w"> </span><span class="o">*</span><span class="nx">Blockchain</span><span class="p">)</span><span class="w"> </span><span class="nx">GetBlockLocator</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">blockchain_api</span><span class="p">.</span><span class="nx">GetBlockLocatorRequest</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">blockchain_api</span><span class="p">.</span><span class="nx">GetBlockLocatorResponse</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
@@ -9345,7 +9405,7 @@ abort startup without writes; <code>LEGACYSYNCING</code> retains its explicit mi
 <h3 id="acquireblobdeletionbatch">AcquireBlobDeletionBatch<a class="headerlink" href="#acquireblobdeletionbatch" title="Permanent link">&para;</a></h3>
 <div class="language-go highlight"><pre><span></span><code><span id="__span-75-1"><a id="__codelineno-75-1" name="__codelineno-75-1" href="#__codelineno-75-1"></a><span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">b</span><span class="w"> </span><span class="o">*</span><span class="nx">Blockchain</span><span class="p">)</span><span class="w"> </span><span class="nx">AcquireBlobDeletionBatch</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">blockchain_api</span><span class="p">.</span><span class="nx">AcquireBlobDeletionBatchRequest</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">blockchain_api</span><span class="p">.</span><span class="nx">AcquireBlobDeletionBatchResponse</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
 </span></code></pre></div>
-<p>Acquires a batch of deletions with locking for processing. Uses <code>SELECT...FOR UPDATE SKIP LOCKED</code> to ensure only one pruner instance processes each batch.</p>
+<p>Acquires a batch of deletions with locking for processing. Uses <code>SELECT...FOR UPDATE SKIP LOCKED</code> to ensure only one pruner instance processes each batch. Store types listed in <code>exclude_store_types</code> are left out of the batch, so the pruner can skip a store whose deletions it is holding without those rows filling every batch.</p>
 <h3 id="completeblobdeletionbatch">CompleteBlobDeletionBatch<a class="headerlink" href="#completeblobdeletionbatch" title="Permanent link">&para;</a></h3>
 <div class="language-go highlight"><pre><span></span><code><span id="__span-76-1"><a id="__codelineno-76-1" name="__codelineno-76-1" href="#__codelineno-76-1"></a><span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">b</span><span class="w"> </span><span class="o">*</span><span class="nx">Blockchain</span><span class="p">)</span><span class="w"> </span><span class="nx">CompleteBlobDeletionBatch</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">blockchain_api</span><span class="p">.</span><span class="nx">CompleteBlobDeletionBatchRequest</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">emptypb</span><span class="p">.</span><span class="nx">Empty</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
 </span></code></pre></div>

@@ -4191,6 +4191,8 @@
       
         
       
+        
+      
     
     
     
@@ -4358,6 +4360,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../protoVersioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../networkConsensusRules/" class="md-nav__link">
         
   
@@ -4423,10 +4453,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_2_6" id="__nav_4_2_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2_7" id="__nav_4_2_7_label" tabindex="0">
             
   
   
@@ -4444,8 +4474,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_2_6">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_2_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7830,7 +7860,9 @@
 </span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="p">}</span>
 </span></code></pre></div>
 <p><strong>Example:</strong></p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>grpcurl<span class="w"> </span>-plaintext<span class="w"> </span>localhost:8096<span class="w"> </span>pruner.PrunerAPI/HealthGRPC
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Run from a Teranode source checkout: server reflection is off by default</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>grpcurl<span class="w"> </span>-plaintext<span class="w"> </span>-import-path<span class="w"> </span>.<span class="w"> </span>-proto<span class="w"> </span>services/pruner/pruner_api/pruner_api.proto<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>localhost:8096<span class="w"> </span>pruner.PrunerAPI/HealthGRPC
 </span></code></pre></div>
 <p><strong>Response:</strong></p>
 <div class="language-json highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">{</span>
@@ -7879,7 +7911,7 @@
 <li><code>block_assembly_timeout</code> - Timed out or errored waiting for Block Assembly to be ready</li>
 <li><code>below_min_height</code> - Block height at or below <code>pruner_minBlockHeight</code></li>
 <li><code>fsm_error</code> - Failed to read the blockchain FSM state</li>
-<li><code>catchup_mode</code> - Node is in the CATCHINGBLOCKS FSM state and <code>pruner_skipDuringCatchup</code> is set</li>
+<li><code>catchup_mode</code> - Node is not in the RUNNING FSM state (CATCHINGBLOCKS, or IDLE after an operator STOP) and <code>pruner_skipDuringCatchup</code> is set</li>
 </ul>
 </li>
 </ul>
@@ -8160,8 +8192,8 @@
 </li>
 <li>
 <p>Verify UTXO store connection:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="c1"># Check UTXO store health</span>
-</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>grpcurl<span class="w"> </span>-plaintext<span class="w"> </span>localhost:8090<span class="w"> </span>asset.AssetAPI/HealthGRPC
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="c1"># Check UTXO store health (Asset reports its dependencies over HTTP)</span>
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8090/health
 </span></code></pre></div>
 </li>
 <li>

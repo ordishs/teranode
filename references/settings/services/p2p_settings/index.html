@@ -4191,6 +4191,8 @@
       
         
       
+        
+      
     
     
     
@@ -4358,6 +4360,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../protoVersioning/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../networkConsensusRules/" class="md-nav__link">
         
   
@@ -4423,10 +4453,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_2_6" id="__nav_4_2_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2_7" id="__nav_4_2_7_label" tabindex="0">
             
   
   
@@ -4444,8 +4474,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_2_6">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_2_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7496,6 +7526,13 @@
 <td>127.0.0.1/32|::1/128</td>
 <td>p2p_websocket_trusted_source_cidrs</td>
 <td>Source CIDRs exempt from the /p2p-ws connection caps; loopback only by design - broader trust would void the caps behind an L7 ingress or NAT (see longdesc). Sentinel <code>none</code> disables the bypass (empty falls back to the default)</td>
+</tr>
+<tr>
+<td>HTTPRateLimit</td>
+<td>int</td>
+<td>100</td>
+<td>p2p_httpRateLimit</td>
+<td>Per-source req/s cap on the P2P HTTP server (/health, /p2p-ws); 0 or negative disables it</td>
 </tr>
 </tbody>
 </table>
