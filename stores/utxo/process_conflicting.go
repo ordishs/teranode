@@ -1286,9 +1286,9 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 	for parentTx := range parentTxs {
 		parentTxHash := &parentTx
 
-		// fields.BlockIDs is requested alongside fields.BlockHeights because the SQL
-		// backend only populates BlockHeights when the block-id join is loaded; the
-		// parent-depth guard below relies on BlockHeights being present for a mined parent.
+		// fields.BlockIDs is requested alongside fields.BlockHeights so that a mined
+		// record with no heights (an older record or a restore) is told apart from an
+		// unmined one; newParentDepthInfo fails closed on the former.
 		parentTxMeta, err := s.Get(ctx, parentTxHash, fields.Utxos, fields.BlockHeights, fields.BlockIDs, fields.UnminedSince)
 		if err != nil {
 			return nil, err

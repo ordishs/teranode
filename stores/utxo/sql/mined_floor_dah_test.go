@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -115,14 +116,35 @@ func TestSpendStampsDAHAtMinedFloor(t *testing.T) {
 }
 
 // Mined far above the cached tip, then flagged conflicting: the stamp comes from the
-// mined height, not the lagging tip. Postgres only, since SetConflicting deadlocks on
-// SQLite.
+// mined height, not the lagging tip.
 func TestSetConflictingStampsDAHAtMinedFloor_Postgres(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Postgres integration test in short mode")
 	}
 
 	store, ctx := setupPostgresStore(t)
+	retention := floorRetention(t, store)
+
+	hash := createMinedAboveTip(ctx, t, store)
+
+	_, _, err := store.SetConflicting(ctx, []chainhash.Hash{hash}, true)
+	require.NoError(t, err)
+
+	dah := readDAH(ctx, t, store, hash)
+	require.NotNil(t, dah)
+	require.GreaterOrEqual(t, *dah, int64(floorMinedHeight)+retention,
+		"the stamp must be at least mined height + retention, not the lagging tip + retention")
+}
+
+// SetConflicting reads each output's spend while its transaction is open. On a
+// single-connection store a read on the pool waits for the connection the
+// transaction holds, so this call used to hang. It must return, and stamp from the
+// mined floor.
+func TestSetConflictingStampsDAHAtMinedFloor_SQLite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	store, _ := setup(ctx, t)
 	retention := floorRetention(t, store)
 
 	hash := createMinedAboveTip(ctx, t, store)

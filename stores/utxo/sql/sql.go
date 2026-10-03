@@ -3728,7 +3728,16 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 }
 
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
+	return s.getSpend(ctx, s.db, spend)
+}
 
+// rowQuerier is satisfied by both *sql.DB and *sql.Tx, so a read can run on the
+// caller's open transaction instead of waiting for a second pool connection.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func (s *Store) getSpend(ctx context.Context, db rowQuerier, spend *utxo.Spend) (*utxo.SpendResponse, error) {
 	q := `
 		SELECT
 		 o.utxo_hash
@@ -3754,7 +3763,7 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		locked                 bool
 	)
 
-	err := s.db.QueryRowContext(ctx, q, spend.TxID[:], spend.Vout).Scan(&utxoHash, &coinbaseSpendingHeight, &spendingDataBytes, &frozen, &spendableIn, &conflicting, &locked)
+	err := db.QueryRowContext(ctx, q, spend.TxID[:], spend.Vout).Scan(&utxoHash, &coinbaseSpendingHeight, &spendingDataBytes, &frozen, &spendableIn, &conflicting, &locked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Match aerospike behavior: return NOT_FOUND status instead of error
@@ -4705,8 +4714,9 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 				UTXOHash: utxoHash,
 			}
 
-			// optimize to get all in 1 query
-			spendResponse, err := s.GetSpend(ctx, spend)
+			// read on the open transaction: the pool call waits for a connection the
+			// transaction holds, which deadlocks a single-connection store
+			spendResponse, err := s.getSpend(ctx, txn, spend)
 			if err != nil {
 				return nil, nil, err
 			}
