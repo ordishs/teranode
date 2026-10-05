@@ -271,3 +271,32 @@ func TestExpiredPreservationStampsDAHAtMinedFloor_Postgres(t *testing.T) {
 	require.NotNil(t, dah)
 	require.GreaterOrEqual(t, *dah, int64(floorMinedHeight)+retention)
 }
+
+// SetConflicting returns the spenders of the flagged transaction's outputs. They
+// must be read before the flag is written: a read after the UPDATE sees
+// conflicting = true and reports CONFLICTING, which would drop the spender.
+func TestSetConflictingReturnsSpendersOfOutputs(t *testing.T) {
+	ctx := context.Background()
+	store, _ := setup(ctx, t)
+
+	require.NoError(t, store.SetBlockHeight(floorCachedTip))
+
+	_, err := store.Create(ctx, tests.ParentTx, floorCachedTip)
+	require.NoError(t, err)
+
+	_, err = store.Create(ctx, tests.Tx, floorCachedTip)
+	require.NoError(t, err)
+
+	hash := *tests.Tx.TxIDChainHash()
+
+	spendTx := bt.NewTx()
+	require.NoError(t, spendTx.From(hash.String(), 0, tests.Tx.Outputs[0].LockingScript.String(), tests.Tx.Outputs[0].Satoshis))
+	require.NoError(t, spendTx.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1000))
+
+	_, _, err = store.SpendAndCreate(ctx, spendTx, floorCachedTip, utxo.WithSpendOnly())
+	require.NoError(t, err)
+
+	_, spenders, err := store.SetConflicting(ctx, []chainhash.Hash{hash}, true)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{*spendTx.TxIDChainHash()}, spenders)
+}

@@ -4658,12 +4658,54 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 		_ = txn.Rollback()
 	}()
 
-	for _, conflictingTxHash := range txHashes {
-		// get the extended tx
-		txMeta, err := s.Get(ctx, &conflictingTxHash)
+	// Read every output's spend before the first write. A read after the UPDATE sees
+	// conflicting = true on its own transaction and reports CONFLICTING instead of
+	// SPENT, which would drop the spender. The reads run on the transaction, not the
+	// pool: the pool read waits for a connection the transaction holds, which
+	// deadlocks a single-connection store.
+	txMetas := make([]*meta.Data, len(txHashes))
+
+	for i := range txHashes {
+		txMeta, err := s.Get(ctx, &txHashes[i])
 		if err != nil {
 			return nil, nil, err
 		}
+
+		txMetas[i] = txMeta
+
+		for vOut, output := range txMeta.Tx.Outputs {
+			if output == nil {
+				// A hole: Outputs is indexed by vout, and a snapshot-seeded
+				// transaction has no row for the vouts already spent when the
+				// snapshot was taken. There is no output to derive a utxo hash from
+				// and nothing to unspend.
+				continue
+			}
+
+			vOutUint32, err := safeconversion.IntToUint32(vOut)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			utxoHash, err = util.UTXOHashFromOutput(&txHashes[i], output, vOutUint32)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			spendResponse, err := s.getSpend(ctx, txn, &utxo.Spend{TxID: &txHashes[i], Vout: vOutUint32, UTXOHash: utxoHash})
+			if err != nil {
+				return nil, nil, err
+			}
+
+			if spendResponse.Status == int(utxo.Status_SPENT) && spendResponse.SpendingData != nil && spendResponse.SpendingData.TxID != nil {
+				spendingTxHashes = append(spendingTxHashes, *spendResponse.SpendingData.TxID)
+			}
+		}
+	}
+
+	for i := range txHashes {
+		conflictingTxHash := txHashes[i]
+		txMeta := txMetas[i]
 
 		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
 			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
@@ -4687,43 +4729,6 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			}
 
 			affectedParentSpends = append(affectedParentSpends, spend)
-		}
-
-		for vOut, output := range txMeta.Tx.Outputs {
-			if output == nil {
-				// A hole: Outputs is indexed by vout, and a snapshot-seeded
-				// transaction has no row for the vouts already spent when the
-				// snapshot was taken. There is no output to derive a utxo hash from
-				// and nothing to unspend.
-				continue
-			}
-
-			vOutUint32, err := safeconversion.IntToUint32(vOut)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			utxoHash, err = util.UTXOHashFromOutput(&conflictingTxHash, output, vOutUint32)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			spend := &utxo.Spend{
-				TxID:     &conflictingTxHash,
-				Vout:     vOutUint32,
-				UTXOHash: utxoHash,
-			}
-
-			// read on the open transaction: the pool call waits for a connection the
-			// transaction holds, which deadlocks a single-connection store
-			spendResponse, err := s.getSpend(ctx, txn, spend)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			if spendResponse.Status == int(utxo.Status_SPENT) && spendResponse.SpendingData != nil && spendResponse.SpendingData.TxID != nil {
-				spendingTxHashes = append(spendingTxHashes, *spendResponse.SpendingData.TxID)
-			}
 		}
 	}
 
