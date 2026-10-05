@@ -139,11 +139,9 @@ func TestPruneHorizon_MinedTxDeletedAtMinedHeightPlusRetention(t *testing.T) {
 // stamp must not survive — otherwise a mined transaction becomes deletable
 // before mined_height + retention and the parent-depth guard's assumption breaks.
 //
-// The conflicting flag and its early stamp are written with direct SQL rather
-// than through Store.SetConflicting: that method opens a transaction at
-// sql.go:4325 and then calls s.GetSpend on the pool at sql.go:4383, which
-// deadlocks on SQLite. What is under test here is the DAH arithmetic in
-// SetMinedMulti, and this sets up its precondition exactly.
+// The conflicting flag and its early stamp are written with direct SQL, which sets
+// up the precondition exactly. The opposite order, mined first and flagged
+// conflicting second, goes through Store.SetConflicting in the test below.
 func TestPruneHorizon_ConflictingThenMinedDoesNotKeepEarlierStamp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -208,4 +206,75 @@ func TestPruneHorizon_ConflictingThenMinedDoesNotKeepEarlierStamp(t *testing.T) 
 		"tx flagged conflicting at %d then mined at %d must survive to %d; "+
 			"a surviving flag-height DAH stamp would break the parent-depth guard",
 		flagHeight, mineHeight, tip)
+}
+
+// The opposite order: a transaction is mined at a height far above the node's cached
+// tip, then flagged conflicting. SetConflicting must not stamp from the lagging
+// cached tip, because the pruner deletes purely on the stamp. Run through the real
+// Store.SetConflicting and the real pruner.
+func TestPruneHorizon_MinedThenConflictingDoesNotStampFromLaggingTip(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, prunerSvc, retention := horizonStore(ctx, t)
+
+	const (
+		cachedTip  uint32 = 500
+		mineHeight uint32 = 1500
+	)
+
+	tx := tests.Tx
+	txHash := tx.TxIDChainHash()
+
+	require.NoError(t, store.SetBlockHeight(cachedTip))
+
+	_, _, err := store.SpendAndCreate(ctx, tx, cachedTip, utxostore.WithCreateOnly())
+	require.NoError(t, err)
+
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txHash}, utxostore.MinedBlockInfo{
+		BlockID:        300,
+		BlockHeight:    mineHeight,
+		SubtreeIdx:     0,
+		OnLongestChain: true,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.SetConflicting(ctx, []chainhash.Hash{*txHash}, true)
+	require.NoError(t, err)
+
+	var stamped int64
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT delete_at_height FROM transactions WHERE hash = $1`, txHash[:]).Scan(&stamped))
+	require.GreaterOrEqual(t, stamped, int64(mineHeight+retention),
+		"SetConflicting must stamp at least mined_height + retention, not cached_tip + 1 + retention")
+
+	// The tip at which a stamp from the lagging cached tip would already delete it.
+	laggingStamp := cachedTip + 1 + retention
+	require.NoError(t, store.SetBlockHeight(laggingStamp))
+
+	_, err = prunerSvc.Prune(ctx, laggingStamp, "<horizon-lagging>")
+	require.NoError(t, err)
+
+	_, err = store.Get(ctx, txHash)
+	require.NoError(t, err,
+		"tx mined at %d then flagged conflicting at cached tip %d must survive pruning at tip %d",
+		mineHeight, cachedTip, laggingStamp)
+
+	tip := mineHeight + retention - 1
+	require.NoError(t, store.SetBlockHeight(tip))
+
+	_, err = prunerSvc.Prune(ctx, tip, "<horizon-below>")
+	require.NoError(t, err)
+
+	_, err = store.Get(ctx, txHash)
+	require.NoError(t, err, "tx must survive pruning at tip %d (mined_height + retention - 1)", tip)
+
+	tip = mineHeight + retention
+	require.NoError(t, store.SetBlockHeight(tip))
+
+	_, err = prunerSvc.Prune(ctx, tip, "<horizon-at>")
+	require.NoError(t, err)
+
+	_, err = store.Get(ctx, txHash)
+	require.Error(t, err, "tx must be pruned at tip %d (mined_height + retention)", tip)
 }
