@@ -110,7 +110,11 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		require.Equal(t, 0, s.Asset.MaxBlockHeaders)
 		require.Equal(t, 0, s.Asset.MaxLastNBlocks)
 		require.Equal(t, 0, s.Asset.MaxNBlocks)
-		require.False(t, s.Asset.RequireAuthCredentials)
+		// Deliberately NOT behaviour-preserving, unlike every other key here. No
+		// default credential pair ships any more, so failing open would leave the
+		// admin routes anonymous on a stock config - strictly worse than before.
+		require.True(t, s.Asset.RequireAuthCredentials)
+
 		require.False(t, s.Asset.SecureCookies)
 		require.Equal(t, "", s.Asset.CORSAllowOrigins)
 		require.False(t, s.Asset.EnforcePostAuth)
@@ -150,8 +154,8 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		{"asset_maxNBlocks", "500", func(t *testing.T, s *Settings) {
 			require.Equal(t, 500, s.Asset.MaxNBlocks)
 		}},
-		{"asset_requireAuthCredentials", "true", func(t *testing.T, s *Settings) {
-			require.True(t, s.Asset.RequireAuthCredentials)
+		{"asset_requireAuthCredentials", "false", func(t *testing.T, s *Settings) {
+			require.False(t, s.Asset.RequireAuthCredentials)
 		}},
 		{"asset_secureCookies", "true", func(t *testing.T, s *Settings) {
 			require.True(t, s.Asset.SecureCookies)
