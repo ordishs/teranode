@@ -1357,6 +1357,11 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			continue
 		}
 
+		// Transactions this level accepted whose two-phase-commit unlock failed, retried once the
+		// level completes so the next level does not meet them as TX_LOCKED.
+		var lockedHashes []chainhash.Hash
+		var lockedMu sync.Mutex
+
 		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions", level+1, maxLevel+1, len(levelTxs))
 
 		// PHASE 2 OPTIMIZATION: Extend transactions with in-block parent outputs
@@ -1422,8 +1427,21 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			}
 
 			g.Go(func() error {
-				// Use existing blessMissingTransaction logic for validation
-				txMeta, err := u.blessMissingTransaction(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, &levelValidatorOptions)
+				// Use existing blessMissing logic for validation. The wrapper drops the
+				// accepted-but-unlock-failed signal this path needs, so call blessMissing direct.
+				txMeta, unlockFailed, err := u.blessMissing(gCtx, blockHash, subtreeHash, tx, blockHeight, blockIds, &levelValidatorOptions)
+
+				// Queue an accepted-but-locked parent for this level's unlock retry before handling
+				// err: the record is spent, created and delivered either way, and children in the next
+				// level spend its outputs. This path counted these transactions in bless_unlock_failed
+				// and, calling the blessMissingTransaction wrapper, had no unlockFailed to act on, so
+				// they stayed locked until mined.
+				if unlockFailed {
+					lockedMu.Lock()
+					lockedHashes = append(lockedHashes, *tx.TxIDChainHash())
+					lockedMu.Unlock()
+				}
+
 				if err != nil {
 					u.logger.Debugf("[processTransactionsInLevels] Failed to validate transaction %s: %v", tx.TxIDChainHash().String(), err)
 
@@ -1475,9 +1493,16 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			})
 		}
 
+		// Unlock before acting on the wait error. The only arm that returns one is a truly invalid
+		// transaction or the conflicting-walk budget, and a sibling's failure must not skip the retry
+		// for parents this level already accepted. ctx, not the errgroup's gCtx (which that failure
+		// cancels), is still live here, so the retry gets its window.
+		waitErr := g.Wait()
+		u.unlockAcceptedTransactions(ctx, subtreeHash, lockedHashes)
+
 		// Fail early if we get an actual tx error thrown
-		if err = g.Wait(); err != nil {
-			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, err)
+		if waitErr != nil {
+			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, waitErr)
 		}
 
 		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))

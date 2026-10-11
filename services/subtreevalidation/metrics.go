@@ -86,6 +86,17 @@ var (
 	// but whose two-phase-commit unlock failed, and were blessed anyway.
 	prometheusSubtreeValidationBlessUnlockFailed prometheus.Counter
 
+	// prometheusSubtreeValidationBlessUnlockRecovered counts transactions in that set that
+	// the per-level retry in unlockAcceptedTransactions did manage to unlock.
+	prometheusSubtreeValidationBlessUnlockRecovered prometheus.Counter
+
+	// prometheusSubtreeValidationBlessUnlockRetryFailed counts the ones the retry could not
+	// unlock either, and that therefore stay locked until they are mined. Together with the two
+	// above it makes the retry's outcome visible: bless_unlock_failed minus this counter and
+	// bless_unlock_recovered counts accepted-and-locked transactions whose retry never ran, i.e.
+	// those left queued when the unlock context itself was already done (deadline or cancellation).
+	prometheusSubtreeValidationBlessUnlockRetryFailed prometheus.Counter
+
 	// prometheusSubtreeValidationSetTXMetaCacheKafkaBatch tracks the duration of processing one
 	// SetCacheMulti batch from a Kafka message. One observation per Kafka message that contained
 	// at least one ADD entry, regardless of how many entries the batch held.
@@ -248,6 +259,24 @@ func _initPrometheusMetrics() {
 			Subsystem: "subtreevalidation",
 			Name:      "bless_unlock_failed",
 			Help:      "Accepted transactions blessed although their two-phase-commit unlock failed",
+		},
+	)
+
+	prometheusSubtreeValidationBlessUnlockRecovered = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "bless_unlock_recovered",
+			Help:      "Accepted transactions the per-level unlock retry unlocked, subset of bless_unlock_failed",
+		},
+	)
+
+	prometheusSubtreeValidationBlessUnlockRetryFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "bless_unlock_retry_failed",
+			Help:      "Accepted transactions the per-level unlock retry also failed to unlock, they stay locked until mined",
 		},
 	)
 

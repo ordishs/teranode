@@ -3754,7 +3754,15 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		// try to process one last time
 		// passing in block height 0, which will default to utxo store block height in validator
 		if _, err := sm.validationClient.Validate(sm.ctx, orphanTx.tx, 0); err != nil {
-			sm.logger.Debugf("failed to validate orphan transaction when evicting %v: %v", txHash, err)
+			// ErrTxUnlockFailed means the orphan was ACCEPTED - spent, created and delivered to
+			// block assembly - and only an unlock is outstanding, so it is not a validation
+			// failure. Every other Validate call site branches on this code; leaving it out here
+			// costs a misleading "failed to validate" line for a transaction the node took.
+			if errors.Is(err, errors.ErrTxUnlockFailed) {
+				sm.logger.Debugf("evicted orphan transaction %v, it was accepted with its unlock pending", txHash)
+			} else {
+				sm.logger.Debugf("failed to validate orphan transaction when evicting %v: %v", txHash, err)
+			}
 		} else {
 			sm.logger.Debugf("evicted orphan transaction %v", txHash)
 		}

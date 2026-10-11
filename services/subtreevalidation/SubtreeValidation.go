@@ -69,7 +69,12 @@ import (
 const conflictingConeWarnThreshold = 1000
 
 // defaultUnlockTimeout bounds the level unlock when validator_twoPhaseCommitTimeout is unset.
-const defaultUnlockTimeout = 2 * time.Second
+// Aliased to the validator's own default rather than restating a literal: the unlock's real
+// budget IS validator.DefaultTwoPhaseCommitTimeout (configured as validator_twoPhaseCommitTimeout,
+// which the fallback above reads), and subtreevalidation has no setting of its own for this.
+// A second literal here would silently disagree with the validator the moment the setting is
+// raised above it - which is the documented remedy for these unlock timeouts.
+const defaultUnlockTimeout = validator.DefaultTwoPhaseCommitTimeout
 
 // missingTx represents a transaction that needs to be retrieved and its position in the subtree.
 //
@@ -511,7 +516,16 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 			// the response metadata does not survive a gRPC error, so read the accepted record back
 			stored := &meta.Data{}
 			if getErr := u.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), stored); getErr != nil {
-				return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to read meta of accepted transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), getErr)
+				// Report the accept anyway. The transaction was spent, created and delivered to
+				// block assembly; only the proof metadata could not be read, and the one thing the
+				// caller still has to do for it is retry the unlock. Returning unlockFailed=false
+				// here discarded that, so a store read of proof data turned an accepted parent into
+				// a plain bless failure with no retry, stranding its child as TX_LOCKED until the
+				// parent is mined. The metadata itself is still not faked: txMeta stays nil.
+				u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] failed to read meta of accepted transaction, it stays queued for unlock: %v",
+					blockHash.String(), subtreeHash.String(), tx.TxID(), getErr)
+
+				return nil, true, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to read meta of accepted transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), getErr)
 			}
 
 			txMeta = stored
@@ -536,14 +550,17 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 	if len(txMeta.BlockIDs) > 0 && len(blockIds) > 0 {
 		for _, blockID := range txMeta.BlockIDs {
 			if blockIds[blockID] {
-				return nil, false, errors.NewTxInvalidError("[blessMissingTransaction][%s/%s][%s] transaction is already mined on our chain, in block %d", blockHash.String(), subtreeHash.String(), tx.TxID(), blockID)
+				// unlockFailed is carried through, not reset: these checks run after acceptance,
+				// so the record is spent, created and delivered even though the bless is rejected
+				// here, and the caller still has to retry its unlock.
+				return nil, unlockFailed, errors.NewTxInvalidError("[blessMissingTransaction][%s/%s][%s] transaction is already mined on our chain, in block %d", blockHash.String(), subtreeHash.String(), tx.TxID(), blockID)
 			}
 		}
 	}
 
 	if txMeta.Conflicting {
 		if err = u.checkCounterConflictingOnCurrentChain(ctx, *tx.TxIDChainHash(), blockIds); err != nil {
-			return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to check counter conflicting tx on current chain", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
+			return nil, unlockFailed, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to check counter conflicting tx on current chain", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
 		}
 	}
 
@@ -1310,6 +1327,20 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 			// process each transaction in the background, since the transactions are all batched into the utxo store
 			g.Go(func() error {
 				txMeta, unlockFailed, err := u.blessMissing(gCtx, chainhash.Hash{}, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
+
+				// Queue an accepted-but-locked parent for this level's unlock retry BEFORE
+				// handling err. blessMissing only ever sets unlockFailed on the accepted path,
+				// and the checks it runs after acceptance (already mined, counter-conflicting,
+				// the accepted-meta read-back) can still reject the bless. The record is spent,
+				// created and delivered either way, so a child in the next level still needs it
+				// spendable; leaving this in the success arm strands the child as TX_LOCKED while
+				// errorsFound counts the same parent as a bless failure.
+				if unlockFailed {
+					lockedMu.Lock()
+					lockedHashes = append(lockedHashes, *tx.TxIDChainHash())
+					lockedMu.Unlock()
+				}
+
 				if err != nil {
 					// Log the error, but do not return it, since we want to process all transactions in the subtree
 					u.logger.Debugf("[validateSubtree][%s] failed to bless missing transaction: %s: %v", subtreeHash.String(), tx.TxIDChainHash().String(), err)
@@ -1337,12 +1368,6 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					}
 
 					return nil
-				}
-
-				if unlockFailed {
-					lockedMu.Lock()
-					lockedHashes = append(lockedHashes, *tx.TxIDChainHash())
-					lockedMu.Unlock()
 				}
 
 				if txMeta == nil {
@@ -1379,11 +1404,18 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 		}
 
 		// wait for each level to process separately
-		if err = g.Wait(); err != nil {
-			return err
-		}
-
+		// Unlock before acting on the wait error. The only arm that returns one is a truly
+		// invalid transaction, and a sibling's failure must not skip the retry for parents
+		// this level already ACCEPTED: those are spent, created and delivered to block
+		// assembly, so skipping the unlock strands their children as TX_LOCKED until the
+		// parent is mined - the outcome this retry exists to avoid. ctx, not the errgroup's
+		// gCtx (which that failure cancels), is still live here, so the retry gets its window.
+		waitErr := g.Wait()
 		u.unlockAcceptedTransactions(ctx, subtreeHash, lockedHashes)
+
+		if waitErr != nil {
+			return waitErr
+		}
 	}
 
 	if errorsFound.Load() > 0 {
@@ -1405,8 +1437,8 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 // unlockAcceptedTransactions retries the two-phase-commit unlock, in one store call, for transactions the
 // validator accepted but could not unlock. Children in the next level spend their outputs, and a locked
 // parent answers them TX_LOCKED. The transactions were already delivered to block assembly, so unlocking
-// them is the step the validator would have taken. A failure is logged only: the record stays locked until
-// it is mined, as it would have before this retry.
+// them is the step the validator would have taken. A failure is logged and counted only: the record stays
+// locked until it is mined, as it would have before this retry.
 func (u *Server) unlockAcceptedTransactions(ctx context.Context, subtreeHash chainhash.Hash, hashes []chainhash.Hash) {
 	if len(hashes) == 0 {
 		return
@@ -1420,12 +1452,17 @@ func (u *Server) unlockAcceptedTransactions(ctx context.Context, subtreeHash cha
 	unlockCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// bless_unlock_failed counts these transactions when they are identified; without these two the
+	// retry's own outcome is invisible, so a node whose retry never succeeds looks identical to one
+	// where it always does.
 	if err := u.utxoStore.SetLocked(unlockCtx, hashes, false); err != nil {
+		prometheusSubtreeValidationBlessUnlockRetryFailed.Add(float64(len(hashes)))
 		u.logger.Warnf("[validateSubtree][%s] failed to unlock %d accepted transactions, they stay locked until mined: %v", subtreeHash.String(), len(hashes), err)
 
 		return
 	}
 
+	prometheusSubtreeValidationBlessUnlockRecovered.Add(float64(len(hashes)))
 	u.logger.Debugf("[validateSubtree][%s] unlocked %d accepted transactions", subtreeHash.String(), len(hashes))
 }
 

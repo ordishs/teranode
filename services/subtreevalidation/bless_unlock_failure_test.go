@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -215,4 +216,241 @@ func TestBlessMissingTransactions_LevelUnlockFailureLeavesParentLocked(t *testin
 	stored := &meta.Data{}
 	require.NoError(t, store.GetMeta(ctx, parent.TxIDChainHash(), stored))
 	require.True(t, stored.Locked)
+}
+
+// unreadableStore writes normally and fails GetMeta, which is how a store that errors on reading
+// back the record of an already-accepted transaction looks. With only set, the failures are limited
+// to that one hash so a test can fail one read while the rest of the path still works.
+type unreadableStore struct {
+	*sql.Store
+	only *chainhash.Hash
+}
+
+func (s *unreadableStore) GetMeta(ctx context.Context, hash *chainhash.Hash, md *meta.Data) error {
+	if s.only == nil || *s.only == *hash {
+		return errors.NewProcessingError("simulated GetMeta failure")
+	}
+
+	return s.Store.GetMeta(ctx, hash, md)
+}
+
+// TestBlessMissing_UnlockFailureSurvivesFailedMetaReadBack pins that a transaction the
+// validator accepted still reaches the level's unlock retry when the accepted-meta
+// read-back fails. The lock is what blocks the child; proof metadata has nothing to do
+// with it, so losing the read must not discard the retry. Returning unlockFailed=false
+// here — as the error arm did before — dropped the one signal the retry runs on, and
+// left a child in the next level answered TX_LOCKED by a parent that was merely
+// un-unlocked, not rejected.
+func TestBlessMissing_UnlockFailureSurvivesFailedMetaReadBack(t *testing.T) {
+	ctx := context.Background()
+
+	server, store, txs, _ := newUnlockFailureServer(t, true, alwaysFail)
+	server.validatorClient = &failingValidator{
+		Interface: server.validatorClient,
+		err:       errors.NewTxUnlockFailedError("[Validate] error marking tx as spendable", errors.NewProcessingError("context deadline exceeded")),
+	}
+	server.utxoStore = &unreadableStore{Store: store.Store}
+
+	txMeta, unlockFailed, err := server.blessMissing(ctx, chainhash.Hash{}, chainhash.Hash{}, txs[1], 2, map[uint32]bool{}, validator.ProcessOptions())
+
+	require.Error(t, err, "the bless still fails: the accepted metadata could not be read")
+	require.Nil(t, txMeta, "no metadata is invented for a read that failed")
+	require.True(t, unlockFailed, "an accepted transaction must still be queued for the unlock retry")
+}
+
+// TestUnlockAcceptedTransactions_CountsRetryOutcome pins the two counters that make the
+// retry's outcome visible. bless_unlock_failed counts these transactions when they are
+// identified; without a recovered/failed split on the retry itself, a node whose retry
+// never succeeds looks identical to one where it always does.
+func TestUnlockAcceptedTransactions_CountsRetryOutcome(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("counts the hashes the retry unlocked", func(t *testing.T) {
+		// 0 failures left: the store unlocks on the first call.
+		server, store, txs, _ := newUnlockFailureServer(t, true, 0)
+
+		// the retry unlocks records that exist and are locked, as after an accepted bless
+		for _, tx := range []*bt.Tx{txs[1], txs[2]} {
+			_, err := store.Create(ctx, tx, 1, utxostore.WithLocked(true))
+			require.NoError(t, err)
+		}
+
+		before := testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRecovered)
+
+		server.unlockAcceptedTransactions(ctx, chainhash.Hash{}, []chainhash.Hash{*txs[1].TxIDChainHash(), *txs[2].TxIDChainHash()})
+
+		for _, tx := range []*bt.Tx{txs[1], txs[2]} {
+			stored := &meta.Data{}
+			require.NoError(t, store.GetMeta(ctx, tx.TxIDChainHash(), stored))
+			require.False(t, stored.Locked, "%s must be spendable after the retry", tx.TxID())
+		}
+
+		require.Equal(t, before+2, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRecovered))
+	})
+
+	t.Run("counts the hashes the retry could not unlock", func(t *testing.T) {
+		server, _, txs, _ := newUnlockFailureServer(t, true, alwaysFail)
+		before := testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed)
+
+		server.unlockAcceptedTransactions(ctx, chainhash.Hash{}, []chainhash.Hash{*txs[1].TxIDChainHash()})
+
+		require.Equal(t, before+1, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed))
+	})
+
+	t.Run("an empty level counts nothing", func(t *testing.T) {
+		server, _, _, _ := newUnlockFailureServer(t, true, alwaysFail)
+		before := testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed)
+
+		server.unlockAcceptedTransactions(ctx, chainhash.Hash{}, nil)
+
+		require.Equal(t, before, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed))
+	})
+}
+
+// TestProcessTransactionsInLevels_UnlockFailedParentGetsUnlocked pins the block-arrival path.
+// processTransactionsInLevels is Phase 3, the blessing of transactions that arrive inside a
+// block, and it runs level by level exactly like the peer path. It called blessMissingTransaction,
+// whose signature has no unlockFailed, so an accepted parent stayed Locked and its child in the
+// next level was answered TX_LOCKED - the one path the retry exists for, and the one it skipped.
+func TestProcessTransactionsInLevels_UnlockFailedParentGetsUnlocked(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	tx, err := createTestTransaction("fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4")
+	require.NoError(t, err)
+
+	store := server.utxoStore.(*utxostore.MockUtxostore)
+	store.On("SetLocked", mock.Anything, []chainhash.Hash{*tx.TxIDChainHash()}, false).Return(nil).Maybe()
+	// blessMissing reads the accepted record back; the fixture's GetMeta stub predates the
+	// 3-argument signature, so give this test one the call actually matches.
+	store.On("GetMeta", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	// the validator accepts the transaction and only its unlock fails
+	server.validatorClient = &failingValidator{
+		Interface: server.validatorClient,
+		err:       errors.NewTxUnlockFailedError("[Validate] error marking tx as spendable", errors.NewProcessingError("context deadline exceeded")),
+	}
+
+	require.NoError(t, server.processTransactionsInLevels(ctx, []*bt.Tx{tx}, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, map[uint32]bool{}, true))
+
+	store.AssertCalled(t, "SetLocked", mock.Anything, []chainhash.Hash{*tx.TxIDChainHash()}, false)
+}
+
+// scriptedValidator answers each transaction with a canned outcome, so a test can put an accepted
+// transaction and a truly invalid one in the same level.
+type scriptedValidator struct {
+	validator.Interface
+
+	unlockFailedFor chainhash.Hash
+	invalidFor      chainhash.Hash
+}
+
+func (v *scriptedValidator) ValidateWithOptions(_ context.Context, tx *bt.Tx, _ uint32, _ *validator.Options) (*meta.Data, error) {
+	h := *tx.TxIDChainHash()
+
+	switch h {
+	case v.unlockFailedFor:
+		return nil, errors.NewTxUnlockFailedError("[Validate] error marking tx as spendable", errors.NewProcessingError("context deadline exceeded"))
+	case v.invalidFor:
+		return nil, errors.NewTxInvalidError("bad transaction")
+	default:
+		return nil, errors.NewProcessingError("unexpected transaction %s", h.String())
+	}
+}
+
+// TestProcessTransactionsInLevels_InvalidSiblingDoesNotSkipUnlock pins the ordering at the level
+// boundary. An invalid transaction makes the errgroup fail and cancels its own context, which used
+// to return the level error before the unlock ran. The transactions the same level had already
+// ACCEPTED are spent, created and delivered, so skipping their unlock left them Locked until mined
+// and answered their children TX_LOCKED - a sibling being invalid has nothing to do with them.
+func TestProcessTransactionsInLevels_InvalidSiblingDoesNotSkipUnlock(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	accepted, err := createTestTransaction("tx1")
+	require.NoError(t, err)
+
+	sibling, err := createTestTransaction("tx2")
+	require.NoError(t, err)
+	require.NotEqual(t, *accepted.TxIDChainHash(), *sibling.TxIDChainHash(), "the two fixtures must be distinct transactions")
+
+	store := server.utxoStore.(*utxostore.MockUtxostore)
+	store.On("SetLocked", mock.Anything, mock.Anything, false).Return(nil).Maybe()
+	store.On("GetMeta", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	server.validatorClient = &scriptedValidator{
+		Interface:       server.validatorClient,
+		unlockFailedFor: *accepted.TxIDChainHash(),
+		invalidFor:      *sibling.TxIDChainHash(),
+	}
+
+	err = server.processTransactionsInLevels(ctx, []*bt.Tx{accepted, sibling}, chainhash.Hash{}, chainhash.Hash{}, 100, 0, 0, map[uint32]bool{}, true)
+	require.Error(t, err, "the invalid sibling still fails the level")
+
+	store.AssertCalled(t, "SetLocked", mock.Anything, []chainhash.Hash{*accepted.TxIDChainHash()}, false)
+}
+
+// TestBlessMissingTransactions_InvalidSiblingDoesNotSkipUnlock is the same ordering pin for the
+// subtree a peer announces, which has its own level loop. The invalid transaction cancels the
+// errgroup's context; the unlock runs on the caller's, which is still live.
+func TestBlessMissingTransactions_InvalidSiblingDoesNotSkipUnlock(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	accepted, err := createTestTransaction("tx1")
+	require.NoError(t, err)
+
+	sibling, err := createTestTransaction("tx2")
+	require.NoError(t, err)
+
+	store := server.utxoStore.(*utxostore.MockUtxostore)
+	store.On("SetLocked", mock.Anything, mock.Anything, false).Return(nil).Maybe()
+	store.On("GetMeta", mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	server.validatorClient = &scriptedValidator{
+		Interface:       server.validatorClient,
+		unlockFailedFor: *accepted.TxIDChainHash(),
+		invalidFor:      *sibling.TxIDChainHash(),
+	}
+
+	missing := []missingTx{{tx: accepted, idx: 0}, {tx: sibling, idx: 1}}
+	txMetaSlice := make([]metaSliceItem, len(missing))
+
+	err = server.blessMissingTransactions(ctx, chainhash.Hash{}, missing, "", "", txMetaSlice, 100, map[uint32]bool{})
+	require.Error(t, err, "the invalid sibling still fails the subtree")
+
+	store.AssertCalled(t, "SetLocked", mock.Anything, []chainhash.Hash{*accepted.TxIDChainHash()}, false)
+}
+
+// TestBlessMissingTransactions_QueuesAcceptedParentDespiteBlessError pins the ordering inside the
+// level closure: a parent the validator ACCEPTED has to reach the level's unlock retry even when a
+// check that runs after acceptance rejects the bless. Queuing sat in the success arm until the only
+// place it could fire for these transactions was skipped, so the record stayed Locked and the
+// child in the next level was answered TX_LOCKED.
+func TestBlessMissingTransactions_QueuesAcceptedParentDespiteBlessError(t *testing.T) {
+	ctx := context.Background()
+
+	// the validator's own unlock fails, and the accepted record cannot be read back either
+	server, store, txs, _ := newUnlockFailureServer(t, true, alwaysFail)
+	server.settings.SubtreeValidation.SpendBatcherSize = 10
+
+	parent := txs[1]
+	server.utxoStore = &unreadableStore{Store: store.Store, only: parent.TxIDChainHash()}
+
+	missing := []missingTx{{tx: parent, idx: 0}}
+	txMetaSlice := make([]metaSliceItem, 1)
+
+	err := server.blessMissingTransactions(ctx, chainhash.Hash{}, missing, "", "", txMetaSlice, 2, map[uint32]bool{})
+	require.Error(t, err, "the bless still fails: the accepted metadata could not be read")
+	require.False(t, txMetaSlice[0].isSet, "no metadata is recorded for a read that failed")
+
+	stored := &meta.Data{}
+	require.NoError(t, store.GetMeta(ctx, parent.TxIDChainHash(), stored))
+	require.False(t, stored.Locked, "the accepted parent must still be spendable for the next level")
 }
