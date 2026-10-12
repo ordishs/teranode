@@ -96,11 +96,13 @@ func TestAcceptedMetaOnUnlockFailure(t *testing.T) {
 		require.Same(t, given, got)
 	})
 
-	t.Run("fails when the accepted record cannot be read", func(t *testing.T) {
-		missing := &SyncManager{utxoStore: newUnlockFailureStore(t, "netsync_unlock_meta_empty")}
+	t.Run("stays accepted when the accepted record cannot be read", func(t *testing.T) {
+		missing := &SyncManager{logger: ulogger.TestLogger{}, utxoStore: newUnlockFailureStore(t, "netsync_unlock_meta_empty")}
 
-		_, err := missing.acceptedMetaOnUnlockFailure(ctx, tx, nil, unlockFailedErr())
-		require.Error(t, err)
+		got, err := missing.acceptedMetaOnUnlockFailure(ctx, tx, nil, unlockFailedErr())
+		require.NoError(t, err, "an accepted tx must not turn into a rejection when only the read-back fails")
+		require.NotNil(t, got)
+		require.Zero(t, got.SizeInBytes, "zero size passes every peer fee filter")
 	})
 
 	t.Run("leaves every other result unchanged", func(t *testing.T) {
@@ -146,6 +148,31 @@ func TestHandleTxMsg_UnlockFailureIsAccepted(t *testing.T) {
 	_, rejected := sm.rejectedTxns.Get(*tx.Hash())
 	require.False(t, rejected, "an accepted tx must not be recorded as rejected")
 	require.Equal(t, []chainhash.Hash{*btTx.TxIDChainHash()}, notifier.announced(), "an accepted tx must be announced to peers")
+}
+
+// The meta read-back fails too: the tx is still accepted, so it is neither rejected nor kept from relay.
+func TestHandleTxMsg_UnlockFailureWithUnreadableMetaIsAccepted(t *testing.T) {
+	tracing.SetupMockTracer()
+	initPrometheusMetrics()
+
+	sm, peer := newUnlockSyncManager(t, &validator.MockValidator{Errors: []error{unlockFailedErr()}})
+
+	notifier := &recordingNotifier{MockPeerNotifier: &MockPeerNotifier{}}
+	sm.peerNotifier = notifier
+	sm.utxoStore = newUnlockFailureStore(t, "netsync_unlock_handletx_nometa")
+
+	btTx := transactions.CreateTestTransactionChainWithCount(t, 3)[1]
+
+	msg := wire.NewMsgTx(1)
+	require.NoError(t, msg.Deserialize(bytes.NewReader(btTx.Bytes())))
+
+	tx := bsvutil.NewTx(msg)
+
+	sm.handleTxMsg(&txMsg{tx: tx, peer: peer})
+
+	_, rejected := sm.rejectedTxns.Get(*tx.Hash())
+	require.False(t, rejected, "an accepted tx must not be recorded as rejected")
+	require.Equal(t, []chainhash.Hash{*btTx.TxIDChainHash()}, notifier.announced(), "an accepted tx must still be announced")
 }
 
 func TestProcessOrphanTransactions_UnlockFailureIsAccepted(t *testing.T) {

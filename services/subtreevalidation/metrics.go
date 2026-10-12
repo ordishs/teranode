@@ -90,12 +90,12 @@ var (
 	// the per-level retry in unlockAcceptedTransactions did manage to unlock.
 	prometheusSubtreeValidationBlessUnlockRecovered prometheus.Counter
 
-	// prometheusSubtreeValidationBlessUnlockRetryFailed counts the ones the retry could not
-	// unlock either, and that therefore stay locked until they are mined. Together with the two
-	// above it makes the retry's outcome visible: bless_unlock_failed minus this counter and
-	// bless_unlock_recovered counts accepted-and-locked transactions whose retry never ran, i.e.
-	// those left queued when the unlock context itself was already done (deadline or cancellation).
-	prometheusSubtreeValidationBlessUnlockRetryFailed prometheus.Counter
+	// prometheusSubtreeValidationBlessUnlockRetryFailedBatches counts unlock retry calls that
+	// returned an error. SetLocked reports the first error without per-record results, so the
+	// unit is one call, not one transaction: on a failed call some or all of its hashes stay
+	// locked until they are mined. The same goes for a retry left unrun because the unlock
+	// context was already done.
+	prometheusSubtreeValidationBlessUnlockRetryFailedBatches prometheus.Counter
 
 	// prometheusSubtreeValidationSetTXMetaCacheKafkaBatch tracks the duration of processing one
 	// SetCacheMulti batch from a Kafka message. One observation per Kafka message that contained
@@ -271,12 +271,12 @@ func _initPrometheusMetrics() {
 		},
 	)
 
-	prometheusSubtreeValidationBlessUnlockRetryFailed = promauto.NewCounter(
+	prometheusSubtreeValidationBlessUnlockRetryFailedBatches = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "teranode",
 			Subsystem: "subtreevalidation",
-			Name:      "bless_unlock_retry_failed",
-			Help:      "Accepted transactions the per-level unlock retry also failed to unlock, they stay locked until mined",
+			Name:      "bless_unlock_retry_failed_batches",
+			Help:      "Unlock retry calls that returned an error, per call not per transaction, the unlocked set of such a call is unknown",
 		},
 	)
 

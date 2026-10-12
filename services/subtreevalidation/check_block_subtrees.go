@@ -1350,17 +1350,28 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		firstErr            error
 	)
 
+	// Transactions accepted whose two-phase-commit unlock failed. This path validates with
+	// WithIgnoreLocked(true), so a locked parent never answers a child in the next level
+	// TX_LOCKED and the unlock need not happen between levels. It runs once on return, covering
+	// the error returns too, so a level wait does not carry up to the unlock timeout per level.
+	var (
+		lockedHashes []chainhash.Hash
+		lockedMu     sync.Mutex
+	)
+
+	defer func() {
+		lockedMu.Lock()
+		defer lockedMu.Unlock()
+
+		u.unlockAcceptedTransactions(ctx, subtreeHash, lockedHashes)
+	}()
+
 	// Process each level in series, but all transactions within a level in parallel
 	for level := uint32(0); level <= maxLevel; level++ {
 		levelTxs := txsPerLevel[level]
 		if len(levelTxs) == 0 {
 			continue
 		}
-
-		// Transactions this level accepted whose two-phase-commit unlock failed, retried once the
-		// level completes so the next level does not meet them as TX_LOCKED.
-		var lockedHashes []chainhash.Hash
-		var lockedMu sync.Mutex
 
 		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions", level+1, maxLevel+1, len(levelTxs))
 
@@ -1493,16 +1504,9 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 			})
 		}
 
-		// Unlock before acting on the wait error. The only arm that returns one is a truly invalid
-		// transaction or the conflicting-walk budget, and a sibling's failure must not skip the retry
-		// for parents this level already accepted. ctx, not the errgroup's gCtx (which that failure
-		// cancels), is still live here, so the retry gets its window.
-		waitErr := g.Wait()
-		u.unlockAcceptedTransactions(ctx, subtreeHash, lockedHashes)
-
 		// Fail early if we get an actual tx error thrown
-		if waitErr != nil {
-			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, waitErr)
+		if err = g.Wait(); err != nil {
+			return errors.NewProcessingError("[processTransactionsInLevels] Failed to process level %d", level+1, err)
 		}
 
 		u.logger.Debugf("[processTransactionsInLevels] Processing level %d/%d with %d transactions DONE", level+1, maxLevel+1, len(levelTxs))

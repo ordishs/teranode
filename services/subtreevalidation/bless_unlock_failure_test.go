@@ -288,30 +288,30 @@ func TestUnlockAcceptedTransactions_CountsRetryOutcome(t *testing.T) {
 		require.Equal(t, before+2, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRecovered))
 	})
 
-	t.Run("counts the hashes the retry could not unlock", func(t *testing.T) {
+	t.Run("counts one failed retry call, not one per hash", func(t *testing.T) {
 		server, _, txs, _ := newUnlockFailureServer(t, true, alwaysFail)
-		before := testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed)
+		before := testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailedBatches)
 
-		server.unlockAcceptedTransactions(ctx, chainhash.Hash{}, []chainhash.Hash{*txs[1].TxIDChainHash()})
+		server.unlockAcceptedTransactions(ctx, chainhash.Hash{}, []chainhash.Hash{*txs[1].TxIDChainHash(), *txs[2].TxIDChainHash()})
 
-		require.Equal(t, before+1, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed))
+		require.Equal(t, before+1, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailedBatches), "two hashes in one failed call count once")
 	})
 
 	t.Run("an empty level counts nothing", func(t *testing.T) {
 		server, _, _, _ := newUnlockFailureServer(t, true, alwaysFail)
-		before := testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed)
+		before := testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailedBatches)
 
 		server.unlockAcceptedTransactions(ctx, chainhash.Hash{}, nil)
 
-		require.Equal(t, before, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailed))
+		require.Equal(t, before, testutil.ToFloat64(prometheusSubtreeValidationBlessUnlockRetryFailedBatches))
 	})
 }
 
 // TestProcessTransactionsInLevels_UnlockFailedParentGetsUnlocked pins the block-arrival path.
 // processTransactionsInLevels is Phase 3, the blessing of transactions that arrive inside a
-// block, and it runs level by level exactly like the peer path. It called blessMissingTransaction,
-// whose signature has no unlockFailed, so an accepted parent stayed Locked and its child in the
-// next level was answered TX_LOCKED - the one path the retry exists for, and the one it skipped.
+// block. It validates with WithIgnoreLocked(true), so children never meet a locked parent as
+// TX_LOCKED; the accepted parent is unlocked once, when the function returns, so it does not
+// stay Locked until it is mined.
 func TestProcessTransactionsInLevels_UnlockFailedParentGetsUnlocked(t *testing.T) {
 	ctx := context.Background()
 
@@ -360,11 +360,11 @@ func (v *scriptedValidator) ValidateWithOptions(_ context.Context, tx *bt.Tx, _ 
 	}
 }
 
-// TestProcessTransactionsInLevels_InvalidSiblingDoesNotSkipUnlock pins the ordering at the level
-// boundary. An invalid transaction makes the errgroup fail and cancels its own context, which used
-// to return the level error before the unlock ran. The transactions the same level had already
-// ACCEPTED are spent, created and delivered, so skipping their unlock left them Locked until mined
-// and answered their children TX_LOCKED - a sibling being invalid has nothing to do with them.
+// TestProcessTransactionsInLevels_InvalidSiblingDoesNotSkipUnlock pins the unlock on the error
+// return. An invalid transaction makes the errgroup fail and cancels its own context. The
+// transactions the same level had already ACCEPTED are spent, created and delivered, so skipping
+// their unlock would leave them Locked until mined - a sibling being invalid has nothing to do
+// with them. The unlock runs on the caller's context, which is still live.
 func TestProcessTransactionsInLevels_InvalidSiblingDoesNotSkipUnlock(t *testing.T) {
 	ctx := context.Background()
 

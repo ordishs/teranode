@@ -1396,8 +1396,10 @@ func (sm *SyncManager) handleTxMsg(tmsg *txMsg) {
 
 // acceptedMetaOnUnlockFailure turns the validator's ErrTxUnlockFailed into a success. The transaction was
 // accepted, spent and created, and only its unlock failed, so it must not be rejected or dropped. The
-// response metadata does not survive a gRPC error, so it is read back from the UTXO store. Any other
-// result is returned unchanged.
+// response metadata does not survive a gRPC error, so it is read back from the UTXO store. If that read
+// fails the transaction is still accepted: it is returned with empty metadata, whose zero size passes
+// every peer fee filter, so it is announced rather than rejected or dropped. Any other result is
+// returned unchanged.
 func (sm *SyncManager) acceptedMetaOnUnlockFailure(ctx context.Context, tx *bt.Tx, txMeta *meta.Data, err error) (*meta.Data, error) {
 	if err == nil || !errors.Is(err, errors.ErrTxUnlockFailed) {
 		return txMeta, err
@@ -1409,7 +1411,9 @@ func (sm *SyncManager) acceptedMetaOnUnlockFailure(ctx context.Context, tx *bt.T
 
 	stored := &meta.Data{}
 	if getErr := sm.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), stored); getErr != nil {
-		return nil, errors.NewProcessingError("[acceptedMetaOnUnlockFailure][%s] failed to read meta of accepted transaction", tx.TxID(), getErr)
+		sm.logger.Warnf("[acceptedMetaOnUnlockFailure][%s] accepted transaction, failed to read its meta, announcing without fee: %v", tx.TxID(), getErr)
+
+		return &meta.Data{}, nil
 	}
 
 	return stored, nil

@@ -1454,9 +1454,10 @@ func (u *Server) unlockAcceptedTransactions(ctx context.Context, subtreeHash cha
 
 	// bless_unlock_failed counts these transactions when they are identified; without these two the
 	// retry's own outcome is invisible, so a node whose retry never succeeds looks identical to one
-	// where it always does.
+	// where it always does. A failed call is counted once, not per hash: the store's SetLocked
+	// returns the first error without per-record results, so a partial failure cannot be split.
 	if err := u.utxoStore.SetLocked(unlockCtx, hashes, false); err != nil {
-		prometheusSubtreeValidationBlessUnlockRetryFailed.Add(float64(len(hashes)))
+		prometheusSubtreeValidationBlessUnlockRetryFailedBatches.Inc()
 		u.logger.Warnf("[validateSubtree][%s] failed to unlock %d accepted transactions, they stay locked until mined: %v", subtreeHash.String(), len(hashes), err)
 
 		return

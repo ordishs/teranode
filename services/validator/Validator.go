@@ -1536,7 +1536,7 @@ func (v *Validator) precheckTransaction(tx *bt.Tx, txID string, blockHeight uint
 // Callers do act on it, by code rather than by trusting a nil error: propagation,
 // the RPC submit path, this package's own Kafka intake, legacy sync and subtree
 // validation all branch on it (see ErrTxUnlockFailed in errors/Error_types.go), and
-// subtree validation retries the unlock per level (unlockAcceptedTransactions in
+// subtree validation retries the unlock (unlockAcceptedTransactions in
 // services/subtreevalidation/SubtreeValidation.go). A caller must therefore not
 // reduce a non-nil error here to "rejected" without checking the code first. If
 // every retry fails, the recovery path is the self-healing loadUnminedTransactions
