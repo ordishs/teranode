@@ -350,8 +350,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SplitMapBuckets:                      getInt("blockassembly_splitMapBuckets", 16*1024, alternativeContext...),
 			StoreTxInpointsForSubtreeMeta:        getBool("blockassembly_storeTxInpointsForSubtreeMeta", true, alternativeContext...),
 			IdleSleepDuration:                    getDuration("blockassembly_idle_sleep_duration", 10*time.Millisecond, alternativeContext...),
-			MaxTransactionsInMemory:              getUint64("blockassembly_maxTransactionsInMemory", 0, alternativeContext...),
-			MaxTransactionsInMemoryResume:        getUint64("blockassembly_maxTransactionsInMemoryResume", 0, alternativeContext...),
+			MaxQueueItems:                        getInt64("blockassembly_maxQueueItems", 0, alternativeContext...),
+			QueueFullWaitTimeout:                 getDuration("blockassembly_queueFullWaitTimeout", 100*time.Millisecond, alternativeContext...),
+			TxMapDirs:                            getMultiString("blockassembly_txMapDirs", "|", []string{}, alternativeContext...),
+			SubtreeMmapDir:                       getString("blockassembly_subtreeMmapDir", "", alternativeContext...),
 		},
 
 		BlockChain: BlockChainSettings{
