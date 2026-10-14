@@ -7943,12 +7943,14 @@
 <p>The function implements a multi-stage persistence process:</p>
 <ol>
 <li><strong>Convert raw block bytes</strong> into a structured block model</li>
+<li><strong>Check for the block's files</strong>: the block file and, when <code>ProcessUTXOFiles</code> is on, both UTXO files. If they all exist, the block is already persisted and <code>BLOB_EXISTS</code> is returned before any work. Any of them that exist without the rest were left by an attempt that stopped early, and are replaced: UTXO files without the block file, or a block file without its UTXO files, which versions that finalized the block file first left on a crash. Leftover UTXO files are removed before the rebuild. A leftover block file is removed only after the UTXO files are finalized, just before it is rewritten, so an attempt that cannot rebuild them leaves it in place</li>
 <li><strong>Create a new UTXO difference set</strong> for tracking changes</li>
 <li><strong>Process the coinbase transaction</strong> if no subtrees are present</li>
 <li><strong>For blocks with subtrees</strong>, process each subtree concurrently according to configured limits</li>
-<li><strong>Close and finalize</strong> the UTXO difference set once all transactions are processed</li>
-<li><strong>Write the complete block</strong> to persistent storage</li>
+<li><strong>Close and finalize</strong> the UTXO difference set once all transactions are processed, before the block file is written</li>
+<li><strong>Write the complete block</strong> to persistent storage and finalize it</li>
 </ol>
+<p>A failure before the UTXO files are finalized aborts them, and a failure while writing the block file aborts it, so a failed attempt never leaves a block file behind. A failure after the UTXO files are finalized leaves them in place without a block file, and the retry removes them in step 2. An error finalizing either fails the block. The Server treats <code>BLOB_EXISTS</code> as "already persisted" only when the block's files all exist, by the same check as step 2.</p>
 </div>
 <p><strong>Parameters:</strong></p>
 <ul>
@@ -8046,7 +8048,7 @@
 <div class="admonition note">
 <p class="admonition-title">Processing Steps</p>
 <ol>
-<li><strong>Check if subtree data already exists</strong> - if it does, just set DAH and skip processing</li>
+<li><strong>Check if subtree data already exists</strong> - if it does, validate it by streaming one transaction at a time: one per node, in node order, each hashing to its node, and ending exactly between transactions. A valid file gets DAH=0 and is reused. On a store read error or a cancelled context the file is kept and an error returned. Any other failure deletes the file and rebuilds it</li>
 <li><strong>Retrieve the subtree</strong> from the subtree store using its hash</li>
 <li><strong>Load transaction metadata</strong> from the UTXO store (batched or individual)</li>
 <li><strong>Stream write</strong> the subtree data file using <code>SubtreeDataWriter</code></li>
@@ -8055,31 +8057,32 @@
 </ol>
 </div>
 <h4 id="phase-2-processsubtreeutxostreaming">Phase 2: ProcessSubtreeUTXOStreaming<a class="headerlink" href="#phase-2-processsubtreeutxostreaming" title="Permanent link">&para;</a></h4>
-<div class="language-go highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">u</span><span class="w"> </span><span class="o">*</span><span class="nx">Server</span><span class="p">)</span><span class="w"> </span><span class="nx">ProcessSubtreeUTXOStreaming</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">subtreeHash</span><span class="w"> </span><span class="nx">chainhash</span><span class="p">.</span><span class="nx">Hash</span><span class="p">,</span><span class="w"> </span><span class="nx">utxoDiff</span><span class="w"> </span><span class="o">*</span><span class="nx">utxopersister</span><span class="p">.</span><span class="nx">UTXOSet</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<div class="language-go highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">u</span><span class="w"> </span><span class="o">*</span><span class="nx">Server</span><span class="p">)</span><span class="w"> </span><span class="nx">ProcessSubtreeUTXOStreaming</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">subtreeHash</span><span class="w"> </span><span class="nx">chainhash</span><span class="p">.</span><span class="nx">Hash</span><span class="p">,</span><span class="w"> </span><span class="nx">coinbaseTx</span><span class="w"> </span><span class="o">*</span><span class="nx">bt</span><span class="p">.</span><span class="nx">Tx</span><span class="p">,</span><span class="w"> </span><span class="nx">utxoDiff</span><span class="w"> </span><span class="o">*</span><span class="nx">utxopersister</span><span class="p">.</span><span class="nx">UTXOSet</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
 </span></code></pre></div>
 <p>Processes UTXO changes by reading from the subtree data files. This phase runs <strong>sequentially</strong> to maintain UTXO ordering.</p>
 <div class="admonition note">
 <p class="admonition-title">Processing Steps</p>
 <ol>
 <li><strong>Open subtree data file</strong> for streaming read</li>
-<li><strong>Process each transaction</strong> through the UTXO diff tracker</li>
+<li><strong>Process the block's coinbase</strong> (<code>coinbaseTx</code>) when node 0 is the coinbase placeholder. A coinbase opening the file is read and dropped, because the file is keyed by subtree hash and competing blocks can share their first subtree. A block without a coinbase, started from a seed, falls back to the file's coinbase when the subtree has a node after the placeholder</li>
+<li><strong>Check each transaction against its node</strong>, then process it through the UTXO diff tracker, so a wrong transaction writes nothing</li>
 <li><strong>Record additions and deletions</strong> to the UTXO set</li>
 </ol>
 </div>
 <h4 id="subtreedatawriter">SubtreeDataWriter<a class="headerlink" href="#subtreedatawriter" title="Permanent link">&para;</a></h4>
-<div class="language-go highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="kd">type</span><span class="w"> </span><span class="nx">SubtreeDataWriter</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">    </span><span class="nx">storer</span><span class="w">      </span><span class="o">*</span><span class="nx">filestorer</span><span class="p">.</span><span class="nx">FileStorer</span>
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">    </span><span class="nx">nextBatchID</span><span class="w"> </span><span class="kt">int</span>
-</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">    </span><span class="c1">// ... additional fields</span>
-</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="p">}</span>
+<div class="language-go highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="kd">func</span><span class="w"> </span><span class="nx">NewSubtreeDataWriter</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">storer</span><span class="w"> </span><span class="o">*</span><span class="nx">filestorer</span><span class="p">.</span><span class="nx">FileStorer</span><span class="p">,</span><span class="w"> </span><span class="nx">window</span><span class="w"> </span><span class="kt">int</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">SubtreeDataWriter</span>
 </span></code></pre></div>
 <p>The <code>SubtreeDataWriter</code> provides <strong>ordered batch writes</strong> for subtree data. It ensures batches are written in the correct order even when produced concurrently.</p>
 <p><strong>Key Methods:</strong></p>
 <ul>
-<li><code>WriteBatch(batchID int, txData [][]byte) error</code>: Writes a batch of transaction data at the specified position</li>
-<li><code>Close() error</code>: Finalizes the file (aborts if batches are pending)</li>
+<li><code>WriteBatch(batchIndex int, txBytes [][]byte) error</code>: Writes a batch of transaction data at the specified position</li>
+<li><code>Close(ctx context.Context) error</code>: Finalizes the file (aborts if batches are pending)</li>
 <li><code>Abort(err error)</code>: Aborts the write operation without finalizing</li>
 </ul>
+<div class="admonition note">
+<p class="admonition-title">Bounded Window</p>
+<p>A batch that arrives before the batches ahead of it is held in memory until they are written. <code>WriteBatch</code> admits at most <code>window</code> batches counting from the next one to write, and a batch further ahead waits, so one slow batch cannot make the writer hold the whole subtree. <code>CreateSubtreeDataFileStreaming</code> passes its batch fetch concurrency, <code>max(4, NumCPU/2)</code>, as the window. The window bounds the parked batches only: batches waiting on the window and batches still fetching hold their own bytes, so the serialized bytes held at once come to about <code>2 × window − 1</code> batches. When <code>ctx</code> is cancelled, as the batch errgroup's context is when a batch fails, waiting batches return an error instead of waiting for a batch that will never arrive.</p>
+</div>
 <div class="admonition tip">
 <p class="admonition-title">Error Safety</p>
 <p>If <code>Close()</code> is called while batches are still pending (gaps in batch sequence), the writer automatically aborts instead of finalizing an incomplete file.</p>
@@ -8143,7 +8146,7 @@
 </ul>
 <h4 id="processing-configuration">Processing Configuration<a class="headerlink" href="#processing-configuration" title="Permanent link">&para;</a></h4>
 <ul>
-<li><strong><code>BlockPersister.PersistSleep</code></strong>: Sleep duration between processing attempts when no blocks are available (default: <code>10s</code>).</li>
+<li><strong><code>BlockPersister.PersistSleep</code></strong>: Sleep duration between processing attempts when no blocks are available, and before retrying a block that failed to persist or to be marked persisted (default: <code>10s</code>). A shutdown cuts the sleep short.</li>
 <li><strong><code>BlockPersister.Concurrency</code></strong>: Number of parallel persistence workers (default: <code>8</code>).</li>
 <li><strong><code>BlockPersister.ProcessUTXOFiles</code></strong>: When true, processes UTXO files during block persistence (default: <code>true</code>).</li>
 <li><strong><code>BlockPersister.SkipUTXODelete</code></strong>: Debug setting to skip UTXO deletion during persistence (default: <code>false</code>).</li>
@@ -8210,9 +8213,9 @@
 <p>The file-based blob store implements automatic cleanup of stale temporary files:</p>
 <ul>
 <li>Temporary files use <code>.tmp</code> extension during writes</li>
-<li>On successful write, temp files are atomically renamed to final names</li>
+<li>On successful write, temp files are atomically renamed to final names; a subtreeData another writer published first, refused by the store's existence check, is kept and promoted rather than failing the block</li>
 <li>On error/abort, temp files are immediately deleted</li>
-<li>During store initialization, stale <code>.tmp</code> files older than 10 minutes are automatically cleaned up</li>
+<li>A <code>.tmp</code> file left by a crash is not swept by the file store; removing it is an operator task</li>
 </ul>
 <h2 id="metrics">Metrics<a class="headerlink" href="#metrics" title="Permanent link">&para;</a></h2>
 <p>The service provides Prometheus metrics for monitoring:</p>
