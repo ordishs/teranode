@@ -88,25 +88,21 @@ func (u *pendingPeerUpdate) merge(from *pendingPeerUpdate) {
 	}
 	if from.height > u.height {
 		u.height = from.height
+	}
+
+	// The raw claim orders the observations in both cases: the capped value is
+	// derived from a ceiling that moves during catchup, so it cannot decide
+	// which claim a peer actually made last. A losing observation must not
+	// displace the winner's claim or its hash.
+	switch {
+	case from.advertisedHeight > u.advertisedHeight:
 		u.advertisedHeight = from.advertisedHeight
 		if from.blockHash != nil {
 			u.blockHash = from.blockHash
 		}
-	} else if from.height == u.height {
-		// Same capped height: both observations are pinned to the same
-		// local+maxLead ceiling, so the capped value cannot break the tie.
-		// Prefer the higher raw claim, and take its paired hash with it; a
-		// losing observation's hash must not overwrite the winner's.
-		switch {
-		case from.advertisedHeight > u.advertisedHeight:
-			u.advertisedHeight = from.advertisedHeight
-			if from.blockHash != nil {
-				u.blockHash = from.blockHash
-			}
-		case from.advertisedHeight == u.advertisedHeight:
-			if from.blockHash != nil {
-				u.blockHash = from.blockHash
-			}
+	case from.advertisedHeight == u.advertisedHeight:
+		if from.blockHash != nil {
+			u.blockHash = from.blockHash
 		}
 	}
 	if from.dataHubURL != "" {

@@ -32,11 +32,14 @@ type PeerInfoResponse struct {
 	ID         string `json:"id"`
 	Transport  string `json:"transport"`
 	ClientName string `json:"client_name"`
-	// Height is capped against local progress and is what sync decisions use.
+	// Height is the peer's latest known block height. For a libp2p peer it is
+	// capped against local progress and is what sync decisions use; for a
+	// legacy (wire-protocol) peer it is the height the peer reported, uncapped,
+	// and no sync decision reads it.
 	Height uint32 `json:"height"`
-	// AdvertisedHeight is the peer's raw claim. It differs from Height only
-	// while this node is catching up, and is 0 for peers on older versions
-	// that do not report it.
+	// AdvertisedHeight is a libp2p peer's raw claim, differing from Height only
+	// while this node is catching up. It is 0 for legacy peers, which never
+	// report it, and for libp2p peers on versions that predate the field.
 	AdvertisedHeight uint32 `json:"advertised_height"`
 	BlockHash        string `json:"block_hash"`
 	DataHubURL       string `json:"data_hub_url"`

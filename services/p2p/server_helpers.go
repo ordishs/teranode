@@ -727,7 +727,7 @@ func (s *Server) sanitizeAdvertisedTip(peerID string, advertisedHeight uint32, a
 
 	displayHeight = advertisedHeight
 	if displayHeight > maxPlausibleAdvertisedHeight {
-		s.logger.Warnf("[sanitizeAdvertisedTip] clamping implausible advertised height from peer %s: %d exceeds plausibility ceiling %d", peerID, advertisedHeight, maxPlausibleAdvertisedHeight)
+		s.logger.Debugf("[sanitizeAdvertisedTip] clamping implausible advertised height from peer %s: %d exceeds plausibility ceiling %d", peerID, advertisedHeight, maxPlausibleAdvertisedHeight)
 		displayHeight = maxPlausibleAdvertisedHeight
 	}
 

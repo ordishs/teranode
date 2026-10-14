@@ -707,6 +707,24 @@ func TestPeerRegistryBatcher_AdvertisedHeightTracksWinningObservation(t *testing
 			"the raw claim must stay paired with the winning capped height")
 	})
 
+	t.Run("a higher capped height with a lower raw claim keeps the higher raw claim", func(t *testing.T) {
+		b, _, reg := newBatcherWithCountingRegistry()
+		pid := mustNewPeerID(t).String()
+
+		// The cap ceiling moved between the two sanitizations, so the later
+		// observation has the higher capped height but the lower raw claim.
+		b.enqueueRegister(pid, "", peerHeightClaim{Height: 10_000, AdvertisedHeight: 962_710}, nil, "", false)
+		b.enqueueRegister(pid, "", peerHeightClaim{Height: 10_100, AdvertisedHeight: 800_000}, nil, "", false)
+
+		b.flushOnce(context.Background())
+
+		got, ok := reg.Get(pid)
+		require.True(t, ok)
+		require.Equal(t, uint32(10_100), got.Height)
+		require.Equal(t, uint32(962_710), got.AdvertisedHeight,
+			"a lower raw claim must not displace a higher one")
+	})
+
 	t.Run("breaks a capped tie on the higher raw claim", func(t *testing.T) {
 		b, _, reg := newBatcherWithCountingRegistry()
 		pid := mustNewPeerID(t).String()
