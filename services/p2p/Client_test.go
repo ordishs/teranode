@@ -228,6 +228,22 @@ func (m *MockPeerServiceClient) GetPeer(ctx context.Context, in *p2p_api.GetPeer
 	}, nil
 }
 
+func TestPeerInfo_DisplayHeight(t *testing.T) {
+	t.Run("reports the advertised claim, not the sync cap", func(t *testing.T) {
+		p := &PeerInfo{Height: 104_791, AdvertisedHeight: 962_710}
+		require.Equal(t, uint32(962_710), p.DisplayHeight())
+	})
+
+	t.Run("falls back to Height for peers that predate AdvertisedHeight", func(t *testing.T) {
+		p := &PeerInfo{Height: 99}
+		require.Equal(t, uint32(99), p.DisplayHeight())
+	})
+
+	t.Run("unknown height stays zero", func(t *testing.T) {
+		require.Zero(t, (&PeerInfo{}).DisplayHeight())
+	})
+}
+
 func TestSimpleClientGetPeers(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		mockClient := &MockPeerServiceClient{

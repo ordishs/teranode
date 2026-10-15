@@ -32,6 +32,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 	var (
 		blockMessage BlockMessage
 		hash         *chainhash.Hash
+		heights      peerHeightClaim
 		err          error
 	)
 
@@ -91,17 +92,9 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 	// The spoof check above proved fromID == blockMessage.PeerID, so the
 	// sender comparison alone decides self.
 	isSelf := fromID == s.P2PClient.GetID()
-	// advertisedHeight is what the peer claimed (only clamped if implausible)
-	// and is reported as-is to WebSocket clients. registryHeight is the capped
-	// copy: it feeds the peer registry, which drives sync decisions. Reporting
-	// the cap as the peer's height makes a catching-up node show every peer at
-	// localHeight+maxLead.
-	// registryHeight's zero value is never used: the isSelf branch returns
-	// before addPeer, and the else branch always assigns it via
-	// sanitizeAdvertisedTip before addPeer is reached.
-	advertisedHeight := blockMessage.Height
-	var registryHeight uint32
 
+	// heights is only ever produced by sanitizeAdvertisedTip: the isSelf branch
+	// returns before addPeer, so its zero value never reaches the registry.
 	if isSelf {
 		hash, err = s.parseHash(blockMessage.Hash, "handleBlockTopic")
 		if err != nil {
@@ -109,7 +102,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 		}
 	} else {
 		var ok bool
-		registryHeight, advertisedHeight, hash, ok = s.sanitizeAdvertisedTip(blockMessage.PeerID, blockMessage.Height, blockMessage.Hash, s.getLocalHeight(ctx))
+		heights, hash, ok = s.sanitizeAdvertisedTip(blockMessage.PeerID, blockMessage.Height, blockMessage.Hash, s.getLocalHeight(ctx))
 		if !ok {
 			return
 		}
@@ -120,7 +113,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 		Timestamp:  time.Now().UTC().Format(isoFormat),
 		Type:       "block",
 		Hash:       hash.String(),
-		Height:     advertisedHeight,
+		Height:     blockMessage.Height, // what the peer advertised; only the registry copy is capped
 		BaseURL:    blockMessage.DataHubURL,
 		PeerID:     blockMessage.PeerID,
 		ClientName: blockMessage.ClientName,
@@ -149,7 +142,7 @@ func (s *Server) handleBlockTopic(ctx context.Context, m []byte, fromID string) 
 
 	// Store using the originator's peer ID
 	if peerID, err := peer.Decode(blockMessage.PeerID); err == nil {
-		s.addPeer(peerID, blockMessage.ClientName, peerHeightClaim{Height: registryHeight, AdvertisedHeight: advertisedHeight}, hash, blockMessage.DataHubURL)
+		s.addPeer(peerID, blockMessage.ClientName, heights, hash, blockMessage.DataHubURL)
 		s.logger.Debugf("[handleBlockTopic] Stored latest block hash %s for peer %s", blockMessage.Hash, peerID)
 	}
 
@@ -703,18 +696,29 @@ func (s *Server) getLocalHeight(ctx context.Context) uint32 {
 	return height
 }
 
-// maxPlausibleAdvertisedHeight bounds the raw advertised height reported to
-// operators (registry AdvertisedHeight, WebSocket notifications, RPC).
-// Unlike the sync-decision cap below, this is not tied to local progress: a
-// catching-up node legitimately reports peers hundreds of thousands of
-// blocks ahead of it, so tying a display bound to localHeight would clip
-// exactly the values this function exists to surface. Instead this is a
-// generous absolute sanity ceiling — at BSV's ~10-minute block interval it
-// is millennia away — that only rejects protocol-nonsense claims such as a
-// peer advertising height 4294967295 (uint32 max).
+// maxPlausibleAdvertisedHeight is an absolute sanity ceiling on what a peer
+// may advertise — at BSV's ~10-minute block interval it is millennia away.
+// It is not tied to local progress: a catching-up node legitimately sees
+// peers hundreds of thousands of blocks ahead. A claim above it, and above the
+// local+lead window, is a protocol violation: the tip is rejected and the peer
+// is scored. Claims at or below it are reported as advertised.
 const maxPlausibleAdvertisedHeight = 500_000_000
 
-func (s *Server) sanitizeAdvertisedTip(peerID string, advertisedHeight uint32, advertisedHash string, localHeight uint32) (registryHeight, displayHeight uint32, hash *chainhash.Hash, ok bool) {
+// peerHeightClaim pairs a peer's sync-decision height with its raw advertised
+// claim. registerPeer / addPeer / addConnectedPeer / enqueueRegister take this
+// struct rather than two adjacent positional uint32s so a transposed call
+// cannot silently swap the sync-decision value and the operator-facing one.
+type peerHeightClaim struct {
+	// Height is capped against local progress; it drives sync decisions.
+	Height uint32
+	// AdvertisedHeight is the height the peer actually claimed; it is
+	// reported to operators.
+	AdvertisedHeight uint32
+}
+
+// sanitizeAdvertisedTip validates a peer's advertised tip. On success it
+// returns the claim both capped for sync decisions and as advertised.
+func (s *Server) sanitizeAdvertisedTip(peerID string, advertisedHeight uint32, advertisedHash string, localHeight uint32) (peerHeightClaim, *chainhash.Hash, bool) {
 	hash, err := chainhash.NewHashFromStr(advertisedHash)
 	if err != nil {
 		// Log the length, never the value: node_status deliberately feeds the
@@ -722,13 +726,7 @@ func (s *Server) sanitizeAdvertisedTip(peerID string, advertisedHeight uint32, a
 		// the peer actually sent), so this is the one place a peer-controlled
 		// string of near-message-cap size could otherwise reach the logs.
 		s.logger.Warnf("[sanitizeAdvertisedTip] rejecting advertised tip from peer %s: invalid block hash (len %d): %v", peerID, len(advertisedHash), err)
-		return 0, 0, nil, false
-	}
-
-	displayHeight = advertisedHeight
-	if displayHeight > maxPlausibleAdvertisedHeight {
-		s.logger.Debugf("[sanitizeAdvertisedTip] clamping implausible advertised height from peer %s: %d exceeds plausibility ceiling %d", peerID, advertisedHeight, maxPlausibleAdvertisedHeight)
-		displayHeight = maxPlausibleAdvertisedHeight
+		return peerHeightClaim{}, nil, false
 	}
 
 	maxLead := uint32(0)
@@ -741,29 +739,27 @@ func (s *Server) sanitizeAdvertisedTip(peerID string, advertisedHeight uint32, a
 		maxAcceptedHeight = uint64(^uint32(0))
 	}
 
+	// Debug, not Warn: a peer that lies keeps lying on every message, and
+	// applyBanScore already logs each charge until the peer is banned.
+	if advertisedHeight > maxPlausibleAdvertisedHeight && uint64(advertisedHeight) > maxAcceptedHeight {
+		s.logger.Debugf("[sanitizeAdvertisedTip] rejecting implausible advertised height from peer %s: %d exceeds plausibility ceiling %d (local height %d)", peerID, advertisedHeight, maxPlausibleAdvertisedHeight, localHeight)
+		s.addProtocolViolation(peerID)
+
+		return peerHeightClaim{}, nil, false
+	}
+
+	heights := peerHeightClaim{Height: advertisedHeight, AdvertisedHeight: advertisedHeight}
+
 	if uint64(advertisedHeight) > maxAcceptedHeight {
-		cappedHeight := uint32(maxAcceptedHeight)
+		heights.Height = uint32(maxAcceptedHeight)
 		// Debug, not Warn: the cap is a routine bound on what an unvalidated
 		// claim may influence during catchup, not a statement about the peer.
 		// A node syncing from genesis hits this on nearly every gossip message
 		// for as long as catchup runs.
-		s.logger.Debugf("[sanitizeAdvertisedTip] capped advertised height for peer %s from %d to %d (local height %d, max lead %d)", peerID, advertisedHeight, cappedHeight, localHeight, maxLead)
-		return cappedHeight, displayHeight, hash, true
+		s.logger.Debugf("[sanitizeAdvertisedTip] capped advertised height for peer %s from %d to %d (local height %d, max lead %d)", peerID, advertisedHeight, heights.Height, localHeight, maxLead)
 	}
 
-	return advertisedHeight, displayHeight, hash, true
-}
-
-// peerHeightClaim pairs a peer's sync-decision height with its raw advertised
-// claim. registerPeer / addPeer / addConnectedPeer / enqueueRegister take this
-// struct rather than two adjacent positional uint32s so a transposed call
-// cannot silently swap the sync-decision value and the operator-facing one.
-type peerHeightClaim struct {
-	// Height is capped against local progress; it drives sync decisions.
-	Height uint32
-	// AdvertisedHeight is the height the peer actually claimed (only clamped
-	// if implausible); it is reported to operators.
-	AdvertisedHeight uint32
+	return heights, hash, true
 }
 
 // registerPeer is a fire-and-forget shorthand for the centralized registry's

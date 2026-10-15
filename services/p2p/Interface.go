@@ -66,6 +66,17 @@ type PeerInfo struct {
 	LastCatchupErrorTime time.Time // When the last catchup error occurred
 }
 
+// DisplayHeight is the height to show an operator: what the peer advertised,
+// or the capped Height for peers on versions that predate AdvertisedHeight.
+// Never use it for sync decisions; those read Height.
+func (p *PeerInfo) DisplayHeight() uint32 {
+	if p.AdvertisedHeight != 0 {
+		return p.AdvertisedHeight
+	}
+
+	return p.Height
+}
+
 // ClientI defines the interface for P2P client operations.
 // This interface abstracts the communication with the P2P service, providing methods
 // for querying peer information and managing peer bans. It serves as a contract for

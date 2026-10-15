@@ -96,6 +96,11 @@
     previous_attempt?: PreviousAttemptData
   }
 
+  // The height to show: what the peer advertised. The registry's `height` is
+  // capped at local height + p2p_max_unvalidated_advertised_height_lead and only
+  // drives sync decisions; it is the fallback for peers that predate the field.
+  const displayHeight = (peer: PeerData): number => peer.advertised_height || peer.height || 0
+
   let allData: PeerData[] = $state([]) // Full dataset
   let data: PeerData[] = $state([]) // Paginated data for display
   let legacyData: PeerData[] = $state([]) // Wire-protocol peers, shown in their own card
@@ -266,11 +271,10 @@
     const sorted = [...dataToSort]
     const multiplier = sortOrder === 'asc' ? 1 : -1
 
-    // The height column displays advertised_height (see its renderer), so sort
-    // on the same value. Sorting the capped `height` would order peers by a
-    // local ceiling they all share while this node catches up.
-    const sortValue = (row) =>
-      sortColumn === 'height' ? (row.advertised_height ?? 0) || (row.height ?? 0) : row[sortColumn]
+    // Sort the height column on the value it displays. Sorting the capped
+    // `height` would order peers by a local ceiling they all share while this
+    // node catches up.
+    const sortValue = (row) => (sortColumn === 'height' ? displayHeight(row) : row[sortColumn])
 
     sorted.sort((a, b) => {
       const aVal = sortValue(a)
@@ -580,20 +584,18 @@
       }
     },
     height: (idField, item, colId) => {
-      // Show what the peer advertised so this matches the Network page. The
-      // registry's `height` is capped at local height + p2p_max_unvalidated_
-      // advertised_height_lead and only drives sync decisions, so surface it in
-      // the tooltip rather than as the headline number.
+      // Headline the advertised height so this matches the Network page, and
+      // surface the capped sync height in the tooltip.
       const syncHeight = item[colId] ?? 0
       const advertised = item.advertised_height ?? 0
-      const display = advertised || syncHeight
+      const display = displayHeight(item)
 
       // For older peers (advertised_height not yet sent), display falls back
       // to the capped sync height — that is not what the peer advertised, so
       // the tooltip must not claim it is.
       let tooltip = advertised
-        ? `Advertised by peer: ${display.toLocaleString()}`
-        : `Sync height (capped): ${display.toLocaleString()}`
+        ? `Advertised by peer: ${advertised.toLocaleString()}`
+        : `Sync height (capped): ${syncHeight.toLocaleString()}\nPeer did not report an advertised height.`
       if (advertised && syncHeight && advertised !== syncHeight) {
         tooltip += `\nSync height (capped): ${syncHeight.toLocaleString()}`
         tooltip += '\nCapped while this node catches up; used for sync decisions only.'
@@ -602,7 +604,7 @@
       return {
         component: RenderSpanWithTooltip,
         props: {
-          value: display ? display.toLocaleString() : '0',
+          value: display.toLocaleString(),
           tooltip: tooltip,
           className: 'num',
         },
@@ -1138,9 +1140,19 @@
               <span class="metric-value">{selectedPeer.client_name || '-'}</span>
             </div>
             <div class="metric-item">
-              <span class="metric-label">Height</span>
-              <span class="metric-value">#{(selectedPeer.advertised_height || selectedPeer.height)?.toLocaleString() || '0'}</span>
+              <span class="metric-label"
+                >{selectedPeer.advertised_height
+                  ? 'Height (advertised)'
+                  : 'Height (sync, capped)'}</span
+              >
+              <span class="metric-value">#{displayHeight(selectedPeer).toLocaleString()}</span>
             </div>
+            {#if selectedPeer.advertised_height && selectedPeer.height && selectedPeer.advertised_height !== selectedPeer.height}
+              <div class="metric-item">
+                <span class="metric-label">Sync height (capped)</span>
+                <span class="metric-value">#{selectedPeer.height.toLocaleString()}</span>
+              </div>
+            {/if}
             <div class="metric-item">
               <span class="metric-label">DataHub URL</span>
               <span class="metric-value url">{selectedPeer.data_hub_url || '-'}</span>

@@ -350,7 +350,11 @@ func (r *CentralizedPeerRegistry) Register(info *PeerInfo) {
 	}
 	// Carried separately from Height: Height is capped against local progress
 	// for sync decisions, AdvertisedHeight is what the peer actually claimed
-	// and is reported to operators unchanged.
+	// and is reported to operators unchanged. Newest-wins, like Height: the
+	// p2p batcher keeps the highest claim within one flush window, but across
+	// windows a lower claim may replace a higher one. That is intended — a
+	// peer that reorgs to a lower tip must not keep showing its old height —
+	// and a display that dips heals on the peer's next announcement.
 	if info.AdvertisedHeight > 0 {
 		existing.AdvertisedHeight = info.AdvertisedHeight
 	}

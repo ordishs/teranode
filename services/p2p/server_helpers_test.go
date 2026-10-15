@@ -1123,55 +1123,177 @@ func TestServerHelpers_SanitizeAdvertisedTip_ClampsAndOverflow(t *testing.T) {
 	t.Run("within lead is returned unchanged", func(t *testing.T) {
 		s, _ := newServerWithLocalRegistry(t)
 		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 50
-		height, display, hash, ok := s.sanitizeAdvertisedTip(pid, 140, validHash, 100)
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, 140, validHash, 100)
 		require.True(t, ok)
 		require.NotNil(t, hash)
-		require.Equal(t, uint32(140), height)
-		require.Equal(t, uint32(140), display)
+		require.Equal(t, uint32(140), heights.Height)
+		require.Equal(t, uint32(140), heights.AdvertisedHeight)
 	})
 
 	t.Run("beyond lead is capped to local height plus lead", func(t *testing.T) {
 		s, _ := newServerWithLocalRegistry(t)
 		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 10
-		height, display, hash, ok := s.sanitizeAdvertisedTip(pid, 1000, validHash, 100)
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, 1000, validHash, 100)
 		require.True(t, ok)
 		require.NotNil(t, hash)
-		require.Equal(t, uint32(110), height, "capped to localHeight+maxLead")
-		require.Equal(t, uint32(1000), display, "the display value is not tied to local progress")
+		require.Equal(t, uint32(110), heights.Height, "capped to localHeight+maxLead")
+		require.Equal(t, uint32(1000), heights.AdvertisedHeight, "the advertised value is not tied to local progress")
 	})
 
 	t.Run("uint32 overflow clamps the ceiling instead of wrapping", func(t *testing.T) {
-		s, _ := newServerWithLocalRegistry(t)
+		s, reg := newServerWithLocalRegistry(t)
 		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 100
 		localHeight := ^uint32(0) - 5 // localHeight+maxLead overflows uint32
-		height, display, hash, ok := s.sanitizeAdvertisedTip(pid, ^uint32(0), validHash, localHeight)
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, ^uint32(0), validHash, localHeight)
 		require.True(t, ok)
 		require.NotNil(t, hash)
-		require.Equal(t, ^uint32(0), height,
+		require.Equal(t, ^uint32(0), heights.Height,
 			"ceiling clamps to max uint32 so a near-max advertisement is accepted, not wrapped")
-		require.Equal(t, uint32(maxPlausibleAdvertisedHeight), display,
-			"a uint32-max claim is implausible on any real chain and must be clamped for display too")
+		require.Equal(t, ^uint32(0), heights.AdvertisedHeight,
+			"a claim inside the local+lead window is not implausible, whatever its absolute value")
+
+		got, ok := reg.Get(pid)
+		require.True(t, ok)
+		require.Zero(t, got.BanScore, "a claim inside the local+lead window must not be scored")
 	})
 
-	t.Run("implausible advertised height is clamped for display without affecting the sync cap", func(t *testing.T) {
-		s, _ := newServerWithLocalRegistry(t)
+	t.Run("advertised height at the plausibility ceiling is accepted", func(t *testing.T) {
+		s, reg := newServerWithLocalRegistry(t)
 		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 10_000
-		height, display, hash, ok := s.sanitizeAdvertisedTip(pid, maxPlausibleAdvertisedHeight+1, validHash, 900_000)
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, maxPlausibleAdvertisedHeight, validHash, 900_000)
 		require.True(t, ok)
 		require.NotNil(t, hash)
-		require.Equal(t, uint32(910_000), height, "sync cap still applies to the local+lead ceiling")
-		require.Equal(t, uint32(maxPlausibleAdvertisedHeight), display,
-			"display value must not exceed the plausibility ceiling")
+		require.Equal(t, uint32(910_000), heights.Height, "sync cap still applies to the local+lead ceiling")
+		require.Equal(t, uint32(maxPlausibleAdvertisedHeight), heights.AdvertisedHeight)
+
+		got, ok := reg.Get(pid)
+		require.True(t, ok)
+		require.Zero(t, got.BanScore, "a claim at the ceiling is plausible and must not be scored")
+	})
+
+	t.Run("implausible advertised height is rejected and scored as a protocol violation", func(t *testing.T) {
+		s, reg := newServerWithLocalRegistry(t)
+		s.settings.P2P.MaxUnvalidatedAdvertisedHeightLead = 10_000
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, maxPlausibleAdvertisedHeight+1, validHash, 900_000)
+		require.False(t, ok, "a claim beyond the plausibility ceiling must not be stored or displayed")
+		require.Nil(t, hash)
+		require.Equal(t, uint32(0), heights.Height)
+		require.Equal(t, uint32(0), heights.AdvertisedHeight)
+
+		got, scored := reg.Get(pid)
+		require.True(t, scored, "the peer must be charged for the implausible claim")
+		require.Positive(t, got.BanScore)
+	})
+
+	t.Run("uint32-max claim from a peer far ahead of local progress is rejected", func(t *testing.T) {
+		s, reg := newServerWithLocalRegistry(t)
+		reg.Register(&blockchain.PeerInfo{ID: pid})
+		heights, _, ok := s.sanitizeAdvertisedTip(pid, ^uint32(0), validHash, 900_000)
+		require.False(t, ok)
+		require.Equal(t, uint32(0), heights.AdvertisedHeight)
+
+		got, scored := reg.Get(pid)
+		require.True(t, scored)
+		require.Positive(t, got.BanScore)
 	})
 
 	t.Run("invalid hash is rejected", func(t *testing.T) {
 		s, _ := newServerWithLocalRegistry(t)
-		height, display, hash, ok := s.sanitizeAdvertisedTip(pid, 100, "not-a-hash", 100)
+		heights, hash, ok := s.sanitizeAdvertisedTip(pid, 100, "not-a-hash", 100)
 		require.False(t, ok)
 		require.Nil(t, hash)
-		require.Equal(t, uint32(0), height)
-		require.Equal(t, uint32(0), display)
+		require.Equal(t, uint32(0), heights.Height)
+		require.Equal(t, uint32(0), heights.AdvertisedHeight)
 	})
+}
+
+// TestHandleBlockTopic_RejectsImplausibleAdvertisedHeight checks that a block
+// announcement beyond the plausibility ceiling reaches no operator-facing
+// surface and no catchup trigger, and that the announcing peer is scored.
+func TestHandleBlockTopic_RejectsImplausibleAdvertisedHeight(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+	setServerLocalHeight(t, s, 900_000)
+
+	self := mustNewPeerID(t)
+	mockP2P := new(MockServerP2PClient)
+	mockP2P.peerID = self
+	s.P2PClient = mockP2P
+	s.notificationCh = make(chan *notificationMsg, 1)
+
+	producer := kafka.NewKafkaAsyncProducerMock()
+	s.blocksKafkaProducerClient = producer
+
+	remote := mustNewPeerID(t)
+	reg.Register(&blockchain.PeerInfo{ID: remote.String()})
+
+	msgBytes, err := json.Marshal(BlockMessage{
+		PeerID:     remote.String(),
+		ClientName: "client/1.0",
+		Hash:       chainhash.HashH([]byte("implausible block")).String(),
+		Height:     maxPlausibleAdvertisedHeight + 1,
+	})
+	require.NoError(t, err)
+
+	s.handleBlockTopic(context.Background(), msgBytes, remote.String())
+
+	select {
+	case notification := <-s.notificationCh:
+		t.Fatalf("unexpected block notification for an implausible height: %+v", notification)
+	default:
+	}
+
+	select {
+	case published := <-producer.PublishChannel():
+		t.Fatalf("unexpected Kafka publish for an implausible height: %+v", published)
+	default:
+	}
+
+	got, ok := reg.Get(remote.String())
+	require.True(t, ok)
+	require.Positive(t, got.BanScore, "the announcing peer must be charged a protocol violation")
+	require.Zero(t, got.Height, "the implausible claim must not reach the sync height")
+	require.Zero(t, got.AdvertisedHeight, "the implausible claim must not reach the displayed height")
+}
+
+// TestHandleNodeStatusTopic_RejectsImplausibleAdvertisedHeight checks that a
+// node_status beyond the plausibility ceiling is still relayed for monitoring
+// but without the height, is never stored, and costs the peer ban score.
+func TestHandleNodeStatusTopic_RejectsImplausibleAdvertisedHeight(t *testing.T) {
+	s, reg := newServerWithLocalRegistry(t)
+	setServerLocalHeight(t, s, 900_000)
+
+	self := mustNewPeerID(t)
+	mockP2P := new(MockServerP2PClient)
+	mockP2P.peerID = self
+	s.P2PClient = mockP2P
+	s.notificationCh = make(chan *notificationMsg, 1)
+
+	remote := mustNewPeerID(t)
+	msgBytes, err := json.Marshal(NodeStatusMessage{
+		PeerID:        remote.String(),
+		BestHeight:    maxPlausibleAdvertisedHeight + 1,
+		BestBlockHash: chainhash.HashH([]byte("implausible tip")).String(),
+	})
+	require.NoError(t, err)
+
+	s.handleNodeStatusTopic(context.Background(), msgBytes, remote.String())
+
+	select {
+	case notification := <-s.notificationCh:
+		require.Zero(t, notification.BestHeight, "the implausible height must not reach WebSocket clients")
+		require.Empty(t, notification.BestBlockHash, "the hash paired with a rejected height must not be relayed")
+	default:
+		t.Fatal("expected node_status notification")
+	}
+
+	got, ok := reg.Get(remote.String())
+	require.True(t, ok)
+	require.Positive(t, got.BanScore, "the advertising peer must be charged a protocol violation")
+	require.Zero(t, got.Height, "the implausible claim must not reach the sync height")
+	require.Zero(t, got.AdvertisedHeight, "the implausible claim must not reach the displayed height")
 }
 
 // TestHandleBlockTopic_RejectsBlacklistedDataHubURL guards the fix for block

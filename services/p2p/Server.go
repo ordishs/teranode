@@ -1669,10 +1669,10 @@ func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, peerID str
 	// clients. It is bounded here rather than in sanitizeNodeStatusMessage so
 	// that sanitizeAdvertisedTip still sees the value the peer actually sent.
 	notificationBestBlockHash := sanitizePeerHexString(nodeStatusMessage.BestBlockHash, maxPeerHexStringLen)
-	// sanitizedBestHeight's zero value is never used: addPeer below is only
-	// reached when sanitizedTipOK is true, which only happens after
-	// sanitizeAdvertisedTip has assigned it a real value.
-	var sanitizedBestHeight uint32
+	// sanitizedHeights is only ever produced by sanitizeAdvertisedTip: addPeer
+	// below is gated on sanitizedTipOK, so its zero value never reaches the
+	// registry.
+	var sanitizedHeights peerHeightClaim
 	var sanitizedBestBlockHash *chainhash.Hash
 	sanitizedTipOK := false
 
@@ -1705,16 +1705,15 @@ func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, peerID str
 
 	if !isSelf && nodeStatusMessage.BestHeight > 0 && nodeStatusMessage.PeerID != "" {
 		var ok bool
-		sanitizedBestHeight, notificationBestHeight, sanitizedBestBlockHash, ok = s.sanitizeAdvertisedTip(nodeStatusMessage.PeerID, nodeStatusMessage.BestHeight, nodeStatusMessage.BestBlockHash, s.getLocalHeight(ctx))
+		sanitizedHeights, sanitizedBestBlockHash, ok = s.sanitizeAdvertisedTip(nodeStatusMessage.PeerID, nodeStatusMessage.BestHeight, nodeStatusMessage.BestBlockHash, s.getLocalHeight(ctx))
 		if ok {
 			sanitizedTipOK = true
 			// Only the registry copy below is capped. notificationBestHeight
-			// keeps the height the peer actually advertised (clamped only if
-			// implausible): the cap is a bound on what an unvalidated claim
-			// may influence, not a statement about the peer, and a node still
-			// catching up would otherwise report every peer at
-			// localHeight+maxLead — a number no peer ever sent, shown next to
-			// that peer's real tip hash.
+			// keeps the height the peer actually advertised: the cap is a
+			// bound on what an unvalidated claim may influence, not a
+			// statement about the peer, and a node still catching up would
+			// otherwise report every peer at localHeight+maxLead — a number
+			// no peer ever sent, shown next to that peer's real tip hash.
 			notificationBestBlockHash = sanitizedBestBlockHash.String()
 		} else {
 			notificationBestHeight = 0
@@ -1790,7 +1789,7 @@ func (s *Server) handleNodeStatusTopic(ctx context.Context, m []byte, peerID str
 			return
 		}
 
-		s.addPeer(peerID, nodeStatusMessage.ClientName, peerHeightClaim{Height: sanitizedBestHeight, AdvertisedHeight: notificationBestHeight}, sanitizedBestBlockHash, nodeStatusMessage.BaseURL)
+		s.addPeer(peerID, nodeStatusMessage.ClientName, sanitizedHeights, sanitizedBestBlockHash, nodeStatusMessage.BaseURL)
 		s.logger.Debugf("[handleNodeStatusTopic] Updated block hash %s for peer %s", notificationBestBlockHash, peerID)
 
 		// Update storage mode if provided
