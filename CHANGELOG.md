@@ -418,12 +418,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 ### Not breaking, but worth knowing
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
-  assembly is in the `reorging`, `reconciling` or `resetting` state, it still holds
-  the tip from before the reorg. `GetMiningCandidate` built candidates on that old
-  tip, so a miner could mine on the losing side of a reorg. In these states it now
-  returns an empty candidate on the Blockchain service tip, as it already did in
+  assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
+  hold the tip from before the reorg. `GetMiningCandidate` built candidates on that
+  old tip, so a miner could mine on the losing side of a reorg. In these states it
+  now returns an empty candidate on the Blockchain service tip, as it already did in
   `blockchainSubscription` and `movingUp`. Mining pools can see more empty candidates
-  while a reorg runs. No action is required. (#1983)
+  while a reorg or a block assembly reset runs, including a reset at an unchanged
+  tip after a storage error. No action is required. (#1983)
 
 - **Two Blockchain RPCs start working.** `GetLatestBlockHeaderFromBlockLocator` and
   `GetBlockHeadersFromOldest` were implemented under names that did not satisfy the
