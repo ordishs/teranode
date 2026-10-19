@@ -36,7 +36,7 @@ The checklist has one section per domain:
 
 | Domain | Required evidence |
 |---|---|
-| Operational readiness | The beta tag. The mainnet, testnet and TeraTestNet nodes that ran it, each for at least 24 hours while following the chain tip. A sync from zero. An upgrade or restart during sync. |
+| Operational readiness | The beta tag. The mainnet, testnet and TeraTestNet nodes that ran it, each for at least 24 hours while following the chain tip. A sync from zero. An upgrade or restart during sync. If the seeder or the snapshot export format changed since the last release: a new seed-to-tip measurement on the [reference hardware](miners/systemRequirements.md), recorded as measured in the [sync guide](miners/kubernetes/minersHowToSyncTheNode.md). Otherwise, N/A and the reason. |
 | QA and testing | The CI run URLs at the beta SHA for `teranode_main_tests.yaml` (unit, smoke and pruner suites), with their results. The results for the consensus packages: `services/blockvalidation`, `services/validator`, `services/subtreevalidation`, `services/blockassembly` and `stores/utxo`. |
 | Consensus parity | For a release with consensus-affecting scope: a [node-validation](https://github.com/bsv-blockchain/node-validation) run against this exact tag, in full mode. Give the report, its verdict, the tool version and the mode. For a release without consensus-affecting scope, write N/A and the reason. |
 | Security | The security review or scan result for this release, or "none in scope" and the reason. |
