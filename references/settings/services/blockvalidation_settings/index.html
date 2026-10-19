@@ -7274,13 +7274,6 @@ loader (0, false and false), so for these keys the two agree. The
 <td><strong>CRITICAL</strong> - gRPC server binding (service skipped if empty)</td>
 </tr>
 <tr>
-<td>KafkaWorkers</td>
-<td>int</td>
-<td>0</td>
-<td>blockvalidation_kafkaWorkers</td>
-<td>Kafka consumer parallelism</td>
-</tr>
-<tr>
 <td>LocalSetTxMinedConcurrency</td>
 <td>int</td>
 <td>8</td>
@@ -7726,7 +7719,7 @@ loader (0, false and false), so for these keys the two agree. The
 <td>int</td>
 <td>0</td>
 <td>blockvalidation_quick_validate_create_concurrency</td>
-<td>Callers allowed in flight at once in each of quick validation's two creating waves (the one-wave apply and the chained create wave), so a batch can put up to twice this many on the store. 0 derives it as max(min(utxostore_storeBatcherSize x utxostore_batcherMaxConcurrent, 16384), utxostore_storeBatcherSize x 8); an explicit value is not capped</td>
+<td>Callers allowed in flight at once in the first wave of a below-checkpoint list that quick validation hands the SQL and Aerospike UTXO stores; that wave creates every record and also spends the inputs of each transaction with no parent in the list. 0 derives it as max(min(utxostore_storeBatcherSize x utxostore_batcherMaxConcurrent, 16384), utxostore_storeBatcherSize x 8); an explicit value is not capped</td>
 </tr>
 <tr>
 <td>OutpointOnlyBelowCheckpoint</td>
@@ -7930,7 +7923,7 @@ loader (0, false and false), so for these keys the two agree. The
 </span></code></pre></div>
 <h3 id="high-performance-configuration">High Performance Configuration<a class="headerlink" href="#high-performance-configuration" title="Permanent link">&para;</a></h3>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">blockvalidation_validateBlockSubtreesConcurrency</span><span class="o">=</span><span class="m">16</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nv">blockvalidation_processTxMetaUsingStoreBatchSize</span><span class="o">=</span><span class="m">2048</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nv">blockvalidation_processTxMetaUsingStore_BatchSize</span><span class="o">=</span><span class="m">2048</span>
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nv">blockvalidation_catchupConcurrency</span><span class="o">=</span><span class="m">8</span>
 </span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="nv">blockvalidation_fetch_num_workers</span><span class="o">=</span><span class="m">32</span>
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="nv">blockvalidation_subtree_batch_size</span><span class="o">=</span><span class="m">32</span>
