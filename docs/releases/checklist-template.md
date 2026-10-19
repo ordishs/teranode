@@ -47,7 +47,19 @@ Copy this file to `docs/releases/vX.Y.Z-checklist.md` and fill in every item wit
 | Item | Evidence |
 |---|---|
 | Open bug-labelled issues that affect the build | |
-| Open Critical or High findings from any source, each closed or waived | |
+
+### Critical and High Findings
+
+One row for each Critical or High finding from any source that is open, or that this release closed. Write "None" in the first row when there are none.
+
+| Finding | Source | Domain | Severity | Status |
+|---|---|---|---|---|
+
+- **Finding:** the issue link or the identifier that the source gave it.
+- **Source:** miner feedback, security review, internal review, audit, or acceptance harness.
+- **Domain:** security, architecture, requirements, QA and testing, or operational.
+- **Severity:** Critical or High.
+- **Status:** Closed in this release, or Waived. A waived finding also has a row in Waivers.
 
 ### Waivers
 
