@@ -150,7 +150,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		}
 	}
 
-	firstErr = s.clearBlessedNotFound(spends, tx.TxIDChainHash(), firstErr)
+	if !ig.RequireParentOutputs {
+		firstErr = s.clearBlessedNotFound(spends, tx.TxIDChainHash(), firstErr)
+	}
 
 	if firstErr != nil {
 		return spends, errors.NewUtxoError("pebble: spend failed", firstErr)
@@ -586,9 +588,9 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		}
 	}
 
-	selfHash := tx.TxIDChainHash()
-	if options.TxID != nil {
-		selfHash = options.TxID
+	selfHash := options.TxID
+	if selfHash == nil {
+		selfHash = tx.TxIDChainHash()
 	}
 
 	groups := groupByParent(spends)
@@ -620,7 +622,9 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 		}
 	}
 
-	firstErr = s.clearBlessedNotFound(spends, selfHash, firstErr)
+	if !options.IgnoreFlags.RequireParentOutputs {
+		firstErr = s.clearBlessedNotFound(spends, selfHash, firstErr)
+	}
 
 	if firstErr != nil {
 		return nil, spends, errors.NewUtxoError("pebble: spend failed", firstErr)
@@ -657,4 +661,8 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	}
 
 	return md, spends, nil
+}
+
+func (s *Store) SpendAndCreateMulti(ctx context.Context, txs []*bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) ([]utxo.SpendAndCreateMultiResult, error) {
+	return utxo.DefaultSpendAndCreateMulti(ctx, s, utxo.SpendAndCreateMultiWidthsFor(s.settings), txs, blockHeight, opts...)
 }

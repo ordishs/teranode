@@ -144,9 +144,9 @@ func (s *Store) buildTx(tx *bt.Tx, blockHeight uint32, options *utxo.CreateOptio
 		md.Locked = true
 	}
 
-	txHash := tx.TxIDChainHash()
-	if options.TxID != nil {
-		txHash = options.TxID
+	txHash := options.TxID
+	if txHash == nil {
+		txHash = tx.TxIDChainHash()
 	}
 
 	isCoinbase := tx.IsCoinbase()
