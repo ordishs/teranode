@@ -28,7 +28,7 @@ Each stable release has one file, `docs/releases/vX.Y.Z-checklist.md`, copied fr
 5. Tag `vX.Y.Z` on the beta SHA.
 6. Link the file from the GitHub Release body and from the Announcements discussion.
 
-The `release-checklist` job in `teranode_main_build.yaml` enforces steps 4 and 5. For a stable tag, the build fails when `docs/releases/vX.Y.Z-checklist.md` is not on `main`, or when it does not contain the line `**Decision:** Go`. The check reads the file from `main`, because the tagged beta commit cannot contain a checklist written after its soak. Branches and beta tags are not checked.
+The `release-checklist` job in `teranode_main_build.yaml` enforces steps 4 and 5. For a stable tag, the build fails when `docs/releases/vX.Y.Z-checklist.md` is not on `main`, or when it does not contain the line `**Decision:** Go`. The check reads the file from `main`, because the tagged beta commit cannot contain a checklist written after its soak. Branches and beta tags are not checked. The check applies to release branches cut from `main` after this job was added. Earlier release lines rely on the manual checklist only.
 
 ### Checklist Items
 
@@ -37,7 +37,7 @@ The checklist has one section per domain:
 | Domain | Required evidence |
 |---|---|
 | Operational readiness | The beta tag. The mainnet, testnet and TeraTestNet nodes that ran it, each for at least 24 hours while following the chain tip. A sync from zero. An upgrade or restart during sync. If the seeder or the snapshot export format changed since the last release: a new seed-to-tip measurement on the [reference hardware](miners/systemRequirements.md), recorded as measured in the [sync guide](miners/kubernetes/minersHowToSyncTheNode.md). Otherwise, N/A and the reason. |
-| QA and testing | The CI run URLs at the beta SHA for `teranode_main_tests.yaml` (unit, smoke and pruner suites), with their results. The results for the consensus packages: `services/blockvalidation`, `services/validator`, `services/subtreevalidation`, `services/blockassembly` and `stores/utxo`. |
+| QA and testing | The CI run URL at the beta SHA for `teranode_main_build.yaml`, with the results of its `test_and_lint` jobs (Go test, smoketest and prunertest). The results for the consensus packages: `services/blockvalidation`, `services/validator`, `services/subtreevalidation`, `services/blockassembly` and `stores/utxo`. |
 | Consensus parity | For a release with consensus-affecting scope: a [node-validation](https://github.com/bsv-blockchain/node-validation) run against this exact tag, in full mode. Give the report, its verdict, the tool version and the mode. For a release without consensus-affecting scope, write N/A and the reason. |
 | Security | The security review or scan result for this release, or "none in scope" and the reason. |
 | Architecture | The architecture reviews or decision records that affect this release, or "none". |

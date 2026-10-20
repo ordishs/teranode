@@ -21,7 +21,7 @@ Copy this file to `docs/releases/vX.Y.Z-checklist.md` and fill in every item wit
 
 | Item | Evidence |
 |---|---|
-| `teranode_main_tests.yaml` run at the beta SHA (unit, smoke, pruner) | |
+| `teranode_main_build.yaml` run at the beta SHA, with its `test_and_lint` jobs (Go test, smoketest, prunertest) | |
 | Consensus package results at the beta SHA (`services/blockvalidation`, `services/validator`, `services/subtreevalidation`, `services/blockassembly`, `stores/utxo`) | |
 
 ## Consensus Parity

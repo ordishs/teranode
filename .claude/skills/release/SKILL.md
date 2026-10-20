@@ -110,7 +110,7 @@ If all pass:
 2. **Verify nothing has landed on top of the beta**: `git rev-parse release/vX.Y` must equal the beta SHA. If they differ, **refuse to tag**: a hotfix landed after the beta soak and that commit hasn't been validated. Tell the user; require a fresh beta cut.
 3. **Write the release checklist.** Copy `docs/releases/checklist-template.md` to `docs/releases/vX.Y.Z-checklist.md` on a branch from `main`, and fill in every item with its evidence (see `docs/howto/releaseProcess.md`):
    - the seven gate answers above, with the beta tag, the nodes and soak durations, and the sync-from-zero and mid-sync-upgrade nodes
-   - the `teranode_main_tests.yaml` run URL at the beta SHA, from `gh run list --workflow teranode_main_tests.yaml --commit <beta-sha>`
+   - the `teranode_main_build.yaml` run URL at the beta SHA and the results of its `test_and_lint` jobs (Go test, smoketest, prunertest), from `gh run list --workflow teranode_main_build.yaml --commit <beta-sha>`
    - the node-validation run against this tag, for a release with consensus-affecting scope, or N/A and the reason
    - the open bug-labelled issues, from `gh issue list --label bug --state open`
    - every open Critical or High finding, each closed or with a waiver (owner, date, reason, close-by date)
