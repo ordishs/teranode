@@ -949,6 +949,13 @@ func handleSendRawTransaction(ctx context.Context, s *RPCServer, cmd interface{}
 	// This will validate scripts, check UTXOs, spend them, create new UTXOs, and send to block assembly
 	_, err = s.validatorClient.Validate(ctx, tx, 0)
 	if err != nil && !errors.Is(err, errors.ErrTxUnlockFailed) {
+		// Overload is retryable, not a terminal verdict on the transaction.
+		if errors.Is(err, errors.ErrThresholdExceeded) {
+			return nil, &bsvjson.RPCError{
+				Code:    bsvjson.ErrRPCMisc,
+				Message: "node busy: block assembly queue full, transaction not processed - retry later",
+			}
+		}
 		return nil, s.rpcSubmitError(err, bsvjson.ErrRPCVerify, txRejectedPrefix)
 	}
 

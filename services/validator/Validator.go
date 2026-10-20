@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -258,6 +259,14 @@ type Validator struct {
 	// This client is used to ensure the validator service remains synchronized with the blockchain.
 	blockchainClient blockchain.ClientI
 
+	// blockAssemblyQueueMonitor caches whether block assembly's ingest queue
+	// holds more than blockassembly_max_queued_transactions transactions
+	// (a shared blockassembly.QueueMonitor; nil when the limit is disabled).
+	// Consulted once per mempool-ingest validation as the back-pressure gate
+	// in validateInternal — before any UTXO work — so a reject never leaves a
+	// transaction spent or created.
+	blockAssemblyQueueMonitor ingestGate
+
 	// stats tracks validator performance metrics
 	stats *gocore.Stat
 
@@ -314,6 +323,15 @@ type Validator struct {
 	// so at most one window is ever published, but this is kept as a collection
 	// so correctness does not depend on that serialization staying single-loader.
 	mtpLoadWindows []mtpLoadWindow
+	// graceChainChecks memoises dahEvictedParentGrace's current-chain verdicts,
+	// keyed on the child's block-ID set. The grace fires when a mined child's
+	// parent has been evicted — i.e. while re-validating a block whose
+	// transactions all carry the SAME BlockIDs — so without memoisation every
+	// transaction of that block repeats an identical blockchain round-trip
+	// (gRPC hop plus an indexed lookup, or a recursive parent_id walk on the
+	// reject path) at exactly the moment the node is already degraded.
+	graceChainChecks   map[string]graceChainCheck
+	graceChainChecksMu sync.Mutex
 }
 
 // mtpLoadWindow is a half-open height range [From, To) that an in-flight
@@ -323,6 +341,23 @@ type mtpLoadWindow struct {
 	From uint32
 	To   uint32
 }
+
+// graceChainCheck is one memoised current-chain verdict.
+type graceChainCheck struct {
+	onCurrentChain bool
+	expires        time.Time
+}
+
+// graceChainCheckTTL bounds how stale a memoised current-chain verdict may be.
+// Deliberately short: the check exists to reject BlockIDs left behind by a lost
+// reorg, so the memo must not outlive a reorg by anything meaningful. A few
+// seconds collapses a whole block's transactions into one round-trip while
+// keeping the staleness window far below the time any reorg takes to settle.
+const graceChainCheckTTL = 5 * time.Second
+
+// graceChainCheckEntries caps the memo so a stream of distinct block-ID sets
+// cannot grow it without bound; expired entries are swept when the cap is hit.
+const graceChainCheckEntries = 1024
 
 // New creates a new Validator instance with the provided configuration.
 // It initializes the validator with the given logger, UTXO store, and Kafka producers.
@@ -414,6 +449,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		logger.Infof("[Validator] blockassembly_sendBatchMaxConcurrent=%d blocks for a dispatch slot, a wait additive to the first-item flush wait that the block-assembly handoff floor %s does not model and cannot; a saturated batcher can therefore strand a transaction locked - watch teranode_validator_handoff_deadline_total, then align blockassembly_queueFullWaitTimeout across both settings contexts or raise validator_handoffRoundTripSlack", tSettings.BlockAssembly.SendBatchMaxConcurrent, v.handoffFloor())
 	}
 
+	// Back-pressure: watch block assembly's ingest queue so mempool validation
+	// can shed load BEFORE doing any UTXO work. Only runs when the operator set
+	// a limit and block assembly is in use (NewQueueMonitor returns nil
+	// otherwise, and the gate's Overloaded() check is nil-safe).
+	if !tSettings.BlockAssembly.Disabled {
+		if monitor := blockassembly.NewQueueMonitor(ctx, logger, blockAssemblyClient, tSettings.BlockAssembly.MaxQueuedTransactions); monitor != nil {
+			v.blockAssemblyQueueMonitor = monitor
+		}
+	}
+
 	txmetaKafkaURL := v.settings.Kafka.TxMetaConfig
 	if txmetaKafkaURL == nil {
 		return nil, errors.NewConfigurationError("missing Kafka URL for txmeta")
@@ -453,6 +498,26 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	}
 
 	return v, nil
+}
+
+// ingestGate is the back-pressure verdict the validator consults per mempool
+// transaction. Satisfied by *blockassembly.QueueMonitor in production (and by
+// a stub in tests); kept as an interface so the gate can be driven directly
+// without standing up a poller.
+type ingestGate interface {
+	Overloaded() bool
+}
+
+// IngestOverloaded reports whether block assembly's ingest queue is currently
+// over blockassembly_max_queued_transactions, i.e. whether the back-pressure
+// gate in validateInternal would shed a mempool transaction right now.
+//
+// Callers that must NOT shed by rejecting — the Kafka consumer, whose submitter
+// already received a 200 from propagation — use this to wait out the overload
+// instead of calling Validate and getting an error they cannot return. Always
+// false when the limit is disabled.
+func (v *Validator) IngestOverloaded() bool {
+	return v.blockAssemblyQueueMonitor != nil && v.blockAssemblyQueueMonitor.Overloaded()
 }
 
 // Close releases the resources the Validator owns: the tx-meta batcher and the
@@ -927,6 +992,28 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		return nil, err
 	}
 
+	// Back-pressure gate: shed mempool ingest while block assembly's queue is
+	// over blockassembly_max_queued_transactions. Placement is load-bearing on
+	// both sides: it MUST sit before any UTXO work — rejecting after
+	// spend/create would strand the tx spent+Locked with no rollback and poison
+	// its descendants — and it must sit AFTER the terminal in-memory checks
+	// above (coinbase, option guards, finality), so a structurally invalid
+	// submission still gets its terminal verdict instead of a retryable "busy"
+	// that a broadcaster would replay forever. Block-context traffic (InBlock:
+	// block validation blessing, announced-subtree validation, legacy sync) is
+	// exempt: those transactions are already committed to a block or subtree,
+	// and refusing them fails valid blocks instead of shedding load. Callers
+	// that skip block assembly entirely have nothing to shed. SkipBackpressure
+	// carries the one case that must never be shed here: a transaction the node
+	// already acknowledged to its submitter (see Options.SkipBackpressure).
+	if v.IngestOverloaded() && !validationOptions.InBlock && validationOptions.AddTXToBlockAssembly && !validationOptions.SkipBackpressure {
+		if prometheusValidatorBackpressureRejects != nil {
+			prometheusValidatorBackpressureRejects.Inc()
+		}
+
+		return nil, errors.NewThresholdExceededError("[Validate][%s] block assembly ingest queue is over blockassembly_max_queued_transactions; rejecting mempool transaction, retry later", txID)
+	}
+
 	var utxoHeights []uint32
 
 	// OutpointOnlySpend: skip parent reads entirely. utxoHeights stays nil.
@@ -944,6 +1031,19 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		// gates selected the same single call and the first read as a gate while
 		// gating nothing.
 		if utxoHeights, err = v.getTransactionInputBlockHeightsAndExtendTx(ctx, tx, txID, validationOptions); err != nil {
+			if errors.Is(err, errors.ErrTxMissingParent) {
+				txMeta, blessed, fatalErr := v.dahEvictedParentGrace(ctx, tx, txID)
+				if fatalErr != nil {
+					span.RecordError(fatalErr)
+
+					return nil, fatalErr
+				}
+
+				if blessed {
+					return txMeta, nil
+				}
+			}
+
 			err = errors.NewProcessingError("[Validate][%s] error getting transaction input block heights", txID, err)
 			span.RecordError(err)
 
@@ -1171,21 +1271,15 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// create phase can surface ErrTxNotFound (e.g. an internal parent lookup) MUST
 			// NOT let it escape untagged, or a failed create gets misread here as a
 			// DAH-evicted parent and the tx is wrongly treated as blessed.
-			//
-			// The parent transaction was not found. This can legitimately happen when the parent has been DAH-evicted
-			// long after the child was mined. Only short-circuit if the stored metadata confirms prior full validation:
-			//   - tx has been included in at least one block (BlockIDs non-empty), AND
-			//   - tx is NOT marked conflicting, AND
-			//   - tx is NOT locked
-			// Otherwise, surface the original ErrTxNotFound — a "tx exists in store" alone is not proof of validation
-			// (a re-org or DAH window could expose a stale or mid-flight record).
-			txMetaData = &meta.Data{}
-			if metaErr := v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); metaErr == nil {
-				if len(txMetaData.BlockIDs) > 0 && !txMetaData.Conflicting && !txMetaData.Locked {
-					v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
+			txMeta, blessed, fatalErr := v.dahEvictedParentGrace(decoupledCtx, tx, txID)
+			if fatalErr != nil {
+				span.RecordError(fatalErr)
 
-					return txMetaData, nil
-				}
+				return nil, fatalErr
+			}
+
+			if blessed {
+				return txMeta, nil
 			}
 		}
 
@@ -1650,6 +1744,149 @@ func (v *Validator) twoPhaseCommitTransaction(ctx context.Context, tx *bt.Tx, tx
 	}
 
 	return nil
+}
+
+// dahEvictedParentGrace reports whether a missing-parent failure can be absorbed
+// because the transaction itself is already fully validated and mined on the
+// CURRENT chain.
+//
+// A parent record can legitimately be gone from the UTXO store when it was
+// DAH-evicted (or its partition was lost) long after this child was mined. Only
+// short-circuit if the stored metadata confirms prior full validation:
+//   - tx has been included in at least one block (BlockIDs non-empty), AND
+//   - at least one of those blocks is on the CURRENT chain (BlockIDs alone are
+//     not proof: a block that lost a reorg keeps its stale ID — only
+//     invalidated blocks get BlockIDs cleared via UnsetMined), AND
+//   - tx is NOT marked conflicting, AND
+//   - tx is NOT locked
+//
+// Under those conditions the record is the durable result of a prior full
+// validation (scripts run, inputs consumed) whose block the node accepted on
+// its current chain, so returning it without re-running validation or
+// re-recording spends is sound:
+//   - Skipping the script/policy re-check cannot change the outcome — it ran
+//     when the record was created, and re-running could only fail on
+//     since-pruned data, which is the wedge this grace exists to break.
+//   - Skipping spend recording is safe because there is nothing to record ON:
+//     the parent record is absent. The child's spends WERE recorded on the
+//     parent before it vanished. The parent cannot "come back" with
+//     unspent-looking outputs through any consistent path: DAH eviction only
+//     ever deletes records whose outputs were ALL spent and mined, so a
+//     restored copy shows them spent; and a reseed after partition loss
+//     rebuilds the UTXO set from persisted chain state, in which this child's
+//     block has already consumed those outputs. Only restoring a stale backup
+//     over live state could resurrect an unspent-looking output — an
+//     operator-induced consistency break that no validate-time bookkeeping
+//     can defend against.
+//
+// Failure semantics: a clean not-found (child record absent) simply denies the
+// grace, and the caller surfaces the original missing-parent error. A STORE or
+// BLOCKCHAIN fault, however, is returned as fatalErr — a DB read error is not
+// a verdict about the transaction, and reclassifying it as "invalid: missing
+// parent" would fail blocks (and feed the BLOCK_INCOMPLETE cap) on transient
+// infrastructure blips. Without a blockchain client (some embedded/test
+// wirings) the grace fails closed.
+//
+// This is the single source of truth for the grace, shared by the extend/heights
+// step and the spend step so their tolerance for evaporated parents cannot drift.
+func (v *Validator) dahEvictedParentGrace(ctx context.Context, tx *bt.Tx, txID string) (txMeta *meta.Data, blessed bool, fatalErr error) {
+	txMetaData := &meta.Data{}
+	if metaErr := v.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), txMetaData); metaErr != nil {
+		if !errors.Is(metaErr, errors.ErrTxNotFound) {
+			return nil, false, errors.NewStorageError("[Validate][%s] DAH-evicted-parent grace: meta read failed (degraded store?)", txID, metaErr)
+		}
+
+		return nil, false, nil
+	}
+
+	if len(txMetaData.BlockIDs) == 0 || txMetaData.Conflicting || txMetaData.Locked {
+		return nil, false, nil
+	}
+
+	if v.blockchainClient == nil {
+		return nil, false, nil
+	}
+
+	onCurrentChain, checked, chainErr := v.blockIDsOnCurrentChain(ctx, txMetaData.BlockIDs)
+	if chainErr != nil {
+		return nil, false, errors.NewServiceError("[Validate][%s] DAH-evicted-parent grace: current-chain check failed", txID, chainErr)
+	}
+
+	if !onCurrentChain {
+		return nil, false, nil
+	}
+
+	// Log once per block-ID set rather than once per transaction: the grace
+	// fires for every transaction of a block being re-validated, and a per-tx
+	// warning buries the signal it exists to raise.
+	if checked {
+		v.logger.Warnf("[Validate][%s] parent tx DAH-evicted, child already mined on current chain and not conflicting/locked, assuming blessed (BlockIDs=%v)", txID, txMetaData.BlockIDs)
+	}
+
+	return txMetaData, true, nil
+}
+
+// blockIDsOnCurrentChain answers dahEvictedParentGrace's current-chain question
+// through a short-lived memo (see graceChainCheckTTL). checked reports whether
+// the answer came from the blockchain service rather than the memo, so the
+// caller can log once per block instead of once per transaction. Errors are
+// never memoised.
+func (v *Validator) blockIDsOnCurrentChain(ctx context.Context, blockIDs []uint32) (onCurrentChain bool, checked bool, err error) {
+	key := blockIDsKey(blockIDs)
+	now := time.Now()
+
+	v.graceChainChecksMu.Lock()
+	if entry, ok := v.graceChainChecks[key]; ok && now.Before(entry.expires) {
+		v.graceChainChecksMu.Unlock()
+
+		return entry.onCurrentChain, false, nil
+	}
+	v.graceChainChecksMu.Unlock()
+
+	onCurrentChain, err = v.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
+	if err != nil {
+		return false, true, err
+	}
+
+	v.graceChainChecksMu.Lock()
+	defer v.graceChainChecksMu.Unlock()
+
+	if v.graceChainChecks == nil {
+		v.graceChainChecks = make(map[string]graceChainCheck)
+	}
+
+	if len(v.graceChainChecks) >= graceChainCheckEntries {
+		for k, entry := range v.graceChainChecks {
+			if !now.Before(entry.expires) {
+				delete(v.graceChainChecks, k)
+			}
+		}
+
+		// Still full of live entries: drop the memo rather than let it grow.
+		if len(v.graceChainChecks) >= graceChainCheckEntries {
+			v.graceChainChecks = make(map[string]graceChainCheck)
+		}
+	}
+
+	v.graceChainChecks[key] = graceChainCheck{onCurrentChain: onCurrentChain, expires: now.Add(graceChainCheckTTL)}
+
+	return onCurrentChain, true, nil
+}
+
+// blockIDsKey builds an order-independent map key for a set of block IDs, so
+// two transactions of the same block share one memo entry regardless of the
+// order the store returned their IDs in.
+func blockIDsKey(blockIDs []uint32) string {
+	sorted := make([]uint32, len(blockIDs))
+	copy(sorted, blockIDs)
+	slices.Sort(sorted)
+
+	key := make([]byte, 0, len(sorted)*4)
+	for _, id := range sorted {
+		key = binary.LittleEndian.AppendUint32(key, id)
+	}
+
+	return string(key)
 }
 
 // getUtxoBlockHeightsAndExtendTx returns the block height of each input's parent
