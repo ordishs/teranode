@@ -369,80 +369,6 @@ func (v *Server) Init(ctx context.Context) (err error) {
 	return nil
 }
 
-// kafkaShedMaxWait bounds how long a Kafka-ingested transaction waits out a
-// block-assembly back-pressure shed before it is force-processed anyway.
-//
-// Waiting turns overload into consumer lag, which is the right async
-// back-pressure signal, but it cannot be unbounded. The validator-txs topic is
-// retention-bounded (60s in the .operator context), so a handler stalled past
-// the retention window lets the broker delete records the consumer never
-// reached — losing a transaction propagation already answered 200 for. A
-// blocked handler also pins its fetched records (and a goroutine) in memory
-// while the puller keeps fetching, which is the same unbounded-memory shape
-// this limit exists to prevent.
-//
-// Past the deadline the transaction bypasses this advisory gate. The existing
-// hard queue limit and its bounded handoff retry/unwind still apply.
-// Fresh submissions are still shed synchronously at propagation ingress, so
-// what reaches this wait is only what was already in flight.
-const kafkaShedMaxWait = 10 * time.Second
-
-// kafkaShedPollInterval is how often a waiting Kafka handler re-checks the
-// back-pressure verdict. Matches the monitor's own sampling interval — a
-// tighter poll cannot see a fresher verdict.
-const kafkaShedPollInterval = blockassembly.QueueMonitorInterval
-
-// awaitIngestCapacity waits out a block-assembly back-pressure shed for a
-// transaction that has ALREADY been accepted from a submitter (the Kafka
-// path). It returns when capacity is available, or — once deadline passes —
-// with options.SkipBackpressure set so validateInternal processes the
-// transaction instead of shedding it.
-//
-// Returns an error only on context cancellation. The shed is counted once per
-// transaction here (as a wait, not as a reject) so the reject counter keeps
-// meaning "transactions turned away" on the paths that can actually turn one
-// away.
-func (v *Server) awaitIngestCapacity(ctx context.Context, txID string, options *Options, deadline time.Time) error {
-	// The validator service always runs the in-process implementation, so this
-	// assertion holds in production; a validator that cannot report the verdict
-	// (test doubles) simply never waits.
-	gate, ok := v.validator.(interface{ IngestOverloaded() bool })
-	if !ok || !gate.IngestOverloaded() {
-		return nil
-	}
-
-	start := time.Now()
-
-	v.logger.Debugf("[Validator] block assembly overloaded, holding kafka tx %s (up to %s)", txID, kafkaShedMaxWait)
-
-	for gate.IngestOverloaded() {
-		if !time.Now().Before(deadline) {
-			// Bypass only the advisory gate; the hard queue limit still applies.
-			options.SkipBackpressure = true
-
-			if prometheusValidatorBackpressureForced != nil {
-				prometheusValidatorBackpressureForced.Inc()
-			}
-
-			v.logger.Warnf("[Validator] block assembly still overloaded after %s; processing kafka tx %s past the advisory gate (hard queue limit still applies)", time.Since(start).Round(time.Millisecond), txID)
-
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(kafkaShedPollInterval):
-		}
-	}
-
-	if prometheusValidatorBackpressureWait != nil {
-		prometheusValidatorBackpressureWait.Observe(time.Since(start).Seconds())
-	}
-
-	return nil
-}
-
 // Start begins the validator server operation and registers handlers for validation requests.
 // This method initiates all background processing, including Kafka consumer setup, HTTP API servers,
 // and synchronization with the blockchain FSM. It waits for the blockchain FSM to transition
@@ -548,18 +474,8 @@ func (v *Server) handleKafkaTxMessage(consumerCtx context.Context, msg *kafka.Ka
 
 	options := kafkaValidationOptions(kafkaMsg.Options)
 
-	// Wait at the advisory gate before UTXO work, then exempt this already-
-	// acknowledged transaction from that gate so a verdict flip cannot shed it.
-	// Keep WaitForBlockAssembly: upstream owns the bounded retry/unwind at the
-	// hard queue limit. Retrying its THRESHOLD_EXCEEDED here would restart that
-	// budget indefinitely and repeat UTXO work after each unwind.
-	if err = v.awaitIngestCapacity(consumerCtx, tx.TxIDChainHash().String(), options, time.Now().Add(kafkaShedMaxWait)); err != nil {
-		return err
-	}
-	options.SkipBackpressure = true
-
-	_, err = v.validator.ValidateWithOptions(consumerCtx, tx, height, options)
-	if err != nil {
+	// should not pass in a height when validating from Kafka, should just be current utxo store height
+	if _, err = v.validator.ValidateWithOptions(consumerCtx, tx, height, options); err != nil {
 		// The tx was accepted, spent and created; only the unlock failed. It is already
 		// logged and counted in the validator, and the lock heals when the tx is mined.
 		if errors.Is(err, errors.ErrTxUnlockFailed) {
