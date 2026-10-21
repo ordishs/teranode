@@ -2139,6 +2139,23 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 		return nil, nil, errors.NewError("best block header is not available")
 	}
 
+	// Block assembly is idle but behind the chain: a failed catch-up or move-forward left it on an
+	// older tip, and nothing is moving it forward (issue 4991). A candidate built on that tip is an
+	// orphan, and its transaction set grows without bound because mined transactions are never
+	// removed. Hand out an empty block on the chain tip instead, as for the in-motion states. If
+	// the chain tip cannot be read, fall through: a transient error must not stop mining.
+	chainTipHeader, chainTipMeta, tipErr := b.blockchainClient.GetBestBlockHeader(ctx)
+	switch {
+	case tipErr != nil:
+		b.logger.Warnf("[GetMiningCandidate] could not read the blockchain tip to check for a stale block assembly tip: %v", tipErr)
+	case !chainTipHeader.Hash().IsEqual(baBestBlockHeader.Hash()):
+		prometheusBlockAssemblyStaleTipCandidates.Inc()
+		b.logger.Warnf("[GetMiningCandidate] block assembly tip %s (height %d) is behind the blockchain tip %s (height %d), returning empty block template on the blockchain tip",
+			baBestBlockHeader.Hash(), baBestBlockHeight, chainTipHeader.Hash(), chainTipMeta.Height)
+
+		return b.generateEmptyBlockCandidate(ctx, chainTipHeader, chainTipMeta.Height)
+	}
+
 	// Get pre-computed data (atomic read, no locks, no channel sync)
 	data := b.subtreeProcessor.GetPrecomputedMiningData()
 

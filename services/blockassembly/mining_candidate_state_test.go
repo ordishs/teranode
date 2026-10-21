@@ -59,3 +59,38 @@ func TestGetMiningCandidate_BlockProcessingStatesBuildOnChainTip(t *testing.T) {
 		})
 	}
 }
+
+// TestGetMiningCandidate_StaleTipWhileRunningBuildsOnChainTip covers issue 4991: block assembly
+// failed to advance (a ProcessConflicting wedge) and sits idle in StateRunning on an old tip.
+// A candidate built on that tip is an orphan, so the candidate must be an empty block on the
+// Blockchain service tip.
+func TestGetMiningCandidate_StaleTipWhileRunningBuildsOnChainTip(t *testing.T) {
+	initPrometheusMetrics()
+
+	testItems := setupBlockAssemblyTest(t)
+	ba := testItems.blockAssembler
+	_, _, genesisBlock := setupBlockchainClient(t, testItems)
+
+	coinbaseTx, err := bt.NewTxFromString("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff03510101ffffffff0100f2052a01000000232103656065e6886ca1e947de3471c9e723673ab6ba34724476417fa9fcef8bafa604ac00000000")
+	require.NoError(t, err)
+
+	require.NoError(t, ba.blockchainClient.AddBlock(t.Context(), &model.Block{
+		Header:           blockHeader1,
+		CoinbaseTx:       coinbaseTx,
+		TransactionCount: 1,
+		Subtrees:         []*chainhash.Hash{},
+	}, ""))
+
+	baTip, _ := ba.CurrentBlock()
+	require.Equal(t, genesisBlock.Header.Hash(), baTip.Hash(), "block assembly must still hold the old tip")
+
+	ba.setCurrentRunningState(StateRunning)
+
+	candidate, subtrees, err := ba.GetMiningCandidate(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, candidate)
+
+	require.Equal(t, blockHeader1.Hash().CloneBytes(), candidate.PreviousHash, "the candidate must build on the Blockchain service tip")
+	require.Equal(t, uint32(2), candidate.Height)
+	require.Empty(t, subtrees)
+}

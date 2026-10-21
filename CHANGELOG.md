@@ -501,6 +501,25 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Not breaking, but worth knowing
 
+- **A failed `ProcessConflicting` rollback no longer wedges block assembly, and its
+  error is capped.** The rollback cleared `Conflicting` on every transaction the
+  cascade visited, including winners that were already flagged. Every retry then
+  failed with `tx is not conflicting`. The rollback now keeps the flag on those
+  winners. A retry also treats a winner as applied when the store records it as
+  the spender of all its inputs. The `MANUAL INTERVENTION REQUIRED` error lists the
+  first 20 rollback failures and a count of the rest, instead of one entry per
+  transaction. Log searches that counted `rollback step 2 (re-spend` entries see
+  at most 20. Nodes already wedged are not repaired by this change. (bitcoin-sv/teranode#4991)
+
+- **Mining candidates no longer build on a stale block assembly tip.** When block
+  assembly is idle but its tip differs from the Blockchain service tip, for example
+  after a failed catch-up, `GetMiningCandidate` now returns an empty candidate on the
+  Blockchain service tip. Before, it returned a full candidate on the old tip, so a
+  miner produced orphan blocks. The new counter
+  `teranode_blockassembly_stale_tip_candidates_total` rises for each such candidate.
+  Alert on any sustained non-zero rate. If the Blockchain service tip cannot be read,
+  the candidate is built as before. (bitcoin-sv/teranode#4991)
+
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
   hold the tip from before the reorg. `GetMiningCandidate` built candidates on that
