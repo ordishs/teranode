@@ -97,6 +97,12 @@ func TestProcessConflicting_TxNotConflictingError(t *testing.T) {
 		Conflicting: false, // Not conflicting
 	}, nil)
 
+	// The parent output is unspent, so the tx was not applied by an earlier run either
+	parentHash := createTestHash("prev-tx")
+	mockStore.On("Get", mock.Anything, &parentHash, mock.Anything).Return(&meta.Data{
+		SpendingDatas: []*spend.SpendingData{nil},
+	}, nil)
+
 	// Execute test
 	result, _, err := ProcessConflicting(ctx, mockStore, 1, chainhash.Hash{}, conflictingTxHashes, map[chainhash.Hash]struct{}{}, NoAncestryGuard)
 
