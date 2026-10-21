@@ -111,7 +111,7 @@ If all pass:
 3. **Write the release checklist.** Copy `docs/releases/checklist-template.md` to `docs/releases/vX.Y.Z-checklist.md` on a branch from `main`, and fill in every item with its evidence (see `docs/howto/releaseProcess.md`):
    - the seven gate answers above, with the beta tag, the nodes and soak durations, and the sync-from-zero and mid-sync-upgrade nodes
    - the `teranode_main_build.yaml` run URL at the beta SHA and the results of its `test_and_lint` jobs (Go test, smoketest, prunertest), from `gh run list --workflow teranode_main_build.yaml --commit <beta-sha>`
-   - the node-validation run against this tag, for a release with consensus-affecting scope, or N/A and the reason
+   - the node-validation run in full mode against the beta SHA (or the immutable image digest built from it), for a release with consensus-affecting scope, or N/A and the reason. The stable tag does not exist yet, so never require a run against `vX.Y.Z`
    - the open bug-labelled issues, from `gh issue list --label bug --state open`
    - every open Critical or High finding, each closed or with a waiver (owner, date, reason, close-by date)
    - the miner feedback register counts and location

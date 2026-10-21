@@ -28,7 +28,7 @@ Copy this file to `docs/releases/vX.Y.Z-checklist.md` and fill in every item wit
 
 | Item | Evidence |
 |---|---|
-| node-validation run against vX.Y.Z in full mode: report, verdict, tool version, mode. Or N/A and the reason. | |
+| node-validation run in full mode against the beta SHA, or the immutable image digest built from it: report, verdict, tool version, mode, SHA or digest. Or N/A and the reason. | |
 
 ## Security
 
