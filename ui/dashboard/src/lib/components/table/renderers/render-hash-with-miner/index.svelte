@@ -14,6 +14,8 @@
     tooltip = '',
     showCopyButton = false,
     copyTooltip = 'Copy hash',
+    badgeColor = '',
+    badgeTooltip = '',
   }: {
     hash?: string
     hashUrl?: string
@@ -23,6 +25,8 @@
     tooltip?: string
     showCopyButton?: boolean
     copyTooltip?: string
+    badgeColor?: string
+    badgeTooltip?: string
   } = $props()
 </script>
 
@@ -45,6 +49,13 @@
         <span class="hash-text">{shortHash || hash}</span>
       {:else}
         <span>-</span>
+      {/if}
+      {#if badgeColor && hash}
+        <span
+          class="hash-badge"
+          style="background-color: {badgeColor}"
+          use:$tippy={{ content: badgeTooltip || badgeColor }}
+        ></span>
       {/if}
       {#if showCopyButton && hash}
         <div class="copy-icon" use:$tippy={{ content: copyTooltip }}>
@@ -109,6 +120,14 @@
     max-width: 100%;
   }
   
+  .hash-badge {
+    display: inline-block;
+    width: 18px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
   .copy-icon {
     cursor: pointer;
     flex-shrink: 0;
