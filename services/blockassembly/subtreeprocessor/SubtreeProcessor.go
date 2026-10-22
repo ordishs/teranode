@@ -1859,7 +1859,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 					// is dropped by that drain regardless of cascade discovery, so
 					// the per-block transient set is not needed here.
 					losingTxHashesMap, _, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion())
+						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain)))
 					if err != nil {
 						return errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions in Reset()", block.String(), err)
 					}
@@ -4501,7 +4501,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 				reverseInputs = append(reverseInputs, h)
 			}
 
-			cascadedConflicting, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), reverseInputs)
+			cascadedConflicting, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), reverseInputs, utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain))
 			if reverseErr != nil {
 				return errors.NewProcessingError("[reorgBlocks][%s] error reversing conflict resolution from moved-back block", block.String(), reverseErr)
 			}
@@ -5591,7 +5591,7 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 
 		var allMarkedConflicting []chainhash.Hash
 		if losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion()); err != nil {
+			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain))); err != nil {
 			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing conflicting transactions", block.String(), err)
 		}
 

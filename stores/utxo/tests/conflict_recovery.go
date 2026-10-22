@@ -278,3 +278,51 @@ func ConflictRecoveryRelatedWinners(t *testing.T, db utxo.Store) {
 	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
 	require.Equal(t, child.TxIDChainHash(), crashSpender(t, ctx, db, winner))
 }
+
+// A WAL remains historical evidence even after its winner is mined again.
+// Recovery must consult all mined block IDs, not just the triggering block.
+func ConflictRecoveryConfirmedWinner(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xe3)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: []chainhash.Hash{*winner.TxIDChainHash()}}
+	_, _, err = utxo.ProcessConflicting(ctx, db, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	for _, id := range []uint32{154, 155} {
+		_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{winner.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: id, BlockHeight: id})
+		require.NoError(t, err)
+	}
+	for _, lookupFails := range []bool{false, true} {
+		guard := utxo.NewCurrentChainGuard(func(_ context.Context, ids []uint32) (bool, error) {
+			require.Contains(t, ids, uint32(155), "must check the later confirmation")
+			if lookupFails {
+				return false, errors.NewStorageError("injected chain lookup failure")
+			}
+			return true, nil
+		})
+		require.Error(t, utxo.RollbackConflictIntent(ctx, db, intent, guard))
+		_, _, err = utxo.ReverseProcessConflicting(ctx, db, intent.BlockHeight, intent.BlockHash, intent.TxHashes, guard)
+		require.Error(t, err)
+		require.False(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+		require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+		require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()))
+		r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+		require.NoError(t, err)
+		require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+	}
+	// If neither mined block remains on the current chain, undo is permitted.
+	orphaned := utxo.NewCurrentChainGuard(func(context.Context, []uint32) (bool, error) { return false, nil })
+	require.NoError(t, utxo.RollbackConflictIntent(ctx, db, intent, orphaned))
+	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+	intent.Kind = utxo.ConflictIntentReverse
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}

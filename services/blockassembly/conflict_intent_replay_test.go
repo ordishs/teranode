@@ -109,6 +109,11 @@ func TestReplayPendingConflictIntents_PendingGaugeReflectsPostReplay(t *testing.
 	}
 
 	mockStore := &utxo.MockUtxostore{}
+	mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		for _, item := range args.Get(1).([]*utxo.UnresolvedMetaData) {
+			item.Data = &meta.Data{}
+		}
+	}).Return(nil).Maybe()
 	// Demoted tx resolves with a nil body → ReverseProcessConflicting is a no-op
 	// success → intent completed.
 	mockStore.On("Get", mock.Anything, &demoted, mock.Anything).Return(&meta.Data{}, nil)
@@ -157,6 +162,11 @@ func TestReplayPendingConflictIntents_ReverseReplayCompletes(t *testing.T) {
 	}
 
 	mockStore := &utxo.MockUtxostore{}
+	mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		for _, item := range args.Get(1).([]*utxo.UnresolvedMetaData) {
+			item.Data = &meta.Data{}
+		}
+	}).Return(nil).Maybe()
 	// Demoted tx resolves with a nil body → ReverseProcessConflicting skips it
 	// (nothing to restore) and returns success.
 	mockStore.On("Get", mock.Anything, &demoted, mock.Anything).
@@ -371,4 +381,90 @@ func TestReplayConflictIntent_UnknownKind(t *testing.T) {
 	})
 
 	require.Error(t, err)
+}
+
+// The stale block and the current chain both contain the same transaction.
+// An old intent must not authorize undo of its currently confirmed spend.
+func TestStaleConflictRecoveryPreservesReminedWinner(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	parent := bt.NewTx()
+	parentIn := &bt.Input{PreviousTxOutIndex: 0, PreviousTxSatoshis: 200000, SequenceNumber: 0xFFFFFFFF, UnlockingScript: bscript.NewFromBytes([]byte{})}
+	_ = parentIn.PreviousTxIDAdd(&chainhash.Hash{7, 7, 7})
+	parent.Inputs = []*bt.Input{parentIn}
+	parent.Outputs = []*bt.Output{{Satoshis: 100000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	parentHash := parent.TxIDChainHash()
+	require.NoError(t, store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*parentHash}, true))
+
+	// L: the counter, already the canonical (non-conflicting) spender of parent[0].
+	txL := bt.NewTx()
+	require.NoError(t, txL.From(parentHash.String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	txL.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+	txL.Outputs = []*bt.Output{{Satoshis: 90000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err = store.SpendAndCreate(ctx, txL, 10, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	_, _, err = store.SpendAndCreate(ctx, txL, store.GetBlockHeight()+1, utxo.WithSpendOnly())
+	require.NoError(t, err)
+
+	// W: the would-be forward winner, left Conflicting=true.
+	txW := bt.NewTx()
+	require.NoError(t, txW.From(parentHash.String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	txW.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+	txW.Outputs = []*bt.Output{{Satoshis: 80000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err = store.SpendAndCreate(ctx, txW, 10, utxo.WithConflicting(true), utxo.WithCreateOnly())
+	require.NoError(t, err)
+	txWHash := txW.TxIDChainHash()
+
+	blockHash := chainhash.HashH([]byte("stale-side-block"))
+	winners := []chainhash.Hash{*txWHash}
+	_, _, err = utxo.ProcessConflicting(ctx, store, 10, blockHash, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	addBlockWithMinedSet(ctx, t, items, blockHeader1)
+	side := *blockHeader1
+	side.Nonce++
+	addBlockWithMinedSet(ctx, t, items, &side)
+	addBlockWithMinedSet(ctx, t, items, blockHeader2)
+	_, sideMeta, err := items.blockchainClient.GetBlockHeader(ctx, side.Hash())
+	require.NoError(t, err)
+	_, mainMeta, err := items.blockchainClient.GetBlockHeader(ctx, blockHeader2.Hash())
+	require.NoError(t, err)
+	onChain, err := items.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{sideMeta.ID})
+	require.NoError(t, err)
+	require.False(t, onChain)
+	onChain, err = items.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{mainMeta.ID})
+	require.NoError(t, err)
+	require.True(t, onChain)
+	for _, id := range []uint32{sideMeta.ID, mainMeta.ID} {
+		_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txWHash}, utxo.MinedBlockInfo{BlockID: id, BlockHeight: 2})
+		require.NoError(t, err)
+	}
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 10, BlockHash: blockHash, TxHashes: winners}
+	err = items.blockAssembler.healStaleConflictIntent(ctx, intent)
+	require.ErrorContains(t, err, "confirmed on the current chain")
+	m, err := store.Get(ctx, txWHash, utxofields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, m.Conflicting)
+	inputs, err := utxo.GetSpends(txW)
+	require.NoError(t, err)
+	actual, err := store.GetSpend(ctx, inputs[0])
+	require.NoError(t, err)
+	require.Equal(t, txWHash, actual.SpendingData.TxID)
+	r, err := store.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+	// The reverse path must enforce the same rule, including restart replay.
+	reverse := intent
+	reverse.Kind = utxo.ConflictIntentReverse
+	require.ErrorContains(t, items.blockAssembler.replayConflictIntent(ctx, reverse), "confirmed on the current chain")
+	m, err = store.Get(ctx, txWHash, utxofields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, m.Conflicting)
+	actual, err = store.GetSpend(ctx, inputs[0])
+	require.NoError(t, err)
+	require.Equal(t, txWHash, actual.SpendingData.TxID)
 }

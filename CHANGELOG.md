@@ -18,6 +18,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — action required before upgrading
 
+- **Conflict undo now checks current-chain confirmation.** BlockAssembly stops
+  recovery if a transaction affected by rollback or reverse processing is still
+  confirmed in any current-chain block, or if that check fails. The WAL remains
+  available for diagnosis. Failed WAL cleanup is now returned and counted in
+  `teranode_utxo_conflict_wal_completion_failures_total`. Affected operators must
+  resolve the pending recovery instead of clearing the WAL or restarting an old
+  build. This does not repair previously corrupted UTXO state. (#2023)
+
 - **Conflict recovery extends the UTXO WAL format and store interface.** SQL stores
   add recovery and lock-owner columns; Aerospike stores add durable checklist
   records. External `utxo.Store` implementations must implement

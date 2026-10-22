@@ -83,3 +83,8 @@ func TestConflictRecoveryRelatedWinners(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryRelatedWinners(t, store)
 }
+
+func TestConflictRecoveryConfirmedWinner(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryConfirmedWinner(t, store)
+}

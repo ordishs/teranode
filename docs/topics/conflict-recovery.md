@@ -77,3 +77,20 @@ If recovery fails:
    command.
 
 See PR 2023 for the implementation and regression tests.
+
+## Current-chain protection
+
+A transaction can be in both an orphaned block and a later main-chain block.
+Before rollback or reverse processing marks a transaction conflicting or removes
+its spend, BlockAssembly checks all of its mined block IDs against the current
+chain. The same check protects descendants reached during reverse processing.
+If a transaction is confirmed, or the chain lookup fails, recovery stops and
+retains the WAL. The saved before-image does not override current confirmation.
+
+Failed WAL completion writes return an error and increment
+`teranode_utxo_conflict_wal_completion_failures_total`. BlockAssembly logs replay
+cleanup failures. These failures must not be treated as successful recovery.
+
+These checks prevent further damage. They do not repair a store corrupted by an
+older build. Invalidating a block alone does not establish that its node's UTXO
+state matches the other nodes.

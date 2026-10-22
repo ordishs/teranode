@@ -549,6 +549,7 @@ func crashSpender(t *testing.T, ctx context.Context, db utxostore.Store, parent 
 // Runs against a bare store (no BlockAssembler), so it covers SQLite, Postgres
 // and Aerospike via the shared backend test suites.
 func ConflictWALCrashRecovery(t *testing.T, db utxostore.Store) {
+	t.Run("journal_confirmed_winner", func(t *testing.T) { ConflictRecoveryConfirmedWinner(t, db) })
 	t.Run("journal_related_winners", func(t *testing.T) { ConflictRecoveryRelatedWinners(t, db) })
 	t.Run("journal_unexpected_owner", func(t *testing.T) { ConflictRecoveryUnexpectedOwner(t, db) })
 	t.Run("journal_persistence", func(t *testing.T) { ConflictRecoveryPersistence(t, db) })
