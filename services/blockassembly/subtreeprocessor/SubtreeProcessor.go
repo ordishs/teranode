@@ -1910,7 +1910,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 					// is dropped by that drain regardless of cascade discovery, so
 					// the per-block transient set is not needed here.
 					losingTxHashesMap, allMarkedConflicting, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block))
+						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion())
 
 					// the store now says these are conflicting; subtree validation's txmeta cache must
 					// forget them. On error this is what the failed run may have flipped.
@@ -1988,6 +1988,12 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	for {
 		if _, found := stp.queue.dequeueBatchUntil(validUntilMillis); !found {
 			break
+		}
+	}
+
+	for _, block := range moveForwardBlocks {
+		if err := utxostore.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, *block.Hash()); err != nil {
+			return err
 		}
 	}
 
@@ -5991,7 +5997,7 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 
 		var allMarkedConflicting []chainhash.Hash
 		losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block))
+			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion())
 
 		// the store now says these are conflicting; subtree validation's txmeta cache must
 		// forget them. On error this is what the failed run may have flipped.
@@ -6597,6 +6603,12 @@ func (stp *SubtreeProcessor) moveForwardBlockDeferringDrain(ctx context.Context,
 		}
 	} else {
 		stp.clearCurrentTxMapShadow()
+	}
+
+	if !deferDrain && len(conflictingNodes) > 0 {
+		if err = utxostore.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, *block.Hash()); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 
 	// Log memory stats after block processing if debug logging is enabled
@@ -8460,4 +8472,14 @@ func (stp *SubtreeProcessor) closeChainedSubtrees() {
 	for _, st := range toClose {
 		st.Close()
 	}
+}
+
+// MarkRecoveredConflicts finishes durable subtree updates during startup,
+// before the caller drains its input queue and acknowledges WAL completion.
+func (stp *SubtreeProcessor) MarkRecoveredConflicts(ctx context.Context, hashes []chainhash.Hash) error {
+	losers := txmap.NewSplitSwissMap(len(hashes))
+	for _, h := range hashes {
+		_ = losers.Put(h, 1)
+	}
+	return stp.markConflictingTxsInSubtrees(ctx, losers)
 }

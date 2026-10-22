@@ -61,7 +61,8 @@ func (g AncestryGuard) enabled() bool { return g.check != nil }
 type ProcessConflictingOption func(*processConflictingOptions)
 
 type processConflictingOptions struct {
-	onRefused func(loser chainhash.Hash)
+	deferCompletion bool
+	onRefused       func(loser chainhash.Hash)
 }
 
 // WithRefusalHandler registers a callback invoked once per losing transaction
@@ -223,4 +224,10 @@ func filterAncestryConfirmedLosers(ctx context.Context, s Store, losers []chainh
 	}
 
 	return kept, refused, nil
+}
+
+// WithDeferredConflictCompletion keeps the checklist until the caller has
+// applied the returned demoted set to subtrees and its transaction queue.
+func WithDeferredConflictCompletion() ProcessConflictingOption {
+	return func(o *processConflictingOptions) { o.deferCompletion = true }
 }

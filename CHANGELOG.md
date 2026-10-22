@@ -18,6 +18,17 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — action required before upgrading
 
+- **Conflict recovery extends the UTXO WAL format and store interface.** SQL stores
+  add recovery and lock-owner columns; Aerospike stores add durable checklist
+  records. External `utxo.Store` implementations must implement
+  `SaveConflictRecovery`, `LoadConflictRecovery`, `RestoreConflictSpends`, and
+  `SetConflictLocks`. Upgrade BlockAssembly with its store implementation. Do not
+  downgrade while new conflict intents are pending. Legacy forward intents have
+  no before-image and require operator repair; unresolved intents now prevent
+  BlockAssembly startup. Preserve the WAL and store backup for diagnosis instead
+  of deleting the pending record. See [recovery guidance](docs/topics/conflict-recovery.md).
+  (#2023)
+
 - **`CheckBlockSubtrees` gRPC errors keep Teranode error codes.** Storage and
   consensus errors include gRPC status metadata. Invalid URLs give `InvalidArgument`
   status. External clients must use `errors.UnwrapGRPC` to read the error chain

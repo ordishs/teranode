@@ -171,20 +171,10 @@ func TestReplayPendingConflictIntents_ReverseReplayCompletes(t *testing.T) {
 	require.Contains(t, spy.completed, intent.IntentID(), "successful replay must clear the intent from the WAL")
 }
 
-// TestReplayPendingConflictIntents_StaleForwardHealed covers the exact gap the
-// reviewer flagged: a forward intent whose block has reorged OFF the longest
-// chain must not be re-applied (that would undo the valid reorg) — but a bare
-// discard would leave a partially-applied forward torn, in particular with the
-// double-spend parents stuck Locked because step 5's unlock never ran on the
-// crash. The fix heals by undoing the forward AND unlocking those parents.
-//
-// This drives a real sqlitememory store through the BlockAssembler gate. The
-// pre-state is the residue of such a crash: the counter L is already the spender
-// (so the inverse Reverse short-circuits — no full execution, no sqlitememory
-// connection deadlock) while the parent is still wrongly Locked.
-func TestReplayPendingConflictIntents_StaleForwardHealed(t *testing.T) {
+// Legacy WALs do not identify lock owners. Recovery must preserve the lock
+// and the WAL so an operator can inspect the original state.
+func TestReplayPendingConflictIntents_StaleLegacyForwardRequiresRepair(t *testing.T) {
 	initPrometheusMetrics()
-
 	ctx := t.Context()
 	items := setupBlockAssemblyTest(t)
 	store := items.utxoStore
@@ -219,73 +209,73 @@ func TestReplayPendingConflictIntents_StaleForwardHealed(t *testing.T) {
 	require.NoError(t, err)
 	txWHash := txW.TxIDChainHash()
 
-	// The crash residue: the forward locked parent at step 2 and never unlocked it.
 	require.NoError(t, store.SetLocked(ctx, []chainhash.Hash{*parentHash}, true))
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 10, BlockHash: chainhash.HashH([]byte("reorged-out-block")), TxHashes: []chainhash.Hash{*txWHash}, StartedAt: 1}
+	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+	// The real blockchain store has no such block, so the forward is stale.
+	items.blockAssembler.replayPendingConflictIntents(ctx)
 	m, err := store.Get(ctx, parentHash, utxofields.Locked)
 	require.NoError(t, err)
-	require.True(t, m.Locked, "precondition: parent is locked")
-
-	intent := utxo.ConflictIntent{
-		Kind:        utxo.ConflictIntentForward,
-		BlockHeight: 10,
-		BlockHash:   chainhash.HashH([]byte("reorged-out-block")),
-		TxHashes:    []chainhash.Hash{*txWHash},
-		StartedAt:   1,
-	}
-	require.NoError(t, store.BeginConflictIntent(ctx, intent))
-
-	// Block is off the longest chain → forward intent is stale → heal.
-	items.blockAssembler.blockchainClient = blockchainMembershipMock(false, false)
-
-	items.blockAssembler.replayPendingConflictIntents(ctx)
-
-	// Healed: the parent the forward locked is unlocked again, and the WAL is clear.
-	m, err = store.Get(ctx, parentHash, utxofields.Locked)
-	require.NoError(t, err)
-	require.False(t, m.Locked, "stale forward heal must unlock the parent the forward left locked")
-
+	require.True(t, m.Locked)
 	pending, err := store.PendingConflictIntents(ctx)
 	require.NoError(t, err)
-	require.Empty(t, pending, "healed stale intent must be cleared from the WAL")
+	require.Len(t, pending, 1)
+	require.Equal(t, intent.IntentID(), pending[0].IntentID())
+	require.ErrorContains(t, items.blockAssembler.checkConflictRecoveryReady(ctx), "unresolved")
 }
 
-// TestReplayPendingConflictIntents_StaleReverseHealed is the mirror: a reverse
-// intent whose block is back ON the longest chain must be healed by RE-APPLYING
-// the forward (ProcessConflicting), not discarded. Uses a mock store to assert
-// the gate routes a stale reverse into ProcessConflicting (which records its own
-// store calls) and completes the intent — convergence of the op itself is
-// covered by the real-backend crash harness.
-func TestReplayPendingConflictIntents_StaleReverseHealed(t *testing.T) {
-	demoted := chainhash.HashH([]byte("stale-demoted"))
+// A stale reverse uses the real forward write path. Its new forward WAL must
+// remain until BlockAssembly acknowledges the subtree and queue updates.
+func TestHealStaleConflictIntent_ReverseRealStore(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
 
-	demotedTx := bt.NewTx()
-	require.NoError(t, demotedTx.From(chainhash.HashH([]byte("p")).String(), 0, "76a914000000000000000000000000000000000000000088ac", 1000))
+	parent := bt.NewTx()
+	parentIn := &bt.Input{PreviousTxOutIndex: 0, PreviousTxSatoshis: 200000, SequenceNumber: 0xFFFFFFFF, UnlockingScript: bscript.NewFromBytes([]byte{})}
+	_ = parentIn.PreviousTxIDAdd(&chainhash.Hash{7, 7, 7})
+	parent.Inputs = []*bt.Input{parentIn}
+	parent.Outputs = []*bt.Output{{Satoshis: 100000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	parentHash := parent.TxIDChainHash()
+	require.NoError(t, store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*parentHash}, true))
 
-	intent := utxo.ConflictIntent{
-		Kind:        utxo.ConflictIntentReverse,
-		BlockHeight: 300,
-		BlockHash:   chainhash.HashH([]byte("re-applied-block")),
-		TxHashes:    []chainhash.Hash{demoted},
-		StartedAt:   1,
-	}
+	// L: the counter, already the canonical (non-conflicting) spender of parent[0].
+	txL := bt.NewTx()
+	require.NoError(t, txL.From(parentHash.String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	txL.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+	txL.Outputs = []*bt.Output{{Satoshis: 90000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err = store.SpendAndCreate(ctx, txL, 10, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	_, _, err = store.SpendAndCreate(ctx, txL, store.GetBlockHeight()+1, utxo.WithSpendOnly())
+	require.NoError(t, err)
 
-	mockStore := &utxo.MockUtxostore{}
-	// Minimal ProcessConflicting flow with no losers (GetCounterConflicting → []).
-	mockStore.On("Get", mock.Anything, &demoted, mock.Anything).Return(&meta.Data{Tx: demotedTx, Conflicting: true}, nil)
-	mockStore.On("GetCounterConflicting", mock.Anything, demoted).Return([]chainhash.Hash{}, nil)
-	mockStore.On("Unspend", mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	mockStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, []*utxo.Spend{}, nil)
-	mockStore.On("SetConflicting", mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, []chainhash.Hash{}, nil)
-	mockStore.On("SetLocked", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	// W: the would-be forward winner, left Conflicting=true.
+	txW := bt.NewTx()
+	require.NoError(t, txW.From(parentHash.String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+	txW.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+	txW.Outputs = []*bt.Output{{Satoshis: 80000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+	_, _, err = store.SpendAndCreate(ctx, txW, 10, utxo.WithConflicting(true), utxo.WithCreateOnly())
+	require.NoError(t, err)
+	txWHash := txW.TxIDChainHash()
 
-	spy := &replaySpyStore{MockUtxostore: mockStore, pending: []utxo.ConflictIntent{intent}}
-	// Block IS on the longest chain → reverse intent is stale → heal via forward.
-	b := newReplayTestAssembler(spy, blockchainMembershipMock(true, false))
-
-	b.replayPendingConflictIntents(context.Background())
-
-	require.Contains(t, spy.completed, intent.IntentID(), "a stale reverse intent must be healed (forward re-applied) and cleared from the WAL")
-	mockStore.AssertCalled(t, "SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 10, BlockHash: chainhash.HashH([]byte("re-applied-block")), TxHashes: []chainhash.Hash{*txWHash}, StartedAt: 1}
+	require.NoError(t, items.blockAssembler.healStaleConflictIntent(ctx, intent))
+	m, err := store.Get(ctx, txWHash, utxofields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, m.Conflicting)
+	spends, err := utxo.GetSpends(txW)
+	require.NoError(t, err)
+	actual, err := store.GetSpend(ctx, spends[0])
+	require.NoError(t, err)
+	require.Equal(t, txWHash, actual.SpendingData.TxID)
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	require.Equal(t, utxo.ConflictIntentForward, pending[0].Kind)
+	require.Equal(t, utxo.ConflictRecoveryFinished, pending[0].Recovery.Phase)
 }
 
 // TestReplayPendingConflictIntents_RealStoreReverseConverges is the crash-
