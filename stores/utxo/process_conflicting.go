@@ -98,52 +98,41 @@ const conflictingWalkFanOut = 128
 // Declared as a package-level var so tests can shrink the delays.
 var step5RetryDelays = []time.Duration{0, 50 * time.Millisecond, 200 * time.Millisecond}
 
-// ProcessConflicting is a method to process conflicting transactions
-// We got a txp (parent), txa and txb. txa and txb are both spending txp[5].
-//
-// tx_original is in block 102a
-// - tx_original.input[0] = tx_parent1[5]
-// - tx_original.input[1] = tx_parent2[6]
-//
-// tx_original_child1 is in block 102a
-// - tx_original_child1.input[0] = tx_parent4[0]
-//
-// tx_double_spend is in block 102b --> block 103b --> block 104b
-// - tx_double_spend.input[0] = tx_parent1[5] - spent by tx_original
-// - tx_double_spend.input[1] = tx_parent3[1] - unspent
-//
-// ReplaceSpend(txb, []chainhash.Hash{txa})
-//
-// What happens with tx_parent2[6]?
-//
-/*
-5 phase commit
- - 1: mark tx_original and all it's children as conflicting
- - 2: un-spend tx_original (update tx_parent1 & tx_parent2 utxos) and all it's children (tx_parent4 from tx_original_child1),
-      marking all unspent txs as not spendable (tx_parent1 & tx_parent2 & tx_parent4)
- - 3: spend tx_double_spend as normal (ignoring the not spendable flag)
- - 4: mark tx_double_spend as not conflicting
- - 5: mark tx_parent1 & tx_parent2 & tx_parent4 as spendable again
-*/
-// ProcessConflicting returns:
-//   - losingTxHashesMap: hashes of txs displaced by the winners (the immediate
-//     counter-conflicting set from GetCounterConflicting). Used by callers to
-//     mark losers in subtrees / drop them from upstream paths.
-//   - allMarkedConflicting: every hash marked Conflicting=true during this run,
-//     in BFS order — losers + every descendant the cascade reached. Callers
-//     (notably block assembly) need this superset to populate a conflictingMap
-//     so the queue→subtree dequeue path can reject children of conflicting
-//     parents that arrive after the cascade has run. On error it lists every
-//     hash step 1 may have flipped, rolled back or not, for txmeta cache
-//     eviction only.
 // compensationTimeout bounds the deferred unwind of a failed ProcessConflicting.
 // It runs on its own context rather than the caller's (see the rollback call site),
-// so it needs a budget of its own: long enough to re-spend and unflag a whole
-// cascade, short enough not to pin a goroutine on a wedged store.
+// so it needs a budget of its own: long enough to restore the recorded spends of a
+// whole cascade, short enough not to pin a goroutine on a wedged store.
 const compensationTimeout = 2 * time.Minute
 
+// ProcessConflicting makes the winning transactions the spenders of their inputs, and demotes the
+// transactions that conflict with them.
+//
+// Take txa and txb, which both spend txp[5]. If txb wins, txa and every transaction that spends
+// the outputs of txa (its descendants) lose.
+//
+// The operation is driven by a durable recovery checklist (ConflictRecovery), saved before any
+// state changes:
+//
+//  1. Collect the winners, the counter-conflicting transactions and their descendants. Record the
+//     owner of every input spend, the parents, and each transaction's Conflicting flag.
+//  2. Lock the parents that no one else has locked, and check that no spend changed since step 1.
+//  3. Mark the whole set Conflicting. A descendant that appears after step 1 aborts the run.
+//  4. Unspend the original spends, then write the winning spends.
+//  5. Mark the winners not Conflicting, save phase applied, unlock the parents, save phase finished.
+//
+// A failure after step 2 restores the recorded owners and flags (RollbackConflictIntent). A retry
+// of a run that reached applied or finished skips the mutation and returns the saved result.
+//
+// ProcessConflicting returns:
+//   - losers: the transactions displaced by the winners, with their descendants. It never contains
+//     a winner. Callers mark these in the subtrees.
+//   - marked: the same set as a list, in discovery order. Block assembly uses it to reject children
+//     of conflicting parents that arrive after the operation.
+//
+// The third parameter is unused. A process-local map cannot prove what an earlier run did, so only
+// the durable checklist authorises a retry. The parameter stays so callers need no change.
 func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, conflictingTxHashes []chainhash.Hash,
-	processedConflictingHashesMap map[chainhash.Hash]struct{}, guard AncestryGuard, opts ...ProcessConflictingOption) (losers txmap.TxMap, marked []chainhash.Hash, err error) {
+	_ map[chainhash.Hash]struct{}, guard AncestryGuard, opts ...ProcessConflictingOption) (losers txmap.TxMap, marked []chainhash.Hash, err error) {
 	ctx, _, done := tracing.Tracer("utxo").Start(ctx, "ProcessConflicting")
 	defer done()
 	var options processConflictingOptions
@@ -257,6 +246,12 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	recovery, err = prepareConflictRecovery(ctx, s, affected.order, winningSpends)
 	if err != nil {
 		return nil, nil, err
+	}
+	recovery.Winners = append([]chainhash.Hash(nil), conflictingTxHashes...)
+	for _, h := range affected.order {
+		if _, isWinner := winnerSet[h]; !isWinner {
+			recovery.Losers = append(recovery.Losers, h)
+		}
 	}
 	if err = s.SaveConflictRecovery(ctx, intent.IntentID(), recovery); err != nil {
 		return nil, nil, err

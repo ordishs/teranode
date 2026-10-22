@@ -910,24 +910,30 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   evicted, expired, requeued, dropped, replayed, replay_failed). Set the key to `0` for the previous
   behaviour. (#2055)
 
-- **A failed `ProcessConflicting` rollback no longer wedges block assembly, and its
-  error is capped.** The rollback cleared `Conflicting` on every transaction the
-  cascade visited, including winners that were already flagged. Every retry then
-  failed with `tx is not conflicting`. The rollback now keeps the flag on those
-  winners. A retry also treats a winner as applied when the store records it as
-  the spender of all its inputs. The `MANUAL INTERVENTION REQUIRED` error lists the
-  first 20 rollback failures and a count of the rest, instead of one entry per
-  transaction. Log searches that counted `rollback step 2 (re-spend` entries see
-  at most 20. Nodes already wedged are not repaired by this change. (bitcoin-sv/teranode#4991)
+- **A failed `ProcessConflicting` no longer wedges block assembly, and its error is
+  capped.** The old rollback cleared `Conflicting` on every transaction the cascade
+  visited, including winners that were already flagged. Every retry then failed with
+  `tx is not conflicting`. The operation now saves a recovery checklist before it
+  changes any state. Rollback restores the recorded spend owners and flags. A retry
+  of a run that already applied returns the saved result. The returned loser set
+  never contains a winner. The forward rollback accepts the winners' own block as
+  confirmation, and still refuses a winner that is confirmed in any other
+  current-chain block. A parent locked by another holder is no longer a reason to
+  fail the operation: the operation neither takes nor releases that lock. The
+  `MANUAL INTERVENTION REQUIRED` error lists the first 20 rollback failures and a
+  count of the rest, instead of one entry per transaction. Log searches that counted
+  `rollback step 2 (re-spend` entries find no such entry now. Nodes that are already
+  wedged are not repaired by this change. (#2023, bitcoin-sv/teranode#4991)
 
 - **Mining candidates no longer build on a stale block assembly tip.** When block
-  assembly is idle but its tip differs from the Blockchain service tip, for example
-  after a failed catch-up, `GetMiningCandidate` now returns an empty candidate on the
-  Blockchain service tip. Before, it returned a full candidate on the old tip, so a
-  miner produced orphan blocks. The new counter
-  `teranode_blockassembly_stale_tip_candidates_total` rises for each such candidate.
-  Alert on any sustained non-zero rate. If the Blockchain service tip cannot be read,
-  the candidate is built as before. (bitcoin-sv/teranode#4991)
+  assembly is idle but its tip differs from the Blockchain service tip,
+  `GetMiningCandidate` now returns an empty candidate on the Blockchain service tip.
+  Before, it returned a full candidate on the old tip, so a miner produced orphan
+  blocks. The new counter `teranode_blockassembly_stale_tip_candidates_total` and
+  the Warn log fire only when the gap lasts more than 10 seconds for the same
+  Blockchain service tip. A shorter gap is the normal delay before block assembly
+  hears of a new block. Alert on a sustained non-zero rate. If the Blockchain service
+  tip cannot be read, the candidate is built as before. (#2023, bitcoin-sv/teranode#4991)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still

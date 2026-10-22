@@ -44,7 +44,9 @@ after the startup subtree updates and queue drain succeed.
 SQL stores add nullable `recovery` and `conflict_owner` columns. The existing
 conditional spend writer performs each recovery write synchronously. Parent locks
 carry the operation ID. Ordinary lock writes clear that ID, so recovery cannot
-release a lock that another operation has acquired.
+release a lock that another operation has acquired. A parent that another holder
+already locked is left out of the operation's lock set. The operation neither takes
+nor releases that lock.
 
 Aerospike stores save the checklist in 64 KiB chunks in the WAL data set. A checksum
 identifies the complete checklist. The root record publishes its phase and chunk
@@ -86,6 +88,14 @@ its spend, BlockAssembly checks all of its mined block IDs against the current
 chain. The same check protects descendants reached during reverse processing.
 If a transaction is confirmed, or the chain lookup fails, recovery stops and
 retains the WAL. The saved before-image does not override current confirmation.
+
+The winners of a forward operation are mined in the block being added. That block is
+already on the current chain. The forward rollback therefore ignores that one block
+ID for the winners. It still refuses a winner that is confirmed in any other
+current-chain block, and it still refuses every other transaction.
+
+The loser set that a forward operation returns, and the list of marked transactions,
+never contain a winner.
 
 Failed WAL completion writes return an error and increment
 `teranode_utxo_conflict_wal_completion_failures_total`. BlockAssembly logs replay

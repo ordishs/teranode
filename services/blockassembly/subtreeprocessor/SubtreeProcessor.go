@@ -1910,7 +1910,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 					// is dropped by that drain regardless of cascade discovery, so
 					// the per-block transient set is not needed here.
 					losingTxHashesMap, allMarkedConflicting, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain)))
+						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(stp.currentChainGuard()))
 
 					// the store now says these are conflicting; subtree validation's txmeta cache must
 					// forget them. On error this is what the failed run may have flipped.
@@ -4930,7 +4930,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 				reverseInputs = append(reverseInputs, h)
 			}
 
-			cascadedConflicting, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), reverseInputs, utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain))
+			cascadedConflicting, touched, reverseErr := utxostore.ReverseProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), reverseInputs, stp.currentChainGuard())
 			if reverseErr != nil {
 				// what the failed reverse may have flipped to conflicting
 				stp.txMetaEvictor.Evict(cascadedConflicting)
@@ -5997,7 +5997,7 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 
 		var allMarkedConflicting []chainhash.Hash
 		losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain)))
+			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(stp.currentChainGuard()))
 
 		// the store now says these are conflicting; subtree validation's txmeta cache must
 		// forget them. On error this is what the failed run may have flipped.
@@ -8482,4 +8482,17 @@ func (stp *SubtreeProcessor) MarkRecoveredConflicts(ctx context.Context, hashes 
 		_ = losers.Put(h, 1)
 	}
 	return stp.markConflictingTxsInSubtrees(ctx, losers)
+}
+
+// currentChainGuard protects transactions confirmed on the current chain during conflict recovery.
+// It resolves block IDs so a forward rollback accepts the winners' own block.
+func (stp *SubtreeProcessor) currentChainGuard() utxostore.CurrentChainGuard {
+	return utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain).WithBlockID(func(ctx context.Context, hash chainhash.Hash) (uint32, error) {
+		_, meta, err := stp.blockchainClient.GetBlockHeader(ctx, &hash)
+		if err != nil {
+			return 0, err
+		}
+
+		return meta.ID, nil
+	})
 }

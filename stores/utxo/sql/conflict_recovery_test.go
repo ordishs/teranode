@@ -20,6 +20,16 @@ func TestConflictRecoveryDescendants(t *testing.T) {
 	tests.ConflictRecoveryDescendants(t, store)
 }
 
+func TestConflictRecoveryForwardOwnBlock(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryForwardOwnBlock(t, store)
+}
+
+func TestConflictRecoveryForeignLock(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryForeignLock(t, store)
+}
+
 func TestConflictRecoveryFailures(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryFailures(t, store)

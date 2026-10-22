@@ -21,7 +21,9 @@ type ConflictRecovery struct {
 	OriginalSpends []*Spend
 	WinningSpends  []*Spend
 	Parents        []chainhash.Hash
-	Losers         []chainhash.Hash
+	// Winners are the transactions the operation promotes. They are never part of Losers.
+	Winners []chainhash.Hash
+	Losers  []chainhash.Hash
 }
 
 type ConflictTransaction struct {
@@ -80,10 +82,10 @@ func (r *ConflictRecovery) Validate() error {
 }
 
 // prepareConflictRecovery snapshots the whole cascade before SetConflicting or
-// Unspend can erase any edge. Parents already locked by another operation cause
-// a retry; they must never be added to this operation's unlock list.
+// Unspend can erase any edge. Parents already locked by another holder stay out of
+// this operation's lock and unlock list.
 func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Hash, winningSpends []*Spend) (*ConflictRecovery, error) {
-	r := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryPrepared, Losers: hashes, WinningSpends: winningSpends}
+	r := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryPrepared, WinningSpends: winningSpends}
 	type outpoint struct {
 		hash  chainhash.Hash
 		index uint32
@@ -146,11 +148,15 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 		if err != nil {
 			return nil, err
 		}
-		if m == nil || m.Locked {
-			return nil, errors.NewProcessingError("conflict parent %s is missing or already locked", h.String())
+		if m == nil {
+			return nil, errors.NewProcessingError("conflict parent %s is missing", h.String())
+		}
+		// A lock held by someone else (a validator, or a lock an older build leaked) is not this
+		// operation's to take or release. Leave it out of the lock set instead of failing every attempt.
+		if !m.Locked {
+			r.Parents = append(r.Parents, h)
 		}
 	}
-	r.Parents = parents.order
 	return r, nil
 }
 
@@ -246,15 +252,19 @@ func verifyConflictSpends(ctx context.Context, s Store, spends []*Spend) error {
 // RollbackConflictIntent also handles stale forward intents after a reorg.
 // Legacy records cannot establish the prior state and remain pending for repair.
 func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent, guards ...CurrentChainGuard) error {
-	for _, guard := range guards {
-		s = guard.protect(s)
-	}
 	r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
 	if err != nil {
 		return err
 	}
 	if r == nil {
 		return errors.NewProcessingError("legacy conflict intent %s has no recovery checklist; manual repair required", intent.IntentID().String())
+	}
+	var protected []*chainProtectedConflictStore
+	for _, guard := range guards {
+		if p := guard.protectForward(ctx, s, r.Winners, intent.BlockHash); p != nil {
+			s = p
+			protected = append(protected, p)
+		}
 	}
 	if r.Phase == ConflictRecoveryRolledBack {
 		return nil
@@ -270,8 +280,8 @@ func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 	for i, tx := range r.Transactions {
 		hashes[i] = tx.Hash
 	}
-	for _, guard := range guards {
-		if err := guard.checkTransactions(ctx, s, hashes); err != nil {
+	for _, p := range protected {
+		if err := p.checkUnconfirmed(ctx, hashes); err != nil {
 			return err
 		}
 	}

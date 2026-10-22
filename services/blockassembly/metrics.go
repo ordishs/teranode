@@ -351,7 +351,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "blockassembly",
 			Name:      "stale_tip_candidates_total",
-			Help:      "Count of mining candidates answered with an empty block on the blockchain tip because block assembly sat idle on an older tip (issue 4991). Any non-zero rate means block assembly is stuck behind the chain.",
+			Help:      "Count of mining candidates answered with an empty block on the blockchain tip because block assembly stayed on an older tip for more than 10 seconds (issue 4991). A sustained non-zero rate means block assembly is stuck behind the chain.",
 		},
 	)
 

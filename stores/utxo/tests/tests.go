@@ -555,6 +555,8 @@ func ConflictWALCrashRecovery(t *testing.T, db utxostore.Store) {
 	t.Run("journal_persistence", func(t *testing.T) { ConflictRecoveryPersistence(t, db) })
 	t.Run("journal_descendant_retry", func(t *testing.T) { ConflictRecoveryDescendants(t, db) })
 	t.Run("journal_failure_boundaries", func(t *testing.T) { ConflictRecoveryFailures(t, db) })
+	t.Run("journal_forward_own_block", func(t *testing.T) { ConflictRecoveryForwardOwnBlock(t, db) })
+	t.Run("journal_foreign_lock", func(t *testing.T) { ConflictRecoveryForeignLock(t, db) })
 
 	ctx := context.Background()
 	require.NoError(t, db.SetBlockHeight(20))
