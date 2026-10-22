@@ -53,6 +53,8 @@
       {#if badgeColor && hash}
         <span
           class="hash-badge"
+          role="img"
+          aria-label={badgeTooltip || 'Chain tip colour'}
           style="background-color: {badgeColor}"
           use:$tippy={{ content: badgeTooltip || badgeColor }}
         ></span>

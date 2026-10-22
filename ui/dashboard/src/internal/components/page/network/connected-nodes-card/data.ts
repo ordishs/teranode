@@ -186,7 +186,14 @@ export interface HashBadge {
   total: number
 }
 
-const GOLDEN_ANGLE = 137.508
+const HUE_MIN = 40
+const HUE_RANGE = 280
+
+export const hueForHash = (hash: string): number => {
+  const n = parseInt(hash.slice(0, 8), 16)
+
+  return HUE_MIN + ((Number.isNaN(n) ? 0 : n) % HUE_RANGE)
+}
 
 export const buildHashBadges = (items: any[]): Map<string, HashBadge> => {
   const counts = new Map<string, number>()
@@ -201,12 +208,10 @@ export const buildHashBadges = (items: any[]): Map<string, HashBadge> => {
     }
   }
 
-  const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
   const badges = new Map<string, HashBadge>()
 
-  ordered.forEach(([hash, count], i) => {
-    const hue = Math.round((i * GOLDEN_ANGLE) % 360)
-    badges.set(hash, { color: `hsl(${hue}, 75%, 55%)`, count, total })
+  counts.forEach((count, hash) => {
+    badges.set(hash, { color: `hsl(${hueForHash(hash)}, 75%, 55%)`, count, total })
   })
 
   return badges
