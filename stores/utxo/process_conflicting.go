@@ -801,8 +801,11 @@ func UnmarkConflictingRecursively(ctx context.Context, s Store, hashes []chainha
 // truncated by log pipelines before the MANUAL INTERVENTION REQUIRED marker could be read.
 const maxRollbackErrors = 20
 
+// maxRollbackMessageBytes bounds one kept failure. A store error for a batch can list every spend in it.
+const maxRollbackMessageBytes = 1024
+
 // capRollbackFailures flattens the failures to one message and keeps the first
-// maxRollbackErrors of them. It does not use errors.JoinCapped: that chains *Error values and
+// maxRollbackErrors of them, each cut to maxRollbackMessageBytes. It does not use errors.JoinCapped: that chains *Error values and
 // drops the links in the middle, which would hide most of the failures it claims to keep.
 func capRollbackFailures(failures []error) error {
 	if len(failures) == 0 {
@@ -816,7 +819,12 @@ func capRollbackFailures(failures []error) error {
 
 	messages := make([]string, 0, len(kept)+1)
 	for _, failure := range kept {
-		messages = append(messages, failure.Error())
+		message := failure.Error()
+		if len(message) > maxRollbackMessageBytes {
+			message = message[:maxRollbackMessageBytes] + "..."
+		}
+
+		messages = append(messages, message)
 	}
 
 	if omitted := len(failures) - len(kept); omitted > 0 {

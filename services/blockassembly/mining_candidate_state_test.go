@@ -124,3 +124,30 @@ func TestStaleTipTracker(t *testing.T) {
 	tracker.clear()
 	require.False(t, tracker.sustained(tipB, start.Add(3*staleTipGrace)), "catching up clears the gap")
 }
+
+func TestStaleTipTrackerCheck(t *testing.T) {
+	var tracker staleTipTracker
+
+	chainTip, baTip := chainhash.HashH([]byte("chain")), chainhash.HashH([]byte("ba"))
+	now := time.Unix(1_000_000, 0)
+
+	behind, sustained := tracker.check(&chainTip, 5, &chainTip, 5, now)
+	require.False(t, behind, "equal tips are not a gap")
+	require.False(t, sustained)
+
+	behind, sustained = tracker.check(&chainTip, 5, &baTip, 4, now)
+	require.True(t, behind, "block assembly is one block behind")
+	require.False(t, sustained)
+
+	behind, sustained = tracker.check(&chainTip, 5, &baTip, 5, now.Add(2*staleTipGrace))
+	require.True(t, behind, "an equal-height fork is a gap")
+	require.True(t, sustained)
+
+	behind, sustained = tracker.check(&chainTip, 5, &baTip, 6, now.Add(3*staleTipGrace))
+	require.False(t, behind, "block assembly ahead of the chain is not a stall")
+	require.False(t, sustained)
+
+	behind, sustained = tracker.check(&chainTip, 5, &baTip, 4, now.Add(4*staleTipGrace))
+	require.True(t, behind)
+	require.False(t, sustained, "the ahead state restarted the clock")
+}
