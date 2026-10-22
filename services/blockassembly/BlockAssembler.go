@@ -2153,13 +2153,10 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	// the chain tip cannot be read, fall through: a transient error must not stop mining.
 	chainTipHeader, chainTipMeta, tipErr := b.blockchainClient.GetBestBlockHeader(ctx)
 
-	switch {
-	case tipErr != nil:
+	if tipErr != nil {
 		b.logger.Warnf("[GetMiningCandidate] could not read the blockchain tip to check for a stale block assembly tip: %v", tipErr)
-	case chainTipHeader.Hash().IsEqual(baBestBlockHeader.Hash()):
-		b.staleTip.clear()
-	default:
-		if b.staleTip.sustained(*chainTipHeader.Hash(), time.Now()) {
+	} else if behind, sustained := b.staleTip.check(chainTipHeader.Hash(), chainTipMeta.Height, baBestBlockHeader.Hash(), baBestBlockHeight, time.Now()); behind {
+		if sustained {
 			prometheusBlockAssemblyStaleTipCandidates.Inc()
 			b.logger.Warnf("[GetMiningCandidate] block assembly tip %s (height %d) is behind the blockchain tip %s (height %d), returning empty block template on the blockchain tip",
 				baBestBlockHeader.Hash(), baBestBlockHeight, chainTipHeader.Hash(), chainTipMeta.Height)
@@ -4371,4 +4368,17 @@ func (s *staleTipTracker) clear() {
 	s.mu.Lock()
 	s.since = time.Time{}
 	s.mu.Unlock()
+}
+
+// check compares the two tips. behind is true when block assembly sits on a different tip that is not ahead
+// of the chain. A tip ahead of the chain, for example after the chain tip was invalidated back to its parent,
+// is not a stall: a candidate on the chain tip would be refused at submission as stale. sustained is true once
+// a behind gap has outlasted staleTipGrace.
+func (s *staleTipTracker) check(chainTip *chainhash.Hash, chainHeight uint32, baTip *chainhash.Hash, baHeight uint32, now time.Time) (behind, sustained bool) {
+	if chainTip.IsEqual(baTip) || chainHeight < baHeight {
+		s.clear()
+		return false, false
+	}
+
+	return true, s.sustained(*chainTip, now)
 }

@@ -575,7 +575,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   blocks. The new counter `teranode_blockassembly_stale_tip_candidates_total` and
   the Warn log fire only when the gap lasts more than 10 seconds for the same
   Blockchain service tip. A shorter gap is the normal delay before block assembly
-  hears of a new block. Alert on a sustained non-zero rate. If the Blockchain service
+  hears of a new block. A block assembly tip that is ahead of the Blockchain service
+  tip is not counted. Alert on a sustained non-zero rate. If the Blockchain service
   tip cannot be read, the candidate is built as before. (#2023, bitcoin-sv/teranode#4991)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
