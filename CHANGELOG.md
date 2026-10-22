@@ -154,6 +154,39 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   An empty `BaseUrl` defaults to `legacy`, so any external caller that omits it gets the same
   refusal and must submit the parent first. Legacy sync keeps the block and retries it once the
   parent commits. Blocks announced by p2p peers still go to catch-up. (#2021)
+- **A panic on the main block validation goroutines no longer stops the node.** The
+  priority-queue block workers and the catchup consumer now recover a panic, as the
+  `blockFoundCh` workers and the Kafka block message handler (#2010) already did. A panic in a goroutine that
+  these start, such as the catchup block fetch and validation workers, still stops the
+  process. Before, the process stopped and restarted, so an alert on a crash loop found it.
+  That alert will not fire now for the covered paths. Monitor the new counter
+  `teranode_blockvalidation_recovered_panics_total` (label `path`: `worker`, `catchup`,
+  `kafka` or `block_found`) and the `PANIC` log line, which has the block hash and the stack.
+  Four more changes come with it:
+    - A Kafka block message that panics is committed and retried in memory, like any
+      other local fault, up to 8 times with backoff. The announcing peer is not blamed.
+      Each attempt that panics counts on `path="kafka"`.
+    - A catchup that panics counts as a failed attempt with the error type `local_panic`. It
+      is not charged to the peer. So is a catchup whose validation waited on a validation of
+      the same block that panicked on another goroutine, also when an alternative peer served
+      that catchup. In that case the node tries no further alternative peer in the cycle. It
+      counts toward
+      `blockvalidation_catchup_max_attempts_per_block` unless it validated at least one block
+      first. In that condition it resets the count, as each other failed catchup that made
+      progress does.
+    - After `blockvalidation_max_corrupt_attempts_per_block` (default 3) worker or
+      `blockFoundCh` panics for one block from one peer, the node stops that peer's
+      announcements and deliveries of the block before it fetches the block, for
+      `blockvalidation_corrupt_attempt_cooldown` (default 10 minutes). The panic counts for
+      the peer that served the attempt that panicked. On the `blockFoundCh` path that is the
+      announcing peer, or the peer that served the block after the announcer answered 429.
+      A capped peer is not fetched from as that 429 fallback either. A block this node has
+      already stored is still answered without error. On the `blockFoundCh` path the cap
+      applies only to blocks announced over Kafka. The `BlockFound` gRPC client sends no peer
+      ID, and a block announced without one is never capped.
+    - The error that a `WaitToComplete` caller gets after a `blockFoundCh` worker panic no
+      longer has the panic value in its text. The panic value is in the `PANIC` log line.
+      (#2012)
 
 - **Legacy peers that send BIP152 messages are no longer disconnected.** go-wire
   is now v1.4.0, which decodes `cmpctblock`, `getblocktxn` and `blocktxn`. Until
