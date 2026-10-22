@@ -45,8 +45,17 @@ describe('buildHashBadges', () => {
 })
 
 describe('hueForHash', () => {
+  it('uses the trailing characters, because block hashes start with proof-of-work zeros', () => {
+    const lead = '00000000000000000000'
+    const x = lead + '1'.repeat(44)
+    const y = lead + '2'.repeat(43) + '9'
+
+    expect(hueForHash(x)).not.toBe(hueForHash(y))
+    expect(hueForHash(x)).toBe(hueForHash('f'.repeat(20) + '1'.repeat(44)))
+  })
+
   it('stays clear of the red range used for error state', () => {
-    for (const h of ['0'.repeat(64), 'f'.repeat(64), 'fffffff0' + '0'.repeat(56), A, B, C]) {
+    for (const h of ['0'.repeat(64), 'f'.repeat(64), '0'.repeat(56) + 'fffffff0', A, B, C]) {
       const hue = hueForHash(h)
 
       expect(hue).toBeGreaterThanOrEqual(40)

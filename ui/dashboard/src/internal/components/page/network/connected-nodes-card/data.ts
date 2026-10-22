@@ -190,7 +190,7 @@ const HUE_MIN = 40
 const HUE_RANGE = 280
 
 export const hueForHash = (hash: string): number => {
-  const n = parseInt(hash.slice(0, 8), 16)
+  const n = parseInt(hash.slice(-8), 16)
 
   return HUE_MIN + ((Number.isNaN(n) ? 0 : n) % HUE_RANGE)
 }
