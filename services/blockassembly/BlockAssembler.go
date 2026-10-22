@@ -104,6 +104,10 @@ type BlockAssembler struct {
 	// logger provides logging functionality for the assembler
 	logger ulogger.Logger
 
+	// staleTip remembers since when block assembly has differed from the same chain tip, so a
+	// candidate is only reported as stale once the gap outlasts the normal new-block notification delay.
+	staleTip staleTipTracker
+
 	// stats tracks operational statistics for monitoring and debugging
 	stats *gocore.Stat
 
@@ -1731,11 +1735,11 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
 		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain)))
+			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(b.currentChainGuard()))
 
 		return err
 	case utxo.ConflictIntentReverse:
-		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain))
+		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, b.currentChainGuard())
 
 		return err
 	default:
@@ -1754,7 +1758,7 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
 	switch intent.Kind {
 	case utxo.ConflictIntentForward:
-		return utxo.RollbackConflictIntent(ctx, b.utxoStore, intent, utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain))
+		return utxo.RollbackConflictIntent(ctx, b.utxoStore, intent, b.currentChainGuard())
 	case utxo.ConflictIntentReverse:
 
 		// Replay is chain-authorised too. The isBlockOnLongestChain gate above
@@ -1763,7 +1767,7 @@ func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utx
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
 		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain)))
+			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(b.currentChainGuard()))
 
 		return err
 	default:
@@ -2148,13 +2152,21 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	// removed. Hand out an empty block on the chain tip instead, as for the in-motion states. If
 	// the chain tip cannot be read, fall through: a transient error must not stop mining.
 	chainTipHeader, chainTipMeta, tipErr := b.blockchainClient.GetBestBlockHeader(ctx)
+
 	switch {
 	case tipErr != nil:
 		b.logger.Warnf("[GetMiningCandidate] could not read the blockchain tip to check for a stale block assembly tip: %v", tipErr)
-	case !chainTipHeader.Hash().IsEqual(baBestBlockHeader.Hash()):
-		prometheusBlockAssemblyStaleTipCandidates.Inc()
-		b.logger.Warnf("[GetMiningCandidate] block assembly tip %s (height %d) is behind the blockchain tip %s (height %d), returning empty block template on the blockchain tip",
-			baBestBlockHeader.Hash(), baBestBlockHeight, chainTipHeader.Hash(), chainTipMeta.Height)
+	case chainTipHeader.Hash().IsEqual(baBestBlockHeader.Hash()):
+		b.staleTip.clear()
+	default:
+		if b.staleTip.sustained(*chainTipHeader.Hash(), time.Now()) {
+			prometheusBlockAssemblyStaleTipCandidates.Inc()
+			b.logger.Warnf("[GetMiningCandidate] block assembly tip %s (height %d) is behind the blockchain tip %s (height %d), returning empty block template on the blockchain tip",
+				baBestBlockHeader.Hash(), baBestBlockHeight, chainTipHeader.Hash(), chainTipMeta.Height)
+		} else {
+			b.logger.Debugf("[GetMiningCandidate] block assembly tip %s is catching up to the blockchain tip %s, returning empty block template on the blockchain tip",
+				baBestBlockHeader.Hash(), chainTipHeader.Hash())
+		}
 
 		return b.generateEmptyBlockCandidate(ctx, chainTipHeader, chainTipMeta.Height)
 	}
@@ -4315,4 +4327,48 @@ func (b *BlockAssembler) prepareRecoveredConflictUpdates(ctx context.Context) ([
 		ids = append(ids, intent.IntentID())
 	}
 	return ids, nil
+}
+
+// currentChainGuard protects transactions confirmed on the current chain during conflict recovery.
+// It resolves block IDs so a forward rollback accepts the winners' own block.
+func (b *BlockAssembler) currentChainGuard() utxo.CurrentChainGuard {
+	return utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain).WithBlockID(func(ctx context.Context, hash chainhash.Hash) (uint32, error) {
+		_, meta, err := b.blockchainClient.GetBlockHeader(ctx, &hash)
+		if err != nil {
+			return 0, err
+		}
+
+		return meta.ID, nil
+	})
+}
+
+// staleTipGrace is how long block assembly may differ from one blockchain tip before the gap counts as a stall.
+// A healthy node differs for the short delay between a block reaching the Blockchain service and block assembly
+// hearing about it.
+const staleTipGrace = 10 * time.Second
+
+type staleTipTracker struct {
+	mu    sync.Mutex
+	tip   chainhash.Hash
+	since time.Time
+}
+
+// sustained records that block assembly differs from chainTip at now. It reports whether the difference has
+// lasted longer than staleTipGrace for this same chain tip.
+func (s *staleTipTracker) sustained(chainTip chainhash.Hash, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.since.IsZero() || s.tip != chainTip {
+		s.tip = chainTip
+		s.since = now
+	}
+
+	return now.Sub(s.since) >= staleTipGrace
+}
+
+func (s *staleTipTracker) clear() {
+	s.mu.Lock()
+	s.since = time.Time{}
+	s.mu.Unlock()
 }

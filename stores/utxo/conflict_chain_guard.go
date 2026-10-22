@@ -14,11 +14,21 @@ import (
 // The triggering WAL block alone cannot establish whether undo is still valid.
 // BlockAssembly serializes chain movement; this is not a distributed writer lock.
 type CurrentChainGuard struct {
-	check func(context.Context, []uint32) (bool, error)
+	check   func(context.Context, []uint32) (bool, error)
+	blockID func(context.Context, chainhash.Hash) (uint32, error)
 }
 
 func NewCurrentChainGuard(check func(context.Context, []uint32) (bool, error)) CurrentChainGuard {
 	return CurrentChainGuard{check: check}
+}
+
+// WithBlockID lets the guard resolve the numeric ID of a block hash. Forward
+// recovery needs it: the winners of a forward operation are mined in the block
+// being added, which is already on the current chain, so that one block must not
+// make them look confirmed elsewhere.
+func (g CurrentChainGuard) WithBlockID(resolve func(context.Context, chainhash.Hash) (uint32, error)) CurrentChainGuard {
+	g.blockID = resolve
+	return g
 }
 
 func (g CurrentChainGuard) protect(s Store) Store {
@@ -35,9 +45,35 @@ func (g CurrentChainGuard) checkTransactions(ctx context.Context, s Store, hashe
 	return (&chainProtectedConflictStore{Store: s, guard: g}).checkUnconfirmed(ctx, hashes)
 }
 
+// protectForward wraps s for the rollback of a forward operation. The winners may carry the
+// ID of ownBlock without being refused. They are still refused when they carry the ID of any
+// other current-chain block. It returns nil when the guard has no check.
+func (g CurrentChainGuard) protectForward(ctx context.Context, s Store, winners []chainhash.Hash, ownBlock chainhash.Hash) *chainProtectedConflictStore {
+	if g.check == nil {
+		return nil
+	}
+	p := &chainProtectedConflictStore{Store: s, guard: g}
+	if len(winners) > 0 && g.blockID != nil {
+		// An unknown block, or a failed lookup, grants no exemption. The guard then stays strict, which
+		// can only refuse more, never overwrite a confirmed spend.
+		if id, err := g.blockID(ctx, ownBlock); err == nil {
+			p.ownBlockID = id
+			p.winners = make(map[chainhash.Hash]struct{}, len(winners))
+
+			for _, h := range winners {
+				p.winners[h] = struct{}{}
+			}
+		}
+	}
+
+	return p
+}
+
 type chainProtectedConflictStore struct {
 	Store
-	guard CurrentChainGuard
+	guard      CurrentChainGuard
+	winners    map[chainhash.Hash]struct{}
+	ownBlockID uint32
 }
 
 func (s *chainProtectedConflictStore) checkUnconfirmed(ctx context.Context, hashes []chainhash.Hash) error {
@@ -59,7 +95,11 @@ func (s *chainProtectedConflictStore) checkUnconfirmed(ctx context.Context, hash
 		if item.Data == nil {
 			return errors.NewProcessingError("cannot authorize conflict undo: transaction %s is missing", item.Hash.String())
 		}
+		_, isWinner := s.winners[item.Hash]
 		for _, id := range item.Data.BlockIDs {
+			if isWinner && id == s.ownBlockID {
+				continue
+			}
 			ids[id] = struct{}{}
 		}
 	}

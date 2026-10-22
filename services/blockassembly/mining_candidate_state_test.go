@@ -2,10 +2,12 @@ package blockassembly
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -86,6 +88,8 @@ func TestGetMiningCandidate_StaleTipWhileRunningBuildsOnChainTip(t *testing.T) {
 
 	ba.setCurrentRunningState(StateRunning)
 
+	before := testutil.ToFloat64(prometheusBlockAssemblyStaleTipCandidates)
+
 	candidate, subtrees, err := ba.GetMiningCandidate(t.Context())
 	require.NoError(t, err)
 	require.NotNil(t, candidate)
@@ -93,4 +97,30 @@ func TestGetMiningCandidate_StaleTipWhileRunningBuildsOnChainTip(t *testing.T) {
 	require.Equal(t, blockHeader1.Hash().CloneBytes(), candidate.PreviousHash, "the candidate must build on the Blockchain service tip")
 	require.Equal(t, uint32(2), candidate.Height)
 	require.Empty(t, subtrees)
+	require.Equal(t, before, testutil.ToFloat64(prometheusBlockAssemblyStaleTipCandidates), "the normal gap before block assembly hears of a block is not a stall")
+
+	// Age the gap past the grace period: the same stale tip is now reported.
+	ba.staleTip.mu.Lock()
+	ba.staleTip.since = time.Now().Add(-2 * staleTipGrace)
+	ba.staleTip.mu.Unlock()
+
+	candidate, _, err = ba.GetMiningCandidate(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, blockHeader1.Hash().CloneBytes(), candidate.PreviousHash)
+	require.Equal(t, before+1, testutil.ToFloat64(prometheusBlockAssemblyStaleTipCandidates), "a sustained gap must be counted")
+}
+
+func TestStaleTipTracker(t *testing.T) {
+	var tracker staleTipTracker
+
+	tipA, tipB := chainhash.HashH([]byte("a")), chainhash.HashH([]byte("b"))
+	start := time.Unix(1_000_000, 0)
+
+	require.False(t, tracker.sustained(tipA, start), "the first sighting is inside the grace period")
+	require.False(t, tracker.sustained(tipA, start.Add(staleTipGrace-time.Second)))
+	require.True(t, tracker.sustained(tipA, start.Add(staleTipGrace)), "the gap has lasted the grace period")
+	require.False(t, tracker.sustained(tipB, start.Add(2*staleTipGrace)), "a new chain tip restarts the clock")
+
+	tracker.clear()
+	require.False(t, tracker.sustained(tipB, start.Add(3*staleTipGrace)), "catching up clears the gap")
 }

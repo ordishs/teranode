@@ -54,6 +54,9 @@ func ConflictRecoveryDescendants(t *testing.T, db utxo.Store) {
 	require.NoError(t, err)
 	require.True(t, losers.Exists(*child.TxIDChainHash()), "retry must recover the child")
 	require.Contains(t, marked, *child.TxIDChainHash())
+	require.True(t, losers.Exists(*loser.TxIDChainHash()))
+	require.False(t, losers.Exists(*winner.TxIDChainHash()), "a winner must not be returned as a loser")
+	require.NotContains(t, marked, *winner.TxIDChainHash(), "a winner must not be returned as marked")
 	require.False(t, crashLocked(t, ctx, db, other.TxIDChainHash()))
 }
 
@@ -159,6 +162,8 @@ func ConflictRecoveryFailures(t *testing.T, db utxo.Store) {
 				require.NoError(t, err)
 				require.True(t, losers.Exists(*child.TxIDChainHash()))
 				require.Contains(t, marked, *child.TxIDChainHash())
+				require.False(t, losers.Exists(*winner.TxIDChainHash()), "a winner must not be returned as a loser")
+				require.NotContains(t, marked, *winner.TxIDChainHash(), "a winner must not be returned as marked")
 				require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
 				require.True(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
 				// Simulate a caller failure, then retry using the same saved output set.
@@ -325,4 +330,112 @@ func ConflictRecoveryConfirmedWinner(t *testing.T, db utxo.Store) {
 	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 	intent.Kind = utxo.ConflictIntentReverse
 	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}
+
+// The winners of a forward operation are mined in the block being added, which is on the current
+// chain. That block alone must not make the rollback refuse them. Any other current-chain block still does.
+func ConflictRecoveryForwardOwnBlock(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	ownBlock := chainhash.HashH([]byte("forward-own-block"))
+	const ownID, otherID = uint32(401), uint32(402)
+	onChain := map[uint32]bool{ownID: true}
+	guard := utxo.NewCurrentChainGuard(func(_ context.Context, ids []uint32) (bool, error) {
+		for _, id := range ids {
+			if onChain[id] {
+				return true, nil
+			}
+		}
+		return false, nil
+	}).WithBlockID(func(_ context.Context, h chainhash.Hash) (uint32, error) {
+		require.Equal(t, ownBlock, h)
+		return ownID, nil
+	})
+
+	for index, otherBlock := range []bool{false, true} {
+		t.Run(fmt.Sprintf("otherCurrentChainBlock=%t", otherBlock), func(t *testing.T) {
+			parent := crashParentTx(0xb1 + byte(index))
+			_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+			require.NoError(t, err)
+			loser := crashSpendTx(t, parent, 80000)
+			_, _, err = db.SpendAndCreate(ctx, loser, 2)
+			require.NoError(t, err)
+			winner := crashSpendTx(t, parent, 70000)
+			_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+			require.NoError(t, err)
+			_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{winner.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: ownID, BlockHeight: 3})
+			require.NoError(t, err)
+
+			if otherBlock {
+				_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{winner.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: otherID, BlockHeight: 4})
+				require.NoError(t, err)
+
+				onChain[otherID] = true
+				defer delete(onChain, otherID)
+			}
+
+			winners := []chainhash.Hash{*winner.TxIDChainHash()}
+			wrapper := &failConflictPhase{Store: db, stage: "unspend"}
+			_, _, err = utxo.ProcessConflicting(ctx, wrapper, 3, ownBlock, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(guard))
+			require.Error(t, err)
+			require.True(t, wrapper.fired)
+
+			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: ownBlock, TxHashes: winners}
+			r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+			require.NoError(t, err)
+
+			if otherBlock {
+				require.NotEqual(t, utxo.ConflictRecoveryRolledBack, r.Phase, "a winner confirmed elsewhere must keep the checklist pending")
+				require.ErrorContains(t, utxo.RollbackConflictIntent(ctx, db, intent, guard), "confirmed on the current chain")
+				require.NoError(t, utxo.RollbackConflictIntent(ctx, db, intent))
+				require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+
+				return
+			}
+
+			require.Equal(t, utxo.ConflictRecoveryRolledBack, r.Phase, "the rollback must not refuse the winners' own block")
+			require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+			require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+			require.False(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
+
+			losers, marked, err := utxo.ProcessConflicting(ctx, db, 3, ownBlock, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(guard))
+			require.NoError(t, err)
+			require.True(t, losers.Exists(*loser.TxIDChainHash()))
+			require.False(t, losers.Exists(*winner.TxIDChainHash()))
+			require.Equal(t, []chainhash.Hash{*loser.TxIDChainHash()}, marked)
+			require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+			require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+		})
+	}
+}
+
+// A parent locked by another holder must not stop the operation, and the operation must neither
+// take nor release that lock.
+func ConflictRecoveryForeignLock(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent, other := crashParentTx(0xb5), crashParentTx(0xb6)
+	for _, tx := range []*bt.Tx{parent, other} {
+		_, _, err := db.SpendAndCreate(ctx, tx, 1, utxo.WithCreateOnly())
+		require.NoError(t, err)
+	}
+	loser := crashSpendTx(t, parent, 80000)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err := db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	child := crashSpendTx(t, loser, 60000)
+	require.NoError(t, child.From(other.TxIDChainHash().String(), 0, other.Outputs[0].LockingScript.String(), other.Outputs[0].Satoshis))
+	child.Inputs[1].UnlockingScript = dummyUnlockingScript
+	_, _, err = db.SpendAndCreate(ctx, child, 2)
+	require.NoError(t, err)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+	require.NoError(t, db.SetLocked(ctx, []chainhash.Hash{*other.TxIDChainHash()}, true))
+	t.Cleanup(func() { _ = db.SetLocked(ctx, []chainhash.Hash{*other.TxIDChainHash()}, false) })
+
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	losers, _, err := utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard)
+	require.NoError(t, err)
+	require.True(t, losers.Exists(*child.TxIDChainHash()))
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()), "the operation must release the lock it took")
+	require.True(t, crashLocked(t, ctx, db, other.TxIDChainHash()), "the operation must not release another holder's lock")
 }
