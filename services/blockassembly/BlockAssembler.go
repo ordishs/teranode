@@ -1501,7 +1501,7 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	}
 
 	for _, id := range recoveredIDs {
-		if err = b.utxoStore.CompleteConflictIntent(ctx, id); err != nil {
+		if err = utxo.CompleteConflictIntent(ctx, b.utxoStore, id); err != nil {
 			return err
 		}
 	}
@@ -1602,7 +1602,7 @@ func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
 
 			prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("stale_healed").Inc()
 
-			if completeErr := b.utxoStore.CompleteConflictIntent(ctx, intent.IntentID()); completeErr != nil {
+			if completeErr := utxo.CompleteConflictIntent(ctx, b.utxoStore, intent.IntentID()); completeErr != nil {
 				b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] healed stale %s intent %s but failed to clear WAL record (will retry next restart): %v",
 					intent.Kind, intent.IntentID().String(), completeErr)
 			}
@@ -1627,7 +1627,7 @@ func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
 		// ProcessConflicting / ReverseProcessConflicting already complete the
 		// intent on success via their own wrapper; this is a belt-and-suspenders
 		// delete (idempotent) so replay is self-contained.
-		if completeErr := b.utxoStore.CompleteConflictIntent(ctx, intent.IntentID()); completeErr != nil {
+		if completeErr := utxo.CompleteConflictIntent(ctx, b.utxoStore, intent.IntentID()); completeErr != nil {
 			b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] replayed %s intent %s but failed to clear WAL record (will retry next restart): %v",
 				intent.Kind, intent.IntentID().String(), completeErr)
 		}
@@ -1765,11 +1765,13 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
 		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion())
+			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain)))
 
 		return err
 	case utxo.ConflictIntentReverse:
-		return b.reverseProcessConflictingAndEvict(ctx, intent)
+		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain))
+
+		return err
 	default:
 		return errors.NewProcessingError("[replayConflictIntent] unknown conflict intent kind %q", intent.Kind)
 	}
@@ -1813,7 +1815,7 @@ func (b *BlockAssembler) reverseProcessConflictingAndEvict(ctx context.Context, 
 func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
 	switch intent.Kind {
 	case utxo.ConflictIntentForward:
-		return utxo.RollbackConflictIntent(ctx, b.utxoStore, intent)
+		return utxo.RollbackConflictIntent(ctx, b.utxoStore, intent, utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain))
 	case utxo.ConflictIntentReverse:
 
 		// Replay is chain-authorised too. The isBlockOnLongestChain gate above
@@ -1822,7 +1824,7 @@ func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utx
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
 		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion())
+			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain)))
 
 		return err
 	default:

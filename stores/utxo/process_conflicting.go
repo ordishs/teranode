@@ -175,7 +175,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		}
 		switch recovery.Phase {
 		case ConflictRecoveryPrepared, ConflictRecoveryMutating, ConflictRecoveryRollingBack:
-			if err = RollbackConflictIntent(ctx, s, intent); err != nil {
+			if err = RollbackConflictIntent(ctx, s, intent, options.currentChainGuard); err != nil {
 				return nil, nil, err
 			}
 		case ConflictRecoveryApplied, ConflictRecoveryFinished:
@@ -248,7 +248,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 					options.onRefused(h)
 				}
 			}
-			if e := s.CompleteConflictIntent(ctx, intent.IntentID()); e != nil {
+			if e := CompleteConflictIntent(ctx, s, intent.IntentID()); e != nil {
 				return nil, nil, e
 			}
 			return txmap.NewSplitSwissMap(0), nil, nil
@@ -268,7 +268,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		}
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), compensationTimeout)
 		defer cancel()
-		if rollbackErr := RollbackConflictIntent(rollbackCtx, s, intent); rollbackErr != nil {
+		if rollbackErr := RollbackConflictIntent(rollbackCtx, s, intent, options.currentChainGuard); rollbackErr != nil {
 			err = errors.NewProcessingError("[ProcessConflicting] MANUAL INTERVENTION REQUIRED: original=%s rollback=%s", err.Error(), rollbackErr.Error(), errors.Join(err, rollbackErr))
 		}
 		losers = nil
@@ -360,7 +360,10 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 //     feed this into processedConflictingHashesMap so the subsequent
 //     moveForwardBlock pass skips ProcessConflicting on these hashes —
 //     re-running it would double-apply the UTXO swap and fail.
-func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, demotedTxHashes []chainhash.Hash) (cascadedToConflicting []chainhash.Hash, allTouched []chainhash.Hash, err error) {
+func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, demotedTxHashes []chainhash.Hash, guards ...CurrentChainGuard) (cascadedToConflicting []chainhash.Hash, allTouched []chainhash.Hash, err error) {
+	for _, guard := range guards {
+		s = guard.protect(s)
+	}
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "ReverseProcessConflicting")
 	defer deferFn()
 
@@ -385,9 +388,15 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 
 	defer func() {
 		if err == nil {
-			_ = s.CompleteConflictIntent(ctx, walIntent.IntentID())
+			err = CompleteConflictIntent(ctx, s, walIntent.IntentID())
 		}
 	}()
+
+	for _, guard := range guards {
+		if err := guard.checkTransactions(ctx, s, demotedTxHashes); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	demotedSet := make(map[chainhash.Hash]struct{}, len(demotedTxHashes))
 	for _, h := range demotedTxHashes {

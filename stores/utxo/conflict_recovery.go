@@ -245,7 +245,10 @@ func verifyConflictSpends(ctx context.Context, s Store, spends []*Spend) error {
 
 // RollbackConflictIntent also handles stale forward intents after a reorg.
 // Legacy records cannot establish the prior state and remain pending for repair.
-func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent) error {
+func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent, guards ...CurrentChainGuard) error {
+	for _, guard := range guards {
+		s = guard.protect(s)
+	}
 	r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
 	if err != nil {
 		return err
@@ -262,6 +265,15 @@ func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent)
 		}
 		r.Phase = ConflictRecoveryRolledBack
 		return s.SaveConflictRecovery(ctx, intent.IntentID(), r)
+	}
+	hashes := make([]chainhash.Hash, len(r.Transactions))
+	for i, tx := range r.Transactions {
+		hashes[i] = tx.Hash
+	}
+	for _, guard := range guards {
+		if err := guard.checkTransactions(ctx, s, hashes); err != nil {
+			return err
+		}
 	}
 	// Do not compensate under a lock that another operation has taken over.
 	if err := s.SetConflictLocks(ctx, intent.IntentID(), r.Parents, true); err != nil {
@@ -293,7 +305,7 @@ func finishConflictRecovery(ctx context.Context, s Store, intent ConflictIntent,
 		_ = result.Put(h, 1)
 	}
 	if !deferCompletion {
-		if err := s.CompleteConflictIntent(ctx, intent.IntentID()); err != nil {
+		if err := CompleteConflictIntent(ctx, s, intent.IntentID()); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -316,7 +328,7 @@ func CompleteConflictIntentsForBlock(ctx context.Context, s Store, blockHash cha
 			return err
 		}
 		if r != nil && r.Phase == ConflictRecoveryFinished {
-			if err := s.CompleteConflictIntent(ctx, intent.IntentID()); err != nil {
+			if err := CompleteConflictIntent(ctx, s, intent.IntentID()); err != nil {
 				return err
 			}
 		}

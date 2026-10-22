@@ -147,7 +147,7 @@ func (s *Store) LoadConflictRecovery(ctx context.Context, id chainhash.Hash) (*u
 		return nil, err
 	}
 	if record != nil && record.Bins["recoveryDone"] == true {
-		if err := s.CompleteConflictIntent(ctx, id); err != nil {
+		if err := utxo.CompleteConflictIntent(ctx, s, id); err != nil {
 			return nil, err
 		}
 		return nil, nil
