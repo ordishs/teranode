@@ -327,6 +327,21 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   (including a non-positive `subtreevalidation_txMetaTombstoneWindow`). It used to
   log the failure and run with no store, then panic on first use.
 
+- **UTXO batch conflicts are now decided by the backend.** SQL and Aerospike
+  process competing claims on the same outpoint in separate, ordered backend
+  batches. A re-submitted spend is accepted when it matches the stored owner,
+  even if an earlier claim in the batch fails. Double-spend errors name the
+  actual owner, including owners absent from the batch. Previously, arrival
+  order could cause a false `UTXO_SPENT` error and rollback of an existing spend
+  when the spending transaction had not yet been created. There is no separate
+  ownership lookup or fallback on a failed lookup. Callers can now see success
+  instead of `UTXO_SPENT` for valid retries. Conflicting batches require extra
+  backend calls; batches without conflicts are unchanged. No configuration
+  change is required. This does not change the general rollback protocol for
+  backend failures or concurrent attempts. Go integrations using
+  `FilterConflictingDuplicateSpendClaims` must migrate to `ProcessSpendBatch`
+  with a synchronous backend callback. (bitcoin-sv/teranode#4934)
+
 - **A failed revert of an invalid block's mined tags now holds block assembly until it
   succeeds.** When block validation reverts the mined tags of an invalid block and
   `SetMinedMulti` fails, or a subtree read fails with anything other than not-found, the
@@ -951,24 +966,6 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   hears of a new block. A block assembly tip that is ahead of the Blockchain service
   tip is not counted. Alert on a sustained non-zero rate. If the Blockchain service
   tip cannot be read, the candidate is built as before. (#2023)
-
-- **A re-submitted spend is no longer refused because a double-spend attempt
-  arrived in the same batch.** The UTXO stores scan each spend batch for two
-  claims on one outpoint and reject the later one, and until now the first claim
-  in arrival order won. Arrival order has no consensus meaning, so when the
-  transaction that already owned the outpoint re-submitted behind a competing
-  claim, the legitimate re-spend was refused with `UTXO_SPENT` naming a
-  transaction that had never spent anything — and because that error class is
-  treated as unwinnable, the rollback then un-spent the inputs that re-spend had
-  just re-applied, resetting outputs a valid transaction had spent back to
-  unspent and letting them be spent again. The winner is now taken from the
-  persisted spender, so a re-submit by the transaction that really owns the
-  outpoint is accepted and the competing claim is refused and named against it.
-  Where nothing is persisted yet, the first claim still wins, which is what the
-  filter was added to guarantee. Callers that re-submit spends (revalidation,
-  retry after a timeout, block processing) see success where they previously saw
-  `UTXO_SPENT`. A competing double-spend attempt is still refused. No action is
-  required. (bitcoin-sv/teranode#4934)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
