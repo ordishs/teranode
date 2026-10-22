@@ -233,7 +233,7 @@ export const getRenderCells = (badges: Map<string, HashBadge>) => ({
       props: {
         ...base.props,
         badgeColor: badge.color,
-        badgeTooltip: `${badge.count} of ${badge.total} nodes on this tip`,
+        badgeTooltip: `${badge.count} of ${badge.total} reporting nodes on tip ${shortHash(hash)}`,
       },
     }
   },
