@@ -3,9 +3,12 @@ package tests
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	utxo "github.com/bsv-blockchain/teranode/stores/utxo"
@@ -438,4 +441,156 @@ func ConflictRecoveryForeignLock(t *testing.T, db utxo.Store) {
 	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
 	require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()), "the operation must release the lock it took")
 	require.True(t, crashLocked(t, ctx, db, other.TxIDChainHash()), "the operation must not release another holder's lock")
+}
+
+// countConflictReads wraps a real store and records the largest number of GetSpend calls in flight
+// at once. The short delay makes overlapping calls observable.
+type countConflictReads struct {
+	utxo.Store
+	inFlight    atomic.Int32
+	maxInFlight atomic.Int32
+}
+
+func (s *countConflictReads) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {
+	n := s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
+
+	for {
+		m := s.maxInFlight.Load()
+		if n <= m || s.maxInFlight.CompareAndSwap(m, n) {
+			break
+		}
+	}
+
+	time.Sleep(2 * time.Millisecond)
+
+	return s.Store.GetSpend(ctx, spend)
+}
+
+// ConflictRecoveryWideCascade checks the checklist for a wide cascade. The snapshot reads run
+// concurrently, bounded by the walk fan-out of 128, and the checklist keeps discovery order: the
+// inputs of each recorded transaction in turn, then the winning inputs.
+func ConflictRecoveryWideCascade(t *testing.T, db utxo.Store) {
+	const width = 200
+
+	ctx := t.Context()
+	parent := crashParentTx(0xb7)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+
+	loser := crashSpendTx(t, parent, 80000)
+	loser.Outputs = nil
+
+	for i := 0; i < width; i++ {
+		loser.Outputs = append(loser.Outputs, &bt.Output{Satoshis: 300, LockingScript: bscript.NewFromBytes([]byte{0x52})})
+	}
+
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+
+	children := make([]*bt.Tx, width)
+	for i := range children {
+		child := bt.NewTx()
+		require.NoError(t, child.From(loser.TxIDChainHash().String(), uint32(i), loser.Outputs[i].LockingScript.String(), loser.Outputs[i].Satoshis))
+		child.Inputs[0].UnlockingScript = dummyUnlockingScript
+		child.Outputs = []*bt.Output{{Satoshis: 200, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+
+		_, _, err = db.SpendAndCreate(ctx, child, 2)
+		require.NoError(t, err)
+
+		children[i] = child
+	}
+
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	counted := &countConflictReads{Store: db}
+	blockHash := chainhash.HashH([]byte("wide-cascade-block"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+
+	losers, marked, err := utxo.ProcessConflicting(ctx, counted, 3, blockHash, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	require.Equal(t, width+1, losers.Length())
+	require.Len(t, marked, width+1)
+	require.True(t, losers.Exists(*loser.TxIDChainHash()))
+	require.False(t, losers.Exists(*winner.TxIDChainHash()), "a winner must not be returned as a loser")
+
+	for _, child := range children {
+		require.True(t, losers.Exists(*child.TxIDChainHash()))
+		require.True(t, crashConflicting(t, ctx, db, child.TxIDChainHash()))
+	}
+
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.False(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+	require.True(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
+
+	maxInFlight := counted.maxInFlight.Load()
+	require.Greater(t, maxInFlight, int32(1), "the snapshot reads must overlap")
+	require.LessOrEqual(t, maxInFlight, int32(128), "the snapshot reads must stay within the walk fan-out")
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: blockHash, TxHashes: winners}
+	r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+
+	// Rebuild the expected order the way a sequential snapshot discovers it.
+	type outpoint struct {
+		hash  chainhash.Hash
+		index uint32
+	}
+
+	var expected []outpoint
+
+	seen := make(map[outpoint]struct{})
+	addExpected := func(spends []*utxo.Spend) {
+		for _, sp := range spends {
+			key := outpoint{*sp.TxID, sp.Vout}
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				expected = append(expected, key)
+			}
+		}
+	}
+
+	txs := map[chainhash.Hash]*bt.Tx{*loser.TxIDChainHash(): loser, *winner.TxIDChainHash(): winner}
+	for _, child := range children {
+		txs[*child.TxIDChainHash()] = child
+	}
+
+	require.Len(t, r.Transactions, width+2)
+
+	for _, recorded := range r.Transactions {
+		tx, ok := txs[recorded.Hash]
+		require.True(t, ok, "the checklist must record only cascade transactions")
+
+		spends, err := utxo.GetSpends(tx)
+		require.NoError(t, err)
+
+		addExpected(spends)
+	}
+
+	winningSpends, err := utxo.GetSpends(winner)
+	require.NoError(t, err)
+
+	addExpected(winningSpends)
+
+	require.Len(t, r.OriginalSpends, width+1)
+
+	for i, original := range r.OriginalSpends {
+		require.Equal(t, expected[i], outpoint{*original.TxID, original.Vout}, "checklist entry %d", i)
+		require.NotNil(t, original.SpendingData)
+
+		// The before-image holds the owner from before the operation: the loser for the parent
+		// output, and each child for its loser output.
+		if original.TxID.IsEqual(parent.TxIDChainHash()) {
+			require.Equal(t, loser.TxIDChainHash(), original.SpendingData.TxID)
+		} else {
+			require.Equal(t, children[original.Vout].TxIDChainHash(), original.SpendingData.TxID)
+		}
+	}
+
+	require.NoError(t, utxo.CompleteConflictIntent(ctx, db, intent.IntentID()))
 }

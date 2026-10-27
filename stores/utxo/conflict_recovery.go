@@ -9,6 +9,8 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"golang.org/x/sync/errgroup"
 )
 
 // ConflictRecovery is one operation's durable checklist. The before-image is
@@ -83,81 +85,126 @@ func (r *ConflictRecovery) Validate() error {
 
 // prepareConflictRecovery snapshots the whole cascade before SetConflicting or
 // Unspend can erase any edge. Parents already locked by another holder stay out of
-// this operation's lock and unlock list.
+// this operation's lock and unlock list. The reads run concurrently, bounded by
+// conflictingWalkFanOut; the checklist keeps discovery order.
 func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Hash, winningSpends []*Spend) (*ConflictRecovery, error) {
 	r := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryPrepared, WinningSpends: winningSpends}
+
+	metas := make([]*meta.Data, len(hashes))
+	if err := forEachConflictRead(ctx, len(hashes), func(ctx context.Context, i int) error {
+		m, err := s.Get(ctx, &hashes[i], fields.Tx, fields.Conflicting)
+		if err != nil {
+			return err
+		}
+
+		if m == nil || m.Tx == nil {
+			return errors.NewProcessingError("cannot snapshot conflict transaction %s", hashes[i].String())
+		}
+
+		metas[i] = m
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
 	type outpoint struct {
 		hash  chainhash.Hash
 		index uint32
 	}
+
 	seen := make(map[outpoint]struct{})
+
 	var parents hashSet
-	for _, h := range hashes {
-		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting)
-		if err != nil {
-			return nil, err
-		}
-		if m == nil || m.Tx == nil {
-			return nil, errors.NewProcessingError("cannot snapshot conflict transaction %s", h.String())
-		}
-		r.Transactions = append(r.Transactions, ConflictTransaction{Hash: h, Conflicting: m.Conflicting})
-		spends, err := GetSpends(m.Tx)
-		if err != nil {
-			return nil, err
-		}
+
+	addSpends := func(spends []*Spend) {
 		for _, sp := range spends {
 			key := outpoint{*sp.TxID, sp.Vout}
 			if _, ok := seen[key]; ok {
 				continue
 			}
+
 			seen[key] = struct{}{}
-			response, err := s.GetSpend(ctx, sp)
-			if err != nil {
-				return nil, err
-			}
-			if response == nil || response.Status == int(Status_NOT_FOUND) || response.Status == int(Status_FROZEN) {
-				return nil, errors.NewProcessingError("cannot snapshot conflict outpoint %s:%d", sp.TxID, sp.Vout)
-			}
-			original := sp.Clone()
-			original.SpendingData = response.SpendingData.Clone()
-			r.OriginalSpends = append(r.OriginalSpends, original)
+			r.OriginalSpends = append(r.OriginalSpends, sp.Clone())
 			parents.add(*sp.TxID)
 		}
 	}
-	// Winning-only inputs also need before-images (including originally unspent inputs).
-	for _, sp := range winningSpends {
-		key := outpoint{*sp.TxID, sp.Vout}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		response, err := s.GetSpend(ctx, sp)
+
+	for i, h := range hashes {
+		r.Transactions = append(r.Transactions, ConflictTransaction{Hash: h, Conflicting: metas[i].Conflicting})
+
+		spends, err := GetSpends(metas[i].Tx)
 		if err != nil {
 			return nil, err
 		}
-		if response == nil || response.Status == int(Status_NOT_FOUND) || response.Status == int(Status_FROZEN) {
-			return nil, errors.NewProcessingError("cannot snapshot winning outpoint %s:%d", sp.TxID, sp.Vout)
-		}
-		original := sp.Clone()
-		original.SpendingData = response.SpendingData.Clone()
-		r.OriginalSpends = append(r.OriginalSpends, original)
-		parents.add(*sp.TxID)
+
+		addSpends(spends)
 	}
-	for _, h := range parents.order {
-		m, err := s.Get(ctx, &h, fields.Locked)
+
+	// Winning-only inputs also need before-images (including originally unspent inputs).
+	addSpends(winningSpends)
+
+	if err := forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
+		original := r.OriginalSpends[i]
+
+		response, err := s.GetSpend(ctx, original)
 		if err != nil {
-			return nil, err
+			return err
 		}
+
+		if response == nil || response.Status == int(Status_NOT_FOUND) || response.Status == int(Status_FROZEN) {
+			return errors.NewProcessingError("cannot snapshot conflict outpoint %s:%d", original.TxID, original.Vout)
+		}
+
+		original.SpendingData = response.SpendingData.Clone()
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	locked := make([]bool, len(parents.order))
+	if err := forEachConflictRead(ctx, len(parents.order), func(ctx context.Context, i int) error {
+		m, err := s.Get(ctx, &parents.order[i], fields.Locked)
+		if err != nil {
+			return err
+		}
+
 		if m == nil {
-			return nil, errors.NewProcessingError("conflict parent %s is missing", h.String())
+			return errors.NewProcessingError("conflict parent %s is missing", parents.order[i].String())
 		}
-		// A lock held by someone else (a validator, or a lock an older build leaked) is not this
-		// operation's to take or release. Leave it out of the lock set instead of failing every attempt.
-		if !m.Locked {
+
+		locked[i] = m.Locked
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// A lock held by someone else (a validator, or a lock an older build leaked) is not this
+	// operation's to take or release. Leave it out of the lock set instead of failing every attempt.
+	for i, h := range parents.order {
+		if !locked[i] {
 			r.Parents = append(r.Parents, h)
 		}
 	}
+
 	return r, nil
+}
+
+// forEachConflictRead runs read for every index in [0, n), at most conflictingWalkFanOut at a
+// time. Each call writes only its own index, so callers keep a deterministic order.
+func forEachConflictRead(ctx context.Context, n int, read func(ctx context.Context, i int) error) error {
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(conflictingWalkFanOut)
+
+	for i := 0; i < n; i++ {
+		g.Go(func() error {
+			return read(gCtx, i)
+		})
+	}
+
+	return g.Wait()
 }
 
 // rollbackConflictRecovery restores recorded owners, never every transaction
@@ -199,14 +246,24 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	}
 	// Verify before making any loser usable again. A failed restoration keeps
 	// the cascade conflicting and the checklist pending.
-	for _, original := range r.OriginalSpends {
-		got, err := s.GetSpend(ctx, original)
+	mismatches := make([]error, len(r.OriginalSpends))
+	_ = forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
+		original := r.OriginalSpends[i]
+
+		owned, err := conflictOwnerMatches(ctx, s, original)
 		if err != nil {
-			failures = append(failures, err)
-			continue
+			mismatches[i] = err
+		} else if !owned {
+			mismatches[i] = errors.NewProcessingError("conflict rollback ownership mismatch at %s:%d", original.TxID, original.Vout)
 		}
-		if got == nil || got.Status == int(Status_NOT_FOUND) || !bytes.Equal(got.SpendingData.Bytes(), original.SpendingData.Bytes()) {
-			failures = append(failures, errors.NewProcessingError("conflict rollback ownership mismatch at %s:%d", original.TxID, original.Vout))
+
+		// Collect every mismatch: one failure must not cancel the other checks.
+		return nil
+	})
+
+	for _, mismatch := range mismatches {
+		if mismatch != nil {
+			failures = append(failures, mismatch)
 		}
 	}
 	if len(failures) != 0 {
@@ -237,16 +294,30 @@ func cloneConflictSpends(spends []*Spend) []*Spend {
 }
 
 func verifyConflictSpends(ctx context.Context, s Store, spends []*Spend) error {
-	for _, original := range spends {
-		got, err := s.GetSpend(ctx, original)
+	return forEachConflictRead(ctx, len(spends), func(ctx context.Context, i int) error {
+		original := spends[i]
+
+		owned, err := conflictOwnerMatches(ctx, s, original)
 		if err != nil {
 			return err
 		}
-		if got == nil || got.Status == int(Status_NOT_FOUND) || !bytes.Equal(got.SpendingData.Bytes(), original.SpendingData.Bytes()) {
+
+		if !owned {
 			return errors.NewProcessingError("conflict ownership changed at %s:%d", original.TxID, original.Vout)
 		}
+
+		return nil
+	})
+}
+
+// conflictOwnerMatches reports whether the outpoint of original still has the spender the checklist recorded.
+func conflictOwnerMatches(ctx context.Context, s Store, original *Spend) (bool, error) {
+	got, err := s.GetSpend(ctx, original)
+	if err != nil {
+		return false, err
 	}
-	return nil
+
+	return got != nil && got.Status != int(Status_NOT_FOUND) && bytes.Equal(got.SpendingData.Bytes(), original.SpendingData.Bytes()), nil
 }
 
 // RollbackConflictIntent also handles stale forward intents after a reorg.

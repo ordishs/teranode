@@ -285,7 +285,11 @@ func TestHealStaleConflictIntent_ReverseRealStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	require.Equal(t, utxo.ConflictIntentForward, pending[0].Kind)
-	require.Equal(t, utxo.ConflictRecoveryFinished, pending[0].Recovery.Phase)
+	require.Nil(t, pending[0].Recovery, "the pending scan must not load checklists")
+
+	recovery, err := store.LoadConflictRecovery(ctx, pending[0].IntentID())
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryFinished, recovery.Phase)
 }
 
 // createStaleReverseParent stores a mined parent with the given number of outputs.

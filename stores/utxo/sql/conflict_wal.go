@@ -91,7 +91,7 @@ func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.H
 
 // PendingConflictIntents returns every begun-but-not-completed intent.
 func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT kind, block_height, block_hash, tx_hashes, started_at, recovery FROM conflict_intents`)
+	rows, err := s.db.QueryContext(ctx, `SELECT kind, block_height, block_hash, tx_hashes, started_at FROM conflict_intents`)
 	if err != nil {
 		return nil, errors.NewStorageError("[PendingConflictIntents] query failed", err)
 	}
@@ -101,15 +101,14 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 
 	for rows.Next() {
 		var (
-			kind         string
-			blockHeight  int64
-			blockHash    []byte
-			txHashes     []byte
-			startedAt    int64
-			recoveryData []byte
+			kind        string
+			blockHeight int64
+			blockHash   []byte
+			txHashes    []byte
+			startedAt   int64
 		)
 
-		if err := rows.Scan(&kind, &blockHeight, &blockHash, &txHashes, &startedAt, &recoveryData); err != nil {
+		if err := rows.Scan(&kind, &blockHeight, &blockHash, &txHashes, &startedAt); err != nil {
 			return nil, errors.NewStorageError("[PendingConflictIntents] scan failed", err)
 		}
 
@@ -123,12 +122,7 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 			return nil, errors.NewStorageError("[PendingConflictIntents] corrupt intent row (kind=%s height=%d startedAt=%d)", kind, blockHeight, startedAt, err)
 		}
 
-		recovery, err := utxo.DecodeConflictRecovery(recoveryData)
-		if err != nil {
-			return nil, err
-		}
 		intents = append(intents, utxo.ConflictIntent{
-			Recovery:    recovery,
 			Kind:        utxo.ConflictIntentKind(kind),
 			BlockHeight: uint32(blockHeight),
 			BlockHash:   *bh,

@@ -126,8 +126,8 @@ func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.H
 }
 
 // PendingConflictIntents scans the WAL set and returns every begun-but-not-
-// completed intent. Called once at BlockAssembler startup, so a full set scan
-// is acceptable.
+// completed intent. It reads only the root bins, never the checklist chunks:
+// callers load a checklist with LoadConflictRecovery when they need it.
 func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
 	stmt := aerospike.NewStatement(s.namespace, s.conflictWALSet())
 	stmt.BinNames = []string{walBinKind, walBinBlockHeight, walBinBlockHash, walBinTxHashes, walBinStartedAt, "recoveryDone"}
@@ -143,7 +143,10 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 	}
 	defer recordset.Close()
 
-	var intents []utxo.ConflictIntent
+	var (
+		intents []utxo.ConflictIntent
+		done    []chainhash.Hash
+	)
 
 	for res := range recordset.Results() {
 		if res.Err != nil {
@@ -190,37 +193,29 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 			return nil, errors.NewStorageError("[PendingConflictIntents] corrupt intent record (kind=%s height=%d startedAt=%d)", kind, blockHeight, startedAt, err)
 		}
 
-		intents = append(intents, utxo.ConflictIntent{
+		intent := utxo.ConflictIntent{
 			Kind:        utxo.ConflictIntentKind(kind),
 			BlockHeight: uint32(blockHeight),
 			BlockHash:   *bh,
 			TxHashes:    hashes,
 			StartedAt:   int64(startedAt),
-		})
-	}
+		}
 
-	live := intents[:0]
-	for _, intent := range intents {
-		r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
-		if err != nil {
-			return nil, err
-		}
-		// Load also completes interrupted chunk deletion. An absent root is
-		// excluded rather than exposed as a new legacy operation.
-		id := intent.IntentID()
-		key, err := aerospike.NewKey(s.namespace, s.conflictWALSet(), id.CloneBytes())
-		if err != nil {
-			return nil, err
-		}
-		exists, err := s.client.Exists(nil, key)
-		if err != nil {
-			return nil, err
-		}
-		if !exists {
+		// A completed intent whose chunk cleanup was interrupted is not pending. Finish its
+		// deletion below rather than expose it as a new legacy operation.
+		if record.Bins["recoveryDone"] == true {
+			done = append(done, intent.IntentID())
 			continue
 		}
-		intent.Recovery = r
-		live = append(live, intent)
+
+		intents = append(intents, intent)
 	}
-	return live, nil
+
+	for _, id := range done {
+		if err := utxo.CompleteConflictIntent(ctx, s, id); err != nil {
+			return nil, err
+		}
+	}
+
+	return intents, nil
 }

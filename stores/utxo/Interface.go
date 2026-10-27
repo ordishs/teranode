@@ -78,6 +78,8 @@ const (
 // operation replayed on restart. See ProcessConflicting / ReverseProcessConflicting.
 type ConflictIntent struct {
 	// Recovery is the versioned before-image and progress of a forward operation.
+	// BeginConflictIntent stores it. PendingConflictIntents leaves it nil; use
+	// LoadConflictRecovery to read it.
 	Recovery *ConflictRecovery `json:"recovery,omitempty"`
 
 	// Kind is the operation direction: forward = ProcessConflicting,

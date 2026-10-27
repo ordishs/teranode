@@ -98,3 +98,8 @@ func TestConflictRecoveryConfirmedWinner(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryConfirmedWinner(t, store)
 }
+
+func TestConflictRecoveryWideCascade(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryWideCascade(t, store)
+}
