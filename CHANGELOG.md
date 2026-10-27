@@ -340,7 +340,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   change is required. This does not change the general rollback protocol for
   backend failures or concurrent attempts. Go integrations using
   `FilterConflictingDuplicateSpendClaims` must migrate to `ProcessSpendBatch`
-  with a synchronous backend callback. (bitcoin-sv/teranode#4934)
+  with a synchronous backend callback. (#2036, bitcoin-sv/teranode#4934)
 
 - **A failed revert of an invalid block's mined tags now holds block assembly until it
   succeeds.** When block validation reverts the mined tags of an invalid block and
