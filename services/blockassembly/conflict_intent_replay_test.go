@@ -288,6 +288,122 @@ func TestHealStaleConflictIntent_ReverseRealStore(t *testing.T) {
 	require.Equal(t, utxo.ConflictRecoveryFinished, pending[0].Recovery.Phase)
 }
 
+// createStaleReverseParent stores a mined parent with the given number of outputs.
+func createStaleReverseParent(ctx context.Context, t *testing.T, store utxo.Store, outputs int) *bt.Tx {
+	t.Helper()
+
+	parent := bt.NewTx()
+	parentIn := &bt.Input{PreviousTxOutIndex: 0, PreviousTxSatoshis: 200000, SequenceNumber: 0xFFFFFFFF, UnlockingScript: bscript.NewFromBytes([]byte{})}
+	_ = parentIn.PreviousTxIDAdd(&chainhash.Hash{7, 7, 7})
+	parent.Inputs = []*bt.Input{parentIn}
+
+	for i := 0; i < outputs; i++ {
+		parent.Outputs = append(parent.Outputs, &bt.Output{Satoshis: 100000, LockingScript: bscript.NewFromBytes([]byte{0x52})})
+	}
+
+	_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	require.NoError(t, store.MarkTransactionsOnLongestChain(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, true))
+
+	return parent
+}
+
+// createStaleReverseSpender stores a transaction that spends parent[vout]. An owner also takes the spend.
+func createStaleReverseSpender(ctx context.Context, t *testing.T, store utxo.Store, parent *bt.Tx, vout uint32, satoshis uint64, owner bool) *bt.Tx {
+	t.Helper()
+
+	tx := bt.NewTx()
+	require.NoError(t, tx.From(parent.TxIDChainHash().String(), vout, parent.Outputs[vout].LockingScript.String(), parent.Outputs[vout].Satoshis))
+	tx.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{})
+	tx.Outputs = []*bt.Output{{Satoshis: satoshis, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
+
+	_, _, err := store.SpendAndCreate(ctx, tx, 10, utxo.WithConflicting(!owner), utxo.WithCreateOnly())
+	require.NoError(t, err)
+
+	if owner {
+		_, _, err = store.SpendAndCreate(ctx, tx, store.GetBlockHeight()+1, utxo.WithSpendOnly())
+		require.NoError(t, err)
+	}
+
+	return tx
+}
+
+func requireConflictOwner(ctx context.Context, t *testing.T, store utxo.Store, owner *bt.Tx, conflicting ...*bt.Tx) {
+	t.Helper()
+
+	m, err := store.Get(ctx, owner.TxIDChainHash(), utxofields.Conflicting)
+	require.NoError(t, err)
+	require.False(t, m.Conflicting)
+
+	spends, err := utxo.GetSpends(owner)
+	require.NoError(t, err)
+
+	actual, err := store.GetSpend(ctx, spends[0])
+	require.NoError(t, err)
+	require.Equal(t, owner.TxIDChainHash(), actual.SpendingData.TxID)
+
+	for _, tx := range conflicting {
+		m, err = store.Get(ctx, tx.TxIDChainHash(), utxofields.Conflicting)
+		require.NoError(t, err)
+		require.True(t, m.Conflicting)
+	}
+}
+
+// A reverse can crash after its WAL record and before its first step. If the block is back on the
+// longest chain at restart, the winner still owns its input and is not conflicting, and no forward
+// checklist exists. The heal must accept that applied state, clear the WAL and let block assembly start.
+func TestReplayPendingConflictIntents_StaleReverseNothingApplied(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	parent := createStaleReverseParent(ctx, t, store, 1)
+	txL := createStaleReverseSpender(ctx, t, store, parent, 0, 90000, false)
+	txW := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, true)
+
+	addBlockWithMinedSet(ctx, t, items, blockHeader1)
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 1, BlockHash: *blockHeader1.Hash(), TxHashes: []chainhash.Hash{*txW.TxIDChainHash()}, StartedAt: 1}
+	require.NoError(t, store.BeginConflictIntent(ctx, intent))
+
+	items.blockAssembler.replayPendingConflictIntents(ctx)
+
+	require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx))
+
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Empty(t, pending)
+
+	requireConflictOwner(ctx, t, store, txW, txL)
+}
+
+// A partial reverse flipped one winner back and left the other applied. The heal must re-apply the
+// flipped winner and leave the applied winner as it is.
+func TestHealStaleConflictIntent_ReversePartiallyApplied(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	parent := createStaleReverseParent(ctx, t, store, 2)
+
+	// Output 0: the reverse did not reach W1. W1 still owns the spend and L1 is conflicting.
+	txL1 := createStaleReverseSpender(ctx, t, store, parent, 0, 90000, false)
+	txW1 := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, true)
+
+	// Output 1: the reverse finished for W2. L2 owns the spend again and W2 is conflicting.
+	txL2 := createStaleReverseSpender(ctx, t, store, parent, 1, 90000, true)
+	txW2 := createStaleReverseSpender(ctx, t, store, parent, 1, 80000, false)
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 10, BlockHash: chainhash.HashH([]byte("partially-reversed-block")),
+		TxHashes: []chainhash.Hash{*txW1.TxIDChainHash(), *txW2.TxIDChainHash()}, StartedAt: 1}
+	require.NoError(t, items.blockAssembler.healStaleConflictIntent(ctx, intent))
+
+	requireConflictOwner(ctx, t, store, txW1, txL1)
+	requireConflictOwner(ctx, t, store, txW2, txL2)
+}
+
 // TestReplayPendingConflictIntents_RealStoreReverseConverges is the crash-
 // recovery integration test (#861) against a REAL sqlitememory store and a real
 // BlockAssembler. It reproduces the most common crash window — a SIGKILL AFTER

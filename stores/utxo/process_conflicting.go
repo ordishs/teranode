@@ -887,6 +887,35 @@ func winnerIsApplied(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt
 	return true, nil
 }
 
+// UnappliedConflictWinners returns the winners that ProcessConflicting must still apply. A winner
+// that is not Conflicting and already owns every input is applied, so it is left out. A reverse that
+// stopped before it reached a winner leaves that winner in this state, with no forward checklist.
+func UnappliedConflictWinners(ctx context.Context, s Store, winners []chainhash.Hash) ([]chainhash.Hash, error) {
+	pending := make([]chainhash.Hash, 0, len(winners))
+
+	for _, h := range winners {
+		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting)
+		if err != nil {
+			return nil, errors.NewProcessingError("[UnappliedConflictWinners][%s] error getting tx", h.String(), err)
+		}
+
+		if m != nil && !m.Conflicting {
+			applied, err := winnerIsApplied(ctx, s, h, m.Tx)
+			if err != nil {
+				return nil, err
+			}
+
+			if applied {
+				continue
+			}
+		}
+
+		pending = append(pending, h)
+	}
+
+	return pending, nil
+}
+
 // setLockedWithRetry retries SetLocked with a bounded back-off — a deliberate exception
 // to "always roll back". By the time we reach step 5 every other phase is committed and
 // correct; the only inconsistency a SetLocked failure introduces is parents that are

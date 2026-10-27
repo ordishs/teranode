@@ -1821,13 +1821,23 @@ func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utx
 	case utxo.ConflictIntentForward:
 		return utxo.RollbackConflictIntent(ctx, b.utxoStore, intent, b.currentChainGuard())
 	case utxo.ConflictIntentReverse:
+		// The reverse may have stopped before it reached some winners. Those are still applied and
+		// have no forward checklist, so ProcessConflicting would refuse them. Re-apply only the rest.
+		winners, err := utxo.UnappliedConflictWinners(ctx, b.utxoStore, intent.TxHashes)
+		if err != nil {
+			return err
+		}
+
+		if len(winners) == 0 {
+			return nil
+		}
 
 		// Replay is chain-authorised too. The isBlockOnLongestChain gate above
 		// only establishes that the intent's block is still on the main chain; it
 		// says nothing about whether a losing transaction is confirmed on that
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
-		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil,
+		_, _, err = utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, winners, nil,
 			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(b.currentChainGuard()))
 
 		return err
