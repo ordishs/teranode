@@ -21,6 +21,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -97,6 +98,7 @@ type TxMetaCache struct {
 	logger                        ulogger.Logger                // Logger for operational logging and diagnostic information
 	noOfBlocksToKeepInTxMetaCache uint32                        // Cache retention horizon (blocks); kept for compatibility with the height-based expiration plumbing in ImprovedCache
 	lanes                         [writeBackLanes]writeBackLane // BatchDecorate write-back, one writer per bucket range (see writeback_lanes.go)
+	tombstones                    *tombstones                   // txs DeleteDemoted evicted; every write path evicts them again (see DeleteDemoted)
 }
 
 // CacheStats provides statistical information about the current state of the cache.
@@ -126,6 +128,11 @@ type CacheStats struct {
 
 	// LaneWaits counts the times a lockfree-cache writer found every lane busy.
 	LaneWaits uint64
+
+	// Evictions is the number of entries the cache dropped to make room (ring
+	// wraps); only the lockfree cache reports it. Explicit deletes are counted
+	// in the cache's own metrics.
+	Evictions uint64
 }
 
 // BucketType defines the allocation strategy for the cache's internal buckets.
@@ -209,6 +216,11 @@ func NewTxMetaCache(
 		return nil, errors.NewServiceError("Cannot use TxMetaCache as the underlying store for TxMetaCache")
 	}
 
+	if tSettings.SubtreeValidation.TxMetaTombstoneWindow <= 0 {
+		// a non-positive window forgets every demotion at once, so writes re-cache demoted txs
+		return nil, errors.NewConfigurationError("subtreevalidation_txMetaTombstoneWindow must be positive, got %s", tSettings.SubtreeValidation.TxMetaTombstoneWindow)
+	}
+
 	initPrometheusMetrics()
 
 	// base size (MB) from the tagged setting
@@ -259,6 +271,7 @@ func NewTxMetaCache(
 		metrics:                       metrics{},
 		logger:                        logger,
 		noOfBlocksToKeepInTxMetaCache: noOfBlocksToKeepInTxMetaCache,
+		tombstones:                    newTombstones(tSettings.SubtreeValidation.TxMetaTombstoneWindow, time.Now),
 	}
 
 	if bucketType == Pointer {
@@ -285,7 +298,14 @@ func NewTxMetaCache(
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
-	if err := t.cache.Set(hash, txMeta); err != nil {
+	if t.skipTombstoned(hash[:]) {
+		return nil
+	}
+
+	err := t.cache.Set(hash, txMeta)
+	t.evictTombstoned(hash[:])
+
+	if err != nil {
 		return err
 	}
 
@@ -305,7 +325,14 @@ func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
-	if err := t.cache.SetFromBytes(key, txMetaBytes); err != nil {
+	if t.skipTombstoned(key) {
+		return nil
+	}
+
+	err := t.cache.SetFromBytes(key, txMetaBytes)
+	t.evictTombstoned(key)
+
+	if err != nil {
 		return err
 	}
 
@@ -325,7 +352,12 @@ func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
 // Returns:
 // - Error if the batch cache operation fails
 func (t *TxMetaCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
-	if err := t.cache.SetMultiFromBytes(keys, values); err != nil {
+	keys, values, _ = t.withoutTombstoned(keys, values, nil)
+
+	err := t.cache.SetMultiFromBytes(keys, values)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -346,7 +378,12 @@ func (t *TxMetaCache) SetCacheMultiSequential(keys [][]byte, values [][]byte) er
 		return nil
 	}
 
-	if err := t.cache.SetMultiSequential(keys, values); err != nil {
+	keys, values, _ = t.withoutTombstoned(keys, values, nil)
+
+	err := t.cache.SetMultiSequential(keys, values)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -364,7 +401,12 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 		return nil
 	}
 
-	if err := t.cache.SetMultiSequentialWithHashes(keys, values, hashes); err != nil {
+	keys, values, hashes = t.withoutTombstoned(keys, values, hashes)
+
+	err := t.cache.SetMultiSequentialWithHashes(keys, values, hashes)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -379,7 +421,12 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 // miss burst, flooded the scheduler and the bucket locks and starved the Kafka
 // txmeta handler.
 func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) error {
-	if err := t.cache.SetMultiSequential(keys, values); err != nil {
+	keys, values, _ = t.withoutTombstoned(keys, values, nil)
+
+	err := t.cache.SetMultiSequential(keys, values)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -405,7 +452,7 @@ func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) err
 // Hit/miss counts are exposed via the standard txmetacache Prometheus metrics.
 func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*meta.Data, bool) {
 	d, ok := t.cache.Get(hash)
-	if !ok {
+	if !ok || t.tombstones.contains(hash[:]) {
 		t.metrics.misses.Add(1)
 		return nil, false
 	}
@@ -422,6 +469,10 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 // not hash them again. Same read-only contract as GetMetaCached.
 func (t *TxMetaCache) GetMetaCachedMulti(_ context.Context, hashes []chainhash.Hash, keyHashes []uint64, out []*meta.Data) {
 	t.cache.GetMulti(hashes, keyHashes, out)
+
+	for _, i := range t.tombstones.matchesHashes(hashes, nil) {
+		out[i] = nil
+	}
 
 	hits := 0
 
@@ -451,6 +502,20 @@ var intoScratchPool = sync.Pool{
 // intoScratchMaxRetain caps the raw buffer kept in the pool, so one oversized
 // batch does not pin its buffer for the life of the process.
 const intoScratchMaxRetain = 4 * 1024 * 1024
+
+// intoScratchBytesPerEntry is the room reserved per lookup when a scratch has
+// to grow: a little above a typical entry (fee, size, flags and one or two
+// parents). The pool loses its scratches on every GC; reserving for the batch
+// up front replaces the doubling growth the reads would otherwise go through.
+const intoScratchBytesPerEntry = 128
+
+// reserve makes sure raw has room for n entries, up to intoScratchMaxRetain.
+func (sc *intoScratch) reserve(n int) {
+	need := min(n*intoScratchBytesPerEntry, intoScratchMaxRetain)
+	if cap(sc.raw) < need {
+		sc.raw = make([]byte, 0, need)
+	}
+}
 
 // Decoded parent hashes and vouts are carved from chunks that are never
 // reused, because callers keep the TxInpoints. A chunk is held by a per-P
@@ -530,7 +595,13 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 	}
 
 	spans := sc.spans[:n]
+
+	sc.reserve(n)
 	t.cache.GetRawMulti(hashes, keyHashes, &sc.raw, spans)
+
+	for _, i := range t.tombstones.matchesHashes(hashes, nil) {
+		spans[i] = [2]int{-1, -1}
+	}
 
 	carver := intoCarverPool.Get().(*intoCarver)
 	defer intoCarverPool.Put(carver)
@@ -583,6 +654,17 @@ func ProbeRangeOf(keyHash uint64) int {
 	return int(keyHash % BucketsCount / (BucketsCount / ProbeRanges))
 }
 
+// BucketLocality reports whether grouping a large lookup by ProbeRangeOf pays
+// off on this cache's backend. The bucketed backends take a lock per bucket,
+// so a grouped batch takes each lock once. The lockfree cache has one global
+// index and no locks; for it the grouping only scatters the caller's result
+// writes, and it ignores keyHashes.
+func (t *TxMetaCache) BucketLocality() bool {
+	_, lockfree := t.cache.(*lockFreeBackend)
+
+	return !lockfree
+}
+
 // GetMeta retrieves transaction metadata for a given transaction hash, first checking the cache
 // and falling back to the underlying store if needed.
 //
@@ -597,7 +679,7 @@ func ProbeRangeOf(keyHash uint64) int {
 // This is one of the primary interface methods that proxies calls to the underlying store
 // with a caching layer in between for improved performance.
 func (t *TxMetaCache) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
-	if cached, ok := t.cache.Get(*hash); ok {
+	if cached, ok := t.cache.Get(*hash); ok && !t.tombstones.contains(hash[:]) {
 		// In pointer mode the cache hands out the same *meta.Data to every
 		// concurrent reader. *data = *cached copies the struct but
 		// ParentTxHashes still points at the cache's backing slice — a
@@ -982,6 +1064,88 @@ func (t *TxMetaCache) Delete(_ context.Context, hash *chainhash.Hash) error {
 	return nil
 }
 
+// DeleteDemoted evicts txs just demoted to conflicting and keeps them out of the
+// cache for subtreevalidation_txMetaTombstoneWindow. Unlike Delete, it also
+// blocks any write that lands after it: a txmeta ADD consumed late from another
+// partition, or a read-through write (GetMeta, BatchDecorate) whose store read
+// returned the tx before the demotion.
+//
+// It records the tombstones before it deletes, and every write path checks them
+// after its write, so either the write sees the tombstone and evicts again, or
+// it finished before the tombstone was recorded and the delete below removes it.
+// A write that checked before the tombstone existed can still land after this
+// returns and stay readable until its own post-write eviction, so every read
+// path also checks the tombstones after reading: once this returns, no read
+// returns these txs.
+func (t *TxMetaCache) DeleteDemoted(hashes []chainhash.Hash) {
+	t.tombstones.add(hashes)
+
+	for i := range hashes {
+		t.cache.Del(hashes[i][:])
+	}
+
+	t.metrics.evictions.Add(uint64(len(hashes)))
+}
+
+// Every write path drops tombstoned entries before its write, so a demoted tx
+// is not readable even briefly, and evicts tombstoned keys after it, for a
+// DeleteDemoted that ran during the write. With no tombstones each is one
+// atomic load.
+
+// skipTombstoned reports whether key is tombstoned and must not be written.
+func (t *TxMetaCache) skipTombstoned(key []byte) bool {
+	if !t.tombstones.contains(key) {
+		return false
+	}
+
+	prometheusTxMetaCacheTombstonedWritesEvicted.Inc()
+
+	return true
+}
+
+// withoutTombstoned returns the batch without its tombstoned entries. It copies
+// only when there is one; hashes may be nil.
+func (t *TxMetaCache) withoutTombstoned(keys, values [][]byte, hashes []uint64) ([][]byte, [][]byte, []uint64) {
+	drop := t.tombstones.matches(keys, nil)
+	if len(drop) == 0 {
+		return keys, values, hashes
+	}
+
+	prometheusTxMetaCacheTombstonedWritesEvicted.Add(float64(len(drop)))
+
+	keptKeys := make([][]byte, 0, len(keys)-len(drop))
+	keptValues := make([][]byte, 0, len(keys)-len(drop))
+
+	var keptHashes []uint64
+	if hashes != nil {
+		keptHashes = make([]uint64, 0, len(keys)-len(drop))
+	}
+
+	for i := range keys {
+		if len(drop) > 0 && drop[0] == i {
+			drop = drop[1:]
+			continue
+		}
+
+		keptKeys = append(keptKeys, keys[i])
+		keptValues = append(keptValues, values[i])
+
+		if hashes != nil {
+			keptHashes = append(keptHashes, hashes[i])
+		}
+	}
+
+	return keptKeys, keptValues, keptHashes
+}
+
+// evictTombstoned evicts the written keys a concurrent DeleteDemoted tombstoned.
+func (t *TxMetaCache) evictTombstoned(keys ...[]byte) {
+	for _, i := range t.tombstones.matches(keys, nil) {
+		t.cache.Del(keys[i])
+		prometheusTxMetaCacheTombstonedWritesEvicted.Inc()
+	}
+}
+
 // DeleteComplete removes the transaction from the durable store completely
 // (master record, pagination children and external blob(s)) via the wrapped
 // store, then drops the cache entry. Unlike Delete — which is cache-only — this
@@ -1036,6 +1200,7 @@ func (t *TxMetaCache) GetCacheStats() *CacheStats {
 		CurrentGenEntries:  s.CurrentGenEntries,
 		PreviousGenEntries: s.PreviousGenEntries,
 		LaneWaits:          s.LaneWaits,
+		Evictions:          s.Evictions,
 	}
 }
 

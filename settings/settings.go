@@ -199,9 +199,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Alert: AlertSettings{
 			GenesisKeys:              getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
 			P2PPrivateKey:            getString("alert_p2p_private_key", "", alternativeContext...),
-			ProtocolID:               getString("alert_protocol_id", "/bitcoin/alert-system/1.0.0", alternativeContext...),
+			ProtocolID:               getString("alert_protocol_id", "", alternativeContext...),
 			StoreURL:                 getURL("alert_store", "sqlite:///alert", alternativeContext...),
-			TopicName:                getString("alert_topic_name", "bitcoin_alert_system", alternativeContext...),
+			TopicName:                getString("alert_topic_name", "", alternativeContext...),
 			P2PPort:                  getPort("ALERT_P2P_PORT", 9908, alternativeContext...),
 			P2PBootstrapPeer:         getString("alert_p2p_bootstrap_peer", "", alternativeContext...),
 			P2PAllowPrivateIPs:       getBool("alert_p2p_allow_private_ips", false, alternativeContext...),
@@ -287,7 +287,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MinedCacheMaxMB:                       getInt("blockMinedCacheMaxMB", 256, alternativeContext...),
 			CheckDuplicateTransactionsConcurrency: getInt("block_checkDuplicateTransactionsConcurrency", -1, alternativeContext...),
 			GetAndValidateSubtreesConcurrency:     getInt("block_getAndValidateSubtreesConcurrency", -1, alternativeContext...),
-			KafkaWorkers:                          getInt("block_kafkaWorkers", 0, alternativeContext...),
 			ValidOrderAndBlessedConcurrency:       getInt("block_validOrderAndBlessedConcurrency", -1, alternativeContext...),
 			BlockStore:                            getURL("blockstore", "file://./data/blockstore", alternativeContext...),
 			FailFastValidation:                    getBool("blockvalidation_fail_fast_validation", true, alternativeContext...),
@@ -397,7 +396,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			RetrySleep:                                getDuration("blockValidationRetrySleep", 1*time.Second, alternativeContext...),
 			GRPCAddress:                               getString("blockvalidation_grpcAddress", "localhost:8088", alternativeContext...),
 			GRPCListenAddress:                         getString("blockvalidation_grpcListenAddress", ":8088", alternativeContext...),
-			KafkaWorkers:                              getInt("blockvalidation_kafkaWorkers", 0, alternativeContext...),
 			LocalSetTxMinedConcurrency:                getInt("blockvalidation_localSetTxMinedConcurrency", 8, alternativeContext...),
 			MaxPreviousBlockHeadersToCheck:            getUint64("blockvalidation_maxPreviousBlockHeadersToCheck", 100, alternativeContext...),
 			MissingTransactionsBatchSize:              getInt("blockvalidation_missingTransactionsBatchSize", 5000, alternativeContext...),
@@ -482,7 +480,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Validator: ValidatorSettings{
 			GRPCAddress:                          getString("validator_grpcAddress", "localhost:8081", alternativeContext...),
 			GRPCListenAddress:                    getString("validator_grpcListenAddress", ":8081", alternativeContext...),
-			KafkaWorkers:                         getInt("validator_kafkaWorkers", 0, alternativeContext...),
 			SendBatchSize:                        getInt("validator_sendBatchSize", 100, alternativeContext...),
 			SendBatchTimeout:                     getInt("validator_sendBatchTimeout", 2, alternativeContext...),
 			SendBatchTickerIntervalMillis:        getInt("validator_sendBatchTickerIntervalMillis", 0, alternativeContext...),
@@ -562,7 +559,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ExternalStoreConcurrency:                getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
 			PostgresPool:                            getPostgresPoolSettings("utxostore", alternativeContext...),
 			VerboseDebug:                            getBool("utxostore_verbose_debug", false, alternativeContext...),
-			UpdateTxMinedStatus:                     getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
 			MaxMinedRoutines:                        getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
 			MaxMinedBatchSize:                       getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:          getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
@@ -705,16 +701,16 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SkipProcessExpiredPreservations: getBool("pruner_skipProcessExpiredPreservations", false, alternativeContext...),      // Skip Phase 1b: expire old parent preservations
 			SkipDeletions:                   getBool("pruner_skipDeletions", false, alternativeContext...),                        // Skip deletions for performance
 			MinBlockHeight:                  getUint32("pruner_min_block_height", 0, alternativeContext...),                       // Do not prune blocks at or below this height
-			UTXOPrunedSetMaxEntries:         getInt("pruner_utxoPrunedSetMaxEntries", 10_000_000, alternativeContext...),          // Soft cap on PrunedTxSet entries; 0 = use built-in 2B default (NOT unlimited)
 		},
 		SubtreeValidation: SubtreeValidationSettings{
-			QuorumAbsoluteTimeout:              getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
-			QuorumPath:                         getString("subtree_quorum_path", "", alternativeContext...),
-			SubtreeStore:                       getURL("subtreestore", "", alternativeContext...),
-			GetMissingTransactions:             getInt("subtreevalidation_getMissingTransactions", max(4, runtime.NumCPU()/2), alternativeContext...),
-			GRPCAddress:                        getString("subtreevalidation_grpcAddress", "localhost:8089", alternativeContext...),
-			GRPCListenAddress:                  getString("subtreevalidation_grpcListenAddress", ":8089", alternativeContext...),
-			ProcessTxMetaUsingCacheConcurrency: getInt("subtreevalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
+			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),
+			QuorumPath:                                getString("subtree_quorum_path", "", alternativeContext...),
+			SubtreeStore:                              getURL("subtreestore", "", alternativeContext...),
+			GetMissingTransactions:                    getInt("subtreevalidation_getMissingTransactions", max(4, runtime.NumCPU()/2), alternativeContext...),
+			GRPCAddress:                               getString("subtreevalidation_grpcAddress", "localhost:8089", alternativeContext...),
+			GRPCListenAddress:                         getString("subtreevalidation_grpcListenAddress", ":8089", alternativeContext...),
+			ProcessTxMetaUsingCacheConcurrency:        getInt("subtreevalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
+			PeerSubtreeConcurrency:                    getInt("subtreevalidation_peerSubtreeConcurrency", 32, alternativeContext...),
 			ProcessTxMetaUsingCacheMissingTxThreshold: getInt("subtreevalidation_processTxMetaUsingCache_MissingTxThreshold", 1, alternativeContext...),
 			SubtreeDAHConcurrency:                     getInt("subtreevalidation_subtreeDAHConcurrency", 8, alternativeContext...),
 			TxMetaCacheEnabled:                        getBool("subtreevalidation_txMetaCacheEnabled", true, alternativeContext...),
@@ -737,7 +733,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BlocksOnly:                                getBool("subtreevalidation_blocks_only", false, alternativeContext...),
 			TxPolicyRejectedCacheEnabled:              getBool("subtreevalidation_txPolicyRejectedCacheEnabled", true, alternativeContext...),
 			TxPolicyRejectedCacheMaxMB:                getInt("subtreevalidation_txPolicyRejectedCacheMaxMB", 64, alternativeContext...),
+			KeptAsideMaxBytesPerSubtree:               getInt("subtreevalidation_keptAsideMaxBytesPerSubtree", 16*1024*1024, alternativeContext...),
 			CheckBlockSubtreesTimeout:                 getDuration("subtreevalidation_check_block_subtrees_timeout", 30*time.Minute, alternativeContext...),
+			TxMetaTombstoneWindow:                     getDuration("subtreevalidation_txMetaTombstoneWindow", 30*time.Minute, alternativeContext...),
 			MaxIncomingSubtreeBytes:                   int64(getInt("subtreevalidation_max_incoming_subtree_bytes", 128*1024*1024, alternativeContext...)),
 		},
 		// Adaptive subtreeData fetch gate. Defaults here mirror the struct
