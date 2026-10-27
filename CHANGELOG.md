@@ -327,20 +327,31 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   (including a non-positive `subtreevalidation_txMetaTombstoneWindow`). It used to
   log the failure and run with no store, then panic on first use.
 
-- **UTXO batch conflicts are now decided by the backend.** SQL and Aerospike
-  process competing claims on the same outpoint in separate, ordered backend
-  batches. A re-submitted spend is accepted when it matches the stored owner,
-  even if an earlier claim in the batch fails. Double-spend errors name the
-  actual owner, including owners absent from the batch. Previously, arrival
-  order could cause a false `UTXO_SPENT` error and rollback of an existing spend
-  when the spending transaction had not yet been created. There is no separate
-  ownership lookup or fallback on a failed lookup. Callers can now see success
-  instead of `UTXO_SPENT` for valid retries. Conflicting batches require extra
-  backend calls; batches without conflicts are unchanged. No configuration
-  change is required. This does not change the general rollback protocol for
-  backend failures or concurrent attempts. Go integrations using
+- **UTXO batch conflicts are now decided by the stored owner.** SQL and Aerospike
+  send competing claims on the same outpoint to the backend in ordered parts. A
+  re-submitted spend is accepted when it matches the stored owner, even if an
+  earlier claim in the batch fails. Double-spend errors name the actual owner,
+  including owners absent from the batch. Previously, arrival order could cause a
+  false `UTXO_SPENT` error and rollback of an existing spend when the spending
+  transaction had not yet been created. Callers can now see success instead of
+  `UTXO_SPENT` for valid retries. No configuration change is required.
+
+  Once a part tells the stored owner of an outpoint, later competing claims in
+  the batch are refused locally with `UTXO_SPENT` naming that owner. Thus
+  alternating double-spends cost two backend calls, not one per claim. A claim
+  whose earlier competitor failed for another reason, such as a storage error or
+  a missing parent, still costs its own backend call. Batches without competing
+  claims are unchanged.
+
+  The Aerospike spend circuit breaker and the
+  `teranode_aerospike_utxo_spend_batch` and
+  `teranode_aerospike_utxo_spend_batch_size` histograms now count one batcher
+  batch, however many parts it needs. The Lua retry of `FILTERED_OUT` records on
+  the expression path is no longer a separate sample. The SQL spend batcher now
+  recovers a panic and answers every waiting caller with an error, instead of
+  leaving them to wait for `utxostore_spendWaitTimeout`. Go integrations using
   `FilterConflictingDuplicateSpendClaims` must migrate to `ProcessSpendBatch`
-  with a synchronous backend callback. (#2036, bitcoin-sv/teranode#4934)
+  with a `SpendBatchHandler`. (#2036, bitcoin-sv/teranode#4934)
 
 - **A failed revert of an invalid block's mined tags now holds block assembly until it
   succeeds.** When block validation reverts the mined tags of an invalid block and
