@@ -192,6 +192,11 @@ func TestConflictRecoveryLateLoserChild(t *testing.T) {
 	tests.ConflictRecoveryLateLoserChild(t, store)
 }
 
+func TestConflictRecoveryLateFreeInputSpender(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryLateFreeInputSpender(t, store)
+}
+
 func TestConflictRecoveryLateWinnerChild(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryLateWinnerChild(t, store)

@@ -701,6 +701,71 @@ func ConflictRecoveryLateWinnerChild(t *testing.T, db utxo.Store) {
 	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 }
 
+// spendFreeInput wraps a real store. When the checklist snapshot first reads the free outpoint, it
+// stores a stranger that spends it, as a validator can after discovery and before the snapshot.
+type spendFreeInput struct {
+	utxo.Store
+	free     *utxo.Spend
+	stranger *bt.Tx
+	done     atomic.Bool
+}
+
+func (s *spendFreeInput) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendResponse, error) {
+	if sp.TxID.IsEqual(s.free.TxID) && sp.Vout == s.free.Vout && s.done.CompareAndSwap(false, true) {
+		if _, _, err := s.Store.SpendAndCreate(ctx, s.stranger, 2); err != nil {
+			return nil, err
+		}
+	}
+	return s.Store.GetSpend(ctx, sp)
+}
+
+// ConflictRecoveryLateFreeInputSpender spends a free input of the winner after discovery and before
+// the snapshot. The stranger is outside the discovered set, so the operation must stop before it
+// mutates anything. A retry then discovers the stranger and marks it conflicting.
+func ConflictRecoveryLateFreeInputSpender(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xf1)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	freeParent := crashParentTx(0xf2)
+	_, _, err = db.SpendAndCreate(ctx, freeParent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	require.NoError(t, winner.From(freeParent.TxIDChainHash().String(), 0, freeParent.Outputs[0].LockingScript.String(), freeParent.Outputs[0].Satoshis))
+	winner.Inputs[1].UnlockingScript = dummyUnlockingScript
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+	stranger := crashSpendTx(t, freeParent, 60000)
+	winningSpends, err := utxo.GetSpends(winner)
+	require.NoError(t, err)
+	require.Len(t, winningSpends, 2)
+
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	wrapper := &spendFreeInput{Store: db, free: winningSpends[1], stranger: stranger}
+	_, _, err = utxo.ProcessConflicting(ctx, wrapper, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.True(t, wrapper.done.Load(), "the snapshot must read the free input")
+	require.ErrorContains(t, err, "retry required")
+	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent), "nothing may change before the retry")
+	require.Equal(t, stranger.TxIDChainHash(), crashSpender(t, ctx, db, freeParent))
+	require.False(t, crashConflicting(t, ctx, db, stranger.TxIDChainHash()))
+	require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()))
+	require.False(t, crashLocked(t, ctx, db, freeParent.TxIDChainHash()))
+
+	losers, _, err := utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, losers.Exists(*loser.TxIDChainHash()))
+	require.True(t, losers.Exists(*stranger.TxIDChainHash()), "the retry must include the stranger")
+	require.True(t, crashConflicting(t, ctx, db, stranger.TxIDChainHash()), "a displaced spender must end conflicting")
+	require.False(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, freeParent))
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}
+
 // ConflictRecoveryReverseThenReadd adds a block, moves it back and adds it again, with the forward
 // intent of the first add still waiting for acknowledgement. The reverse must retire that finished
 // checklist, so the second add runs a new forward operation instead of failing on the old one.

@@ -38,6 +38,11 @@ rollback does not touch the inputs of that child, so it needs no before-image. W
 the child's parent ends `Conflicting`, the rollback marks the child and its
 descendants `Conflicting` too, and reports them for txmeta cache eviction.
 
+A validator can also spend a free winning input after discovery and before the
+snapshot. The checklist then records an owner that is not in the discovered set.
+The forward operation stops before it changes anything and asks for a retry. The
+retry discovers that spender and marks it `Conflicting`.
+
 BlockAssembly retains a finished WAL until subtree updates and the queue drain
 succeed. At startup, it replays pending work before loading unmined transactions.
 Unresolved recovery prevents startup, and so does a record whose replay failed,

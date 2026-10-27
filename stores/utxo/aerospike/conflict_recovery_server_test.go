@@ -100,6 +100,13 @@ func TestAerospikeConflictRecoveryLateLoserChild(t *testing.T) {
 	tests.ConflictRecoveryLateLoserChild(t, store)
 }
 
+func TestAerospikeConflictRecoveryLateFreeInputSpender(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryLateFreeInputSpender(t, store)
+}
+
 func TestAerospikeConflictRecoveryLateWinnerChild(t *testing.T) {
 	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
 	t.Cleanup(deferFn)

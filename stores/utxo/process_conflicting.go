@@ -240,6 +240,19 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	if err != nil {
 		return nil, nil, err
 	}
+	// A validator can spend a free winning input after discovery. Unspending that owner without
+	// marking it would leave it usable. Stop before any mutation and plan again.
+	for _, sp := range recovery.OriginalSpends {
+		if sp.SpendingData != nil && !affected.has(*sp.SpendingData.TxID) {
+			return nil, nil, errors.NewProcessingError("conflict spender %s at %s:%d changed during preparation; retry required", sp.SpendingData.TxID.String(), sp.TxID.String(), sp.Vout)
+		}
+	}
+	// The winners stay Conflicting until the run clears their flag below.
+	for _, h := range conflictTransactionHashes(recovery) {
+		if _, isWinner := winnerSet[h]; !isWinner {
+			mayBeMarked = append(mayBeMarked, h)
+		}
+	}
 	recovery.Winners = append([]chainhash.Hash(nil), conflictingTxHashes...)
 	for _, h := range affected.order {
 		if _, isWinner := winnerSet[h]; !isWinner {
