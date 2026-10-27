@@ -59,6 +59,30 @@ func (s *Store) RestoreConflictSpends(ctx context.Context, spends []*utxo.Spend,
 	return nil
 }
 
+// ReleaseConflictLocks releases only the locks that conflict_owner shows this operation still owns.
+// A lock that another holder took, or that this operation never acquired, is left as it is.
+func (s *Store) ReleaseConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash) error {
+	txn, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = txn.Rollback() }()
+	for _, h := range parents {
+		var rowID int
+		err = txn.QueryRowContext(ctx, `UPDATE transactions SET locked = false, conflict_owner = NULL WHERE hash = $1 AND conflict_owner = $2 RETURNING id`, h[:], id[:]).Scan(&rowID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return errors.NewStorageError("releasing conflict lock %s", h.String(), err)
+		}
+		if err := s.setDAH(ctx, txn, rowID); err != nil {
+			return err
+		}
+	}
+	return txn.Commit()
+}
+
 // The owner is the durable operation ID, not the process ID. Ordinary lock
 // writers clear conflict_owner atomically when they change locked. Recovery
 // therefore cannot release a lock acquired by another operation after a crash.

@@ -2008,3 +2008,7 @@ func (m *MockUTXOStore) RestoreConflictSpends(context.Context, []*utxo.Spend, ui
 func (m *MockUTXOStore) SetConflictLocks(context.Context, chainhash.Hash, []chainhash.Hash, bool) error {
 	return nil
 }
+
+func (m *MockUTXOStore) ReleaseConflictLocks(context.Context, chainhash.Hash, []chainhash.Hash) error {
+	return nil
+}

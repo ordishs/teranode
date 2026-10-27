@@ -53,3 +53,19 @@ func TestForEachConflictRead_StopsAfterFailure(t *testing.T) {
 	require.Error(t, err)
 	require.LessOrEqual(t, started.Load(), int32(conflictingWalkFanOut), "no read may start after the failure")
 }
+
+// A cancelled ctx can stop forEachConflictRead before every read ran. It must report that, or a
+// caller takes unread outpoints as verified.
+func TestForEachConflictRead_CancelledReportsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	var started atomic.Int32
+
+	err := forEachConflictRead(ctx, 5, func(context.Context, int) error {
+		started.Add(1)
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Less(t, started.Load(), int32(5))
+}

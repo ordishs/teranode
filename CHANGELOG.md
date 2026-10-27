@@ -21,7 +21,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 - **Conflict undo now checks current-chain confirmation.** BlockAssembly stops
   recovery if a transaction affected by rollback or reverse processing is still
   confirmed in any current-chain block, or if that check fails. The WAL remains
-  available for diagnosis. Failed WAL cleanup is now returned and counted in
+  available for diagnosis. A stale forward intent whose winners are all confirmed on
+  the current chain, still own their inputs and are not conflicting is completed
+  without a rollback, because the current chain confirms the same outcome. Failed
+  WAL cleanup is now returned and counted in
   `teranode_utxo_conflict_wal_completion_failures_total`. Affected operators must
   resolve the pending recovery instead of clearing the WAL or restarting an old
   build. This does not repair previously corrupted UTXO state. (#2023)
@@ -29,13 +32,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 - **Conflict recovery extends the UTXO WAL format and store interface.** SQL stores
   add recovery and lock-owner columns; Aerospike stores add durable checklist
   records. External `utxo.Store` implementations must implement
-  `SaveConflictRecovery`, `LoadConflictRecovery`, `RestoreConflictSpends`, and
-  `SetConflictLocks`. Upgrade BlockAssembly with its store implementation. Do not
-  downgrade while new conflict intents are pending. Legacy forward intents have
-  no before-image and require operator repair; unresolved intents now prevent
-  BlockAssembly startup. Preserve the WAL and store backup for diagnosis instead
-  of deleting the pending record. See [recovery guidance](docs/topics/conflict-recovery.md).
-  (#2023)
+  `SaveConflictRecovery`, `LoadConflictRecovery`, `RestoreConflictSpends`,
+  `SetConflictLocks`, and `ReleaseConflictLocks`. Upgrade BlockAssembly with its
+  store implementation. Do not downgrade while new conflict intents are pending.
+  Legacy forward intents have no before-image and require operator repair;
+  unresolved intents now prevent BlockAssembly startup, and so does an intent whose
+  replay failed at startup, even when its checklist reads finished. Preserve the WAL
+  and store backup for diagnosis instead of deleting the pending record. See
+  [recovery guidance](docs/topics/conflict-recovery.md). (#2023)
 
 - **`CheckBlockSubtrees` gRPC errors keep Teranode error codes.** Storage and
   consensus errors include gRPC status metadata. Invalid URLs give `InvalidArgument`

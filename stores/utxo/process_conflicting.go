@@ -89,15 +89,6 @@ var (
 // fully linear (one node per level), where the ceiling is moot.
 const conflictingWalkFanOut = 128
 
-// step5RetryDelays controls the bounded back-off when SetLocked(false) fails at the very
-// last step of ProcessConflicting. The slice length is the number of attempts; the value
-// at index i is the delay BEFORE attempt i (so index 0 is always zero — the first attempt
-// is immediate). Rolling back at step 5 would create more inconsistency than retrying a
-// simple state update — see ProcessConflicting for rationale.
-//
-// Declared as a package-level var so tests can shrink the delays.
-var step5RetryDelays = []time.Duration{0, 50 * time.Millisecond, 200 * time.Millisecond}
-
 // compensationTimeout bounds the deferred unwind of a failed ProcessConflicting.
 // It runs on its own context rather than the caller's (see the rollback call site),
 // so it needs a budget of its own: long enough to restore the recorded spends of a
@@ -144,19 +135,18 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	if err != nil {
 		return nil, nil, err
 	}
-	if recovery == nil {
-		pending, e := s.PendingConflictIntents(ctx)
-		if e != nil {
-			return nil, nil, e
-		}
-		for _, old := range pending {
-			if old.IntentID() == intent.IntentID() {
-				return nil, nil, errors.NewProcessingError("legacy conflict intent %s has no recovery checklist; manual repair required", intent.IntentID().String())
-			}
-		}
-	}
 	if err = s.BeginConflictIntent(ctx, intent); err != nil {
 		return nil, nil, errors.NewProcessingError("failed to record conflict WAL intent", err)
+	}
+	if recovery == nil {
+		// Begin gives a new intent a planning checklist and leaves an existing record as it is, so a
+		// record that still has no checklist is a legacy intent. This avoids a scan of the whole WAL.
+		if recovery, err = s.LoadConflictRecovery(ctx, intent.IntentID()); err != nil {
+			return nil, nil, err
+		}
+		if recovery == nil {
+			return nil, nil, errors.NewProcessingError("legacy conflict intent %s has no recovery checklist; manual repair required", intent.IntentID().String())
+		}
 	}
 	if recovery != nil {
 		if err = recovery.Validate(); err != nil {
@@ -164,7 +154,10 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		}
 		switch recovery.Phase {
 		case ConflictRecoveryPrepared, ConflictRecoveryMutating, ConflictRecoveryRollingBack:
-			if err = RollbackConflictIntent(ctx, s, intent, options.currentChainGuard); err != nil {
+			mayBeMarked = conflictTransactionHashes(recovery)
+			cascaded, rollbackErr := RollbackConflictIntent(ctx, s, intent, options.currentChainGuard)
+			mayBeMarked = append(mayBeMarked, cascaded...)
+			if err = rollbackErr; err != nil {
 				return nil, nil, err
 			}
 		case ConflictRecoveryApplied, ConflictRecoveryFinished:
@@ -263,7 +256,9 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		}
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), compensationTimeout)
 		defer cancel()
-		if rollbackErr := RollbackConflictIntent(rollbackCtx, s, intent, options.currentChainGuard); rollbackErr != nil {
+		cascaded, rollbackErr := RollbackConflictIntent(rollbackCtx, s, intent, options.currentChainGuard)
+		mayBeMarked = append(mayBeMarked, cascaded...)
+		if rollbackErr != nil {
 			err = errors.NewProcessingError("[ProcessConflicting] MANUAL INTERVENTION REQUIRED: original=%s rollback=%s", err.Error(), rollbackErr.Error(), errors.Join(err, rollbackErr))
 		}
 		losers = nil
@@ -384,6 +379,17 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 	defer func() {
 		if err == nil {
 			err = CompleteConflictIntent(ctx, s, walIntent.IntentID())
+		}
+	}()
+
+	// Registered after the completion above, so it runs first. The reverse undid the forward
+	// operation of this block, so that operation's finished checklist no longer describes the
+	// store. Retire it before the reverse intent goes: a crash in between leaves the reverse intent,
+	// whose replay converges and retires it again. A later re-add of the block then runs a new
+	// forward operation instead of failing on the old checklist.
+	defer func() {
+		if err == nil {
+			err = CompleteConflictIntentsForBlock(ctx, s, blockHash)
 		}
 	}()
 
@@ -887,6 +893,53 @@ func winnerIsApplied(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt
 	return true, nil
 }
 
+// ConflictWinnersConfirmed reports whether the forward operation of intent was applied and every
+// winner is now confirmed on the current chain, still owns its inputs and is not Conflicting. A
+// stale forward intent in that state needs no rollback: the current chain confirms the same outcome.
+// It reports false when any winner fails one of these checks, so the caller rolls back as before.
+func ConflictWinnersConfirmed(ctx context.Context, s Store, intent ConflictIntent, guard CurrentChainGuard) (bool, error) {
+	if guard.check == nil || len(intent.TxHashes) == 0 {
+		return false, nil
+	}
+
+	r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
+	if err != nil {
+		return false, err
+	}
+
+	if r == nil || (r.Phase != ConflictRecoveryApplied && r.Phase != ConflictRecoveryFinished) {
+		return false, nil
+	}
+
+	for _, h := range intent.TxHashes {
+		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting, fields.BlockIDs)
+		if err != nil {
+			return false, errors.NewProcessingError("[ConflictWinnersConfirmed][%s] error getting tx", h.String(), err)
+		}
+
+		if m == nil || m.Conflicting || len(m.BlockIDs) == 0 {
+			return false, nil
+		}
+
+		// The intent is stale, so its own block is off the current chain and cannot confirm the winner.
+		confirmed, err := guard.check(ctx, m.BlockIDs)
+		if err != nil {
+			return false, errors.NewProcessingError("[ConflictWinnersConfirmed][%s] current-chain lookup failed", h.String(), err)
+		}
+
+		if !confirmed {
+			return false, nil
+		}
+
+		applied, err := winnerIsApplied(ctx, s, h, m.Tx)
+		if err != nil || !applied {
+			return false, err
+		}
+	}
+
+	return true, nil
+}
+
 // UnappliedConflictWinners returns the winners that ProcessConflicting must still apply. A winner
 // that is not Conflicting and already owns every input is applied, so it is left out. A reverse that
 // stopped before it reached a winner leaves that winner in this state, with no forward checklist.
@@ -914,31 +967,6 @@ func UnappliedConflictWinners(ctx context.Context, s Store, winners []chainhash.
 	}
 
 	return pending, nil
-}
-
-// setLockedWithRetry retries SetLocked with a bounded back-off — a deliberate exception
-// to "always roll back". By the time we reach step 5 every other phase is committed and
-// correct; the only inconsistency a SetLocked failure introduces is parents that are
-// still locked. Rolling back here would re-introduce conflicting markers and unspend the
-// winner — strictly worse than retrying a simple state update.
-func setLockedWithRetry(ctx context.Context, s Store, hashes []chainhash.Hash, value bool) error {
-	var err error
-
-	for _, delay := range step5RetryDelays {
-		if delay > 0 {
-			select {
-			case <-ctx.Done():
-				return errors.NewProcessingError("setLockedWithRetry aborted by context", ctx.Err())
-			case <-time.After(delay):
-			}
-		}
-
-		if err = s.SetLocked(ctx, hashes, value); err == nil {
-			return nil
-		}
-	}
-
-	return err
 }
 
 // MarkConflictingRecursively marks the given transactions as conflicting, and iteratively marks all their spending

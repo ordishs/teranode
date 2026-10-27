@@ -186,3 +186,82 @@ func TestRestoreConflictSpendsStopsOnContext(t *testing.T) {
 		requireSpentBy(sp, true)
 	}
 }
+
+func TestConflictRecoveryLateLoserChild(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryLateLoserChild(t, store)
+}
+
+func TestConflictRecoveryLateWinnerChild(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryLateWinnerChild(t, store)
+}
+
+func TestConflictRecoveryReverseThenReadd(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryReverseThenReadd(t, store)
+}
+
+// lockAfterPrepare wraps the store. Once the checklist is prepared, another holder locks the parent,
+// so the operation cannot take its locks.
+type lockAfterPrepare struct {
+	*Store
+	parent chainhash.Hash
+}
+
+func (s *lockAfterPrepare) SaveConflictRecovery(ctx context.Context, id chainhash.Hash, r *utxo.ConflictRecovery) error {
+	if err := s.Store.SaveConflictRecovery(ctx, id, r); err != nil {
+		return err
+	}
+	if r.Phase == utxo.ConflictRecoveryPrepared {
+		return s.Store.SetLocked(ctx, []chainhash.Hash{s.parent}, true)
+	}
+	return nil
+}
+
+// A parent locked by another holder after preparation stops the operation before it mutates
+// anything. The rollback must not try to release that lock, which the operation never took.
+func TestConflictRecoveryPreparedForeignLock(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := t.Context()
+
+	parent := newExtendedTxWithOutputs(t, 1)
+	_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := newExtendedSpendingTx(t, parent, 0)
+	_, _, err = store.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := newExtendedSpendingTx(t, parent, 0)
+	winner.Inputs[0].SequenceNumber = 1
+	_, _, err = store.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	wrapper := &lockAfterPrepare{Store: store, parent: *parent.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, wrapper, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "MANUAL INTERVENTION", "nothing was mutated, so the rollback must succeed")
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+	r, err := store.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryRolledBack, r.Phase)
+
+	m, err := store.Get(ctx, parent.TxIDChainHash(), fields.Locked)
+	require.NoError(t, err)
+	require.True(t, m.Locked, "the other holder keeps its lock")
+
+	m, err = store.Get(ctx, winner.TxIDChainHash(), fields.Conflicting)
+	require.NoError(t, err)
+	require.True(t, m.Conflicting)
+}
+
+func TestConflictRecoveryLegacyIntent(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryLegacyIntent(t, store)
+}
+
+func TestConflictRecoveryCancelledVerify(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryCancelledVerify(t, store)
+}

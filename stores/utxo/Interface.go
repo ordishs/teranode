@@ -836,6 +836,11 @@ type Store interface {
 	// Backends whose conflict Unspend never locks parents may implement a no-op.
 	SetConflictLocks(ctx context.Context, intentID chainhash.Hash, parents []chainhash.Hash, locked bool) error
 
+	// ReleaseConflictLocks releases the parent locks this WAL operation still owns and leaves every
+	// other lock as it is. A rollback before mutation uses it: the operation may never have taken a
+	// lock that another holder has. Backends that never lock parents may implement a no-op.
+	ReleaseConflictLocks(ctx context.Context, intentID chainhash.Hash, parents []chainhash.Hash) error
+
 	// LoadConflictRecovery returns nil for an absent or legacy intent.
 	LoadConflictRecovery(ctx context.Context, intentID chainhash.Hash) (*ConflictRecovery, error)
 

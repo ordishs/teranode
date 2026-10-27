@@ -1998,8 +1998,11 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		moveForwardHashes[i] = *block.Hash()
 	}
 
-	if err := utxostore.CompleteConflictIntentsForBlocks(ctx, stp.utxoStore, moveForwardHashes); err != nil {
-		return err
+	// The reset has committed, so a failed acknowledgement is only reported. The intents stay
+	// pending and the next block, reset or restart acknowledges them. Requesting a reset from here
+	// would loop while the store keeps failing.
+	if ackErr := utxostore.CompleteConflictIntentsForBlocks(ctx, stp.utxoStore, moveForwardHashes); ackErr != nil {
+		stp.logger.Errorf("[SubtreeProcessor][Reset] conflict WAL acknowledgement failed after commit; the intents stay pending: %v", ackErr)
 	}
 
 	return nil
@@ -6601,18 +6604,23 @@ func (stp *SubtreeProcessor) moveForwardBlockDeferringDrain(ctx context.Context,
 	// caller, which runs them after it has answered (see deferredBlockDrain).
 	if deferDrain {
 		drain = &deferredBlockDrain{
-			drainQueue:        transactionMap != nil && transactionMap.Length() > 0,
-			transactionMap:    transactionMap,
-			losingTxHashesMap: losingTxHashesMap,
-			conflictingHashes: conflictingHashes,
+			drainQueue:         transactionMap != nil && transactionMap.Length() > 0,
+			transactionMap:     transactionMap,
+			losingTxHashesMap:  losingTxHashesMap,
+			conflictingHashes:  conflictingHashes,
+			ackConflictIntents: len(conflictingNodes) > 0,
 		}
 	} else {
 		stp.clearCurrentTxMapShadow()
 	}
 
+	// The block is committed, so a failed acknowledgement must not fail the call: the deferred
+	// swap-back above would install the cleared shadow over the applied block. Request a reset
+	// instead, as the deferred drain does; the reset acknowledges the intent again.
 	if !deferDrain && len(conflictingNodes) > 0 {
-		if err = utxostore.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, *block.Hash()); err != nil {
-			return nil, nil, nil, err
+		if ackErr := utxostore.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, *block.Hash()); ackErr != nil {
+			stp.logger.Errorf("[moveForwardBlock][%s] conflict WAL acknowledgement failed after commit, requesting a block assembly reset: %v", block.String(), ackErr)
+			stp.drainResetRequested.Store(true)
 		}
 	}
 

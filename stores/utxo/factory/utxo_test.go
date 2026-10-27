@@ -481,3 +481,7 @@ func (m *MockUTXOStore) RestoreConflictSpends(ctx context.Context, spends []*utx
 func (m *MockUTXOStore) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash, locked bool) error {
 	return nil
 }
+
+func (m *MockUTXOStore) ReleaseConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash) error {
+	return nil
+}

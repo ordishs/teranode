@@ -9,7 +9,6 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -90,7 +89,13 @@ func (r *ConflictRecovery) Validate() error {
 func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Hash, winningSpends []*Spend) (*ConflictRecovery, error) {
 	r := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryPrepared, WinningSpends: winningSpends}
 
-	metas := make([]*meta.Data, len(hashes))
+	// Keep only what the checklist needs from each transaction, not its body: a cascade can be wide.
+	type txSnapshot struct {
+		spends      []*Spend
+		conflicting bool
+	}
+
+	snapshots := make([]txSnapshot, len(hashes))
 	if err := forEachConflictRead(ctx, len(hashes), func(ctx context.Context, i int) error {
 		m, err := s.Get(ctx, &hashes[i], fields.Tx, fields.Conflicting)
 		if err != nil {
@@ -101,7 +106,12 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 			return errors.NewProcessingError("cannot snapshot conflict transaction %s", hashes[i].String())
 		}
 
-		metas[i] = m
+		spends, err := GetSpends(m.Tx)
+		if err != nil {
+			return err
+		}
+
+		snapshots[i] = txSnapshot{spends: spends, conflicting: m.Conflicting}
 
 		return nil
 	}); err != nil {
@@ -131,14 +141,8 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 	}
 
 	for i, h := range hashes {
-		r.Transactions = append(r.Transactions, ConflictTransaction{Hash: h, Conflicting: metas[i].Conflicting})
-
-		spends, err := GetSpends(metas[i].Tx)
-		if err != nil {
-			return nil, err
-		}
-
-		addSpends(spends)
+		r.Transactions = append(r.Transactions, ConflictTransaction{Hash: h, Conflicting: snapshots[i].conflicting})
+		addSpends(snapshots[i].spends)
 	}
 
 	// Winning-only inputs also need before-images (including originally unspent inputs).
@@ -214,30 +218,40 @@ func forEachConflictRead(ctx context.Context, n int, read func(ctx context.Conte
 		})
 	}
 
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// errgroup reports errors only from reads that ran. A cancelled ctx can stop the loop or the reads
+	// with every index unread, which must not pass for success.
+	return ctx.Err()
 }
 
 // rollbackConflictRecovery restores recorded owners, never every transaction
 // visited by the cascade. Unexpected spenders cause an error, not an overwrite.
-func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery, height uint32, id chainhash.Hash) error {
+//
+// A child outside the checklist can attach to a checklist transaction at any time. The rollback
+// never touches that child's inputs, so it needs no before-image. When its parent ends Conflicting,
+// the child is marked Conflicting too, and cascaded returns it with its descendants.
+func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery, height uint32, id chainhash.Hash) (cascaded []chainhash.Hash, err error) {
 	// A saved applied operation can have usable winners. Disable all recorded
 	// transactions before removing any winning spend during compensation.
-	hashes := make([]chainhash.Hash, len(r.Transactions))
-	for i, tx := range r.Transactions {
-		hashes[i] = tx.Hash
+	hashes := conflictTransactionHashes(r)
+	known := make(map[chainhash.Hash]struct{}, len(hashes))
+	for _, h := range hashes {
+		known[h] = struct{}{}
 	}
+	// SetConflicting reports the children of a transaction only while that transaction is not yet
+	// conflicting, so this first mark is where the children outside the checklist show up.
+	var outside []chainhash.Hash
 	if len(hashes) > 0 {
 		_, children, err := s.SetConflicting(ctx, hashes, true)
 		if err != nil {
-			return err
-		}
-		known := make(map[chainhash.Hash]struct{}, len(hashes))
-		for _, h := range hashes {
-			known[h] = struct{}{}
+			return nil, err
 		}
 		for _, child := range children {
 			if _, ok := known[child]; !ok {
-				return errors.NewProcessingError("conflict rollback found a descendant outside the recovery checklist: %s", child.String())
+				outside = append(outside, child)
 			}
 		}
 	}
@@ -257,7 +271,7 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	// Verify before making any loser usable again. A failed restoration keeps
 	// the cascade conflicting and the checklist pending.
 	mismatches := make([]error, len(r.OriginalSpends))
-	_ = forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
+	verifyErr := forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
 		original := r.OriginalSpends[i]
 
 		owned, err := conflictOwnerMatches(ctx, s, original)
@@ -271,28 +285,58 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 		return nil
 	})
 
+	// An outpoint whose read never ran is unverified, not a match.
+	if verifyErr != nil {
+		failures = append(failures, verifyErr)
+	}
 	for _, mismatch := range mismatches {
 		if mismatch != nil {
 			failures = append(failures, mismatch)
 		}
 	}
 	if len(failures) != 0 {
-		return capRollbackFailures(failures)
+		return nil, capRollbackFailures(failures)
 	}
+	endsConflicting := make(map[chainhash.Hash]struct{}, len(r.Transactions))
 	for _, value := range []bool{true, false} {
 		var hashes []chainhash.Hash
 		for _, tx := range r.Transactions {
 			if tx.Conflicting == value {
 				hashes = append(hashes, tx.Hash)
+				if value {
+					endsConflicting[tx.Hash] = struct{}{}
+				}
 			}
 		}
 		if len(hashes) != 0 {
 			if _, _, err := s.SetConflicting(ctx, hashes, value); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	return s.SetConflictLocks(ctx, id, r.Parents, false)
+	// A child of a transaction that ends Conflicting spends a conflicting output.
+	var spendsConflicting []chainhash.Hash
+	for _, child := range outside {
+		m, err := s.Get(ctx, &child, fields.TxInpoints)
+		if err != nil {
+			return nil, err
+		}
+		if m == nil {
+			continue
+		}
+		for _, parent := range m.TxInpoints.GetParentTxHashes() {
+			if _, ok := endsConflicting[parent]; ok {
+				spendsConflicting = append(spendsConflicting, child)
+				break
+			}
+		}
+	}
+	if len(spendsConflicting) > 0 {
+		if _, cascaded, err = MarkConflictingRecursively(ctx, s, spendsConflicting); err != nil {
+			return cascaded, err
+		}
+	}
+	return cascaded, s.SetConflictLocks(ctx, id, r.Parents, false)
 }
 
 func cloneConflictSpends(spends []*Spend) []*Spend {
@@ -332,13 +376,17 @@ func conflictOwnerMatches(ctx context.Context, s Store, original *Spend) (bool, 
 
 // RollbackConflictIntent also handles stale forward intents after a reorg.
 // Legacy records cannot establish the prior state and remain pending for repair.
-func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent, guards ...CurrentChainGuard) error {
+//
+// cascaded lists the transactions outside the checklist that the rollback marked Conflicting:
+// children that attached to a checklist transaction which ends Conflicting, and their descendants.
+// On error it lists what the rollback may have marked. Callers evict them from the txmeta cache.
+func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent, guards ...CurrentChainGuard) (cascaded []chainhash.Hash, err error) {
 	r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if r == nil {
-		return errors.NewProcessingError("legacy conflict intent %s has no recovery checklist; manual repair required", intent.IntentID().String())
+		return nil, errors.NewProcessingError("legacy conflict intent %s has no recovery checklist; manual repair required", intent.IntentID().String())
 	}
 	var protected []*chainProtectedConflictStore
 	for _, guard := range guards {
@@ -348,14 +396,16 @@ func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 		}
 	}
 	if r.Phase == ConflictRecoveryRolledBack {
-		return nil
+		return nil, nil
 	}
 	if r.Phase == ConflictRecoveryPlanning || r.Phase == ConflictRecoveryPrepared {
-		if err := s.SetConflictLocks(ctx, intent.IntentID(), r.Parents, false); err != nil {
-			return err
+		// Nothing was mutated. Taking the locks is all or nothing, but a crash can stop the operation
+		// before or after it took them, and another holder can have one. Release only what it owns.
+		if err := s.ReleaseConflictLocks(ctx, intent.IntentID(), r.Parents); err != nil {
+			return nil, err
 		}
 		r.Phase = ConflictRecoveryRolledBack
-		return s.SaveConflictRecovery(ctx, intent.IntentID(), r)
+		return nil, s.SaveConflictRecovery(ctx, intent.IntentID(), r)
 	}
 	hashes := make([]chainhash.Hash, len(r.Transactions))
 	for i, tx := range r.Transactions {
@@ -363,22 +413,22 @@ func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 	}
 	for _, p := range protected {
 		if err := p.checkUnconfirmed(ctx, hashes); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	// Do not compensate under a lock that another operation has taken over.
 	if err := s.SetConflictLocks(ctx, intent.IntentID(), r.Parents, true); err != nil {
-		return err
+		return nil, err
 	}
 	r.Phase = ConflictRecoveryRollingBack
 	if err = s.SaveConflictRecovery(ctx, intent.IntentID(), r); err != nil {
-		return err
+		return nil, err
 	}
-	if err = rollbackConflictRecovery(ctx, s, r, intent.BlockHeight, intent.IntentID()); err != nil {
-		return err
+	if cascaded, err = rollbackConflictRecovery(ctx, s, r, intent.BlockHeight, intent.IntentID()); err != nil {
+		return cascaded, err
 	}
 	r.Phase = ConflictRecoveryRolledBack
-	return s.SaveConflictRecovery(ctx, intent.IntentID(), r)
+	return cascaded, s.SaveConflictRecovery(ctx, intent.IntentID(), r)
 }
 
 func finishConflictRecovery(ctx context.Context, s Store, intent ConflictIntent, r *ConflictRecovery, deferCompletion bool) (txmap.TxMap, []chainhash.Hash, error) {

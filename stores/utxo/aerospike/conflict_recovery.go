@@ -37,12 +37,19 @@ func (s *Store) SaveConflictRecovery(ctx context.Context, id chainhash.Hash, r *
 	if err != nil {
 		return err
 	}
-	record, err := s.client.Get(nil, key, "recoveryRefs")
+	record, err := s.client.Get(nil, key, "recoveryRefs", "recovery")
 	if err != nil {
 		return err
 	}
 	if record == nil {
 		return errors.NewStorageError("missing conflict WAL intent")
+	}
+	policy := util.GetAerospikeWritePolicy(s.settings, 0)
+	policy.RecordExistsAction = as.UPDATE_ONLY
+	// The content is immutable after publication and only the phase changes. When the root already
+	// publishes this digest, its chunks are complete, so write the phase alone.
+	if record.Bins["recovery"] == digest {
+		return s.client.PutBins(policy, key, as.NewBin("recoveryPhase", r.Phase))
 	}
 	refs, _ := record.Bins["recoveryRefs"].([]interface{})
 	ref := digest + ":" + strconv.Itoa(count)
@@ -52,8 +59,6 @@ func (s *Store) SaveConflictRecovery(ctx context.Context, id chainhash.Hash, r *
 			found = true
 		}
 	}
-	policy := util.GetAerospikeWritePolicy(s.settings, 0)
-	policy.RecordExistsAction = as.UPDATE_ONLY
 	if !found {
 		refs = append(refs, ref)
 		// Record cleanup ownership before creating any chunk. A crash at any
@@ -202,21 +207,34 @@ func (s *Store) LoadConflictRecovery(ctx context.Context, id chainhash.Hash) (*u
 
 func (s *Store) RestoreConflictSpends(ctx context.Context, spends []*utxo.Spend, height uint32) error {
 	for _, sp := range spends {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		if sp == nil || sp.SpendingData == nil {
 			return errors.NewProcessingError("invalid conflict restoration spend")
 		}
-		group := completion.NewGroup(1)
-		item := &batchSpend{spend: sp, blockHeight: height, group: group, ignoreConflicting: true, ignoreLocked: true, requireParentOutput: true}
-		// Direct synchronous dispatch avoids an outstanding queued write after rollback.
-		s.sendSpendBatchLua([]*batchSpend{item})
+	}
+	batchSize := s.settings.UtxoStore.SpendBatcherSize
+	if batchSize <= 0 {
+		batchSize = len(spends)
+	}
+	for start := 0; start < len(spends); start += batchSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		batch := spends[start:min(start+batchSize, len(spends))]
+		group := completion.NewGroup(int32(len(batch))) //nolint:gosec // bounded by the spend batcher size
+		items := make([]*batchSpend, len(batch))
+		for i, sp := range batch {
+			items[i] = &batchSpend{spend: sp, blockHeight: height, group: group, ignoreConflicting: true, ignoreLocked: true, requireParentOutput: true}
+		}
+		// Direct synchronous dispatch avoids an outstanding queued write after rollback:
+		// sendSpendBatchLua completes every item before it returns, so the wait does not block.
+		s.sendSpendBatchLua(items)
 		if err := group.Wait(context.Background(), 0); err != nil {
 			return err
 		}
-		if sp.Err != nil {
-			return sp.Err
+		for _, sp := range batch {
+			if sp.Err != nil {
+				return sp.Err
+			}
 		}
 	}
 	return nil
@@ -225,5 +243,10 @@ func (s *Store) RestoreConflictSpends(ctx context.Context, spends []*utxo.Spend,
 // Aerospike Unspend does not acquire parent locks. Do not release boolean locks
 // owned by validation while recovering a conflict operation (issue 1291).
 func (s *Store) SetConflictLocks(_ context.Context, _ chainhash.Hash, _ []chainhash.Hash, _ bool) error {
+	return nil
+}
+
+// ReleaseConflictLocks is a no-op for the same reason as SetConflictLocks.
+func (s *Store) ReleaseConflictLocks(_ context.Context, _ chainhash.Hash, _ []chainhash.Hash) error {
 	return nil
 }

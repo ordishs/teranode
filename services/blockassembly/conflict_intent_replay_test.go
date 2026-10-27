@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxofields "github.com/bsv-blockchain/teranode/stores/utxo/fields"
@@ -223,7 +224,7 @@ func TestReplayPendingConflictIntents_StaleLegacyForwardRequiresRepair(t *testin
 	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 10, BlockHash: chainhash.HashH([]byte("reorged-out-block")), TxHashes: []chainhash.Hash{*txWHash}, StartedAt: 1}
 	require.NoError(t, store.BeginConflictIntent(ctx, intent))
 	// The real blockchain store has no such block, so the forward is stale.
-	items.blockAssembler.replayPendingConflictIntents(ctx)
+	replayFailed := items.blockAssembler.replayPendingConflictIntents(ctx)
 	m, err := store.Get(ctx, parentHash, utxofields.Locked)
 	require.NoError(t, err)
 	require.True(t, m.Locked)
@@ -231,7 +232,7 @@ func TestReplayPendingConflictIntents_StaleLegacyForwardRequiresRepair(t *testin
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	require.Equal(t, intent.IntentID(), pending[0].IntentID())
-	require.ErrorContains(t, items.blockAssembler.checkConflictRecoveryReady(ctx), "unresolved")
+	require.ErrorContains(t, items.blockAssembler.checkConflictRecoveryReady(ctx, replayFailed), "failed to replay")
 }
 
 // A stale reverse uses the real forward write path. Its new forward WAL must
@@ -371,9 +372,10 @@ func TestReplayPendingConflictIntents_StaleReverseNothingApplied(t *testing.T) {
 	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 1, BlockHash: *blockHeader1.Hash(), TxHashes: []chainhash.Hash{*txW.TxIDChainHash()}, StartedAt: 1}
 	require.NoError(t, store.BeginConflictIntent(ctx, intent))
 
-	items.blockAssembler.replayPendingConflictIntents(ctx)
+	replayFailed := items.blockAssembler.replayPendingConflictIntents(ctx)
+	require.Empty(t, replayFailed)
 
-	require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx))
+	require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx, replayFailed))
 
 	pending, err := store.PendingConflictIntents(ctx)
 	require.NoError(t, err)
@@ -564,8 +566,9 @@ func TestStaleConflictRecoveryPreservesReminedWinner(t *testing.T) {
 		require.NoError(t, err)
 	}
 	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 10, BlockHash: blockHash, TxHashes: winners}
-	err = items.blockAssembler.healStaleConflictIntent(ctx, intent)
-	require.ErrorContains(t, err, "confirmed on the current chain")
+	// The current chain confirms the same winner, so the forward outcome stands and the heal needs
+	// no rollback. Refusing here would keep the intent pending and block every restart.
+	require.NoError(t, items.blockAssembler.healStaleConflictIntent(ctx, intent))
 	m, err := store.Get(ctx, txWHash, utxofields.Conflicting)
 	require.NoError(t, err)
 	require.False(t, m.Conflicting)
@@ -577,6 +580,14 @@ func TestStaleConflictRecoveryPreservesReminedWinner(t *testing.T) {
 	r, err := store.LoadConflictRecovery(ctx, intent.IntentID())
 	require.NoError(t, err)
 	require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+
+	// On restart the stale intent is healed and cleared, and block assembly may start.
+	replayFailed := items.blockAssembler.replayPendingConflictIntents(ctx)
+	require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx, replayFailed))
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Empty(t, pending)
+
 	// The reverse path must enforce the same rule, including restart replay.
 	reverse := intent
 	reverse.Kind = utxo.ConflictIntentReverse
@@ -587,4 +598,162 @@ func TestStaleConflictRecoveryPreservesReminedWinner(t *testing.T) {
 	actual, err = store.GetSpend(ctx, inputs[0])
 	require.NoError(t, err)
 	require.Equal(t, txWHash, actual.SpendingData.TxID)
+}
+
+// A finished forward intent whose replay fails must stop startup. Its checklist still reads finished
+// and its block is on the longest chain, which the gate alone would accept, but the store now
+// contradicts the checklist.
+func TestCheckConflictRecoveryReady_RefusesFailedReplay(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	parent := createStaleReverseParent(ctx, t, store, 1)
+	createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+	txW := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+
+	addBlockWithMinedSet(ctx, t, items, blockHeader1)
+
+	winners := []chainhash.Hash{*txW.TxIDChainHash()}
+	_, _, err := utxo.ProcessConflicting(ctx, store, 1, *blockHeader1.Hash(), winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	// Something flipped the winner back before block assembly acknowledged the operation.
+	_, _, err = store.SetConflicting(ctx, winners, true)
+	require.NoError(t, err)
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 1, BlockHash: *blockHeader1.Hash(), TxHashes: winners}
+
+	replayFailed := items.blockAssembler.replayPendingConflictIntents(ctx)
+	require.Contains(t, replayFailed, intent.IntentID())
+
+	require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx, nil), "the phase and chain checks alone accept this intent")
+	require.ErrorContains(t, items.blockAssembler.checkConflictRecoveryReady(ctx, replayFailed), "failed to replay")
+}
+
+// A crash right after a reverse began leaves its intent and the finished forward intent of the same
+// block. Replay must run the reverse first, which retires the forward intent, and clear both.
+func TestReplayPendingConflictIntents_ReverseRetiresForward(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	parent := createStaleReverseParent(ctx, t, store, 1)
+	txL := createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+	txW := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+
+	block := chainhash.HashH([]byte("reverse-retires-forward-block"))
+	winners := []chainhash.Hash{*txW.TxIDChainHash()}
+	_, _, err := utxo.ProcessConflicting(ctx, store, 10, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	reverse := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 10, BlockHash: block, TxHashes: winners, StartedAt: 1}
+	require.NoError(t, store.BeginConflictIntent(ctx, reverse))
+
+	// The block is unknown to the chain, so it is off the longest chain: the reverse is current
+	// and the forward is stale.
+	items.blockAssembler.blockchainClient = blockchainMembershipMock(false, true)
+
+	replayFailed := items.blockAssembler.replayPendingConflictIntents(ctx)
+	require.Empty(t, replayFailed)
+
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Empty(t, pending)
+
+	requireConflictOwner(ctx, t, store, txL, txW)
+}
+
+// A reverse that fails leaves the forward intent of the same block untouched. Rolling the forward
+// back over a partial reverse could corrupt the store, so both stay pending for repair.
+func TestReplayPendingConflictIntents_FailedReverseKeepsForward(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	parent := createStaleReverseParent(ctx, t, store, 1)
+	createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+	txW := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+
+	block := chainhash.HashH([]byte("failed-reverse-keeps-forward-block"))
+	winners := []chainhash.Hash{*txW.TxIDChainHash()}
+	_, _, err := utxo.ProcessConflicting(ctx, store, 10, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	child := createStaleReverseSpender(ctx, t, store, txW, 0, 70000, true)
+
+	reverse := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 10, BlockHash: block, TxHashes: winners, StartedAt: 1}
+	require.NoError(t, store.BeginConflictIntent(ctx, reverse))
+
+	childHash := *child.TxIDChainHash()
+	items.blockAssembler.utxoStore = &evictionFaultStore{Store: store, failMarkOf: &childHash}
+	items.blockAssembler.blockchainClient = blockchainMembershipMock(false, true)
+
+	forward := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 10, BlockHash: block, TxHashes: winners}
+
+	replayFailed := items.blockAssembler.replayPendingConflictIntents(ctx)
+	require.Contains(t, replayFailed, reverse.IntentID())
+	require.Contains(t, replayFailed, forward.IntentID())
+
+	r, err := store.LoadConflictRecovery(ctx, forward.IntentID())
+	require.NoError(t, err)
+	require.NotNil(t, r)
+	require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase, "the forward checklist must not be rolled back over a failed reverse")
+}
+
+// After a crash, block assembly can resume behind the block of a finished forward intent. Startup
+// must leave that intent to the catch-up and acknowledge only the intents of blocks it has reached.
+// The catch-up then accepts the applied winner from the finished checklist.
+func TestPrepareRecoveredConflictUpdates_WaitsForAssemblyTip(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+
+	addBlockWithMinedSet(ctx, t, items, blockHeader1)
+	addBlockWithMinedSet(ctx, t, items, blockHeader2)
+	items.blockAssembler.setBestBlockHeader(blockHeader1, 1)
+
+	parent := createStaleReverseParent(ctx, t, store, 2)
+	txL1 := createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+	txW1 := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+	txL2 := createStaleReverseSpender(ctx, t, store, parent, 1, 90000, true)
+	txW2 := createStaleReverseSpender(ctx, t, store, parent, 1, 80000, false)
+
+	reached := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 1, BlockHash: *blockHeader1.Hash(), TxHashes: []chainhash.Hash{*txW1.TxIDChainHash()}}
+	ahead := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 2, BlockHash: *blockHeader2.Hash(), TxHashes: []chainhash.Hash{*txW2.TxIDChainHash()}}
+
+	for _, intent := range []utxo.ConflictIntent{reached, ahead} {
+		_, _, err := utxo.ProcessConflicting(ctx, store, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+		require.NoError(t, err)
+	}
+
+	items.blockAssembler.subtreeProcessor.Stop(ctx)
+
+	mockStp := &subtreeprocessor.MockSubtreeProcessor{}
+	mockStp.On("MarkRecoveredConflicts", mock.Anything, mock.Anything).Return(nil)
+	mockStp.On("Stop", mock.Anything).Return()
+	items.blockAssembler.subtreeProcessor = mockStp
+
+	ids, err := items.blockAssembler.prepareRecoveredConflictUpdates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{reached.IntentID()}, ids, "only the intent of a block that assembly reached may be acknowledged")
+	mockStp.AssertCalled(t, "MarkRecoveredConflicts", mock.Anything, []chainhash.Hash{*txL1.TxIDChainHash()})
+	mockStp.AssertNumberOfCalls(t, "MarkRecoveredConflicts", 1)
+	require.NotContains(t, items.blockAssembler.unminedDropHashes, *txL2.TxIDChainHash())
+
+	// The catch-up applies block 2: ProcessConflicting accepts the applied winner from the
+	// checklist, and the block's acknowledgement completes the intent.
+	losers, _, err := utxo.ProcessConflicting(ctx, store, ahead.BlockHeight, ahead.BlockHash, ahead.TxHashes, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, losers.Exists(*txL2.TxIDChainHash()))
+	require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, store, ahead.BlockHash))
+
+	r, err := store.LoadConflictRecovery(ctx, ahead.IntentID())
+	require.NoError(t, err)
+	require.Nil(t, r)
+	requireConflictOwner(ctx, t, store, txW2, txL2)
 }

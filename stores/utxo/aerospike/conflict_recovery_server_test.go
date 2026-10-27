@@ -92,3 +92,38 @@ func TestAerospikeConflictRecoveryWideCascade(t *testing.T) {
 
 	tests.ConflictRecoveryWideCascade(t, store)
 }
+
+func TestAerospikeConflictRecoveryLateLoserChild(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryLateLoserChild(t, store)
+}
+
+func TestAerospikeConflictRecoveryLateWinnerChild(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryLateWinnerChild(t, store)
+}
+
+func TestAerospikeConflictRecoveryReverseThenReadd(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryReverseThenReadd(t, store)
+}
+
+func TestAerospikeConflictRecoveryLegacyIntent(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryLegacyIntent(t, store)
+}
+
+func TestAerospikeConflictRecoveryCancelledVerify(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryCancelledVerify(t, store)
+}

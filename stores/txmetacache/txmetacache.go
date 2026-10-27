@@ -1605,3 +1605,7 @@ func (t *TxMetaCache) RestoreConflictSpends(ctx context.Context, spends []*utxo.
 func (t *TxMetaCache) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash, locked bool) error {
 	return t.utxoStore.SetConflictLocks(ctx, id, parents, locked)
 }
+
+func (t *TxMetaCache) ReleaseConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash) error {
+	return t.utxoStore.ReleaseConflictLocks(ctx, id, parents)
+}

@@ -150,7 +150,8 @@ func ConflictRecoveryFailures(t *testing.T, db utxo.Store) {
 				if crash {
 					// Exercise the public recovery entrypoint separately so original state
 					// can be checked before a subsequent forward attempt changes it again.
-					require.NoError(t, utxo.RollbackConflictIntent(ctx, db, intent))
+					_, err = utxo.RollbackConflictIntent(ctx, db, intent)
+					require.NoError(t, err)
 				}
 				require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()), "pre-flagged winner must remain flagged")
 				require.True(t, crashConflicting(t, ctx, db, child.TxIDChainHash()), "pre-flagged descendant must remain flagged")
@@ -244,7 +245,8 @@ func ConflictRecoveryUnexpectedOwner(t *testing.T, db utxo.Store) {
 	_, _, err = db.SpendAndCreate(ctx, stranger, 3)
 	require.NoError(t, err)
 	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
-	require.Error(t, utxo.RollbackConflictIntent(ctx, db, intent))
+	_, err = utxo.RollbackConflictIntent(ctx, db, intent)
+	require.Error(t, err)
 	require.Equal(t, stranger.TxIDChainHash(), crashSpender(t, ctx, db, parent), "rollback must not overwrite an unexpected owner")
 	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
 	require.True(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
@@ -255,7 +257,8 @@ func ConflictRecoveryUnexpectedOwner(t *testing.T, db utxo.Store) {
 	strangers, err := utxo.GetSpends(stranger)
 	require.NoError(t, err)
 	require.NoError(t, db.Unspend(ctx, strangers))
-	require.NoError(t, utxo.RollbackConflictIntent(ctx, db, intent))
+	_, err = utxo.RollbackConflictIntent(ctx, db, intent)
+	require.NoError(t, err)
 	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 }
 
@@ -315,7 +318,8 @@ func ConflictRecoveryConfirmedWinner(t *testing.T, db utxo.Store) {
 			}
 			return true, nil
 		})
-		require.Error(t, utxo.RollbackConflictIntent(ctx, db, intent, guard))
+		_, err = utxo.RollbackConflictIntent(ctx, db, intent, guard)
+		require.Error(t, err)
 		_, _, err = utxo.ReverseProcessConflicting(ctx, db, intent.BlockHeight, intent.BlockHash, intent.TxHashes, guard)
 		require.Error(t, err)
 		require.False(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
@@ -327,7 +331,8 @@ func ConflictRecoveryConfirmedWinner(t *testing.T, db utxo.Store) {
 	}
 	// If neither mined block remains on the current chain, undo is permitted.
 	orphaned := utxo.NewCurrentChainGuard(func(context.Context, []uint32) (bool, error) { return false, nil })
-	require.NoError(t, utxo.RollbackConflictIntent(ctx, db, intent, orphaned))
+	_, err = utxo.RollbackConflictIntent(ctx, db, intent, orphaned)
+	require.NoError(t, err)
 	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
 	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
 	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
@@ -388,8 +393,10 @@ func ConflictRecoveryForwardOwnBlock(t *testing.T, db utxo.Store) {
 
 			if otherBlock {
 				require.NotEqual(t, utxo.ConflictRecoveryRolledBack, r.Phase, "a winner confirmed elsewhere must keep the checklist pending")
-				require.ErrorContains(t, utxo.RollbackConflictIntent(ctx, db, intent, guard), "confirmed on the current chain")
-				require.NoError(t, utxo.RollbackConflictIntent(ctx, db, intent))
+				_, err = utxo.RollbackConflictIntent(ctx, db, intent, guard)
+				require.ErrorContains(t, err, "confirmed on the current chain")
+				_, err = utxo.RollbackConflictIntent(ctx, db, intent)
+				require.NoError(t, err)
 				require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 
 				return
@@ -593,4 +600,245 @@ func ConflictRecoveryWideCascade(t *testing.T, db utxo.Store) {
 	}
 
 	require.NoError(t, utxo.CompleteConflictIntent(ctx, db, intent.IntentID()))
+}
+
+// attachLoserChild wraps a real store. Just before the operation starts to mutate, it stores a new
+// child of the loser, as a validator can while the checklist is prepared.
+type attachLoserChild struct {
+	utxo.Store
+	child *bt.Tx
+	done  bool
+}
+
+func (s *attachLoserChild) SaveConflictRecovery(ctx context.Context, id chainhash.Hash, r *utxo.ConflictRecovery) error {
+	if r.Phase == utxo.ConflictRecoveryMutating && !s.done {
+		s.done = true
+		if _, _, err := s.Store.SpendAndCreate(ctx, s.child, 2); err != nil {
+			return err
+		}
+	}
+	return s.Store.SaveConflictRecovery(ctx, id, r)
+}
+
+// ConflictRecoveryLateLoserChild attaches a child to the loser after the checklist is prepared. The
+// operation must stop and roll back, and the rollback must not fail on that child: it never touches
+// the child's inputs. A retry then includes the child.
+func ConflictRecoveryLateLoserChild(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xd1)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+	child := crashSpendTx(t, loser, 60000)
+
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	wrapper := &attachLoserChild{Store: db, child: child}
+	_, _, err = utxo.ProcessConflicting(ctx, wrapper, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.ErrorContains(t, err, "retry required")
+	require.NotContains(t, err.Error(), "MANUAL INTERVENTION", "the rollback must not fail on a child outside the checklist")
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+	r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryRolledBack, r.Phase)
+	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.False(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
+	require.False(t, crashConflicting(t, ctx, db, child.TxIDChainHash()), "the loser ends usable, so its child must stay usable")
+	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+	require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()))
+
+	losers, _, err := utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, losers.Exists(*child.TxIDChainHash()), "the retry must include the late child")
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}
+
+// ConflictRecoveryLateWinnerChild rolls back a finished forward operation after a mempool child
+// attached to the winner. The winner ends conflicting, so the child must end conflicting too, and
+// the rollback must report it for txmeta cache eviction.
+func ConflictRecoveryLateWinnerChild(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xd2)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	child := crashSpendTx(t, winner, 60000)
+	_, _, err = db.SpendAndCreate(ctx, child, 3)
+	require.NoError(t, err)
+	grandchild := crashSpendTx(t, child, 50000)
+	_, _, err = db.SpendAndCreate(ctx, grandchild, 3)
+	require.NoError(t, err)
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+	cascaded, err := utxo.RollbackConflictIntent(ctx, db, intent)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []chainhash.Hash{*child.TxIDChainHash(), *grandchild.TxIDChainHash()}, cascaded)
+
+	r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryRolledBack, r.Phase)
+	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.False(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
+	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+	require.True(t, crashConflicting(t, ctx, db, child.TxIDChainHash()), "a child of a conflicting winner must be conflicting")
+	require.True(t, crashConflicting(t, ctx, db, grandchild.TxIDChainHash()))
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}
+
+// ConflictRecoveryReverseThenReadd adds a block, moves it back and adds it again, with the forward
+// intent of the first add still waiting for acknowledgement. The reverse must retire that finished
+// checklist, so the second add runs a new forward operation instead of failing on the old one.
+func ConflictRecoveryReverseThenReadd(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xd3)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	block := chainhash.HashH([]byte("reverse-then-readd-block"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	forward := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: block, TxHashes: winners}
+
+	for round := 0; round < 2; round++ {
+		_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+		require.NoError(t, err, "add %d", round+1)
+		require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+
+		_, _, err = utxo.ReverseProcessConflicting(ctx, db, 3, block, winners)
+		require.NoError(t, err, "move back %d", round+1)
+		require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+		require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+
+		r, err := db.LoadConflictRecovery(ctx, forward.IntentID())
+		require.NoError(t, err)
+		require.Nil(t, r, "the reverse must retire the finished forward checklist")
+	}
+
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard)
+	require.NoError(t, err, "final add")
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+}
+
+// countPendingScans wraps a real store and counts the scans of the whole WAL.
+type countPendingScans struct {
+	utxo.Store
+	scans atomic.Int32
+}
+
+func (s *countPendingScans) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	s.scans.Add(1)
+	return s.Store.PendingConflictIntents(ctx)
+}
+
+// ConflictRecoveryLegacyIntent checks that a new operation finds an existing intent without a scan
+// of the whole WAL, and that an intent recorded without a checklist is still refused.
+func ConflictRecoveryLegacyIntent(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xd4)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+
+	legacy := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: chainhash.HashH([]byte("legacy-block")), TxHashes: winners, StartedAt: 1}
+	require.NoError(t, db.BeginConflictIntent(ctx, legacy))
+
+	counter := &countPendingScans{Store: db}
+	_, _, err = utxo.ProcessConflicting(ctx, counter, 3, legacy.BlockHash, winners, nil, utxo.NoAncestryGuard)
+	require.ErrorContains(t, err, "legacy conflict intent")
+	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent), "a refused legacy intent must change nothing")
+	require.NoError(t, db.CompleteConflictIntent(ctx, legacy.IntentID()))
+
+	_, _, err = utxo.ProcessConflicting(ctx, counter, 3, chainhash.HashH([]byte("new-block")), winners, nil, utxo.NoAncestryGuard)
+	require.NoError(t, err)
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.Zero(t, counter.scans.Load(), "an operation must not scan the whole WAL")
+}
+
+// cancelDuringRestore wraps a real store. Its restore cancels the rollback's ctx and writes nothing,
+// as when compensationTimeout expires during the restore.
+type cancelDuringRestore struct {
+	utxo.Store
+	cancel context.CancelFunc
+}
+
+func (s *cancelDuringRestore) RestoreConflictSpends(context.Context, []*utxo.Spend, uint32) error {
+	s.cancel()
+	return nil
+}
+
+// The writes after the restore ignore the cancellation, so only the verify reads see it.
+func (s *cancelDuringRestore) SetConflicting(ctx context.Context, hashes []chainhash.Hash, value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
+	return s.Store.SetConflicting(context.WithoutCancel(ctx), hashes, value)
+}
+
+func (s *cancelDuringRestore) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash, locked bool) error {
+	return s.Store.SetConflictLocks(context.WithoutCancel(ctx), id, parents, locked)
+}
+
+func (s *cancelDuringRestore) SaveConflictRecovery(ctx context.Context, id chainhash.Hash, r *utxo.ConflictRecovery) error {
+	return s.Store.SaveConflictRecovery(context.WithoutCancel(ctx), id, r)
+}
+
+// ConflictRecoveryCancelledVerify cancels the rollback before it verifies the restored owners. An
+// outpoint that was never read is not verified, so the rollback must fail and keep the losers
+// conflicting instead of marking them usable.
+func ConflictRecoveryCancelledVerify(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xd6)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	rollbackCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+	_, err = utxo.RollbackConflictIntent(rollbackCtx, &cancelDuringRestore{Store: db, cancel: cancel}, intent)
+	require.Error(t, err, "unverified owners must fail the rollback")
+
+	r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	require.NotEqual(t, utxo.ConflictRecoveryRolledBack, r.Phase)
+	require.True(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()), "the loser must stay conflicting")
+
+	_, err = utxo.RollbackConflictIntent(ctx, db, intent)
+	require.NoError(t, err)
+	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 }

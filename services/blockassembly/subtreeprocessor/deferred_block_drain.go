@@ -30,6 +30,10 @@ type deferredBlockDrain struct {
 	transactionMap    *SortedHashSet
 	losingTxHashesMap txmap.TxMap
 	conflictingHashes map[chainhash.Hash]struct{}
+	// ackConflictIntents is set when the block has conflicting nodes, so ProcessConflicting ran
+	// for it and left a forward intent to acknowledge. It does not depend on how many
+	// transactions the operation demoted, which can be none.
+	ackConflictIntents bool
 }
 
 // runDeferredBlockDrain runs the end of a moveForwardBlock that
@@ -72,7 +76,7 @@ func (stp *SubtreeProcessor) runDeferredBlockDrain(ctx context.Context, block *m
 	// The clear is moveForwardBlock's commit point, so a storage error from it
 	// keeps the label it had when the clear ran inside moveForwardBlock.
 	stp.drainAndLogDiskTxMapErr("moveForwardBlock_commit")
-	if !stp.drainResetRequested.Load() && len(drain.conflictingHashes) > 0 {
+	if !stp.drainResetRequested.Load() && drain.ackConflictIntents {
 		if err := utxo.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, *block.Hash()); err != nil {
 			stp.logger.Errorf("[SubtreeProcessor] conflict WAL acknowledgement failed: %v", err)
 			stp.drainResetRequested.Store(true)

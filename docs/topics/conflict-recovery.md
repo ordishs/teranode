@@ -30,14 +30,26 @@ flowchart LR
 A forward retry uses the saved descendant list. It does not try to recover deleted
 spend links from the current UTXO graph. Rollback restores the recorded spend
 owners, checks them, and then restores the original flags. An unexpected spender
-causes an error; recovery does not overwrite it. A descendant outside the saved
-checklist also stops rollback before it removes any spend. These cases retain
-the WAL for diagnosis and repair.
+causes an error; recovery does not overwrite it. This case retains the WAL for
+diagnosis and repair.
+
+A child can attach to a checklist transaction after the checklist was saved. The
+rollback does not touch the inputs of that child, so it needs no before-image. When
+the child's parent ends `Conflicting`, the rollback marks the child and its
+descendants `Conflicting` too, and reports them for txmeta cache eviction.
 
 BlockAssembly retains a finished WAL until subtree updates and the queue drain
 succeed. At startup, it replays pending work before loading unmined transactions.
-Unresolved recovery prevents startup. Finished forward records are removed only
-after the startup subtree updates and queue drain succeed.
+Unresolved recovery prevents startup, and so does a record whose replay failed,
+even when its checklist reads finished. Finished forward records are removed only
+after the startup subtree updates and queue drain succeed, and only when block
+assembly has reached the record's block. Otherwise the catch-up applies the block,
+accepts the applied winners from the finished checklist and acknowledges the record.
+
+A successful reverse retires the finished forward record of its block, so a later
+re-add of the block runs a new forward operation. At startup, replay runs reverse
+records first. A forward record whose block still has a pending reverse record is
+left as it is, because a rollback over a partial reverse could corrupt the store.
 
 ## Store implementations
 
@@ -46,18 +58,23 @@ conditional spend writer performs each recovery write synchronously. Parent lock
 carry the operation ID. Ordinary lock writes clear that ID, so recovery cannot
 release a lock that another operation has acquired. A parent that another holder
 already locked is left out of the operation's lock set. The operation neither takes
-nor releases that lock.
+nor releases that lock. Taking the lock set is all or nothing. A rollback before any
+mutation releases only the locks that the operation still owns, because another
+holder can lock a parent between preparation and acquisition.
 
 Aerospike stores save the checklist in 64 KiB chunks in the WAL data set. A checksum
 identifies the complete checklist. The root record publishes its phase and chunk
-reference after the chunks are written. Cleanup retains the root until all chunks
-are deleted. These records do not expire automatically.
+reference after the chunks are written. The checklist content does not change after
+publication, so a later phase change writes only the root phase. Cleanup retains the
+root until all chunks are deleted. These records do not expire automatically.
+Restored spends are written in synchronous Lua batches, so no write arrives after
+the rollback returns.
 
 Aerospike conflict recovery does not acquire or release parent locks. This matches
 its existing `Unspend` behavior. Boolean validation locks must not be cleared by
 recovery.
 
-External `utxo.Store` implementations must implement the four recovery methods in
+External `utxo.Store` implementations must implement the five recovery methods in
 `stores/utxo/Interface.go`. They must preserve conditional spend writes and durable
 phase ordering. Returning success without saving the checklist is not sufficient.
 
@@ -93,6 +110,12 @@ The winners of a forward operation are mined in the block being added. That bloc
 already on the current chain. The forward rollback therefore ignores that one block
 ID for the winners. It still refuses a winner that is confirmed in any other
 current-chain block, and it still refuses every other transaction.
+
+A stale forward record can have winners that the new chain confirms again. When
+every winner is confirmed on the current chain, still owns its inputs and is not
+`Conflicting`, the current chain confirms the same outcome. Startup then completes
+the record without a rollback. When only some winners are confirmed, the rollback
+still refuses and the record stays pending for repair.
 
 The loser set that a forward operation returns, and the list of marked transactions,
 never contain a winner.

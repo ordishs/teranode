@@ -355,3 +355,7 @@ func (m *NullStore) RestoreConflictSpends(ctx context.Context, spends []*utxo.Sp
 func (m *NullStore) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash, locked bool) error {
 	return nil
 }
+
+func (m *NullStore) ReleaseConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash) error {
+	return nil
+}
