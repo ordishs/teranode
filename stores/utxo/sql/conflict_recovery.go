@@ -42,6 +42,9 @@ func (s *Store) LoadConflictRecovery(ctx context.Context, id chainhash.Hash) (*u
 
 func (s *Store) RestoreConflictSpends(ctx context.Context, spends []*utxo.Spend, height uint32) error {
 	for _, sp := range spends {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if sp == nil || sp.SpendingData == nil {
 			return errors.NewProcessingError("invalid conflict restoration spend")
 		}
@@ -50,9 +53,6 @@ func (s *Store) RestoreConflictSpends(ctx context.Context, spends []*utxo.Spend,
 		done := make(chan error, 1)
 		s.sendSpendBatch([]*batchSpend{{spend: sp, blockHeight: height, errCh: done, ignoreConflicting: true, ignoreLocked: true}})
 		if err := <-done; err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
