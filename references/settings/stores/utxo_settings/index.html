@@ -2211,7 +2211,7 @@
   <span class="md-ellipsis">
     
   
-    Backup Teranode
+    Back Up and Restore Teranode
   
 
     
@@ -7441,13 +7441,6 @@
 <td>Verbose debug logging</td>
 </tr>
 <tr>
-<td>UpdateTxMinedStatus</td>
-<td>bool</td>
-<td>true</td>
-<td>utxostore_updateTxMinedStatus</td>
-<td>Transaction mined status updates</td>
-</tr>
-<tr>
 <td>MaxMinedRoutines</td>
 <td>int</td>
 <td>128</td>
@@ -7474,6 +7467,13 @@
 <td>false</td>
 <td>utxostore_disableDAHCleaner</td>
 <td><strong>CRITICAL</strong> - DAH cleaner process control</td>
+</tr>
+<tr>
+<td>ConflictingChildrenMaxNodes</td>
+<td>int</td>
+<td>100000</td>
+<td>utxostore_conflictingChildrenMaxNodes</td>
+<td>Fail-closed node budget per root of a conflicting-descendant walk (&lt;=0 = unlimited). Subtree validation walks a block's conflicting transactions as one batch from N roots (the transactions and their counter-spenders) and allows N × this budget: the old aggregate bound of N separate walks. Worst case, the visited set reaches N × this budget entries, and a single runaway cone fails after N × this budget reads rather than this budget</td>
 </tr>
 </tbody>
 </table>

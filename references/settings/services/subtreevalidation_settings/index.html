@@ -2211,7 +2211,7 @@
   <span class="md-ellipsis">
     
   
-    Backup Teranode
+    Back Up and Restore Teranode
   
 
     
@@ -7179,6 +7179,13 @@
 <td>32</td>
 <td>subtreevalidation_peerSubtreeConcurrency</td>
 <td>Peer-announced subtrees validated at once (each holds ~1 GiB per 1M txs); taken before the quorum lock, so block validation never waits behind the queue. Block subtrees do not use it. 0 or less disables the limit</td>
+</tr>
+<tr>
+<td>TxMetaTombstoneWindow</td>
+<td>time.Duration</td>
+<td>30m</td>
+<td>subtreevalidation_txMetaTombstoneWindow</td>
+<td>How long a txmeta DELETE (a tx demoted to conflicting) keeps that tx out of the txmeta cache, against late ADDs and read-through writes; entries live one to two windows, about 60 MB per million demoted txs. Must exceed the worst txmeta consumer lag; must be positive</td>
 </tr>
 <tr>
 <td>ProcessTxMetaUsingCacheMissingTxThreshold</td>
