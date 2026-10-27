@@ -78,9 +78,8 @@ func resetWALSpendTx(t *testing.T, parent *bt.Tx, satoshis uint64) *bt.Tx {
 	return tx
 }
 
-// A reset over blocks with no conflicting nodes has no forward WAL intents to complete, so it must
-// not scan the pending intents once per block.
-func TestReset_NoConflictingNodesSkipsPendingIntentScan(t *testing.T) {
+// A reset scans the pending intents once for all its moveForward blocks, not once per block.
+func TestReset_ScansPendingIntentsOnce(t *testing.T) {
 	stp, store, _ := newResetWALTestProcessor(t)
 
 	moveBack, moveForward := resetFixture()
@@ -90,18 +89,19 @@ func TestReset_NoConflictingNodesSkipsPendingIntentScan(t *testing.T) {
 	require.NoError(t, response.Err)
 	require.Equal(t, moveForward[1].Header.Hash(), stp.GetCurrentBlockHeader().Hash(), "reset must land on the last moveForward block")
 
-	require.Zero(t, store.scans.Load(), "blocks without conflicting nodes must not scan the pending intents")
+	require.Equal(t, int32(1), store.scans.Load(), "a reset must scan the pending intents exactly once")
 }
 
-// A reset over a block with a conflicting node runs ProcessConflicting with deferred completion. The
-// reset must still complete that block's WAL intent after the block is applied.
-func TestReset_ConflictingNodeCompletesWALIntent(t *testing.T) {
+// createResetWALConflict stores a parent, a loser that spends it and a conflicting winner that
+// spends the same output, and returns the loser and the winner.
+func createResetWALConflict(t *testing.T, store utxo.Store, seed byte) (*bt.Tx, *bt.Tx) {
+	t.Helper()
+
 	ctx := t.Context()
-	stp, store, subtreeStore := newResetWALTestProcessor(t)
 
 	parent := bt.NewTx()
 	parentIn := &bt.Input{PreviousTxOutIndex: 0, PreviousTxSatoshis: 200000, SequenceNumber: 0xFFFFFFFF, UnlockingScript: bscript.NewFromBytes([]byte{})}
-	_ = parentIn.PreviousTxIDAdd(&chainhash.Hash{9, 9, 9})
+	_ = parentIn.PreviousTxIDAdd(&chainhash.Hash{9, 9, seed})
 	parent.Inputs = []*bt.Input{parentIn}
 	parent.Outputs = []*bt.Output{{Satoshis: 100000, LockingScript: bscript.NewFromBytes([]byte{0x52})}}
 	_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
@@ -114,6 +114,55 @@ func TestReset_ConflictingNodeCompletesWALIntent(t *testing.T) {
 	winner := resetWALSpendTx(t, parent, 80000)
 	_, _, err = store.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
 	require.NoError(t, err)
+
+	return loser, winner
+}
+
+// A deferred drain whose acknowledgement failed leaves a finished forward intent pending. The
+// follow-up reset may take the fast-forward branch, and it must still complete that intent.
+func TestReset_FastForwardCompletesWALIntent(t *testing.T) {
+	ctx := t.Context()
+	stp, store, _ := newResetWALTestProcessor(t)
+
+	moveBack, moveForward := resetFixture()
+
+	_, winner := createResetWALConflict(t, store, 1)
+	_, _, err := utxo.ProcessConflicting(ctx, store, 1, *moveForward[0].Hash(), []chainhash.Hash{*winner.TxIDChainHash()}, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	otherBlock := chainhash.HashH([]byte("reset-wal-other-block"))
+	_, otherWinner := createResetWALConflict(t, store, 2)
+	_, _, err = utxo.ProcessConflicting(ctx, store, 1, otherBlock, []chainhash.Hash{*otherWinner.TxIDChainHash()}, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+
+	stp.InitCurrentBlockHeader(moveBack[0].Header)
+	store.scans.Store(0)
+
+	response := stp.Reset(moveBack[0].Header, moveBack, moveForward, true, func() error { return nil })
+	require.NoError(t, response.Err)
+	require.Equal(t, moveForward[1].Header.Hash(), stp.GetCurrentBlockHeader().Hash(), "reset must land on the last moveForward block")
+
+	scans := store.scans.Load()
+
+	pending, err = store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "the fast-forward reset must complete the intent of its moveForward block")
+	require.Equal(t, otherBlock, pending[0].BlockHash, "an intent for a block outside the reset must stay pending")
+
+	require.Equal(t, int32(1), scans, "a reset must scan the pending intents exactly once")
+}
+
+// A reset over a block with a conflicting node runs ProcessConflicting with deferred completion. The
+// reset must still complete that block's WAL intent after the block is applied.
+func TestReset_ConflictingNodeCompletesWALIntent(t *testing.T) {
+	ctx := t.Context()
+	stp, store, subtreeStore := newResetWALTestProcessor(t)
+
+	loser, winner := createResetWALConflict(t, store, 9)
 
 	st, err := subtreepkg.NewTreeByLeafCount(4)
 	require.NoError(t, err)

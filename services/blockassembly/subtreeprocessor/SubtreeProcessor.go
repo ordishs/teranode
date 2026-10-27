@@ -1757,10 +1757,6 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// the map is only used during the reset process and is not stored in the SubtreeProcessor struct
 	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
-	// conflictBlocks lists the moveForward blocks that carry conflicting nodes. Only these can
-	// have forward WAL intents, so the other blocks skip the pending-intent scan.
-	var conflictBlocks []chainhash.Hash
-
 	// Every per-block step below reports progress, for the same reason Reorg
 	// does: the owner's main loop is blocked on this call for its whole length,
 	// and a reset can move hundreds of blocks (issue 1447). The serial loops beat
@@ -1881,8 +1877,6 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 			}
 
 			if len(conflictingNodes) > 0 {
-				conflictBlocks = append(conflictBlocks, *block.Hash())
-
 				// Skip hashes already handled by an earlier moveBack pass
 				// that ran ReverseProcessConflicting. See the symmetric
 				// filter in processConflictingTransactions for the full
@@ -1997,10 +1991,15 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		}
 	}
 
-	for _, blockHash := range conflictBlocks {
-		if err := utxostore.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, blockHash); err != nil {
-			return err
-		}
+	// Both reset branches complete the finished forward intents of every moveForward block. An
+	// earlier failed acknowledgement can leave one pending, even on the fast-forward branch.
+	moveForwardHashes := make([]chainhash.Hash, len(moveForwardBlocks))
+	for i, block := range moveForwardBlocks {
+		moveForwardHashes[i] = *block.Hash()
+	}
+
+	if err := utxostore.CompleteConflictIntentsForBlocks(ctx, stp.utxoStore, moveForwardHashes); err != nil {
+		return err
 	}
 
 	return nil

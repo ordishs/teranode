@@ -1,7 +1,9 @@
 package utxo
 
 import (
+	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -27,4 +29,27 @@ func TestRollback_CapsMessageLength(t *testing.T) {
 	require.Error(t, err)
 	require.Less(t, len(err.Error()), 2*maxRollbackMessageBytes+200)
 	require.Contains(t, err.Error(), "flag clear failed", "a later failure survives a huge earlier one")
+}
+
+// Some stores ignore ctx in their reads. After one read fails, forEachConflictRead must not start
+// the reads that remain, so a failed check on a wide cascade returns without reading it all.
+func TestForEachConflictRead_StopsAfterFailure(t *testing.T) {
+	const n = 10_000
+
+	var started atomic.Int32
+
+	err := forEachConflictRead(t.Context(), n, func(ctx context.Context, i int) error {
+		started.Add(1)
+
+		if i == 0 {
+			return errors.NewProcessingError("read %d failed", i)
+		}
+
+		// Hold every slot until the failure cancels the group.
+		<-ctx.Done()
+
+		return nil
+	})
+	require.Error(t, err)
+	require.LessOrEqual(t, started.Load(), int32(conflictingWalkFanOut), "no read may start after the failure")
 }

@@ -199,7 +199,17 @@ func forEachConflictRead(ctx context.Context, n int, read func(ctx context.Conte
 	g.SetLimit(conflictingWalkFanOut)
 
 	for i := 0; i < n; i++ {
+		// Some stores ignore ctx in their reads, so do not start more reads after a failure.
+		if gCtx.Err() != nil {
+			break
+		}
+
 		g.Go(func() error {
+			// g.Go can wait for a slot that the failing read frees, so check again here.
+			if err := gCtx.Err(); err != nil {
+				return err
+			}
+
 			return read(gCtx, i)
 		})
 	}
@@ -396,12 +406,30 @@ func finishConflictRecovery(ctx context.Context, s Store, intent ConflictIntent,
 // CompleteConflictIntentsForBlock is called only after subtree and queue work
 // for the block has succeeded. Prepared or failed operations remain pending.
 func CompleteConflictIntentsForBlock(ctx context.Context, s Store, blockHash chainhash.Hash) error {
+	return CompleteConflictIntentsForBlocks(ctx, s, []chainhash.Hash{blockHash})
+}
+
+// CompleteConflictIntentsForBlocks completes the finished forward intents of all the given
+// blocks with one pending-intent scan. The same rules apply as for CompleteConflictIntentsForBlock.
+func CompleteConflictIntentsForBlocks(ctx context.Context, s Store, blockHashes []chainhash.Hash) error {
+	if len(blockHashes) == 0 {
+		return nil
+	}
+
+	blocks := make(map[chainhash.Hash]struct{}, len(blockHashes))
+	for _, h := range blockHashes {
+		blocks[h] = struct{}{}
+	}
+
 	intents, err := s.PendingConflictIntents(ctx)
 	if err != nil {
 		return err
 	}
 	for _, intent := range intents {
-		if intent.Kind != ConflictIntentForward || intent.BlockHash != blockHash {
+		if intent.Kind != ConflictIntentForward {
+			continue
+		}
+		if _, ok := blocks[intent.BlockHash]; !ok {
 			continue
 		}
 		r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
