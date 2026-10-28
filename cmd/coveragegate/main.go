@@ -60,7 +60,7 @@ func run(profilePath, thresholdsPath, modulePath string) error {
 	}
 
 	if failed {
-		return errors.NewProcessingError("statement coverage is below its minimum for at least one package in %s; add tests, or, if the drop is intended, lower the minimum in the same pull request and say why", thresholdsPath)
+		return errors.NewProcessingError("statement coverage is below its minimum for at least one package in %s. If this pull request removed no tests, first check the make test output for \"Skipping\" lines: tests that need a container (Aerospike, PostgreSQL) skip when it cannot start, for example when an image pull is rate-limited, and their coverage is then missing. Otherwise add tests or, if the drop is intended, lower the minimum in the same pull request and say why", thresholdsPath)
 	}
 
 	return nil
