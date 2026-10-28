@@ -1478,6 +1478,7 @@ func ConflictRecoveryPartialReverseReadd(t *testing.T, db utxo.Store) {
 			}
 			require.Len(t, forBlock, 1, "the block keeps one forward intent")
 			require.Equal(t, utxo.ForwardConflictIntentID(block), forBlock[0].IntentID())
+			require.ElementsMatch(t, winners, forBlock[0].TxHashes, "planning intent must retain every merged winner for crash replay")
 
 			require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
 			r, err := db.LoadConflictRecovery(ctx, utxo.ForwardConflictIntentID(block))

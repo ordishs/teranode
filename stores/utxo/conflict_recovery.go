@@ -443,6 +443,11 @@ func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, 
 		}
 
 		m, err := s.Get(ctx, &owner, fields.Conflicting)
+		// A spend can precede its owner's Create. Leave a missing owner to the
+		// verification pass so the remaining original spends are still restored.
+		if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}

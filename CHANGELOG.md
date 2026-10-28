@@ -26,7 +26,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   without a rollback, as a reorg keeps a transaction of an orphaned block; this also
   covers a partial re-mine. When BlockAssembly never reached that block, startup
   reverses the winners that the current chain does not confirm. A confirmed winner
-  that no longer owns its inputs keeps the intent pending. The parent locks it still
+  that no longer owns its inputs keeps the intent pending. Pruned parents of confirmed
+  winners no longer block startup; current-chain confirmation authorizes those inputs. The parent locks it still
   holds are released. A rollback leaves an input that the operation freed with a
   later owner outside the operation, and the loser that spent it stays conflicting. Failed
   WAL cleanup is now returned and counted in

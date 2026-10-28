@@ -195,6 +195,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			// A caller may have filtered its winners differently. Re-plan every winner whose
 			// saved swap is being retired, so a subset cannot abandon a partly reversed winner.
 			conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
+			intent.TxHashes = conflictingTxHashes
 			// A reverse of this block undid some winners, or stopped part way through one, and did
 			// not retire the checklist. The checklist no longer describes the store, so retire it and
 			// plan again. The new plan takes a new before-image and skips the winners that are applied.
@@ -952,6 +953,11 @@ func (h *hashSet) add(hashes ...chainhash.Hash) {
 // winnerIsApplied reports whether the store records the winner as the spender of every one of
 // its inputs, which is the end state of a completed ProcessConflicting run for that winner.
 func winnerIsApplied(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt.Tx) (bool, error) {
+	return winnerInputsOwned(ctx, s, txHash, tx, false)
+}
+
+// Confirmed winners may have pruned parents. Other callers still require every input.
+func winnerInputsOwned(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt.Tx, allowPruned bool) (bool, error) {
 	if tx == nil || len(tx.Inputs) == 0 {
 		return false, nil
 	}
@@ -961,6 +967,9 @@ func winnerIsApplied(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt
 		vout := input.PreviousTxOutIndex
 
 		parentMeta, err := s.Get(ctx, parentHash, fields.Utxos)
+		if allowPruned && (errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) || (err == nil && parentMeta == nil)) {
+			continue
+		}
 		if err != nil {
 			return false, errors.NewProcessingError("[ProcessConflicting][%s] error getting parent %s to check the winner is applied", txHash.String(), parentHash.String(), err)
 		}
@@ -1129,7 +1138,7 @@ func splitConfirmedConflictWinners(ctx context.Context, s Store, winners []chain
 			continue
 		}
 
-		applied, err := winnerIsApplied(ctx, s, h, m.Tx)
+		applied, err := winnerInputsOwned(ctx, s, h, m.Tx, true)
 		if err != nil {
 			return false, nil, err
 		}

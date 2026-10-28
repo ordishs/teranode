@@ -154,7 +154,9 @@ current-chain block, and it still refuses every other transaction.
 A stale forward record can have winners that the new chain confirms again. When the
 operation was applied and at least one winner is confirmed on the current chain,
 startup keeps the applied state of the confirmed winners, as a reorg keeps a
-transaction of an orphaned block. Each confirmed winner must still own every input.
+transaction of an orphaned block. Each confirmed winner must still own every input whose parent remains in the store.
+A missing parent may have been pruned during the outage; current-chain confirmation
+is sufficient for that input. Storage failures still retain the checklist.
 If one does not, the store contradicts the record, and the record stays pending.
 This includes a partial re-mine, where the new chain confirms only some winners.
 For the other winners:
