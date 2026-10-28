@@ -825,3 +825,42 @@ func TestHealStaleConflictIntent_PartialRemineReversesWhenAssemblyDidNotReachBlo
 		})
 	}
 }
+
+// Startup may encounter an acknowledged-in-memory block whose durable WAL delete failed,
+// after the independent pruner removed a fully spent parent.
+func TestReplayPendingConflictIntents_ConfirmedPrunedParent(t *testing.T) {
+	for _, missing := range []bool{true, false} {
+		t.Run(fmt.Sprintf("missing=%t", missing), func(t *testing.T) {
+			ctx := t.Context()
+			items := setupBlockAssemblyTest(t)
+			store := items.utxoStore
+			require.NoError(t, store.SetBlockHeight(10))
+			parent := createStaleReverseParent(ctx, t, store, 1)
+			createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+			winner := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+			addBlockWithMinedSet(ctx, t, items, blockHeader1)
+			winners := []chainhash.Hash{*winner.TxIDChainHash()}
+			_, _, err := utxo.ProcessConflicting(ctx, store, 1, *blockHeader1.Hash(), winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			require.NoError(t, err)
+			_, blockMeta, err := items.blockchainClient.GetBlockHeader(ctx, blockHeader1.Hash())
+			require.NoError(t, err)
+			_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{winner.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: blockMeta.ID, BlockHeight: 1})
+			require.NoError(t, err)
+			if missing {
+				require.NoError(t, store.Delete(ctx, parent.TxIDChainHash()))
+			} else {
+				spends, e := utxo.GetSpends(winner)
+				require.NoError(t, e)
+				require.NoError(t, store.Unspend(ctx, spends))
+			}
+			failed := items.blockAssembler.replayPendingConflictIntents(ctx)
+			if missing {
+				require.Empty(t, failed)
+				require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx, failed))
+			} else {
+				require.NotEmpty(t, failed, "confirmation must not hide a present parent's ownership mismatch")
+				require.Error(t, items.blockAssembler.checkConflictRecoveryReady(ctx, failed))
+			}
+		})
+	}
+}

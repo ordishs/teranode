@@ -185,7 +185,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 				return nil, nil, err
 			}
 		case ConflictRecoveryApplied, ConflictRecoveryFinished:
-			settled, e := conflictWinnersSettled(ctx, s, recovery.Winners)
+			settled, e := conflictWinnersSettled(ctx, s, recovery.Winners, options.currentChainGuard)
 			if e != nil {
 				return nil, nil, e
 			}
@@ -1157,11 +1157,11 @@ func splitConfirmedConflictWinners(ctx context.Context, s Store, winners []chain
 // Conflicting, and the spender of every input. It returns false when a winner is Conflicting, which
 // only a reverse of the block sets. A winner that is not Conflicting but lost an input contradicts the
 // checklist, and that is an error.
-func conflictWinnersSettled(ctx context.Context, s Store, winners []chainhash.Hash) (bool, error) {
+func conflictWinnersSettled(ctx context.Context, s Store, winners []chainhash.Hash, guard CurrentChainGuard) (bool, error) {
 	settled := true
 
 	for _, h := range winners {
-		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting)
+		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting, fields.BlockIDs)
 		if err != nil {
 			return false, errors.NewProcessingError("[conflictWinnersSettled][%s] error getting tx", h.String(), err)
 		}
@@ -1175,7 +1175,14 @@ func conflictWinnersSettled(ctx context.Context, s Store, winners []chainhash.Ha
 			continue
 		}
 
-		applied, err := winnerIsApplied(ctx, s, h, m.Tx)
+		confirmed := false
+		if guard.check != nil && len(m.BlockIDs) > 0 {
+			confirmed, err = guard.check(ctx, m.BlockIDs)
+			if err != nil {
+				return false, err
+			}
+		}
+		applied, err := winnerInputsOwned(ctx, s, h, m.Tx, confirmed)
 		if err != nil {
 			return false, err
 		}
