@@ -337,20 +337,21 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `UTXO_SPENT` for valid retries. No configuration change is required.
 
   Once a part tells the stored owner of an outpoint, later competing claims in
-  the batch are refused locally with `UTXO_SPENT` naming that owner. Thus
-  alternating double-spends cost two backend calls, not one per claim. A claim
-  whose earlier competitor failed for another reason, such as a storage error or
-  a missing parent, still costs its own backend call. Batches without competing
-  claims are unchanged.
+  the batch are refused locally with `UTXO_SPENT` naming that owner, when they
+  run the same store checks as the claim that showed the owner: the same UTXO
+  hash, block height and ignore flags. Thus alternating double-spends cost two
+  backend calls, not one per claim. A claim with other checks, or whose earlier
+  competitor failed for another reason (a storage error or a missing parent, for
+  example), still costs its own backend call. Batches without competing claims
+  are unchanged.
 
   The `teranode_aerospike_utxo_spend_batch` and
   `teranode_aerospike_utxo_spend_batch_size` histograms now count one batcher
-  batch, however many parts it needs. The Aerospike spend circuit breaker counts
-  a split batch like the same batch without a split: once per batch on the
-  expression path, and once per record key on the Lua path. A record key that
-  appears in more parts, or in the Lua retry of `FILTERED_OUT` records, now
-  counts once. The Lua retry of `FILTERED_OUT` records is also no longer a
-  separate histogram sample. The SQL spend batcher now
+  batch, however many parts it needs. The Lua retry of `FILTERED_OUT` records is
+  no longer a separate histogram sample. The Aerospike spend circuit breaker
+  counts a batch that is not split exactly as before. In a split batch, the
+  expression path counts once per batch, and the Lua path skips a record key
+  that an earlier part already counted. The SQL spend batcher now
   recovers a panic and answers every waiting caller with an error, instead of
   leaving them to wait for `utxostore_spendWaitTimeout`. Go integrations using
   `FilterConflictingDuplicateSpendClaims` must migrate to `ProcessSpendBatch`
