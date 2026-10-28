@@ -149,6 +149,13 @@ func TestAerospikeConflictRecoveryReverseCompletionFailure(t *testing.T) {
 	tests.ConflictRecoveryReverseCompletionFailure(t, store)
 }
 
+func TestAerospikeConflictRecoveryWinnerWithConflictingChild(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryWinnerWithConflictingChild(t, store)
+}
+
 func TestAerospikeConflictRecoveryLateWinnerChild(t *testing.T) {
 	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
 	t.Cleanup(deferFn)

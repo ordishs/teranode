@@ -325,9 +325,21 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			mayBeMarked = append(mayBeMarked, h)
 		}
 	}
+	// Mark the losers and the winners in separate calls. Aerospike reports the children of a
+	// transaction even when it is already Conflicting, and the run never touches a winner's outputs,
+	// so a winner's child (for example a conflicting child that arrived with it) is not a cascade
+	// change. Checking it would refuse every retry.
+	var losersToMark []chainhash.Hash
+	for _, h := range affected.order {
+		if _, isWinner := winnerSet[h]; !isWinner {
+			losersToMark = append(losersToMark, h)
+		}
+	}
 	var discovered []chainhash.Hash
-	if _, discovered, err = s.SetConflicting(ctx, affected.order, true); err != nil {
-		return nil, nil, err
+	if len(losersToMark) > 0 {
+		if _, discovered, err = s.SetConflicting(ctx, losersToMark, true); err != nil {
+			return nil, nil, err
+		}
 	}
 	// A validator can attach a child while the checklist is being prepared.
 	// Do not erase that edge without a before-image. Roll back and plan again.
@@ -335,6 +347,9 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		if !affected.has(h) {
 			return nil, nil, errors.NewProcessingError("conflict descendants changed during preparation; retry required")
 		}
+	}
+	if _, _, err = s.SetConflicting(ctx, conflictingTxHashes, true); err != nil {
+		return nil, nil, err
 	}
 	var originalSpent []*Spend
 	for _, sp := range recovery.OriginalSpends {

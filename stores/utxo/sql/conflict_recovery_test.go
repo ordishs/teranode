@@ -227,6 +227,11 @@ func TestConflictRecoveryReverseCompletionFailure(t *testing.T) {
 	tests.ConflictRecoveryReverseCompletionFailure(t, store)
 }
 
+func TestConflictRecoveryWinnerWithConflictingChild(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryWinnerWithConflictingChild(t, store)
+}
+
 func TestConflictRecoveryLateWinnerChild(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryLateWinnerChild(t, store)

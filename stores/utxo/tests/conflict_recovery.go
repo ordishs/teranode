@@ -1312,3 +1312,44 @@ func ConflictRecoveryReverseCompletionFailure(t *testing.T, db utxo.Store) {
 	reverse := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 3, BlockHash: block, TxHashes: winners}
 	require.NoError(t, db.CompleteConflictIntent(ctx, reverse.IntentID()))
 }
+
+// ConflictRecoveryWinnerWithConflictingChild adds a block, lets a mempool child spend its applied
+// winner, moves the block back and adds it again. The reverse demotes the winner and the child, and
+// the child keeps its spend of the winner's output. The child spends the winner, not a cascade member,
+// so the re-add must succeed and leave the child Conflicting. Aerospike reports that child on every
+// mark, so a check over the winners' children refused every retry.
+func ConflictRecoveryWinnerWithConflictingChild(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0x97)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	block := chainhash.HashH([]byte("winner-with-conflicting-child"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard)
+	require.NoError(t, err)
+
+	child := crashSpendTx(t, winner, 60000)
+	_, _, err = db.SpendAndCreate(ctx, child, 3)
+	require.NoError(t, err)
+
+	_, _, err = utxo.ReverseProcessConflicting(ctx, db, 3, block, winners)
+	require.NoError(t, err)
+	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+	require.True(t, crashConflicting(t, ctx, db, child.TxIDChainHash()))
+	require.Equal(t, child.TxIDChainHash(), crashSpender(t, ctx, db, winner), "the child keeps its spend of the winner")
+
+	losers, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard)
+	require.NoError(t, err, "a child of the winner must not block the re-add")
+	require.True(t, losers.Exists(*loser.TxIDChainHash()))
+	require.False(t, losers.Exists(*child.TxIDChainHash()))
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.False(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+	require.True(t, crashConflicting(t, ctx, db, child.TxIDChainHash()))
+}
