@@ -41,6 +41,14 @@ func (r *recentAnnouncements) add(hash *chainhash.Hash) {
 	}
 }
 
+// empty reports whether nothing has been announced since this process started.
+func (r *recentAnnouncements) empty() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.count == 0
+}
+
 func (r *recentAnnouncements) contains(hash *chainhash.Hash) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -115,7 +123,15 @@ func (sm *SyncManager) reconcileAnnouncedTip(ctx context.Context, pending *chain
 		return hash
 	}
 
-	sm.logger.Warnf("[blockAnnounceReconciler][%s] best block at height %d was not announced from blocks-final, announcing it now", hash, meta.Height)
+	// Nothing announced since this process started is the normal state after a Legacy
+	// restart: blocks-final delivered the tip to the previous process. Only a tip left
+	// unannounced while this process has been announcing points at a lost publish.
+	if sm.announced.empty() {
+		sm.logger.Infof("[blockAnnounceReconciler][%s] announcing best block at height %d, the first announcement since this process started", hash, meta.Height)
+	} else {
+		sm.logger.Warnf("[blockAnnounceReconciler][%s] best block at height %d was not announced from blocks-final, announcing it now", hash, meta.Height)
+	}
+
 	sm.announceBlock(hash, header.ToWireBlockHeader(), meta.Height)
 
 	return nil

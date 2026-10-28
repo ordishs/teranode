@@ -291,3 +291,17 @@ func TestRunBlockAnnounceReconciler_AnnouncesAndStops(t *testing.T) {
 		t.Fatal("the reconciler did not stop when its context was cancelled")
 	}
 }
+
+// The reconciler logs a lost publish only when this process has announced something: an
+// empty record is the normal state after a Legacy restart, not a missed blocks-final.
+func TestRecentAnnouncements_EmptyUntilTheFirstAnnouncement(t *testing.T) {
+	var r recentAnnouncements
+
+	require.True(t, r.empty())
+
+	hash := chainhash.Hash{0x01}
+	r.add(&hash)
+
+	require.False(t, r.empty())
+	require.True(t, r.contains(&hash))
+}
