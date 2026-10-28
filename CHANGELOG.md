@@ -349,13 +349,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `teranode_aerospike_utxo_spend_batch_size` histograms now count one batcher
   batch, however many parts it needs. The Lua retry of `FILTERED_OUT` records is
   no longer a separate histogram sample. The Aerospike spend circuit breaker
-  counts a batch that is not split exactly as before. In a split batch, the
-  expression path counts once per batch, and the Lua path skips a record key
-  that an earlier part already counted. The SQL spend batcher now
+  records expression outcomes before Lua retries, including in split batches.
+  Repeated expression failures count once per batcher batch until a success
+  resets the breaker; the next failure then counts again. Repeated expression
+  successes are likewise coalesced until a failure. Lua records every success
+  and infrastructure failure in processing order, including retries and repeated
+  keys in later parts. Split Lua batches can therefore reach the breaker
+  threshold sooner during an outage because they perform more backend operations.
+  Breaker settings are unchanged. The SQL spend batcher now
   recovers a panic and answers every waiting caller with an error, instead of
   leaving them to wait for `utxostore_spendWaitTimeout`. Go integrations using
   `FilterConflictingDuplicateSpendClaims` must migrate to `ProcessSpendBatch`
-  with a `SpendBatchHandler`. (#2036, bitcoin-sv/teranode#4934)
+  with a `SpendBatchHandler`; omitting `SameChecks` disables local rejection
+  and sends all claims to the backend. (#2036, bitcoin-sv/teranode#4934)
 
 - **A failed revert of an invalid block's mined tags now holds block assembly until it
   succeeds.** When block validation reverts the mined tags of an invalid block and
