@@ -343,11 +343,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   a missing parent, still costs its own backend call. Batches without competing
   claims are unchanged.
 
-  The Aerospike spend circuit breaker and the
-  `teranode_aerospike_utxo_spend_batch` and
+  The `teranode_aerospike_utxo_spend_batch` and
   `teranode_aerospike_utxo_spend_batch_size` histograms now count one batcher
-  batch, however many parts it needs. The Lua retry of `FILTERED_OUT` records on
-  the expression path is no longer a separate sample. The SQL spend batcher now
+  batch, however many parts it needs. The Aerospike spend circuit breaker counts
+  a split batch like the same batch without a split: once per batch on the
+  expression path, and once per record key on the Lua path. A record key that
+  appears in more parts, or in the Lua retry of `FILTERED_OUT` records, now
+  counts once. The Lua retry of `FILTERED_OUT` records is also no longer a
+  separate histogram sample. The SQL spend batcher now
   recovers a panic and answers every waiting caller with an error, instead of
   leaving them to wait for `utxostore_spendWaitTimeout`. Go integrations using
   `FilterConflictingDuplicateSpendClaims` must migrate to `ProcessSpendBatch`
