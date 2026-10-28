@@ -21,7 +21,7 @@ Aerospike is a high-performance NoSQL database used as a backend for Teranode's 
 | ReadPolicyURL | *url.URL | "defaultReadPolicy" | aerospike_readPolicy | **CRITICAL** - Read operation policy URL |
 | WritePolicyURL | *url.URL | "defaultWritePolicy" | aerospike_writePolicy | **CRITICAL** - Write operation policy URL |
 | QueryPolicyURL | *url.URL | "defaultQueryPolicy" | aerospike_queryPolicy | **CRITICAL** - Query operation policy URL |
-| UseDefaultBasePolicies | bool | false | aerospike_useDefaultBasePolicies | Use Aerospike default base policies |
+| UseDefaultBasePolicies | bool | false | aerospike_useDefaultBasePolicies | Skips parsing the policy URLs; do not use (see Policy Configuration Behavior) |
 | UseDefaultPolicies | bool | false | aerospike_useDefaultPolicies | Use Aerospike default policies |
 
 ### Performance and Debugging
@@ -62,7 +62,7 @@ aerospike:///?MaxRetries=5&SleepBetweenRetries=500ms&TotalTimeout=1s&SocketTimeo
 The read mode and the commit level are not configurable:
 
 - Reads use the client default read mode: `ReadModeAP=ONE` for an available-mode namespace, and `ReadModeSC=SESSION` for a strong-consistency namespace.
-- Writes always use `CommitLevel=COMMIT_ALL`. A write is acknowledged only when the master and every reachable replica hold it.
+- Writes made with the write and batch write policies use `CommitLevel=COMMIT_ALL`. A write is acknowledged only when the master and every reachable replica hold it. The exception is the pruner's own record removals, which use `COMMIT_MASTER` while `pruner_relaxRemovalCommitLevel` is true (the default).
 
 For the consistency mode of the UTXO namespace, see [UTXO Store](../../../topics/stores/utxo.md#consistency-mode).
 
@@ -92,18 +92,19 @@ For the consistency mode of the UTXO namespace, see [UTXO Store](../../../topics
 
 - When `UseDefaultPolicies = true`:
 
-    - Aerospike client default policies used
-    - Policy URLs are ignored
+    - The read, write, batch and query policies use the Aerospike client defaults
+    - The policy URLs are ignored
 
 - When `UseDefaultPolicies = false` (recommended):
 
-    - Custom policy URLs are parsed and applied
+    - The policy URLs are parsed and applied
     - Allows fine-tuned timeout and retry behavior
 
 - When `UseDefaultBasePolicies = true`:
 
-    - Aerospike default base policies used as foundation
-    - Custom parameters applied on top
+    - The policy URLs, and the connection settings in the Aerospike store URL, are not parsed
+    - The connection settings use the Aerospike client defaults
+    - Unless `UseDefaultPolicies` is also true, the read, write, batch and query policies are built from values that were never set: every operation runs with `TotalTimeout=0` (no timeout), `SocketTimeout=0` and `MaxRetries=0`. Do not use it; use `UseDefaultPolicies` instead.
 
 ### Connection Pool Warm-Up
 

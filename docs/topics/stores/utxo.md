@@ -476,17 +476,26 @@ The following datastores are supported (either in development / experimental or 
 
 #### Consistency Mode
 
-Aerospike runs each namespace in one of two modes. In **available mode** (the default), the cluster keeps accepting reads and writes during a network partition, so a read can return data that is not the latest committed write. In **strong-consistency mode**, a partition makes some records unavailable rather than stale. Strong-consistency mode is an Aerospike Enterprise Edition feature, and is set per namespace with `strong-consistency true`.
+Aerospike runs each namespace in one of two modes:
+
+- **Available mode** (the default). During a network partition, each side keeps accepting reads and writes. So a read can return data that is not the latest committed write.
+- **Strong-consistency mode**, an Aerospike Enterprise Edition feature, set per namespace with `strong-consistency true`. A partition makes some records unavailable instead of letting both sides write them. How fresh a read is depends on the read mode; see "Reads" below.
 
 Teranode does not set or require a mode. No Aerospike configuration in this repository sets `strong-consistency`, so each one runs the UTXO namespace in available mode. This includes the Docker, Kubernetes, compose and test configurations, and the `deploy/docker/base/aerospike-ee.conf` file for the Enterprise image.
 
-The controls that Teranode applies are the same in both modes:
+Teranode applies these controls in both modes:
 
-- **Writes**: every write uses `CommitLevel=COMMIT_ALL` (`util/aerospike.go`), so a write is acknowledged only when the master and every reachable replica hold it. This is not configurable. In available mode it narrows the window for a stale read during a partition, but does not close it, because each side of a partition can still accept writes.
-- **Reads**: the read mode is not configurable. Reads use the client defaults: `ReadModeAP=ONE` in available mode, and `ReadModeSC=SESSION` in strong-consistency mode. So a namespace changed to strong-consistency mode needs no client change.
-- **Spend and unspend**: each spend and each unspend is one operation on one record, through the `teranode.lua` UDF or a filter expression (`stores/utxo/aerospike/spend.go`, `un_spend.go`). The record cannot be left half-spent by that operation.
+- **Writes**: every write made with `GetAerospikeWritePolicy` or `GetAerospikeBatchWritePolicy` (`util/aerospike.go`) uses `CommitLevel=COMMIT_ALL`, so the write is acknowledged only when the master and every reachable replica hold it. This is not configurable. In available mode it narrows the window for a stale read during a partition, but does not close it, because each side of a partition can still accept writes. The exception is the pruner's own record removals: its hard deletes, and its one-second TTL touches when `pruner_utxoSetTTL` is true. These use `COMMIT_MASTER` while `pruner_relaxRemovalCommitLevel` is true, which is the default (`stores/utxo/aerospike/pruner/prune_policies.go`).
+- **Reads**: the read mode is not configurable. Single and batch reads use the client defaults: `ReadModeAP=ONE` in available mode, and `ReadModeSC=SESSION` in strong-consistency mode. `SESSION` guarantees that a client sees its own writes and never reads an older value than it has already seen. It does not guarantee that a client sees the latest write that another client made. When the partition map changes, an old master can serve reads for a short time to a client that has not yet seen the new map. The guarantee across clients needs `ReadModeSC=LINEARIZE`, which the policy URLs cannot select.
+- **Deletes**: `Store.Delete` (`delete.go`), the release of the creation lock (`create.go`) and the pruner's hard deletes leave `DurableDelete=false`.
+- **Spend and unspend**: each spend and each unspend is one operation on one record, through the `teranode.lua` UDF or a filter expression (`stores/utxo/aerospike/spend.go`, `un_spend.go`). That operation cannot leave the record half-spent.
 
-An operator who needs reads that never return stale data during a partition must run the UTXO namespace in strong-consistency mode on Aerospike Enterprise Edition. See the [Aerospike settings reference](../../references/settings/stores/aerospike_settings.md#policy-url-format) for the policy URLs.
+Teranode is not ready for a strong-consistency UTXO namespace. Changing the namespace alone has two effects:
+
+- A strong-consistency namespace rejects non-durable deletes by default. So transaction deletion and hard-delete pruning fail, and a failed creation-lock release logs a warning. The delete paths must use durable deletes first. Allowing expunge on the namespace is not an equivalent fix: it is a separate consistency tradeoff. See Aerospike's [durable deletes in strong-consistency mode](https://aerospike.com/docs/database/learn/architecture/durable-deletes/#tombstones-and-strong-consistency-mode).
+- Reads stay at `SESSION`. A Teranode service can still read a value that another service has already replaced. Reads that are never stale across Teranode processes need `LINEARIZE`, which needs a code change. See Aerospike's [consistency guarantees](https://aerospike.com/docs/database/learn/architecture/clustering/consistency-modes/).
+
+See the [Aerospike settings reference](../../references/settings/stores/aerospike_settings.md#policy-url-format) for the policy URLs.
 
 ### 5.3. Data Pruning
 

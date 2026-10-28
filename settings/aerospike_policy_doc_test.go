@@ -9,7 +9,8 @@ import (
 )
 
 // TestAerospikePolicyLongdescsNameOnlyParsedKeys guards the operator text for the
-// aerospike_readPolicy, aerospike_writePolicy and aerospike_batchPolicy URLs.
+// aerospike_readPolicy, aerospike_writePolicy, aerospike_batchPolicy and
+// aerospike_queryPolicy URLs.
 // The longdescs offered ReadModeSC, ReadModeAP, CommitLevel, RecordExistsAction
 // and GenerationPolicy as controls and described the value as a JSON file, but
 // getAerospikeClient (util/aerospike.go) reads only a fixed set of query keys
@@ -30,15 +31,21 @@ func TestAerospikePolicyLongdescsNameOnlyParsedKeys(t *testing.T) {
 		"JSON configuration",
 		"RecordExistsAction",
 		"GenerationPolicy",
-		"COMMIT_MASTER",
+		"COMMIT_ALL vs COMMIT_MASTER",
 		"MaxConcurrentThreads",
 		"SendSetName",
+		"MaxConcurrentNodes",
+		"RecordQueueSize",
+		"IncludeBinData",
+		"FailOnClusterChange",
+		"Ignored when aerospike_useDefaultBasePolicies is true",
 	}
 
 	parsedKeys := map[string][]string{
 		"aerospike_readPolicy":  {"MaxRetries", "TotalTimeout", "SocketTimeout", "SleepBetweenRetries", "SleepMultiplier", "ExitFastOnExhaustedConnectionPool"},
 		"aerospike_writePolicy": {"MaxRetries", "TotalTimeout", "SocketTimeout", "SleepBetweenRetries", "SleepMultiplier", "ExitFastOnExhaustedConnectionPool"},
 		"aerospike_batchPolicy": {"MaxRetries", "TotalTimeout", "SocketTimeout", "SleepBetweenRetries", "SleepMultiplier", "AllowInlineSSD", "ConcurrentNodes"},
+		"aerospike_queryPolicy": {"MaxRetries", "TotalTimeout", "SocketTimeout", "SleepBetweenRetries", "SleepMultiplier"},
 	}
 
 	for key, keys := range parsedKeys {
@@ -55,4 +62,15 @@ func TestAerospikePolicyLongdescsNameOnlyParsedKeys(t *testing.T) {
 	}
 
 	require.Contains(t, longdescs["aerospike_writePolicy"], "COMMIT_ALL", "the write policy longdesc must state that CommitLevel is fixed at COMMIT_ALL")
+	require.Contains(t, longdescs["aerospike_writePolicy"], "pruner_relaxRemovalCommitLevel", "the write policy longdesc must name the pruner's COMMIT_MASTER exception")
+
+	// aerospike_useDefaultBasePolicies skips URL parsing and leaves the policy package
+	// variables at zero, so GetAerospike*Policy applies no timeout and no retries. Every
+	// policy longdesc, and the flag's own, must say so rather than call the URL "ignored".
+	for key := range parsedKeys {
+		require.Contains(t, longdescs[key], "aerospike_useDefaultPolicies", "the %s longdesc must name the flag that does ignore the URL", key)
+		require.Contains(t, longdescs[key], "TotalTimeout=0", "the %s longdesc must warn what aerospike_useDefaultBasePolicies does", key)
+	}
+
+	require.Contains(t, longdescs["aerospike_useDefaultBasePolicies"], "TotalTimeout=0", "the flag's own longdesc must warn that it leaves the policies without a timeout")
 }
