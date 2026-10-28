@@ -686,9 +686,10 @@ func ConflictRecoveryLateWinnerChild(t *testing.T, db utxo.Store) {
 	require.NoError(t, err)
 
 	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
-	cascaded, err := utxo.RollbackConflictIntent(ctx, db, intent)
+	mayBeMarked, err := utxo.RollbackConflictIntent(ctx, db, intent)
 	require.NoError(t, err)
-	require.ElementsMatch(t, []chainhash.Hash{*child.TxIDChainHash(), *grandchild.TxIDChainHash()}, cascaded)
+	require.ElementsMatch(t, []chainhash.Hash{*winner.TxIDChainHash(), *loser.TxIDChainHash(), *child.TxIDChainHash(), *grandchild.TxIDChainHash()}, mayBeMarked,
+		"the rollback reports the checklist and the children it cascaded")
 
 	r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
 	require.NoError(t, err)
@@ -766,9 +767,329 @@ func ConflictRecoveryLateFreeInputSpender(t *testing.T, db utxo.Store) {
 	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 }
 
-// ConflictRecoveryReverseThenReadd adds a block, moves it back and adds it again, with the forward
-// intent of the first add still waiting for acknowledgement. The reverse must retire that finished
-// checklist, so the second add runs a new forward operation instead of failing on the old one.
+// failBeforeMutation wraps a real store and fails one step that runs before the first flag change.
+type failBeforeMutation struct {
+	utxo.Store
+	stage string
+}
+
+func (s *failBeforeMutation) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash, value bool) error {
+	if value && s.stage == "lock" {
+		return errors.NewStorageError("injected lock failure")
+	}
+	return s.Store.SetConflictLocks(ctx, id, parents, value)
+}
+
+func (s *failBeforeMutation) SaveConflictRecovery(ctx context.Context, id chainhash.Hash, r *utxo.ConflictRecovery) error {
+	if r.Phase == utxo.ConflictRecoveryMutating && s.stage == "save_mutating" {
+		return errors.NewStorageError("injected save failure")
+	}
+	return s.Store.SaveConflictRecovery(ctx, id, r)
+}
+
+// ConflictRecoveryEarlyFailure fails the operation before it changes a flag. Nothing changed, so
+// the caller must get nothing to evict: an eviction leaves txmeta tombstones for the whole cascade.
+func ConflictRecoveryEarlyFailure(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	for index, stage := range []string{"lock", "save_mutating"} {
+		t.Run(stage, func(t *testing.T) {
+			parent := crashParentTx(0xb1 + byte(index))
+			_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+			require.NoError(t, err)
+			loser := crashSpendTx(t, parent, 80000)
+			_, _, err = db.SpendAndCreate(ctx, loser, 2)
+			require.NoError(t, err)
+			child := crashSpendTx(t, loser, 60000)
+			_, _, err = db.SpendAndCreate(ctx, child, 2)
+			require.NoError(t, err)
+			winner := crashSpendTx(t, parent, 70000)
+			_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+			require.NoError(t, err)
+
+			winners := []chainhash.Hash{*winner.TxIDChainHash()}
+			losers, marked, err := utxo.ProcessConflicting(ctx, &failBeforeMutation{Store: db, stage: stage}, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			require.ErrorContains(t, err, "injected")
+			require.Nil(t, losers)
+			require.Empty(t, marked, "nothing changed, so nothing may be evicted")
+			require.False(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
+			require.False(t, crashConflicting(t, ctx, db, child.TxIDChainHash()))
+			require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+			require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()))
+
+			losers, _, err = utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			require.NoError(t, err)
+			require.True(t, losers.Exists(*child.TxIDChainHash()))
+			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+			require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+		})
+	}
+}
+
+// ConflictRecoveryRefusedAfterRollback leaves an applied checklist that a crash stopped before its
+// rollback, and a child that then attached to the applied winner. The next run rolls the checklist
+// back, which flags the winner and cascades to the child. marked is that run's loser set, so the run
+// must hand the rolled-back transactions to the evictor, whether the guard refuses the new demotion
+// or the run succeeds. The child stays Conflicting in both cases.
+func ConflictRecoveryRefusedAfterRollback(t *testing.T, db utxo.Store) {
+	for index, refused := range []bool{true, false} {
+		t.Run(map[bool]string{true: "refused", false: "succeeds"}[refused], func(t *testing.T) {
+			ctx := t.Context()
+			parent := crashParentTx(0xc1 + byte(index))
+			_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+			require.NoError(t, err)
+			loser := crashSpendTx(t, parent, 80000)
+			_, _, err = db.SpendAndCreate(ctx, loser, 2)
+			require.NoError(t, err)
+			winner := crashSpendTx(t, parent, 70000)
+			_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+			require.NoError(t, err)
+
+			winners := []chainhash.Hash{*winner.TxIDChainHash()}
+			crashed := &failConflictPhase{Store: db, stage: "publish_applied", crash: true}
+			_, _, err = utxo.ProcessConflicting(ctx, crashed, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			require.Error(t, err)
+			require.False(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()), "the crash must leave the winner applied")
+
+			child := crashSpendTx(t, winner, 60000)
+			_, _, err = db.SpendAndCreate(ctx, child, 3)
+			require.NoError(t, err)
+
+			guard := utxo.NoAncestryGuard
+			if refused {
+				_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{loser.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: 50, BlockHeight: 2})
+				require.NoError(t, err)
+				guard = utxo.NewAncestryGuard(func(context.Context, []uint32, *chainhash.Hash) (bool, error) { return true, nil })
+			}
+
+			var evicted []chainhash.Hash
+			losers, marked, err := utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, guard, utxo.WithDeferredConflictCompletion(),
+				utxo.WithConflictEvictor(func(hashes []chainhash.Hash) { evicted = append(evicted, hashes...) }))
+			require.NoError(t, err)
+			require.True(t, crashConflicting(t, ctx, db, child.TxIDChainHash()), "the rollback cascades to the late child")
+			require.Contains(t, evicted, *child.TxIDChainHash(), "the cascaded child must leave the txmeta cache")
+			require.Contains(t, evicted, *winner.TxIDChainHash(), "the rollback flagged the winner")
+
+			if refused {
+				require.Zero(t, losers.Length())
+				require.Empty(t, marked, "marked is the loser set of this run, and the guard refused every loser")
+				require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+				require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+				return
+			}
+
+			require.True(t, losers.Exists(*loser.TxIDChainHash()))
+			require.NotContains(t, marked, *child.TxIDChainHash(), "the child is not a loser of this run")
+			require.False(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+			require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+			require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+		})
+	}
+}
+
+// failFinalUnlock wraps a real store and fails the unlock that moves a checklist from applied to
+// finished, as a crash at that point does. The parents stay locked.
+type failFinalUnlock struct {
+	utxo.Store
+}
+
+func (s *failFinalUnlock) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash, value bool) error {
+	if !value {
+		return errors.NewStorageError("injected final unlock failure")
+	}
+	return s.Store.SetConflictLocks(ctx, id, parents, value)
+}
+
+// ConflictRecoveryHealStaleForward heals a forward intent whose block left the current chain. The
+// operation has two winners, W1 and W2, each with its own loser and parent. Block 77 is on the
+// current chain.
+func ConflictRecoveryHealStaleForward(t *testing.T, db utxo.Store) {
+	const currentBlockID = 77
+
+	cases := []struct {
+		name         string
+		applied      bool
+		reverse      bool
+		minedW1      bool
+		minedW2      bool
+		guardErr     bool
+		wantRetired  bool
+		wantRollback bool
+	}{
+		{name: "finished/all confirmed", minedW1: true, minedW2: true, wantRetired: true},
+		{name: "applied/all confirmed", applied: true, minedW1: true, minedW2: true, wantRetired: true},
+		{name: "finished/partial re-mine", minedW1: true, wantRetired: true},
+		{name: "applied/partial re-mine", applied: true, minedW1: true, wantRetired: true},
+		{name: "finished/reversed", reverse: true, wantRetired: true},
+		{name: "finished/none confirmed", wantRollback: true},
+		{name: "finished/guard error", minedW1: true, guardErr: true},
+	}
+
+	for index, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			seed := 0x30 + byte(index)*4
+			parents := []*bt.Tx{crashParentTx(seed), crashParentTx(seed + 1)}
+			var losers, winnerTxs []*bt.Tx
+			for _, parent := range parents {
+				_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+				require.NoError(t, err)
+				loser := crashSpendTx(t, parent, 80000)
+				_, _, err = db.SpendAndCreate(ctx, loser, 2)
+				require.NoError(t, err)
+				winner := crashSpendTx(t, parent, 70000)
+				_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+				require.NoError(t, err)
+				losers = append(losers, loser)
+				winnerTxs = append(winnerTxs, winner)
+			}
+
+			block := chainhash.HashH([]byte("heal-stale-forward-" + tc.name))
+			winners := []chainhash.Hash{*winnerTxs[0].TxIDChainHash(), *winnerTxs[1].TxIDChainHash()}
+			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: block, TxHashes: winners}
+
+			var run utxo.Store = db
+			if tc.applied {
+				run = &failFinalUnlock{Store: db}
+			}
+			_, _, err := utxo.ProcessConflicting(ctx, run, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			if tc.applied {
+				require.ErrorContains(t, err, "injected final unlock failure")
+			} else {
+				require.NoError(t, err)
+			}
+
+			r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+			require.NoError(t, err)
+			if tc.applied {
+				require.Equal(t, utxo.ConflictRecoveryApplied, r.Phase)
+			} else {
+				require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+			}
+
+			if tc.reverse {
+				_, _, err = utxo.ReverseProcessConflicting(ctx, db, 3, block, winners)
+				require.NoError(t, err)
+			}
+
+			for i, mined := range []bool{tc.minedW1, tc.minedW2} {
+				if mined {
+					_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{winnerTxs[i].TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: currentBlockID, BlockHeight: 4})
+					require.NoError(t, err)
+				}
+			}
+
+			guard := utxo.NewCurrentChainGuard(func(_ context.Context, ids []uint32) (bool, error) {
+				if tc.guardErr {
+					return false, errors.NewServiceError("injected chain lookup failure")
+				}
+				for _, id := range ids {
+					if id == currentBlockID {
+						return true, nil
+					}
+				}
+				return false, nil
+			})
+
+			mayBeMarked, err := utxo.HealStaleForwardIntent(ctx, db, intent, guard)
+
+			r, loadErr := db.LoadConflictRecovery(ctx, intent.IntentID())
+			require.NoError(t, loadErr)
+
+			switch {
+			case tc.guardErr:
+				require.ErrorContains(t, err, "injected chain lookup failure")
+				require.Empty(t, mayBeMarked, "nothing changed")
+				require.NotNil(t, r, "the intent stays for the next attempt")
+				require.False(t, crashConflicting(t, ctx, db, winnerTxs[0].TxIDChainHash()))
+			case tc.wantRetired:
+				require.NoError(t, err)
+				require.Empty(t, mayBeMarked, "retirement changes no flag")
+				require.Nil(t, r, "the intent is retired")
+				wantConflicting := tc.reverse
+				for i := range winnerTxs {
+					require.Equal(t, wantConflicting, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()), "winner %d", i)
+					want := winnerTxs[i].TxIDChainHash()
+					if tc.reverse {
+						want = losers[i].TxIDChainHash()
+					}
+					require.Equal(t, want, crashSpender(t, ctx, db, parents[i]), "owner of parent %d", i)
+				}
+			case tc.wantRollback:
+				require.NoError(t, err)
+				require.ElementsMatch(t, append(append([]chainhash.Hash(nil), winners...), *losers[0].TxIDChainHash(), *losers[1].TxIDChainHash()), mayBeMarked)
+				require.Equal(t, utxo.ConflictRecoveryRolledBack, r.Phase)
+				for i := range winnerTxs {
+					require.True(t, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()))
+					require.False(t, crashConflicting(t, ctx, db, losers[i].TxIDChainHash()))
+					require.Equal(t, losers[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]))
+				}
+			}
+
+			if !tc.guardErr {
+				for i, parent := range parents {
+					require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()), "parent %d must not stay locked", i)
+				}
+			}
+
+			if r != nil {
+				require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+			}
+		})
+	}
+}
+
+// ConflictRecoveryOutsiderOwnedInput runs an operation whose cascade reaches a conflicting child C
+// that also spends Q:0. Q:0 belongs to Z, which is outside the cascade. The operation must succeed
+// and must not touch Q:0: Z keeps its input and stays usable.
+func ConflictRecoveryOutsiderOwnedInput(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0xa1)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	q := crashParentTx(0xa2)
+	_, _, err = db.SpendAndCreate(ctx, q, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	z := crashSpendTx(t, q, 50000)
+	_, _, err = db.SpendAndCreate(ctx, z, 2)
+	require.NoError(t, err)
+	c := crashSpendTx(t, loser, 40000)
+	require.NoError(t, c.From(q.TxIDChainHash().String(), 0, q.Outputs[0].LockingScript.String(), q.Outputs[0].Satoshis))
+	c.Inputs[1].UnlockingScript = dummyUnlockingScript
+	_, _, err = db.SpendAndCreate(ctx, c, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	losers, _, err := utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, losers.Exists(*loser.TxIDChainHash()))
+	require.True(t, losers.Exists(*c.TxIDChainHash()), "the cascade must reach the conflicting child")
+	require.False(t, losers.Exists(*z.TxIDChainHash()))
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+	require.Equal(t, z.TxIDChainHash(), crashSpender(t, ctx, db, q), "Z must keep its input")
+	require.False(t, crashConflicting(t, ctx, db, z.TxIDChainHash()))
+	require.True(t, crashConflicting(t, ctx, db, c.TxIDChainHash()))
+	require.False(t, crashLocked(t, ctx, db, q.TxIDChainHash()), "the operation must not leave the outsider's parent locked")
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, TxHashes: winners}
+	r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	for _, sp := range r.OriginalSpends {
+		require.False(t, sp.TxID.IsEqual(q.TxIDChainHash()), "the checklist must not record the outsider's spend")
+	}
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}
+
+// ConflictRecoveryReverseThenReadd adds a block, moves it back and adds it again, while the forward
+// intent of each add still waits for acknowledgement. The reverse leaves the finished checklist to its
+// caller. In the first round the caller does not retire it, as after a crash, so the next add must
+// retire it because its winners are Conflicting again. In the second round the caller retires it.
 func ConflictRecoveryReverseThenReadd(t *testing.T, db utxo.Store) {
 	ctx := t.Context()
 	parent := crashParentTx(0xd3)
@@ -797,7 +1118,18 @@ func ConflictRecoveryReverseThenReadd(t *testing.T, db utxo.Store) {
 
 		r, err := db.LoadConflictRecovery(ctx, forward.IntentID())
 		require.NoError(t, err)
-		require.Nil(t, r, "the reverse must retire the finished forward checklist")
+		require.NotNil(t, r, "the reverse leaves the forward checklist to its caller")
+
+		if round == 0 {
+			// Model a crash before the caller retired the checklist: the next add must retire the
+			// stale checklist itself, because its winners are Conflicting again.
+			continue
+		}
+
+		require.NoError(t, utxo.RetireConflictIntentsForBlocks(ctx, db, []chainhash.Hash{block}))
+		r, err = db.LoadConflictRecovery(ctx, forward.IntentID())
+		require.NoError(t, err)
+		require.Nil(t, r, "the caller retires the finished forward checklist")
 	}
 
 	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard)
@@ -906,4 +1238,77 @@ func ConflictRecoveryCancelledVerify(t *testing.T, db utxo.Store) {
 	require.NoError(t, err)
 	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
 	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}
+
+// ConflictRecoverySetConflictingChildren pins what SetConflicting reports as children. Both backends
+// read the spender of every output with GetSpend before they write the flag. SQL's GetSpend reports
+// an output of a Conflicting transaction as CONFLICTING, not SPENT, so SQL reports the children only
+// while the transaction is not yet Conflicting. Aerospike reports them on every call. The rollback
+// cascade relies on its first mark, which runs while the applied winners are not Conflicting.
+func ConflictRecoverySetConflictingChildren(t *testing.T, db utxo.Store, reportsWhileConflicting bool) {
+	ctx := t.Context()
+	grandparent := crashParentTx(0x91)
+	_, _, err := db.SpendAndCreate(ctx, grandparent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	parent := crashSpendTx(t, grandparent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, parent, 2)
+	require.NoError(t, err)
+	child := crashSpendTx(t, parent, 60000)
+	_, _, err = db.SpendAndCreate(ctx, child, 2)
+	require.NoError(t, err)
+
+	want := []chainhash.Hash{*child.TxIDChainHash()}
+	_, children, err := db.SetConflicting(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, true)
+	require.NoError(t, err)
+	require.Equal(t, want, children, "the first mark reports the child")
+
+	whileConflicting := []chainhash.Hash{}
+	if reportsWhileConflicting {
+		whileConflicting = want
+	}
+	_, children, err = db.SetConflicting(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, true)
+	require.NoError(t, err)
+	require.ElementsMatch(t, whileConflicting, children, "a second mark of a Conflicting parent")
+	_, children, err = db.SetConflicting(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, false)
+	require.NoError(t, err)
+	require.ElementsMatch(t, whileConflicting, children, "a clear of a Conflicting parent")
+}
+
+// failCompletion wraps a real store and fails every CompleteConflictIntent.
+type failCompletion struct {
+	utxo.Store
+}
+
+func (s *failCompletion) CompleteConflictIntent(context.Context, chainhash.Hash) error {
+	return errors.NewStorageError("injected WAL completion failure")
+}
+
+// ConflictRecoveryReverseCompletionFailure fails the completion of a reverse intent after the reverse
+// has run. The call must return error-shaped results: no allTouched, and the demoted winner for
+// txmeta cache eviction.
+func ConflictRecoveryReverseCompletionFailure(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0x95)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	block := chainhash.HashH([]byte("reverse-completion-failure"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard)
+	require.NoError(t, err)
+
+	cascaded, allTouched, err := utxo.ReverseProcessConflicting(ctx, &failCompletion{Store: db}, 3, block, winners)
+	require.ErrorContains(t, err, "injected WAL completion failure")
+	require.Nil(t, allTouched, "an error must not come with a success-shaped allTouched")
+	require.Contains(t, cascaded, *winner.TxIDChainHash(), "the demoted winner must be returned for eviction")
+	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+
+	reverse := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 3, BlockHash: block, TxHashes: winners}
+	require.NoError(t, db.CompleteConflictIntent(ctx, reverse.IntentID()))
 }

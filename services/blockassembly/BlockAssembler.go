@@ -1855,13 +1855,14 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 	}
 }
 
-// processConflictingAndEvict re-runs ProcessConflicting for a WAL intent and
-// evicts every tx it marked conflicting (losers and their cascaded descendants)
-// from subtree validation's txmeta cache. On failure it evicts what the run may
-// have flipped.
-func (b *BlockAssembler) processConflictingAndEvict(ctx context.Context, intent utxo.ConflictIntent, seeded map[chainhash.Hash]struct{}) error {
-	_, allMarkedConflicting, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, seeded,
-		utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash))
+// processConflictingAndEvict re-runs ProcessConflicting for the given winners of a
+// WAL intent and evicts every tx it marked conflicting (losers and their cascaded
+// descendants) from subtree validation's txmeta cache. On failure it evicts what
+// the run may have flipped.
+func (b *BlockAssembler) processConflictingAndEvict(ctx context.Context, intent utxo.ConflictIntent, winners []chainhash.Hash) error {
+	_, allMarkedConflicting, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, winners, nil,
+		utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(b.currentChainGuard()),
+		utxo.WithConflictEvictor(b.txMetaEvictor.Evict))
 
 	b.txMetaEvictor.Evict(allMarkedConflicting)
 
@@ -1874,38 +1875,23 @@ func (b *BlockAssembler) processConflictingAndEvict(ctx context.Context, intent 
 // non-conflicting needs no eviction: the txmeta cache never holds conflicting
 // entries, so there is nothing stale, and a miss repopulates from the store. On
 // failure it evicts what the run may have flipped.
+//
+// After a successful reverse it retires the block's forward checklist. A failure there is only
+// logged: a re-add of the block or the next startup retires a checklist whose winners are reversed.
 func (b *BlockAssembler) reverseProcessConflictingAndEvict(ctx context.Context, intent utxo.ConflictIntent) error {
-	cascadedToConflicting, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes)
+	cascadedToConflicting, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, b.currentChainGuard())
 
 	b.txMetaEvictor.Evict(cascadedToConflicting)
 
-	return err
-}
-
-// rollbackConflictIntentAndEvict restores the before-image of a stale forward
-// intent and evicts every checklist tx from subtree validation's txmeta cache. The
-// rollback flips the applied winners back to conflicting, and a failed rollback
-// can leave any checklist tx conflicting.
-func (b *BlockAssembler) rollbackConflictIntentAndEvict(ctx context.Context, intent utxo.ConflictIntent) error {
-	recovery, err := b.utxoStore.LoadConflictRecovery(ctx, intent.IntentID())
 	if err != nil {
 		return err
 	}
 
-	cascaded, err := utxo.RollbackConflictIntent(ctx, b.utxoStore, intent, b.currentChainGuard())
-
-	if recovery != nil {
-		hashes := make([]chainhash.Hash, len(recovery.Transactions))
-		for i, tx := range recovery.Transactions {
-			hashes[i] = tx.Hash
-		}
-
-		b.txMetaEvictor.Evict(hashes)
+	if retireErr := utxo.RetireConflictIntentsForBlocks(ctx, b.utxoStore, []chainhash.Hash{intent.BlockHash}); retireErr != nil {
+		b.logger.Warnf("[reverseProcessConflictingAndEvict] could not retire the forward conflict checklist of reversed block %s: %v", intent.BlockHash.String(), retireErr)
 	}
 
-	b.txMetaEvictor.Evict(cascaded)
-
-	return err
+	return nil
 }
 
 // healStaleConflictIntent converges the UTXO state for an intent whose block has
@@ -1919,17 +1905,11 @@ func (b *BlockAssembler) rollbackConflictIntentAndEvict(ctx context.Context, int
 func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
 	switch intent.Kind {
 	case utxo.ConflictIntentForward:
-		confirmed, err := utxo.ConflictWinnersConfirmed(ctx, b.utxoStore, intent, b.currentChainGuard())
-		if err != nil {
-			return err
-		}
+		mayBeMarked, err := utxo.HealStaleForwardIntent(ctx, b.utxoStore, intent, b.currentChainGuard())
 
-		if confirmed {
-			b.logger.Infof("[healStaleConflictIntent] every winner of stale forward intent %s is confirmed on the current chain; no rollback needed", intent.IntentID().String())
-			return nil
-		}
+		b.txMetaEvictor.Evict(mayBeMarked)
 
-		return b.rollbackConflictIntentAndEvict(ctx, intent)
+		return err
 	case utxo.ConflictIntentReverse:
 		// The reverse may have stopped before it reached some winners. Those are still applied and
 		// have no forward checklist, so ProcessConflicting would refuse them. Re-apply only the rest.
@@ -1954,49 +1934,6 @@ func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utx
 	default:
 		return errors.NewProcessingError("[healStaleConflictIntent] unknown conflict intent kind %q", intent.Kind)
 	}
-}
-
-// unlockConflictParents clears the Locked flag on the parents of the given txs'
-// inputs — the parents a forward ProcessConflicting locks at step 2 and unlocks
-// at step 5. Used when healing a stale forward whose step-5 unlock a crash
-// skipped. A winner whose record is gone (pruned) contributes no parents.
-func (b *BlockAssembler) unlockConflictParents(ctx context.Context, txHashes []chainhash.Hash) error {
-	parentSet := make(map[chainhash.Hash]struct{}, len(txHashes))
-
-	for i := range txHashes {
-		h := txHashes[i]
-
-		// Only the parent hashes are read below, so ask for the inpoints rather
-		// than the whole transaction: fields.Tx pulls every output and, on
-		// aerospike, the external blob of a spilled transaction.
-		txMeta, err := b.utxoStore.Get(ctx, &h, fields.TxInpoints)
-		if err != nil {
-			if errors.Is(err, errors.ErrTxNotFound) {
-				continue
-			}
-
-			return errors.NewProcessingError("[unlockConflictParents][%s] failed to load tx", h.String(), err)
-		}
-
-		if txMeta == nil {
-			continue
-		}
-
-		for _, parentHash := range txMeta.TxInpoints.GetParentTxHashes() {
-			parentSet[parentHash] = struct{}{}
-		}
-	}
-
-	if len(parentSet) == 0 {
-		return nil
-	}
-
-	parents := make([]chainhash.Hash, 0, len(parentSet))
-	for p := range parentSet {
-		parents = append(parents, p)
-	}
-
-	return b.utxoStore.SetLocked(ctx, parents, false)
 }
 
 // Wait blocks until all background goroutines have finished.

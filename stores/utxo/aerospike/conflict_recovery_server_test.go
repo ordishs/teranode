@@ -107,6 +107,48 @@ func TestAerospikeConflictRecoveryLateFreeInputSpender(t *testing.T) {
 	tests.ConflictRecoveryLateFreeInputSpender(t, store)
 }
 
+func TestAerospikeConflictRecoveryOutsiderOwnedInput(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryOutsiderOwnedInput(t, store)
+}
+
+func TestAerospikeConflictRecoveryEarlyFailure(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryEarlyFailure(t, store)
+}
+
+func TestAerospikeConflictRecoveryRefusedAfterRollback(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryRefusedAfterRollback(t, store)
+}
+
+func TestAerospikeConflictRecoveryHealStaleForward(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryHealStaleForward(t, store)
+}
+
+func TestAerospikeConflictRecoverySetConflictingChildren(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoverySetConflictingChildren(t, store, true)
+}
+
+func TestAerospikeConflictRecoveryReverseCompletionFailure(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryReverseCompletionFailure(t, store)
+}
+
 func TestAerospikeConflictRecoveryLateWinnerChild(t *testing.T) {
 	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
 	t.Cleanup(deferFn)

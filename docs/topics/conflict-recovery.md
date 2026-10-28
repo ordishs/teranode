@@ -43,6 +43,10 @@ snapshot. The checklist then records an owner that is not in the discovered set.
 The forward operation stops before it changes anything and asks for a retry. The
 retry discovers that spender and marks it `Conflicting`.
 
+An input of a conflicting cascade member can belong to a transaction outside the
+cascade. That spend is not part of the operation. The checklist leaves it out, so the
+operation neither unspends nor restores it, and the owner keeps its input.
+
 BlockAssembly retains a finished WAL until subtree updates and the queue drain
 succeed. At startup, it replays pending work before loading unmined transactions.
 Unresolved recovery prevents startup, and so does a record whose replay failed,
@@ -51,10 +55,18 @@ after the startup subtree updates and queue drain succeed, and only when block
 assembly has reached the record's block. Otherwise the catch-up applies the block,
 accepts the applied winners from the finished checklist and acknowledges the record.
 
-A successful reverse retires the finished forward record of its block, so a later
-re-add of the block runs a new forward operation. At startup, replay runs reverse
-records first. A forward record whose block still has a pending reverse record is
-left as it is, because a rollback over a partial reverse could corrupt the store.
+After a successful reverse, its caller retires the applied or finished forward
+record of the block and releases any parent lock that the record still owns. A reorg
+does this with one WAL scan for all its moved-back blocks. The reverse has already
+committed, so a failed retirement is only logged. A later re-add of the block, or the
+next startup, retires a record whose winners are `Conflicting` again and no longer
+own their inputs. Then a re-add runs a new forward operation. At startup, replay runs
+reverse records first. A forward record whose block still has a pending reverse
+record is left as it is, because a rollback over a partial reverse could corrupt the
+store.
+
+A failed acknowledgement after a block is committed is only logged. The finished
+record stays pending, and the next startup replays and acknowledges it.
 
 ## Store implementations
 
@@ -108,19 +120,25 @@ A transaction can be in both an orphaned block and a later main-chain block.
 Before rollback or reverse processing marks a transaction conflicting or removes
 its spend, BlockAssembly checks all of its mined block IDs against the current
 chain. The same check protects descendants reached during reverse processing.
-If a transaction is confirmed, or the chain lookup fails, recovery stops and
-retains the WAL. The saved before-image does not override current confirmation.
+If a transaction is confirmed, or the chain lookup fails, the rollback or reverse
+stops and recovery retains the WAL. The saved before-image does not override current
+confirmation. A stale forward record with a confirmed winner does not reach the
+rollback: startup keeps its applied state, as described below.
 
 The winners of a forward operation are mined in the block being added. That block is
 already on the current chain. The forward rollback therefore ignores that one block
 ID for the winners. It still refuses a winner that is confirmed in any other
 current-chain block, and it still refuses every other transaction.
 
-A stale forward record can have winners that the new chain confirms again. When
-every winner is confirmed on the current chain, still owns its inputs and is not
-`Conflicting`, the current chain confirms the same outcome. Startup then completes
-the record without a rollback. When only some winners are confirmed, the rollback
-still refuses and the record stays pending for repair.
+A stale forward record can have winners that the new chain confirms again. When the
+operation was applied and at least one winner is confirmed on the current chain,
+startup keeps the applied state, as a reorg keeps a transaction of an orphaned block.
+It releases the parent locks that the record still owns and completes the record
+without a rollback. This includes a partial re-mine, where the new chain confirms
+only some winners. The other winners stay applied, like any other transaction of the
+orphaned block. When block assembly moves back that block, its reverse handles them.
+A stale forward record whose winners a reverse has already undone is retired in the
+same way. Otherwise the record is rolled back.
 
 The loser set that a forward operation returns, and the list of marked transactions,
 never contain a winner.

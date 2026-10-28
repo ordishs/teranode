@@ -198,6 +198,85 @@ func TestReplayPendingConflictIntents_ReverseEvictsDemotedFromTxMetaCache(t *tes
 	require.Equal(t, 2, collector.count())
 }
 
+// A stale forward heal that rolls back evicts what the rollback changed: every checklist tx.
+func TestHealStaleConflictIntent_ForwardRollbackEvicts(t *testing.T) {
+	ctx := t.Context()
+	f := newEvictionReplayFixture(t, utxo.ConflictIntentForward)
+
+	_, _, err := utxo.ProcessConflicting(ctx, f.store, f.intent.BlockHeight, f.intent.BlockHash, f.intent.TxHashes, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	// Nothing is confirmed on the current chain, so the heal rolls the operation back.
+	f.items.blockAssembler.blockchainClient = blockchainMembershipMock(false, false)
+
+	require.NoError(t, f.items.blockAssembler.healStaleConflictIntent(ctx, f.intent))
+
+	require.Eventually(t, func() bool { return f.collector.has(f.winnerHash, f.loserHash, f.childHash) },
+		5*time.Second, 10*time.Millisecond, "the rollback flips the winner and restores the cascade, so all three must be evicted")
+	require.Equal(t, 3, f.collector.count())
+}
+
+// A stale forward heal that changes nothing must evict nothing. A refused heal is retried on every
+// startup, and each eviction leaves txmeta tombstones for the whole checklist.
+func TestHealStaleConflictIntent_ForwardNoChangeEvictsNothing(t *testing.T) {
+	t.Run("rollback refused", func(t *testing.T) {
+		ctx := t.Context()
+		f := newEvictionReplayFixture(t, utxo.ConflictIntentForward)
+
+		_, _, err := utxo.ProcessConflicting(ctx, f.store, f.intent.BlockHeight, f.intent.BlockHash, f.intent.TxHashes, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+		require.NoError(t, err)
+
+		// The loser is confirmed on the current chain, so the guard refuses the rollback.
+		_, err = f.store.SetMinedMulti(ctx, []*chainhash.Hash{&f.loserHash}, utxo.MinedBlockInfo{BlockID: 5, BlockHeight: 9})
+		require.NoError(t, err)
+		f.items.blockAssembler.blockchainClient = blockchainMembershipMock(true, false)
+
+		require.Error(t, f.items.blockAssembler.healStaleConflictIntent(ctx, f.intent))
+		require.Len(t, f.pending(t), 1, "a refused heal keeps the intent")
+		require.Never(t, func() bool { return f.collector.count() > 0 }, 300*time.Millisecond, 10*time.Millisecond,
+			"a refused rollback changed nothing, so nothing may be evicted")
+	})
+
+	t.Run("reversed checklist retired", func(t *testing.T) {
+		ctx := t.Context()
+		f := newEvictionReplayFixture(t, utxo.ConflictIntentForward)
+
+		_, _, err := utxo.ProcessConflicting(ctx, f.store, f.intent.BlockHeight, f.intent.BlockHash, f.intent.TxHashes, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+		require.NoError(t, err)
+
+		// A reverse of the block ran and stopped before it retired the forward checklist.
+		_, _, err = utxo.ReverseProcessConflicting(ctx, f.store, f.intent.BlockHeight, f.intent.BlockHash, f.intent.TxHashes)
+		require.NoError(t, err)
+		f.items.blockAssembler.blockchainClient = blockchainMembershipMock(false, false)
+
+		require.NoError(t, f.items.blockAssembler.healStaleConflictIntent(ctx, f.intent))
+		require.Empty(t, f.pending(t), "the heal retires the reversed checklist")
+		require.Never(t, func() bool { return f.collector.count() > 0 }, 300*time.Millisecond, 10*time.Millisecond,
+			"retirement changes no flag, so nothing may be evicted")
+	})
+}
+
+// A stale reverse heal re-applies the winner and evicts what that demotion marked conflicting.
+func TestHealStaleConflictIntent_ReverseEvictsDemoted(t *testing.T) {
+	ctx := t.Context()
+	f := newEvictionReplayFixture(t, utxo.ConflictIntentForward)
+
+	// The reverse completed: W is conflicting and L owns the input. The block is back on the chain.
+	reverse := f.intent
+	reverse.Kind = utxo.ConflictIntentReverse
+
+	require.NoError(t, f.items.blockAssembler.healStaleConflictIntent(ctx, reverse))
+
+	require.Eventually(t, func() bool { return f.collector.has(f.loserHash, f.childHash) },
+		5*time.Second, 10*time.Millisecond, "the loser and its cascaded child must be evicted")
+	require.False(t, f.collector.has(f.winnerHash), "the re-applied winner must not be evicted")
+	require.Equal(t, 2, f.collector.count())
+
+	forward := reverse
+	forward.Kind = utxo.ConflictIntentForward
+	require.NoError(t, f.store.CompleteConflictIntent(ctx, forward.IntentID()))
+}
+
 // TestWithTxMetaProducer pins that a typed-nil producer (what the daemon passes
 // when no txmeta topic is configured and the getter returns a nil pointer)
 // is treated as "no producer", not as a live one that would panic on Publish.

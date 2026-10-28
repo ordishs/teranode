@@ -579,9 +579,12 @@ func TestStaleConflictRecoveryPreservesReminedWinner(t *testing.T) {
 	require.Equal(t, txWHash, actual.SpendingData.TxID)
 	r, err := store.LoadConflictRecovery(ctx, intent.IntentID())
 	require.NoError(t, err)
-	require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+	require.Nil(t, r, "the heal retires the intent")
+	parentMeta, err := store.Get(ctx, parentHash, utxofields.Locked)
+	require.NoError(t, err)
+	require.False(t, parentMeta.Locked, "the heal must not leave the parent locked")
 
-	// On restart the stale intent is healed and cleared, and block assembly may start.
+	// On restart nothing is left to heal, and block assembly may start.
 	replayFailed := items.blockAssembler.replayPendingConflictIntents(ctx)
 	require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx, replayFailed))
 	pending, err := store.PendingConflictIntents(ctx)

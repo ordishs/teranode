@@ -125,8 +125,6 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 
 	seen := make(map[outpoint]struct{})
 
-	var parents hashSet
-
 	addSpends := func(spends []*Spend) {
 		for _, sp := range spends {
 			key := outpoint{*sp.TxID, sp.Vout}
@@ -136,7 +134,6 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 
 			seen[key] = struct{}{}
 			r.OriginalSpends = append(r.OriginalSpends, sp.Clone())
-			parents.add(*sp.TxID)
 		}
 	}
 
@@ -166,6 +163,39 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 	}); err != nil {
 		return nil, err
 	}
+
+	members := make(map[chainhash.Hash]struct{}, len(hashes))
+	for _, h := range hashes {
+		members[h] = struct{}{}
+	}
+
+	winning := make(map[outpoint]struct{}, len(winningSpends))
+	for _, sp := range winningSpends {
+		winning[outpoint{*sp.TxID, sp.Vout}] = struct{}{}
+	}
+
+	// An input of a conflicting cascade member can belong to a transaction outside the cascade. That
+	// spend is not the cascade's, so the operation must neither unspend nor restore it. A winning input
+	// with an outside owner is different: a validator spent it after discovery, so plan again.
+	var parents hashSet
+
+	kept := r.OriginalSpends[:0]
+	for _, original := range r.OriginalSpends {
+		if original.SpendingData != nil {
+			if _, member := members[*original.SpendingData.TxID]; !member {
+				if _, ok := winning[outpoint{*original.TxID, original.Vout}]; ok {
+					return nil, errors.NewProcessingError("conflict spender %s at %s:%d changed during preparation; retry required", original.SpendingData.TxID.String(), original.TxID.String(), original.Vout)
+				}
+
+				continue
+			}
+		}
+
+		kept = append(kept, original)
+		parents.add(*original.TxID)
+	}
+
+	r.OriginalSpends = kept
 
 	locked := make([]bool, len(parents.order))
 	if err := forEachConflictRead(ctx, len(parents.order), func(ctx context.Context, i int) error {
@@ -241,8 +271,11 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	for _, h := range hashes {
 		known[h] = struct{}{}
 	}
-	// SetConflicting reports the children of a transaction only while that transaction is not yet
-	// conflicting, so this first mark is where the children outside the checklist show up.
+	// SetConflicting reports the spenders of a transaction's outputs. Aerospike reports them on every
+	// call; SQL only while the transaction is not yet Conflicting, because its GetSpend reports an
+	// output of a Conflicting transaction as CONFLICTING (ConflictRecoverySetConflictingChildren pins
+	// both). So collect the children outside the checklist from this first mark: it runs while the
+	// applied winners and restored losers are not Conflicting. A later mark can miss them on SQL.
 	var outside []chainhash.Hash
 	if len(hashes) > 0 {
 		_, children, err := s.SetConflicting(ctx, hashes, true)
@@ -377,14 +410,20 @@ func conflictOwnerMatches(ctx context.Context, s Store, original *Spend) (bool, 
 // RollbackConflictIntent also handles stale forward intents after a reorg.
 // Legacy records cannot establish the prior state and remain pending for repair.
 //
-// cascaded lists the transactions outside the checklist that the rollback marked Conflicting:
-// children that attached to a checklist transaction which ends Conflicting, and their descendants.
-// On error it lists what the rollback may have marked. Callers evict them from the txmeta cache.
-func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent, guards ...CurrentChainGuard) (cascaded []chainhash.Hash, err error) {
+// mayBeMarked lists every transaction whose Conflicting flag the rollback may have changed: the
+// checklist transactions, and the children outside the checklist that it marked because their parent
+// ends Conflicting. It is empty when the rollback stops before it changes a flag, for example when a
+// guard refuses it. Callers evict these transactions from the txmeta cache, also on error.
+func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent, guards ...CurrentChainGuard) (mayBeMarked []chainhash.Hash, err error) {
 	r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
 	if err != nil {
 		return nil, err
 	}
+	return rollbackConflictIntent(ctx, s, intent, r, guards...)
+}
+
+// rollbackConflictIntent is RollbackConflictIntent with the checklist already loaded.
+func rollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent, r *ConflictRecovery, guards ...CurrentChainGuard) (mayBeMarked []chainhash.Hash, err error) {
 	if r == nil {
 		return nil, errors.NewProcessingError("legacy conflict intent %s has no recovery checklist; manual repair required", intent.IntentID().String())
 	}
@@ -424,11 +463,13 @@ func RollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 	if err = s.SaveConflictRecovery(ctx, intent.IntentID(), r); err != nil {
 		return nil, err
 	}
-	if cascaded, err = rollbackConflictRecovery(ctx, s, r, intent.BlockHeight, intent.IntentID()); err != nil {
-		return cascaded, err
+	cascaded, err := rollbackConflictRecovery(ctx, s, r, intent.BlockHeight, intent.IntentID())
+	mayBeMarked = append(hashes, cascaded...)
+	if err != nil {
+		return mayBeMarked, err
 	}
 	r.Phase = ConflictRecoveryRolledBack
-	return cascaded, s.SaveConflictRecovery(ctx, intent.IntentID(), r)
+	return mayBeMarked, s.SaveConflictRecovery(ctx, intent.IntentID(), r)
 }
 
 func finishConflictRecovery(ctx context.Context, s Store, intent ConflictIntent, r *ConflictRecovery, deferCompletion bool) (txmap.TxMap, []chainhash.Hash, error) {

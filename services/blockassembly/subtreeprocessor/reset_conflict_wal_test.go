@@ -26,11 +26,12 @@ import (
 )
 
 // countPendingScans wraps a real store and counts the pending-intent scans. failComplete makes every
-// CompleteConflictIntent fail.
+// CompleteConflictIntent fail, and failPending makes every scan fail.
 type countPendingScans struct {
 	utxo.Store
 	scans        atomic.Int32
 	failComplete atomic.Bool
+	failPending  atomic.Bool
 }
 
 func (s *countPendingScans) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
@@ -43,6 +44,10 @@ func (s *countPendingScans) CompleteConflictIntent(ctx context.Context, intentID
 
 func (s *countPendingScans) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
 	s.scans.Add(1)
+
+	if s.failPending.Load() {
+		return nil, errors.NewStorageError("injected WAL scan failure")
+	}
 
 	return s.Store.PendingConflictIntents(ctx)
 }
@@ -248,22 +253,47 @@ func TestReset_ConflictingNodeCompletesWALIntent(t *testing.T) {
 func storeConflictSubtree(t *testing.T, subtreeStore *blob_memory.Memory, winner *bt.Tx) *chainhash.Hash {
 	t.Helper()
 
+	return storeTestSubtree(t, subtreeStore, true, winner)
+}
+
+// storeTestSubtree stores a subtree with the given txs after the coinbase, with its meta, and returns
+// its hash. With conflicting set, every tx is also a conflicting node.
+func storeTestSubtree(t *testing.T, subtreeStore *blob_memory.Memory, conflicting bool, txs ...*bt.Tx) *chainhash.Hash {
+	t.Helper()
+
 	st, err := subtreepkg.NewTreeByLeafCount(4)
 	require.NoError(t, err)
 	require.NoError(t, st.AddCoinbaseNode())
-	require.NoError(t, st.AddNode(*winner.TxIDChainHash(), 1, 1))
-	require.NoError(t, st.AddConflictingNode(*winner.TxIDChainHash()))
+
+	for _, tx := range txs {
+		require.NoError(t, st.AddNode(*tx.TxIDChainHash(), 1, 1))
+
+		if conflicting {
+			require.NoError(t, st.AddConflictingNode(*tx.TxIDChainHash()))
+		}
+	}
 
 	subtreeBytes, err := st.Serialize()
 	require.NoError(t, err)
 	require.NoError(t, subtreeStore.Set(t.Context(), st.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
 
+	// A move back reads the subtree meta too.
+	meta := subtreepkg.NewSubtreeMeta(st)
+	for i := range st.Nodes {
+		require.NoError(t, meta.SetTxInpoints(i, subtreepkg.NewTxInpoints()))
+	}
+
+	metaBytes, err := meta.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Set(t.Context(), st.RootHash()[:], fileformat.FileTypeSubtreeMeta, metaBytes))
+
 	return st.RootHash()
 }
 
 // A failed WAL acknowledgement after moveForwardBlock's commit point must not fail the call. The
-// call's swap-back would install the cleared shadow over the applied block. It requests a reset.
-func TestMoveForwardBlock_AckFailureAfterCommitRequestsReset(t *testing.T) {
+// call's swap-back would install the cleared shadow over the applied block. A reset would acknowledge
+// nothing, because block assembly is already at the block, so the intent stays for startup recovery.
+func TestMoveForwardBlock_AckFailureAfterCommitLeavesIntent(t *testing.T) {
 	ctx := t.Context()
 	stp, store, subtreeStore, chain := newResetWALTestProcessor(t, false)
 
@@ -276,7 +306,7 @@ func TestMoveForwardBlock_AckFailureAfterCommitRequestsReset(t *testing.T) {
 
 	_, _, err := stp.moveForwardBlock(ctx, block, true, map[chainhash.Hash]struct{}{}, true, false)
 	require.NoError(t, err, "the block is applied; a failed acknowledgement must not fail the call")
-	require.True(t, stp.TakeDrainResetRequested(), "the failed acknowledgement must request a reset")
+	require.False(t, stp.TakeDrainResetRequested(), "a reset cannot acknowledge the intent, so none is requested")
 
 	pending, err := store.PendingConflictIntents(ctx)
 	require.NoError(t, err)
@@ -309,8 +339,32 @@ func TestRunDeferredBlockDrain_AcknowledgesWithoutDemotedTxs(t *testing.T) {
 	require.Empty(t, pending, "the drain must acknowledge the intent of a block with conflicting nodes")
 }
 
+// The deferred drain has the same policy as moveForwardBlock: a failed acknowledgement after the
+// commit is only reported, and the intent stays pending.
+func TestRunDeferredBlockDrain_AckFailureLeavesIntent(t *testing.T) {
+	ctx := t.Context()
+	stp, store, _, chain := newResetWALTestProcessor(t, false)
+
+	_, winner := createResetWALConflict(t, store, 9)
+
+	block := chain.moveForward[0]
+
+	_, _, err := utxo.ProcessConflicting(ctx, store, 1, *block.Hash(), []chainhash.Hash{*winner.TxIDChainHash()}, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	store.failComplete.Store(true)
+
+	stp.runDeferredBlockDrain(ctx, block, &deferredBlockDrain{ackConflictIntents: true})
+
+	require.False(t, stp.TakeDrainResetRequested(), "a reset cannot acknowledge the intent, so none is requested")
+
+	pending, err := store.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "the unacknowledged intent stays pending")
+}
+
 // A reset has no rollback, so a failed WAL acknowledgement after it committed is only reported. The
-// reset succeeds and the intent stays pending for the next acknowledgement.
+// reset succeeds and the intent stays pending for startup recovery.
 func TestReset_AckFailureAfterCommitDoesNotFailReset(t *testing.T) {
 	ctx := t.Context()
 	stp, store, subtreeStore, chain := newResetWALTestProcessor(t, true)
@@ -329,4 +383,133 @@ func TestReset_AckFailureAfterCommitDoesNotFailReset(t *testing.T) {
 	pending, err := store.PendingConflictIntents(ctx)
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "the unacknowledged intent stays pending")
+}
+
+// A reorg that moves back a block with conflicting nodes reverses its forward operation and retires
+// the forward checklist with one WAL scan. The reverse has committed, so a failed retirement is only
+// logged: the reorg succeeds, and a re-add of the block or the next startup retires the checklist.
+func TestReorgBlocks_RetiresReversedForwardChecklist(t *testing.T) {
+	for _, failRetire := range []bool{false, true} {
+		t.Run(map[bool]string{false: "retired", true: "retire fails"}[failRetire], func(t *testing.T) {
+			ctx := t.Context()
+			stp, store, subtreeStore, chain := newResetWALTestProcessor(t, false)
+
+			loser, winner := createResetWALConflict(t, store, 20)
+
+			block := chain.moveForward[0]
+			block.Subtrees = []*chainhash.Hash{storeConflictSubtree(t, subtreeStore, winner)}
+
+			// Leave the forward checklist pending, as a failed acknowledgement does.
+			store.failComplete.Store(true)
+			_, _, err := stp.moveForwardBlock(ctx, block, true, map[chainhash.Hash]struct{}{}, true, false)
+			require.NoError(t, err)
+			store.failComplete.Store(false)
+
+			forward := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: block.Height, BlockHash: *block.Hash(), TxHashes: []chainhash.Hash{*winner.TxIDChainHash()}}
+			r, err := store.LoadConflictRecovery(ctx, forward.IntentID())
+			require.NoError(t, err)
+			require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+
+			side := &model.Block{Height: 1, CoinbaseTx: coinbaseTx2, TransactionCount: 1, Subtrees: []*chainhash.Hash{}, Header: childHeader(chain.genesis, 401)}
+			require.NoError(t, stp.blockchainClient.AddBlock(ctx, side, "", blockchainoptions.WithMinedSet(true)))
+
+			store.scans.Store(0)
+			store.failPending.Store(failRetire)
+
+			require.NoError(t, stp.reorgBlocks(ctx, []*model.Block{block}, []*model.Block{side}), "the reverse committed, so the reorg must succeed")
+			require.Equal(t, int32(1), store.scans.Load(), "the reorg retires all reversed blocks with one scan")
+
+			m, err := store.Get(ctx, winner.TxIDChainHash(), fields.Conflicting)
+			require.NoError(t, err)
+			require.True(t, m.Conflicting, "the reverse demotes the winner")
+			m, err = store.Get(ctx, loser.TxIDChainHash(), fields.Conflicting)
+			require.NoError(t, err)
+			require.False(t, m.Conflicting, "the reverse restores the loser")
+
+			store.failPending.Store(false)
+
+			r, err = store.LoadConflictRecovery(ctx, forward.IntentID())
+			require.NoError(t, err)
+			if failRetire {
+				require.NotNil(t, r, "a failed retirement leaves the checklist for later")
+				return
+			}
+			require.Nil(t, r, "the reorg retires the forward checklist of the reversed block")
+		})
+	}
+}
+
+// A partial re-mine, end to end. Block B applied two winners, W1 and W2. A reorg replaced B with a side
+// block that mines W1 only. Startup heals the stale forward intent of B: the current chain confirms
+// W1, so it keeps the applied state and retires the intent. Block assembly's catch-up reorg then moves
+// back B. W1 is re-mined in the side block, so the reverse skips it and undoes only W2.
+func TestReorgBlocks_PartialRemineAfterAcceptedHeal(t *testing.T) {
+	ctx := t.Context()
+	stp, store, subtreeStore, chain := newResetWALTestProcessor(t, false)
+
+	loser1, winner1 := createResetWALConflict(t, store, 30)
+	loser2, winner2 := createResetWALConflict(t, store, 31)
+
+	block := chain.moveForward[0]
+	block.Subtrees = []*chainhash.Hash{storeTestSubtree(t, subtreeStore, true, winner1, winner2)}
+
+	// Leave the forward intent pending, as a crash before the acknowledgement does.
+	store.failComplete.Store(true)
+	_, _, err := stp.moveForwardBlock(ctx, block, true, map[chainhash.Hash]struct{}{}, true, false)
+	require.NoError(t, err)
+	store.failComplete.Store(false)
+
+	side := &model.Block{Height: 1, CoinbaseTx: coinbaseTx2, TransactionCount: 2, Header: childHeader(chain.genesis, 402),
+		Subtrees: []*chainhash.Hash{storeTestSubtree(t, subtreeStore, false, winner1)}}
+	require.NoError(t, stp.blockchainClient.AddBlock(ctx, side, "", blockchainoptions.WithMinedSet(true)))
+
+	_, sideMeta, err := stp.blockchainClient.GetBlockHeader(ctx, side.Hash())
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{winner1.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: sideMeta.ID, BlockHeight: 1})
+	require.NoError(t, err)
+
+	forward := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: block.Height, BlockHash: *block.Hash(),
+		TxHashes: []chainhash.Hash{*winner1.TxIDChainHash(), *winner2.TxIDChainHash()}}
+	guard := utxo.NewCurrentChainGuard(func(_ context.Context, ids []uint32) (bool, error) {
+		for _, id := range ids {
+			if id == sideMeta.ID {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+
+	mayBeMarked, err := utxo.HealStaleForwardIntent(ctx, store, forward, guard)
+	require.NoError(t, err)
+	require.Empty(t, mayBeMarked)
+
+	r, err := store.LoadConflictRecovery(ctx, forward.IntentID())
+	require.NoError(t, err)
+	require.Nil(t, r, "the heal accepts the partial re-mine and retires the intent")
+
+	require.NoError(t, stp.reorgBlocks(ctx, []*model.Block{block}, []*model.Block{side}))
+
+	owner := func(tx *bt.Tx) *chainhash.Hash {
+		spends, err := utxo.GetSpends(tx)
+		require.NoError(t, err)
+
+		response, err := store.GetSpend(ctx, spends[0])
+		require.NoError(t, err)
+
+		return response.SpendingData.TxID
+	}
+	conflicting := func(tx *bt.Tx) bool {
+		m, err := store.Get(ctx, tx.TxIDChainHash(), fields.Conflicting)
+		require.NoError(t, err)
+
+		return m.Conflicting
+	}
+
+	require.Equal(t, winner1.TxIDChainHash(), owner(winner1), "W1 is re-mined, so it keeps its input")
+	require.False(t, conflicting(winner1))
+	require.True(t, conflicting(loser1))
+
+	require.Equal(t, loser2.TxIDChainHash(), owner(winner2), "the reverse gives W2's input back to L2")
+	require.True(t, conflicting(winner2), "the reverse demotes W2")
+	require.False(t, conflicting(loser2))
 }

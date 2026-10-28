@@ -21,9 +21,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 - **Conflict undo now checks current-chain confirmation.** BlockAssembly stops
   recovery if a transaction affected by rollback or reverse processing is still
   confirmed in any current-chain block, or if that check fails. The WAL remains
-  available for diagnosis. A stale forward intent whose winners are all confirmed on
-  the current chain, still own their inputs and are not conflicting is completed
-  without a rollback, because the current chain confirms the same outcome. Failed
+  available for diagnosis. A stale forward intent that was applied and has at least
+  one winner confirmed on the current chain keeps the applied state and is completed
+  without a rollback, as a reorg keeps a transaction of an orphaned block; this also
+  covers a partial re-mine. The parent locks it still holds are released. Failed
   WAL cleanup is now returned and counted in
   `teranode_utxo_conflict_wal_completion_failures_total`. Affected operators must
   resolve the pending recovery instead of clearing the WAL or restarting an old

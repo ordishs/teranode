@@ -77,9 +77,10 @@ func (stp *SubtreeProcessor) runDeferredBlockDrain(ctx context.Context, block *m
 	// keeps the label it had when the clear ran inside moveForwardBlock.
 	stp.drainAndLogDiskTxMapErr("moveForwardBlock_commit")
 	if !stp.drainResetRequested.Load() && drain.ackConflictIntents {
+		// The block is committed. A failed acknowledgement is only reported, as in moveForwardBlock:
+		// the finished intent stays pending, and the next startup replays and acknowledges it.
 		if err := utxo.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, *block.Hash()); err != nil {
-			stp.logger.Errorf("[SubtreeProcessor] conflict WAL acknowledgement failed: %v", err)
-			stp.drainResetRequested.Store(true)
+			stp.logger.Errorf("[SubtreeProcessor][%s] conflict WAL acknowledgement failed after commit; the intent stays pending until startup recovery: %v", block.String(), err)
 		}
 	}
 }

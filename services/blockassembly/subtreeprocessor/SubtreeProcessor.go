@@ -1910,7 +1910,8 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 					// is dropped by that drain regardless of cascade discovery, so
 					// the per-block transient set is not needed here.
 					losingTxHashesMap, allMarkedConflicting, err := utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(stp.currentChainGuard()))
+						utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(stp.currentChainGuard()),
+						utxostore.WithConflictEvictor(stp.txMetaEvictor.Evict))
 
 					// the store now says these are conflicting; subtree validation's txmeta cache must
 					// forget them. On error this is what the failed run may have flipped.
@@ -1999,7 +2000,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	}
 
 	// The reset has committed, so a failed acknowledgement is only reported. The intents stay
-	// pending and the next block, reset or restart acknowledges them. Requesting a reset from here
+	// pending, and the next startup replays and acknowledges them. Requesting a reset from here
 	// would loop while the store keeps failing.
 	if ackErr := utxostore.CompleteConflictIntentsForBlocks(ctx, stp.utxoStore, moveForwardHashes); ackErr != nil {
 		stp.logger.Errorf("[SubtreeProcessor][Reset] conflict WAL acknowledgement failed after commit; the intents stay pending: %v", ackErr)
@@ -4887,6 +4888,8 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		return errors.NewProcessingError("[reorgBlocks] error collecting moveForward tx hashes", err)
 	}
 
+	var reversedBlocks []chainhash.Hash
+
 	for _, block := range moveBackBlocks {
 		stp.reportProgressUnlessDone(ctx)
 
@@ -4945,6 +4948,8 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 
 				return errors.NewProcessingError("[reorgBlocks][%s] error reversing conflict resolution from moved-back block", block.String(), reverseErr)
 			}
+
+			reversedBlocks = append(reversedBlocks, *block.Hash())
 
 			for _, hash := range conflictingHashes {
 				processedConflictingHashesMap[hash] = struct{}{}
@@ -5039,6 +5044,14 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 				}
 			}
 		}
+	}
+
+	// The reverses undid the forward operations of these blocks, so their checklists no longer
+	// describe the store. Retire them with one WAL scan for the whole reorg. The reverses have
+	// committed, so a failure here must not fail the reorg: a re-add of the block or the next startup
+	// retires a checklist whose winners are reversed.
+	if retireErr := utxostore.RetireConflictIntentsForBlocks(ctx, stp.utxoStore, reversedBlocks); retireErr != nil {
+		stp.logger.Warnf("[reorgBlocks] could not retire the forward conflict checklists of %d reversed blocks: %v", len(reversedBlocks), retireErr)
 	}
 
 	if len(moveBackBlocks) > 0 {
@@ -6005,7 +6018,8 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 
 		var allMarkedConflicting []chainhash.Hash
 		losingTxHashesMap, allMarkedConflicting, err = utxostore.ProcessConflicting(ctx, stp.utxoStore, block.Height, *block.Hash(), conflictingNodes, processedConflictingHashesMap,
-			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(stp.currentChainGuard()))
+			utxostore.NewAncestryGuard(stp.blockchainClient.CheckBlockIsAncestorOfBlock), stp.refusalHandler(block), utxostore.WithDeferredConflictCompletion(), utxostore.WithRecoveryChainGuard(stp.currentChainGuard()),
+			utxostore.WithConflictEvictor(stp.txMetaEvictor.Evict))
 
 		// the store now says these are conflicting; subtree validation's txmeta cache must
 		// forget them. On error this is what the failed run may have flipped.
@@ -6615,12 +6629,12 @@ func (stp *SubtreeProcessor) moveForwardBlockDeferringDrain(ctx context.Context,
 	}
 
 	// The block is committed, so a failed acknowledgement must not fail the call: the deferred
-	// swap-back above would install the cleared shadow over the applied block. Request a reset
-	// instead, as the deferred drain does; the reset acknowledges the intent again.
+	// swap-back above would install the cleared shadow over the applied block. It is only reported,
+	// as in reset(). The finished intent stays pending, and the next startup replays and acknowledges
+	// it. A reset would not help: block assembly is already at this block, so it acknowledges nothing.
 	if !deferDrain && len(conflictingNodes) > 0 {
 		if ackErr := utxostore.CompleteConflictIntentsForBlock(ctx, stp.utxoStore, *block.Hash()); ackErr != nil {
-			stp.logger.Errorf("[moveForwardBlock][%s] conflict WAL acknowledgement failed after commit, requesting a block assembly reset: %v", block.String(), ackErr)
-			stp.drainResetRequested.Store(true)
+			stp.logger.Errorf("[moveForwardBlock][%s] conflict WAL acknowledgement failed after commit; the intent stays pending until startup recovery: %v", block.String(), ackErr)
 		}
 	}
 

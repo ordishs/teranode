@@ -64,6 +64,17 @@ type processConflictingOptions struct {
 	currentChainGuard CurrentChainGuard
 	deferCompletion   bool
 	onRefused         func(loser chainhash.Hash)
+	evict             func(hashes []chainhash.Hash)
+}
+
+// WithConflictEvictor registers a callback for transactions that a successful run may have flipped
+// to Conflicting but does not return in marked: what the rollback of an earlier checklist changed,
+// also when the guard then refuses the demotion. Callers pass their txmeta cache eviction. It must
+// not block.
+func WithConflictEvictor(evict func(hashes []chainhash.Hash)) ProcessConflictingOption {
+	return func(o *processConflictingOptions) {
+		o.evict = evict
+	}
 }
 
 // WithRefusalHandler registers a callback invoked once per losing transaction

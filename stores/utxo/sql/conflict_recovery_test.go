@@ -197,6 +197,36 @@ func TestConflictRecoveryLateFreeInputSpender(t *testing.T) {
 	tests.ConflictRecoveryLateFreeInputSpender(t, store)
 }
 
+func TestConflictRecoveryOutsiderOwnedInput(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryOutsiderOwnedInput(t, store)
+}
+
+func TestConflictRecoveryEarlyFailure(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryEarlyFailure(t, store)
+}
+
+func TestConflictRecoveryRefusedAfterRollback(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryRefusedAfterRollback(t, store)
+}
+
+func TestConflictRecoveryHealStaleForward(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryHealStaleForward(t, store)
+}
+
+func TestConflictRecoverySetConflictingChildren(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoverySetConflictingChildren(t, store, false)
+}
+
+func TestConflictRecoveryReverseCompletionFailure(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryReverseCompletionFailure(t, store)
+}
+
 func TestConflictRecoveryLateWinnerChild(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryLateWinnerChild(t, store)
