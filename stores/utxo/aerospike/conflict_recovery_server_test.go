@@ -204,3 +204,31 @@ func TestAerospikeConflictRecoveryBlockKeyedIntent(t *testing.T) {
 
 	tests.ConflictRecoveryBlockKeyedIntent(t, store)
 }
+
+func TestAerospikeConflictRecoverySupersetWinners(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoverySupersetWinners(t, store)
+}
+
+func TestAerospikeConflictRecoveryFreedWinningInputTaken(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryFreedWinningInputTaken(t, store)
+}
+
+func TestAerospikeConflictRecoveryAppliedWinnerPrunedParent(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryAppliedWinnerPrunedParent(t, store)
+}
+
+func TestAerospikeConflictRecoveryLegacyKey(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryLegacyKey(t, store)
+}

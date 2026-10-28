@@ -31,6 +31,16 @@ func (g CurrentChainGuard) WithBlockID(resolve func(context.Context, chainhash.H
 	return g
 }
 
+// BlockID resolves the numeric ID of a block hash with the resolver that WithBlockID set. It returns
+// an error when the guard has no resolver.
+func (g CurrentChainGuard) BlockID(ctx context.Context, hash chainhash.Hash) (uint32, error) {
+	if g.blockID == nil {
+		return 0, errors.NewProcessingError("current-chain guard has no block ID resolver")
+	}
+
+	return g.blockID(ctx, hash)
+}
+
 func (g CurrentChainGuard) protect(s Store) Store {
 	if g.check == nil {
 		return s

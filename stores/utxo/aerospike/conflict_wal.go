@@ -30,7 +30,13 @@ const (
 	walBinBlockHash   = "blockHash"
 	walBinTxHashes    = "txHashes"
 	walBinStartedAt   = "startedAt"
+	// walBinKeyFormula marks a record whose key this build derives from its fields. A record
+	// without it was written by an older build, or under an explicit key, and keeps that key.
+	walBinKeyFormula = "keyFormula"
 )
+
+// walKeyFormulaVersion is the version of IntentID's derivation that this build writes.
+const walKeyFormulaVersion = 2
 
 const errWALRecordMissingBin = "[PendingConflictIntents] WAL record missing or invalid %s bin"
 
@@ -88,6 +94,10 @@ func (s *Store) BeginConflictIntent(ctx context.Context, intent utxo.ConflictInt
 		aerospike.NewBin(walBinStartedAt, int(intent.StartedAt)),
 	}
 
+	if intent.ID == (chainhash.Hash{}) {
+		bins = append(bins, aerospike.NewBin(walBinKeyFormula, walKeyFormulaVersion))
+	}
+
 	if intent.Recovery != nil {
 		if intent.Recovery.Phase != utxo.ConflictRecoveryPlanning {
 			return errors.NewStorageError("Begin requires a planning checklist")
@@ -130,7 +140,7 @@ func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.H
 // callers load a checklist with LoadConflictRecovery when they need it.
 func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
 	stmt := aerospike.NewStatement(s.namespace, s.conflictWALSet())
-	stmt.BinNames = []string{walBinKind, walBinBlockHeight, walBinBlockHash, walBinTxHashes, walBinStartedAt, "recoveryDone"}
+	stmt.BinNames = []string{walBinKind, walBinBlockHeight, walBinBlockHash, walBinTxHashes, walBinStartedAt, walBinKeyFormula, "recoveryDone"}
 
 	queryPolicy := aerospike.NewQueryPolicy()
 	queryPolicy.MaxRetries = 3
@@ -199,6 +209,12 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 			BlockHash:   *bh,
 			TxHashes:    hashes,
 			StartedAt:   int64(startedAt),
+		}
+
+		// The query returns no user keys. A record that this build keyed by its fields carries the
+		// key formula. One without it was written by an older build, under that build's formula.
+		if _, derived := record.Bins[walBinKeyFormula]; !derived {
+			intent.ID = utxo.LegacyConflictIntentID(intent.Kind, intent.BlockHash, intent.BlockHeight, intent.TxHashes)
 		}
 
 		// A completed intent whose chunk cleanup was interrupted is not pending. Finish its

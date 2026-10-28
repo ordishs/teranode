@@ -381,3 +381,23 @@ func TestRestoreConflictSpendsHonoursDeadline_Postgres(t *testing.T) {
 		})
 	}
 }
+
+func TestConflictRecoverySupersetWinners(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoverySupersetWinners(t, store)
+}
+
+func TestConflictRecoveryFreedWinningInputTaken(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryFreedWinningInputTaken(t, store)
+}
+
+func TestConflictRecoveryAppliedWinnerPrunedParent(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryAppliedWinnerPrunedParent(t, store)
+}
+
+func TestConflictRecoveryLegacyKey(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryLegacyKey(t, store)
+}

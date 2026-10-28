@@ -133,6 +133,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	ctx, _, done := tracing.Tracer("utxo").Start(ctx, "ProcessConflicting")
 	defer done()
 	var options processConflictingOptions
+
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -189,11 +190,32 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			if e != nil {
 				return nil, nil, e
 			}
+			// A caller may have filtered its winners differently. The intent is keyed by the block, so
+			// a caller with a winner that the checklist does not know finds this record too. When that
+			// winner is still Conflicting, the saved result does not cover it: plan again. An applied
+			// one was skipped by the run that wrote the checklist, and the plan below checks it again.
+			known := make(map[chainhash.Hash]struct{}, len(recovery.Winners))
+			for _, h := range recovery.Winners {
+				known[h] = struct{}{}
+			}
+			for _, h := range conflictingTxHashes {
+				if _, ok := known[h]; ok {
+					continue
+				}
+				m, e := s.Get(ctx, &h, fields.Conflicting)
+				if e != nil {
+					return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] error getting tx", h.String(), e)
+				}
+				if m != nil && m.Conflicting {
+					settled = false
+					break
+				}
+			}
 			if settled {
 				return finishConflictRecovery(ctx, s, intent, recovery, options.deferCompletion)
 			}
-			// A caller may have filtered its winners differently. Re-plan every winner whose
-			// saved swap is being retired, so a subset cannot abandon a partly reversed winner.
+			// Re-plan every winner whose saved swap is being retired, so a subset cannot abandon a
+			// partly reversed winner.
 			conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
 			intent.TxHashes = conflictingTxHashes
 			// A reverse of this block undid some winners, or stopped part way through one, and did
@@ -220,7 +242,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		if h.Equal(subtree.CoinbasePlaceholderHashValue) {
 			return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] tx is frozen", h.String())
 		}
-		m, e := s.Get(ctx, &h, fields.Tx, fields.Conflicting)
+		m, e := s.Get(ctx, &h, fields.Tx, fields.Conflicting, fields.BlockIDs)
 		if e != nil {
 			return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] error getting tx", h.String(), e)
 		}
@@ -232,9 +254,10 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		}
 		// A process-local processed map cannot prove the side effects of a previous operation. The
 		// store can: a winner that is not Conflicting and owns every input is applied. A reverse that
-		// stopped before it reached a winner leaves it so, and its block's checklist can be gone.
+		// stopped before it reached a winner leaves it so, and its block's checklist can be gone. A
+		// confirmed winner can have a pruned parent, as in conflictWinnersSettled.
 		if !m.Conflicting {
-			applied, e := winnerIsApplied(ctx, s, h, m.Tx)
+			applied, e := appliedWinnerOwnsInputs(ctx, s, h, m, options.currentChainGuard)
 			if e != nil {
 				return nil, nil, e
 			}
@@ -265,6 +288,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		return txmap.NewSplitSwissMap(0), nil, nil
 	}
 	conflictingTxHashes = pending
+
 	if guard.enabled() {
 		_, refused, e := filterAncestryConfirmedLosers(ctx, s, affected.order, winnerSet, blockHash, guard)
 		if e != nil {
@@ -309,6 +333,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		var checklist hashSet
 		checklist.add(conflictTransactionHashes(recovery)...)
 		var outside []chainhash.Hash
+
 		for _, h := range rolledBack {
 			if !checklist.has(h) {
 				outside = append(outside, h)
@@ -342,12 +367,14 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	// so a winner's child (for example a conflicting child that arrived with it) is not a cascade
 	// change. Checking it would refuse every retry.
 	var losersToMark []chainhash.Hash
+
 	for _, h := range affected.order {
 		if _, isWinner := winnerSet[h]; !isWinner {
 			losersToMark = append(losersToMark, h)
 		}
 	}
 	var discovered []chainhash.Hash
+
 	if len(losersToMark) > 0 {
 		if _, discovered, err = s.SetConflicting(ctx, losersToMark, true); err != nil {
 			return nil, nil, err
@@ -364,6 +391,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		return nil, nil, err
 	}
 	var originalSpent []*Spend
+
 	for _, sp := range recovery.OriginalSpends {
 		if sp.SpendingData != nil {
 			originalSpent = append(originalSpent, sp.Clone())
@@ -379,6 +407,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	}
 	// From here a rollback flips the winners back to Conflicting.
 	mayBeMarked = conflictTransactionHashes(recovery)
+
 	if _, _, err = s.SetConflicting(ctx, conflictingTxHashes, false); err != nil {
 		return nil, nil, err
 	}
@@ -1175,14 +1204,7 @@ func conflictWinnersSettled(ctx context.Context, s Store, winners []chainhash.Ha
 			continue
 		}
 
-		confirmed := false
-		if guard.check != nil && len(m.BlockIDs) > 0 {
-			confirmed, err = guard.check(ctx, m.BlockIDs)
-			if err != nil {
-				return false, err
-			}
-		}
-		applied, err := winnerInputsOwned(ctx, s, h, m.Tx, confirmed)
+		applied, err := appliedWinnerOwnsInputs(ctx, s, h, m, guard)
 		if err != nil {
 			return false, err
 		}
@@ -1193,6 +1215,24 @@ func conflictWinnersSettled(ctx context.Context, s Store, winners []chainhash.Ha
 	}
 
 	return settled, nil
+}
+
+// appliedWinnerOwnsInputs reports whether a winner that is not Conflicting still owns every input. A
+// winner that the current chain confirms can have a pruned parent; its other inputs must still be
+// owned. m must hold the tx and its block IDs.
+func appliedWinnerOwnsInputs(ctx context.Context, s Store, h chainhash.Hash, m *meta.Data, guard CurrentChainGuard) (bool, error) {
+	confirmed := false
+
+	if guard.check != nil && len(m.BlockIDs) > 0 {
+		var err error
+
+		confirmed, err = guard.check(ctx, m.BlockIDs)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	return winnerInputsOwned(ctx, s, h, m.Tx, confirmed)
 }
 
 // MarkConflictingRecursively marks the given transactions as conflicting, and iteratively marks all their spending
@@ -1296,6 +1336,7 @@ func GetAndLockChildren(ctx context.Context, s Store, hash chainhash.Hash) ([]ch
 		}
 
 		var nextLevel []chainhash.Hash
+
 		for _, txMeta := range results {
 			if txMeta == nil {
 				continue

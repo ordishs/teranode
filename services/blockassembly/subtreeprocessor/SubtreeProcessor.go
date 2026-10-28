@@ -8527,10 +8527,21 @@ func (stp *SubtreeProcessor) MarkRecoveredConflicts(ctx context.Context, hashes 
 // currentChainGuard protects transactions confirmed on the current chain during conflict recovery.
 // It resolves block IDs so a forward rollback accepts the winners' own block.
 func (stp *SubtreeProcessor) currentChainGuard() utxostore.CurrentChainGuard {
-	return utxostore.NewCurrentChainGuard(stp.blockchainClient.CheckBlockIsInCurrentChain).WithBlockID(func(ctx context.Context, hash chainhash.Hash) (uint32, error) {
-		_, meta, err := stp.blockchainClient.GetBlockHeader(ctx, &hash)
+	return CurrentChainGuard(stp.blockchainClient)
+}
+
+// CurrentChainGuard builds the guard that protects transactions confirmed on the current chain
+// during conflict recovery. It resolves block IDs so a forward rollback accepts the winners' own
+// block. A header without meta resolves to an error, so the rollback takes no exemption from it.
+func CurrentChainGuard(client blockchain.ClientI) utxostore.CurrentChainGuard {
+	return utxostore.NewCurrentChainGuard(client.CheckBlockIsInCurrentChain).WithBlockID(func(ctx context.Context, hash chainhash.Hash) (uint32, error) {
+		_, meta, err := client.GetBlockHeader(ctx, &hash)
 		if err != nil {
 			return 0, err
+		}
+
+		if meta == nil {
+			return 0, errors.NewProcessingError("block %s has no header meta", hash.String())
 		}
 
 		return meta.ID, nil

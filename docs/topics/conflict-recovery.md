@@ -10,9 +10,12 @@ process can recover it after a restart. This design assumes that BlockAssembly
 serializes reorg operations. It does not support concurrent reorg writers.
 
 A forward intent is keyed by its block hash. Every caller and every retry of the
-block finds the same record, whatever subset of the winners it passes. The
-acknowledgement and the retirement of a block compute the ID, so they do not scan
-the WAL. A reverse intent is keyed by its block and its transactions.
+block finds the same record, whatever subset of the winners it passes. A caller
+that passes a winner the record does not know, and that is still `Conflicting`,
+makes the operation plan again. The acknowledgement and the retirement of a block
+compute the ID, so they do not scan the WAL. A reverse intent is keyed by its block
+and its transactions. A record that an older build wrote keeps the key of that
+build; the WAL scan reports it under that key, and it still needs manual repair.
 
 ## Recovery phases
 
@@ -39,11 +42,12 @@ causes an error; recovery does not overwrite it. This case retains the WAL for
 diagnosis and repair.
 
 There is one exception. The operation frees the inputs of its losers, and the
-validator can give a freed input to a new transaction before a rollback runs. That
+rollback frees the winning inputs that were unspent at planning. The validator can
+give such a freed input to a new transaction before the rollback verifies it. That
 spend is legitimate. When the new owner is outside the checklist and not
-`Conflicting`, and no winner spends the input, the rollback leaves the input with
-that owner. The loser that spent it ends `Conflicting` and gets none of its inputs
-back. So does every checklist transaction that spends the loser's outputs.
+`Conflicting`, the rollback leaves the input with that owner. A loser that lost an
+input this way ends `Conflicting` and gets none of its inputs back. So does every
+checklist transaction that spends that loser's outputs.
 
 A child can attach to a checklist transaction after the checklist was saved. The
 rollback does not touch the inputs of that child, so it needs no before-image. When

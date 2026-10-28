@@ -1599,3 +1599,200 @@ func ConflictRecoveryBlockKeyedIntent(t *testing.T, db utxo.Store) {
 		require.Equal(t, winnerTxs[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]))
 	}
 }
+
+// ConflictRecoverySupersetWinners finishes a block with winner W1 and then runs the block again with
+// W1 and W2. The intent is keyed by the block, so the second run finds the finished checklist. W2 is
+// not in it, so the run must plan again and apply W2 instead of returning the saved result.
+func ConflictRecoverySupersetWinners(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	var parents, losers, winnerTxs []*bt.Tx
+	for _, seed := range []byte{0x1c, 0x1d} {
+		parent := crashParentTx(seed)
+		_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+		require.NoError(t, err)
+		loser := crashSpendTx(t, parent, 80000)
+		_, _, err = db.SpendAndCreate(ctx, loser, 2)
+		require.NoError(t, err)
+		winner := crashSpendTx(t, parent, 70000)
+		_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+		require.NoError(t, err)
+		parents = append(parents, parent)
+		losers = append(losers, loser)
+		winnerTxs = append(winnerTxs, winner)
+	}
+
+	block := chainhash.HashH([]byte("superset-winners"))
+	winners := []chainhash.Hash{*winnerTxs[0].TxIDChainHash(), *winnerTxs[1].TxIDChainHash()}
+	first, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners[:1], nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, first.Exists(*losers[0].TxIDChainHash()))
+
+	second, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, second.Exists(*losers[1].TxIDChainHash()), "the second run must apply the winner the checklist did not know")
+
+	for i := range parents {
+		require.Equal(t, winnerTxs[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]), "owner of parent %d", i)
+		require.False(t, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()), "winner %d", i)
+		require.True(t, crashConflicting(t, ctx, db, losers[i].TxIDChainHash()), "loser %d", i)
+	}
+
+	r, err := db.LoadConflictRecovery(ctx, utxo.ForwardConflictIntentID(block))
+	require.NoError(t, err)
+	require.Equal(t, winners[1:], r.Winners, "the new checklist records the winner it applied")
+
+	// A third run with both winners finds every one applied and keeps the saved result.
+	third, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, third.Exists(*losers[1].TxIDChainHash()))
+	require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
+}
+
+// ConflictRecoveryFreedWinningInputTaken rolls back a finished forward operation after a new
+// transaction took a winning input that was free at planning. Winner W spends P1:0, contested by L,
+// and P2:0, which was unspent. The rollback frees P2:0, and T takes it before the verification. T's
+// spend is legitimate, so the rollback must leave it and still succeed.
+func ConflictRecoveryFreedWinningInputTaken(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	p1 := crashParentTx(0x1e)
+	p2 := crashParentTx(0x1f)
+	for _, parent := range []*bt.Tx{p1, p2} {
+		_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+		require.NoError(t, err)
+	}
+	loser := crashSpendTx(t, p1, 80000)
+	_, _, err := db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, p1, 70000)
+	require.NoError(t, winner.From(p2.TxIDChainHash().String(), 0, p2.Outputs[0].LockingScript.String(), p2.Outputs[0].Satoshis))
+	winner.Inputs[1].UnlockingScript = dummyUnlockingScript
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	block := chainhash.HashH([]byte("freed-winning-input-taken"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, p2))
+
+	// The rollback's first step frees the winning spends. Model T taking P2:0 right after it.
+	winningSpends, err := utxo.GetSpends(winner)
+	require.NoError(t, err)
+	require.NoError(t, db.Unspend(ctx, winningSpends[1:]))
+	taker := crashSpendTx(t, p2, 50000)
+	_, _, err = db.SpendAndCreate(ctx, taker, 3)
+	require.NoError(t, err)
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: block, TxHashes: winners}
+	_, err = utxo.RollbackConflictIntent(ctx, db, intent)
+	require.NoError(t, err, "a legitimate spend of a freed winning input must not block the rollback")
+
+	require.Equal(t, taker.TxIDChainHash(), crashSpender(t, ctx, db, p2), "T keeps P2:0")
+	require.False(t, crashConflicting(t, ctx, db, taker.TxIDChainHash()))
+	require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, p1), "L gets P1:0 back")
+	require.False(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
+	require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+
+	r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryRolledBack, r.Phase)
+	require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+}
+
+// ConflictRecoveryAppliedWinnerPrunedParent runs a block again after its winner was applied and
+// acknowledged, and after the pruner removed the winner's parent. The winner is confirmed on the
+// current chain, so the run must skip it instead of failing on the missing parent.
+func ConflictRecoveryAppliedWinnerPrunedParent(t *testing.T, db utxo.Store) {
+	const currentBlockID = 78
+
+	ctx := t.Context()
+	parent := crashParentTx(0x20)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	block := chainhash.HashH([]byte("applied-winner-pruned-parent"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard)
+	require.NoError(t, err)
+
+	_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{winner.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: currentBlockID, BlockHeight: 3})
+	require.NoError(t, err)
+	require.NoError(t, db.Delete(ctx, parent.TxIDChainHash()))
+
+	guard := utxo.NewCurrentChainGuard(func(_ context.Context, ids []uint32) (bool, error) {
+		for _, id := range ids {
+			if id == currentBlockID {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+
+	losers, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithRecoveryChainGuard(guard))
+	require.NoError(t, err, "a confirmed applied winner with a pruned parent must be skipped")
+	require.Zero(t, losers.Length())
+
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard)
+	require.Error(t, err, "without confirmation a missing parent is still an error")
+}
+
+// ConflictRecoveryLegacyKey checks that a forward record written by an older build keeps its own key.
+// A new operation on the same block has its own record, and the legacy record stays for repair.
+func ConflictRecoveryLegacyKey(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	parent := crashParentTx(0x21)
+	_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	loser := crashSpendTx(t, parent, 80000)
+	_, _, err = db.SpendAndCreate(ctx, loser, 2)
+	require.NoError(t, err)
+	winner := crashSpendTx(t, parent, 70000)
+	_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+	require.NoError(t, err)
+
+	block := chainhash.HashH([]byte("legacy-key-block"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	legacyID := utxo.LegacyConflictIntentID(utxo.ConflictIntentForward, block, 3, winners)
+	require.NotEqual(t, utxo.ForwardConflictIntentID(block), legacyID)
+
+	legacy := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: block, TxHashes: winners, StartedAt: 1, ID: legacyID}
+	require.NoError(t, db.BeginConflictIntent(ctx, legacy))
+
+	pending, err := db.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	var found bool
+	for _, p := range pending {
+		if p.BlockHash == block {
+			require.Equal(t, legacyID, p.IntentID(), "a legacy record is addressed by its stored key")
+			found = true
+		}
+	}
+	require.True(t, found)
+
+	r, err := db.LoadConflictRecovery(ctx, legacyID)
+	require.NoError(t, err)
+	require.Nil(t, r, "a legacy record has no checklist")
+
+	_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err, "a new operation on the block has its own record")
+	require.Equal(t, winner.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+
+	pending, err = db.PendingConflictIntents(ctx)
+	require.NoError(t, err)
+	var ids []chainhash.Hash
+	for _, p := range pending {
+		if p.BlockHash == block {
+			ids = append(ids, p.IntentID())
+		}
+	}
+	require.ElementsMatch(t, []chainhash.Hash{legacyID, utxo.ForwardConflictIntentID(block)}, ids)
+
+	require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
+	require.NoError(t, db.CompleteConflictIntent(ctx, legacyID))
+}

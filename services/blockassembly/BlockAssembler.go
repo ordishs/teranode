@@ -4379,6 +4379,10 @@ func (b *BlockAssembler) SetSkipWaitForPendingBlocks(skip bool) {
 // intent whose replay failed is refused even when its checklist reads finished:
 // the store may contradict the checklist, and the checklist is its only record.
 func (b *BlockAssembler) checkConflictRecoveryReady(ctx context.Context, replayFailed map[chainhash.Hash]struct{}) error {
+	if b.utxoStore == nil {
+		return nil
+	}
+
 	intents, err := b.utxoStore.PendingConflictIntents(ctx)
 	if err != nil {
 		return err
@@ -4408,6 +4412,10 @@ func (b *BlockAssembler) checkConflictRecoveryReady(ctx context.Context, replayF
 // prepareRecoveredConflictUpdates is called after loading unmined transactions
 // and before the startup queue drain. Return IDs only after subtree updates succeed.
 func (b *BlockAssembler) prepareRecoveredConflictUpdates(ctx context.Context) ([]chainhash.Hash, error) {
+	if b.utxoStore == nil {
+		return nil, nil
+	}
+
 	intents, err := b.utxoStore.PendingConflictIntents(ctx)
 	if err != nil {
 		return nil, err
@@ -4487,14 +4495,7 @@ func (b *BlockAssembler) assemblyReachedBlock(ctx context.Context, blockHash cha
 // currentChainGuard protects transactions confirmed on the current chain during conflict recovery.
 // It resolves block IDs so a forward rollback accepts the winners' own block.
 func (b *BlockAssembler) currentChainGuard() utxo.CurrentChainGuard {
-	return utxo.NewCurrentChainGuard(b.blockchainClient.CheckBlockIsInCurrentChain).WithBlockID(func(ctx context.Context, hash chainhash.Hash) (uint32, error) {
-		_, meta, err := b.blockchainClient.GetBlockHeader(ctx, &hash)
-		if err != nil {
-			return 0, err
-		}
-
-		return meta.ID, nil
-	})
+	return subtreeprocessor.CurrentChainGuard(b.blockchainClient)
 }
 
 // staleTipGrace is how long block assembly may remain on the same tip behind the blockchain before the gap counts as a stall.

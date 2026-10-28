@@ -52,9 +52,10 @@ func TestRecoveryMissingDisplacedOwner(t *testing.T) {
 	r := &ConflictRecovery{OriginalSpends: []*Spend{{TxID: &parent, SpendingData: spend.NewSpendingData(&original, 0)}}}
 	for _, lookupErr := range []error{nil, errors.ErrTxNotFound, errors.ErrNotFound} {
 		store := recoveryReadStore{lookupErr: lookupErr, response: &SpendResponse{SpendingData: spend.NewSpendingData(&outsider, 0)}}
-		displaced, release, err := displacedConflictOwners(t.Context(), store, r, nil)
+		displaced, leave, release, err := displacedConflictOwners(t.Context(), store, r, nil)
 		require.NoError(t, err, "missing owner must not abort compensation before restoration")
 		require.Empty(t, displaced.order)
+		require.Equal(t, []bool{false}, leave)
 		require.Empty(t, release)
 	}
 }

@@ -54,6 +54,7 @@ func DecodeConflictRecovery(data []byte) (*ConflictRecovery, error) {
 		return nil, nil
 	}
 	var r ConflictRecovery
+
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, errors.NewStorageError("invalid conflict recovery checklist", err)
 	}
@@ -116,11 +117,6 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 		return nil
 	}); err != nil {
 		return nil, err
-	}
-
-	type outpoint struct {
-		hash  chainhash.Hash
-		index uint32
 	}
 
 	seen := make(map[outpoint]struct{})
@@ -226,6 +222,12 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 	return r, nil
 }
 
+// outpoint identifies one transaction output.
+type outpoint struct {
+	hash  chainhash.Hash
+	index uint32
+}
+
 // conflictTransactionHashes lists the hashes of every transaction in the checklist.
 func conflictTransactionHashes(r *ConflictRecovery) []chainhash.Hash {
 	hashes := make([]chainhash.Hash, len(r.Transactions))
@@ -287,6 +289,7 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	// both). So collect the children outside the checklist from this first mark: it runs while the
 	// applied winners and restored losers are not Conflicting. A later mark can miss them on SQL.
 	var outside []chainhash.Hash
+
 	if len(hashes) > 0 {
 		_, children, err := s.SetConflicting(ctx, hashes, true)
 		if err != nil {
@@ -299,33 +302,40 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 		}
 	}
 	var failures []error
+
 	if err := s.Unspend(ctx, cloneConflictSpends(r.WinningSpends)); err != nil {
 		failures = append(failures, err)
 	}
-	displaced, release, err := displacedConflictOwners(ctx, s, r, known)
+
+	displaced, leave, release, err := displacedConflictOwners(ctx, s, r, known)
 	if err != nil {
 		return nil, err
 	}
+
 	if len(release) > 0 {
 		if err := s.Unspend(ctx, release); err != nil {
 			failures = append(failures, err)
 		}
 	}
+
 	var restore []*Spend
-	for _, original := range r.OriginalSpends {
-		if original.SpendingData != nil && !displaced.has(*original.SpendingData.TxID) {
+
+	for i, original := range r.OriginalSpends {
+		if original.SpendingData != nil && !leave[i] {
 			restore = append(restore, original.Clone())
 		}
 	}
+
 	if err := s.RestoreConflictSpends(ctx, restore, height); err != nil {
 		failures = append(failures, err)
 	}
+
 	// Verify before making any loser usable again. A failed restoration keeps
 	// the cascade conflicting and the checklist pending.
 	mismatches := make([]error, len(r.OriginalSpends))
 	verifyErr := forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
 		original := r.OriginalSpends[i]
-		if original.SpendingData != nil && displaced.has(*original.SpendingData.TxID) {
+		if leave[i] {
 			return nil
 		}
 
@@ -355,6 +365,7 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	endsConflicting := make(map[chainhash.Hash]struct{}, len(r.Transactions))
 	for _, value := range []bool{true, false} {
 		var hashes []chainhash.Hash
+
 		for _, tx := range r.Transactions {
 			if (tx.Conflicting || displaced.has(tx.Hash)) == value {
 				hashes = append(hashes, tx.Hash)
@@ -371,6 +382,7 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	}
 	// A child of a transaction that ends Conflicting spends a conflicting output.
 	var spendsConflicting []chainhash.Hash
+
 	for _, child := range outside {
 		m, err := s.Get(ctx, &child, fields.TxInpoints)
 		if err != nil {
@@ -394,20 +406,17 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	return cascaded, s.SetConflictLocks(ctx, id, r.Parents, false)
 }
 
-// displacedConflictOwners finds the checklist transactions that cannot get their inputs back. The
-// operation freed the inputs of its losers, and the validator can give a freed input to a new
-// transaction before the rollback runs. That spend is legitimate, so the rollback leaves it. Its
-// recorded owner, and every checklist transaction that spends that owner's outputs, then ends
-// Conflicting and gets none of its inputs back. release lists their inputs that still point at them.
+// displacedConflictOwners finds the inputs that the rollback must leave as they are, and the
+// checklist transactions that cannot get their inputs back. The operation freed the inputs of its
+// losers, and the rollback frees the inputs of its winners that were free at planning. The validator
+// can give such a freed input to a new transaction before the rollback verifies it. That spend is
+// legitimate, so the rollback leaves it, and leave marks the outpoint. A recorded owner that lost an
+// input this way, and every checklist transaction that spends that owner's outputs, ends Conflicting
+// and gets none of its inputs back. release lists their inputs that still point at them.
 //
-// Only an input that no winner spends counts, and only when its new owner is outside the checklist
+// A loser's input counts only when no winner spends it. The new owner must be outside the checklist
 // and not Conflicting. Any other unexpected owner still fails the verification.
-func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, members map[chainhash.Hash]struct{}) (displaced hashSet, release []*Spend, err error) {
-	type outpoint struct {
-		hash  chainhash.Hash
-		index uint32
-	}
-
+func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, members map[chainhash.Hash]struct{}) (displaced hashSet, leave []bool, release []*Spend, err error) {
 	winning := make(map[outpoint]struct{}, len(r.WinningSpends))
 	for _, sp := range r.WinningSpends {
 		winning[outpoint{*sp.TxID, sp.Vout}] = struct{}{}
@@ -415,12 +424,10 @@ func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, 
 
 	owners := make([]*chainhash.Hash, len(r.OriginalSpends))
 	taken := make([]bool, len(r.OriginalSpends))
+	leave = make([]bool, len(r.OriginalSpends))
 
 	if err := forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
 		original := r.OriginalSpends[i]
-		if original.SpendingData == nil {
-			return nil
-		}
 
 		response, err := s.GetSpend(ctx, original)
 		if err != nil {
@@ -433,6 +440,27 @@ func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, 
 
 		owner := *response.SpendingData.TxID
 		owners[i] = &owner
+
+		if original.SpendingData == nil {
+			// A winning input that was free at planning. The rollback gives it back, and a
+			// transaction outside the checklist can take it before the verification.
+			if _, member := members[owner]; member {
+				return nil
+			}
+
+			m, err := s.Get(ctx, &owner, fields.Conflicting)
+			if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+				return nil
+			}
+
+			if err != nil {
+				return err
+			}
+
+			leave[i] = m != nil && !m.Conflicting
+
+			return nil
+		}
 
 		if _, ok := winning[outpoint{*original.TxID, original.Vout}]; ok || owner.IsEqual(original.SpendingData.TxID) {
 			return nil
@@ -456,7 +484,7 @@ func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, 
 
 		return nil
 	}); err != nil {
-		return displaced, nil, err
+		return displaced, nil, nil, err
 	}
 
 	for i, original := range r.OriginalSpends {
@@ -466,7 +494,7 @@ func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, 
 	}
 
 	if len(displaced.order) == 0 {
-		return displaced, nil, nil
+		return displaced, leave, nil, nil
 	}
 
 	for changed := true; changed; {
@@ -481,12 +509,18 @@ func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, 
 	}
 
 	for i, original := range r.OriginalSpends {
-		if original.SpendingData != nil && displaced.has(*original.SpendingData.TxID) && owners[i] != nil && owners[i].IsEqual(original.SpendingData.TxID) {
+		if original.SpendingData == nil || !displaced.has(*original.SpendingData.TxID) {
+			continue
+		}
+
+		leave[i] = true
+
+		if owners[i] != nil && owners[i].IsEqual(original.SpendingData.TxID) {
 			release = append(release, original.Clone())
 		}
 	}
 
-	return displaced, release, nil
+	return displaced, leave, release, nil
 }
 
 func cloneConflictSpends(spends []*Spend) []*Spend {
@@ -545,6 +579,7 @@ func rollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 		return nil, errors.NewProcessingError("legacy conflict intent %s has no recovery checklist; manual repair required", intent.IntentID().String())
 	}
 	var protected []*chainProtectedConflictStore
+
 	for _, guard := range guards {
 		if p := guard.protectForward(ctx, s, r.Winners, intent.BlockHash); p != nil {
 			s = p
@@ -564,6 +599,7 @@ func rollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 		return nil, s.SaveConflictRecovery(ctx, intent.IntentID(), r)
 	}
 	hashes := conflictTransactionHashes(r)
+
 	for _, p := range protected {
 		if err := p.checkUnconfirmed(ctx, hashes); err != nil {
 			return nil, err
@@ -579,6 +615,7 @@ func rollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 	}
 	cascaded, err := rollbackConflictRecovery(ctx, s, r, intent.BlockHeight, intent.IntentID())
 	mayBeMarked = append(hashes, cascaded...)
+
 	if err != nil {
 		return mayBeMarked, err
 	}

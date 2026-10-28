@@ -864,3 +864,14 @@ func TestReplayPendingConflictIntents_ConfirmedPrunedParent(t *testing.T) {
 		})
 	}
 }
+
+// An assembler without a UTXO store has no WAL. The startup checks must skip it, as the replay does.
+func TestConflictRecoveryStartupChecks_NilStore(t *testing.T) {
+	b := &BlockAssembler{}
+
+	require.NoError(t, b.checkConflictRecoveryReady(t.Context(), nil))
+
+	ids, err := b.prepareRecoveredConflictUpdates(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, ids)
+}

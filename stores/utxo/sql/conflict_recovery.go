@@ -97,12 +97,14 @@ func (s *Store) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents
 	defer func() { _ = txn.Rollback() }()
 	for _, h := range parents {
 		var rowID int
+
 		if locked {
 			err = txn.QueryRowContext(ctx, `UPDATE transactions SET locked = true, conflict_owner = $2, delete_at_height = NULL WHERE hash = $1 AND (locked = false OR conflict_owner = $2) RETURNING id`, h[:], id[:]).Scan(&rowID)
 		} else {
 			err = txn.QueryRowContext(ctx, `UPDATE transactions SET locked = false, conflict_owner = NULL WHERE hash = $1 AND conflict_owner = $2 RETURNING id`, h[:], id[:]).Scan(&rowID)
 			if errors.Is(err, sql.ErrNoRows) {
 				var alreadyUnlocked bool
+
 				if e := txn.QueryRowContext(ctx, `SELECT NOT locked FROM transactions WHERE hash = $1`, h[:]).Scan(&alreadyUnlocked); e != nil {
 					return e
 				}
