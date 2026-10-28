@@ -838,7 +838,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `probe_aerospikeURL`, `probe_postgresURL`, `probe_postgresDiskCapacityGB`,
   `probe_floors`) and a Blockchain subscriber named `probe`. Operators who enable the
   probe set a long random token, keep the default localhost bind or put a TLS reverse
-  proxy in front, and read `docs/topics/services/probe.md`.
+  proxy in front, and read `docs/topics/services/probe.md`. (#2078)
 
 - **Peer subtrees announced during a catchup are validated afterwards instead of
   lost.** While catching up, the subtree validator used to drop every
