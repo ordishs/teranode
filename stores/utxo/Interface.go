@@ -104,13 +104,17 @@ type ConflictIntent struct {
 	StartedAt int64
 }
 
-// IntentID derives a deterministic identifier for the intent from its kind,
-// block hash, block height and the (sorted) set of tx hashes. Two invocations
-// with the same (kind, block, height, hashes) yield the same id, which makes
-// BeginConflictIntent idempotent across a crash-retry of the same operation
-// and lets startup replay deduplicate naturally. The hash ordering is
-// normalised so callers need not pre-sort.
+// IntentID derives a deterministic identifier for the intent. A forward intent is keyed by its
+// block alone (ForwardConflictIntentID): its checklist holds the winners, so a retry with a subset of
+// them, or a caller that filters them differently, finds the same record. A reverse intent is keyed
+// by its kind, block hash, block height and the (sorted) set of tx hashes. Two invocations with the
+// same key yield the same id, which makes BeginConflictIntent idempotent across a crash-retry of the
+// same operation and lets startup replay deduplicate naturally.
 func (ci ConflictIntent) IntentID() chainhash.Hash {
+	if ci.Kind == ConflictIntentForward {
+		return ForwardConflictIntentID(ci.BlockHash)
+	}
+
 	sorted := make([]chainhash.Hash, len(ci.TxHashes))
 	copy(sorted, ci.TxHashes)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -128,6 +132,16 @@ func (ci ConflictIntent) IntentID() chainhash.Hash {
 	for i := range sorted {
 		buf = append(buf, sorted[i][:]...)
 	}
+
+	return chainhash.HashH(buf)
+}
+
+// ForwardConflictIntentID is the ID of the forward intent of a block. Callers that acknowledge or
+// retire a block's intent compute it, so they need no scan of the WAL.
+func ForwardConflictIntentID(blockHash chainhash.Hash) chainhash.Hash {
+	buf := make([]byte, 0, len(ConflictIntentForward)+chainhash.HashSize)
+	buf = append(buf, []byte(ConflictIntentForward)...)
+	buf = append(buf, blockHash[:]...)
 
 	return chainhash.HashH(buf)
 }

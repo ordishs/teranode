@@ -1,7 +1,9 @@
 package aerospike
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -59,10 +61,15 @@ func TestRestoreConflictSpends_OneRoundTripPerBatch(t *testing.T) {
 	calls := 0
 	s.batchOperateFn = func(policy *aerospike.BatchPolicy, records []aerospike.BatchRecordIfc) aerospike.Error {
 		calls++
+		require.Positive(t, policy.TotalTimeout)
+		require.LessOrEqual(t, policy.TotalTimeout, time.Second)
+		require.LessOrEqual(t, policy.SocketTimeout, time.Second)
 		return s.client.BatchOperate(policy, records)
 	}
 
-	require.NoError(t, s.RestoreConflictSpends(ctx, spends, 2))
+	bounded, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	require.NoError(t, s.RestoreConflictSpends(bounded, spends, 2))
 	require.Equal(t, 1, calls, "the restore must send its spends as one batch")
 
 	s.batchOperateFn = nil
@@ -133,4 +140,21 @@ func TestSaveConflictRecovery_PhaseSaveKeepsChunks(t *testing.T) {
 	require.Equal(t, before.Generation, after.Generation, "a phase save must not rewrite the checklist chunks")
 
 	require.NoError(t, s.CompleteConflictIntent(ctx, id))
+}
+
+func TestConflictBatchPolicyDeadline(t *testing.T) {
+	policy := aerospike.NewBatchPolicy()
+	policy.TotalTimeout = time.Minute
+	policy.SocketTimeout = time.Minute
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	require.NoError(t, boundConflictBatchPolicy(ctx, policy))
+	require.Positive(t, policy.TotalTimeout)
+	require.LessOrEqual(t, policy.TotalTimeout, time.Second)
+	require.LessOrEqual(t, policy.SocketTimeout, time.Second)
+	cancel()
+	require.ErrorIs(t, boundConflictBatchPolicy(ctx, policy), context.Canceled)
+	expired, stop := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer stop()
+	require.ErrorIs(t, boundConflictBatchPolicy(expired, policy), context.DeadlineExceeded)
 }

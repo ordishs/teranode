@@ -111,14 +111,20 @@ const compensationTimeout = 2 * time.Minute
 //  4. Unspend the original spends, then write the winning spends.
 //  5. Mark the winners not Conflicting, save phase applied, unlock the parents, save phase finished.
 //
-// A failure after step 2 restores the recorded owners and flags (RollbackConflictIntent). A retry
-// of a run that reached applied or finished skips the mutation and returns the saved result.
+// A failure after step 2 restores the recorded owners and flags (RollbackConflictIntent). The
+// intent is keyed by the block, so every caller and retry finds the same checklist. A retry of a run
+// that reached applied or finished skips the mutation and returns the saved result. When a reverse of
+// the block has since made a winner Conflicting again, the retry retires the checklist and plans
+// again. A winner that is not Conflicting and owns every input is already applied, and the plan skips
+// it.
 //
 // ProcessConflicting returns:
 //   - losers: the transactions displaced by the winners, with their descendants. It never contains
 //     a winner. Callers mark these in the subtrees.
 //   - marked: the same set as a list, in discovery order. Block assembly uses it to reject children
-//     of conflicting parents that arrive after the operation.
+//     of conflicting parents that arrive after the operation. On error it lists every checklist
+//     transaction the run or its rollback may have flipped to Conflicting, for txmeta cache
+//     eviction only. The winners are in it only once the run has tried to clear their flag.
 //
 // The third parameter is unused. A process-local map cannot prove what an earlier run did, so only
 // the durable checklist authorises a retry. The parameter stays so callers need no change.
@@ -179,44 +185,33 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 				return nil, nil, err
 			}
 		case ConflictRecoveryApplied, ConflictRecoveryFinished:
-			reversed, e := conflictWinnersReversed(ctx, s, conflictingTxHashes)
+			settled, e := conflictWinnersSettled(ctx, s, recovery.Winners)
 			if e != nil {
 				return nil, nil, e
 			}
-			if reversed {
-				// A reverse of this block undid the operation and stopped before it retired the
-				// checklist. The checklist no longer describes the store, so retire it and plan again.
-				if e := retireConflictIntent(ctx, s, intent.IntentID(), recovery); e != nil {
-					return nil, nil, e
-				}
-				if e := s.BeginConflictIntent(ctx, intent); e != nil {
-					return nil, nil, errors.NewProcessingError("failed to record conflict WAL intent", e)
-				}
-				break
+			if settled {
+				return finishConflictRecovery(ctx, s, intent, recovery, options.deferCompletion)
 			}
-			// Recover the original output set, not edges that Unspend has erased.
-			for _, hash := range conflictingTxHashes {
-				m, e := s.Get(ctx, &hash, fields.Tx, fields.Conflicting)
-				if e != nil {
-					return nil, nil, e
-				}
-				if m == nil || m.Conflicting {
-					return nil, nil, errors.NewProcessingError("applied conflict winner %s changed before acknowledgement", hash.String())
-				}
-				applied, e := winnerIsApplied(ctx, s, hash, m.Tx)
-				if e != nil {
-					return nil, nil, e
-				}
-				if !applied {
-					return nil, nil, errors.NewProcessingError("applied conflict winner %s no longer owns its inputs", hash.String())
-				}
+			// A caller may have filtered its winners differently. Re-plan every winner whose
+			// saved swap is being retired, so a subset cannot abandon a partly reversed winner.
+			conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
+			// A reverse of this block undid some winners, or stopped part way through one, and did
+			// not retire the checklist. The checklist no longer describes the store, so retire it and
+			// plan again. The new plan takes a new before-image and skips the winners that are applied.
+			if e := retireConflictIntent(ctx, s, intent.IntentID(), recovery); e != nil {
+				return nil, nil, e
 			}
-			return finishConflictRecovery(ctx, s, intent, recovery, options.deferCompletion)
+			if e := s.BeginConflictIntent(ctx, intent); e != nil {
+				return nil, nil, errors.NewProcessingError("failed to record conflict WAL intent", e)
+			}
 		}
 	}
 	winnerSet := make(map[chainhash.Hash]struct{}, len(conflictingTxHashes))
 	var winningSpends []*Spend
 	var affected hashSet
+	var pending []chainhash.Hash
+	// Applied winners remain winners even when this plan only mutates a subset.
+	// Never include them in an ancestry check or the returned loser set.
 	for _, h := range conflictingTxHashes {
 		winnerSet[h] = struct{}{}
 	}
@@ -231,14 +226,24 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		if m == nil {
 			return nil, nil, errors.NewTxNotFoundError("[ProcessConflicting][%s] winning tx not found", h.String())
 		}
-		// A process-local processed map cannot prove the side effects of a previous
-		// operation. Only a durable checklist authorises the applied retry above.
-		if !m.Conflicting {
-			return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] tx is not conflicting; no recovery checklist proves completion", h.String())
-		}
 		if m.Tx == nil {
 			return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] winning transaction body is missing", h.String())
 		}
+		// A process-local processed map cannot prove the side effects of a previous operation. The
+		// store can: a winner that is not Conflicting and owns every input is applied. A reverse that
+		// stopped before it reached a winner leaves it so, and its block's checklist can be gone.
+		if !m.Conflicting {
+			applied, e := winnerIsApplied(ctx, s, h, m.Tx)
+			if e != nil {
+				return nil, nil, e
+			}
+			if !applied {
+				return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] tx is not conflicting and does not own its inputs", h.String())
+			}
+			continue
+		}
+		pending = append(pending, h)
+		winnerSet[h] = struct{}{}
 		hashes, e := s.GetCounterConflicting(ctx, h)
 		if e != nil {
 			return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] error getting counter conflicting txs", h.String(), e)
@@ -251,6 +256,14 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		affected.add(hashes...)
 		affected.add(h)
 	}
+	if len(pending) == 0 {
+		// Every winner is applied. The intent records no change, so remove it.
+		if e := CompleteConflictIntent(ctx, s, intent.IntentID()); e != nil {
+			return nil, nil, e
+		}
+		return txmap.NewSplitSwissMap(0), nil, nil
+	}
+	conflictingTxHashes = pending
 	if guard.enabled() {
 		_, refused, e := filterAncestryConfirmedLosers(ctx, s, affected.order, winnerSet, blockHash, guard)
 		if e != nil {
@@ -304,8 +317,6 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		if rollbackErr != nil {
 			err = errors.NewProcessingError("[ProcessConflicting] MANUAL INTERVENTION REQUIRED: original=%s rollback=%s", err.Error(), rollbackErr.Error(), errors.Join(err, rollbackErr))
 		}
-		losers = nil
-		marked = nil
 	}()
 	if err = s.SetConflictLocks(ctx, intent.IntentID(), recovery.Parents, true); err != nil {
 		return nil, nil, err
@@ -365,6 +376,8 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	if err = s.RestoreConflictSpends(ctx, cloneConflictSpends(winningSpends), blockHeight); err != nil {
 		return nil, nil, err
 	}
+	// From here a rollback flips the winners back to Conflicting.
+	mayBeMarked = conflictTransactionHashes(recovery)
 	if _, _, err = s.SetConflicting(ctx, conflictingTxHashes, false); err != nil {
 		return nil, nil, err
 	}
@@ -969,13 +982,17 @@ func winnerIsApplied(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt
 //   - Every winner is Conflicting again: a reverse undid the operation and stopped before it retired
 //     the checklist. Retire the intent.
 //   - The operation was applied and a winner is confirmed on the current chain: keep the applied
-//     state, as a reorg keeps a transaction of an orphaned block. A later reverse of the block handles
-//     the winners that the current chain does not confirm. Release the locks and retire the intent.
+//     state of the confirmed winners, as a reorg keeps a transaction of an orphaned block. When block
+//     assembly reached the block, its moveBack reverses the other winners. Otherwise no moveBack
+//     follows, so reverse them here. Then release the locks and retire the intent.
 //   - Otherwise, roll the operation back.
+//
+// assemblyReached reports whether block assembly reached the intent's block. It is called only when
+// a winner is confirmed and another is not.
 //
 // It returns the transactions whose Conflicting flag it may have changed, for txmeta cache eviction,
 // also on error. It is empty when nothing changed.
-func HealStaleForwardIntent(ctx context.Context, s Store, intent ConflictIntent, guard CurrentChainGuard) ([]chainhash.Hash, error) {
+func HealStaleForwardIntent(ctx context.Context, s Store, intent ConflictIntent, guard CurrentChainGuard, assemblyReached func(context.Context) (bool, error)) ([]chainhash.Hash, error) {
 	r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
 	if err != nil {
 		return nil, err
@@ -987,14 +1004,34 @@ func HealStaleForwardIntent(ctx context.Context, s Store, intent ConflictIntent,
 			return nil, err
 		}
 
-		if !reversed {
-			if reversed, err = anyConflictWinnerConfirmed(ctx, s, r.Winners, guard); err != nil {
-				return nil, err
-			}
-		}
-
 		if reversed {
 			return nil, retireConflictIntent(ctx, s, intent.IntentID(), r)
+		}
+
+		confirmed, unconfirmed, err := splitConfirmedConflictWinners(ctx, s, r.Winners, guard)
+		if err != nil {
+			return nil, err
+		}
+
+		if confirmed {
+			var mayBeMarked []chainhash.Hash
+
+			if len(unconfirmed) > 0 {
+				reached, err := assemblyReached(ctx)
+				if err != nil {
+					return nil, err
+				}
+
+				// Reverse before the retirement. The reverse records its own intent, and the checklist
+				// stays until the reverse succeeds, so a crash between them loses nothing.
+				if !reached {
+					if mayBeMarked, _, err = ReverseProcessConflicting(ctx, s, intent.BlockHeight, intent.BlockHash, unconfirmed, guard); err != nil {
+						return mayBeMarked, err
+					}
+				}
+			}
+
+			return mayBeMarked, retireConflictIntent(ctx, s, intent.IntentID(), r)
 		}
 	}
 
@@ -1004,37 +1041,18 @@ func HealStaleForwardIntent(ctx context.Context, s Store, intent ConflictIntent,
 // RetireConflictIntentsForBlocks retires the applied and finished forward intents of blocks that a
 // reverse has moved back. It releases the parent locks that each intent still owns, so an intent
 // that stopped between applied and finished leaks no lock. Other phases stay pending for recovery.
+// A forward intent is keyed by its block, so this needs no scan of the WAL.
 func RetireConflictIntentsForBlocks(ctx context.Context, s Store, blockHashes []chainhash.Hash) error {
-	if len(blockHashes) == 0 {
-		return nil
-	}
+	for _, blockHash := range blockHashes {
+		id := ForwardConflictIntentID(blockHash)
 
-	blocks := make(map[chainhash.Hash]struct{}, len(blockHashes))
-	for _, h := range blockHashes {
-		blocks[h] = struct{}{}
-	}
-
-	intents, err := s.PendingConflictIntents(ctx)
-	if err != nil {
-		return err
-	}
-
-	for _, intent := range intents {
-		if intent.Kind != ConflictIntentForward {
-			continue
-		}
-
-		if _, ok := blocks[intent.BlockHash]; !ok {
-			continue
-		}
-
-		r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
+		r, err := s.LoadConflictRecovery(ctx, id)
 		if err != nil {
 			return err
 		}
 
 		if r != nil && (r.Phase == ConflictRecoveryApplied || r.Phase == ConflictRecoveryFinished) {
-			if err := retireConflictIntent(ctx, s, intent.IntentID(), r); err != nil {
+			if err := retireConflictIntent(ctx, s, id, r); err != nil {
 				return err
 			}
 		}
@@ -1080,63 +1098,85 @@ func conflictWinnersReversed(ctx context.Context, s Store, winners []chainhash.H
 	return true, nil
 }
 
-// anyConflictWinnerConfirmed reports whether the current chain confirms at least one winner that is
-// not Conflicting. A stale intent's own block is off the current chain, so it confirms nothing.
-func anyConflictWinnerConfirmed(ctx context.Context, s Store, winners []chainhash.Hash, guard CurrentChainGuard) (bool, error) {
+// splitConfirmedConflictWinners reports whether the current chain confirms at least one winner that
+// is not Conflicting, and lists the winners it does not confirm. A stale intent's own block is off the
+// current chain, so it confirms nothing. A confirmed winner must still own every input: the applied
+// state is kept only when the store still shows it, so a mismatch keeps the checklist.
+func splitConfirmedConflictWinners(ctx context.Context, s Store, winners []chainhash.Hash, guard CurrentChainGuard) (confirmed bool, unconfirmed []chainhash.Hash, err error) {
 	if guard.check == nil {
-		return false, nil
+		return false, nil, nil
 	}
 
 	for _, h := range winners {
-		m, err := s.Get(ctx, &h, fields.Conflicting, fields.BlockIDs)
+		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting, fields.BlockIDs)
 		if err != nil {
-			return false, errors.NewProcessingError("[anyConflictWinnerConfirmed][%s] error getting tx", h.String(), err)
+			return false, nil, errors.NewProcessingError("[splitConfirmedConflictWinners][%s] error getting tx", h.String(), err)
 		}
 
-		if m == nil || m.Conflicting || len(m.BlockIDs) == 0 {
+		if m == nil {
+			return false, nil, errors.NewProcessingError("[splitConfirmedConflictWinners][%s] conflict winner is missing", h.String())
+		}
+
+		isConfirmed := false
+		if !m.Conflicting && len(m.BlockIDs) > 0 {
+			if isConfirmed, err = guard.check(ctx, m.BlockIDs); err != nil {
+				return false, nil, errors.NewProcessingError("[splitConfirmedConflictWinners][%s] current-chain lookup failed", h.String(), err)
+			}
+		}
+
+		if !isConfirmed {
+			unconfirmed = append(unconfirmed, h)
 			continue
 		}
 
-		confirmed, err := guard.check(ctx, m.BlockIDs)
+		applied, err := winnerIsApplied(ctx, s, h, m.Tx)
 		if err != nil {
-			return false, errors.NewProcessingError("[anyConflictWinnerConfirmed][%s] current-chain lookup failed", h.String(), err)
+			return false, nil, err
 		}
 
-		if confirmed {
-			return true, nil
+		if !applied {
+			return false, nil, errors.NewProcessingError("[splitConfirmedConflictWinners][%s] confirmed conflict winner no longer owns its inputs", h.String())
 		}
+
+		confirmed = true
 	}
 
-	return false, nil
+	return confirmed, unconfirmed, nil
 }
 
-// UnappliedConflictWinners returns the winners that ProcessConflicting must still apply. A winner
-// that is not Conflicting and already owns every input is applied, so it is left out. A reverse that
-// stopped before it reached a winner leaves that winner in this state, with no forward checklist.
-func UnappliedConflictWinners(ctx context.Context, s Store, winners []chainhash.Hash) ([]chainhash.Hash, error) {
-	pending := make([]chainhash.Hash, 0, len(winners))
+// conflictWinnersSettled reports whether every winner of an applied checklist is still applied: not
+// Conflicting, and the spender of every input. It returns false when a winner is Conflicting, which
+// only a reverse of the block sets. A winner that is not Conflicting but lost an input contradicts the
+// checklist, and that is an error.
+func conflictWinnersSettled(ctx context.Context, s Store, winners []chainhash.Hash) (bool, error) {
+	settled := true
 
 	for _, h := range winners {
 		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting)
 		if err != nil {
-			return nil, errors.NewProcessingError("[UnappliedConflictWinners][%s] error getting tx", h.String(), err)
+			return false, errors.NewProcessingError("[conflictWinnersSettled][%s] error getting tx", h.String(), err)
 		}
 
-		if m != nil && !m.Conflicting {
-			applied, err := winnerIsApplied(ctx, s, h, m.Tx)
-			if err != nil {
-				return nil, err
-			}
-
-			if applied {
-				continue
-			}
+		if m == nil {
+			return false, errors.NewProcessingError("applied conflict winner %s changed before acknowledgement", h.String())
 		}
 
-		pending = append(pending, h)
+		if m.Conflicting {
+			settled = false
+			continue
+		}
+
+		applied, err := winnerIsApplied(ctx, s, h, m.Tx)
+		if err != nil {
+			return false, err
+		}
+
+		if !applied {
+			return false, errors.NewProcessingError("applied conflict winner %s no longer owns its inputs", h.String())
+		}
 	}
 
-	return pending, nil
+	return settled, nil
 }
 
 // MarkConflictingRecursively marks the given transactions as conflicting, and iteratively marks all their spending

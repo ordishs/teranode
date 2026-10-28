@@ -227,7 +227,7 @@ func (s *Store) RestoreConflictSpends(ctx context.Context, spends []*utxo.Spend,
 		}
 		// Direct synchronous dispatch avoids an outstanding queued write after rollback:
 		// sendSpendBatchLua completes every item before it returns, so the wait does not block.
-		s.sendSpendBatchLua(items)
+		s.executeLuaSpendBatchContext(ctx, items)
 		if err := group.Wait(context.Background(), 0); err != nil {
 			return err
 		}

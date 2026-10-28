@@ -226,6 +226,16 @@ func prepareConflictRecovery(ctx context.Context, s Store, hashes []chainhash.Ha
 	return r, nil
 }
 
+// conflictTransactionHashes lists the hashes of every transaction in the checklist.
+func conflictTransactionHashes(r *ConflictRecovery) []chainhash.Hash {
+	hashes := make([]chainhash.Hash, len(r.Transactions))
+	for i, tx := range r.Transactions {
+		hashes[i] = tx.Hash
+	}
+
+	return hashes
+}
+
 // forEachConflictRead runs read for every index in [0, n), at most conflictingWalkFanOut at a
 // time. Each call writes only its own index, so callers keep a deterministic order.
 func forEachConflictRead(ctx context.Context, n int, read func(ctx context.Context, i int) error) error {
@@ -292,9 +302,18 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	if err := s.Unspend(ctx, cloneConflictSpends(r.WinningSpends)); err != nil {
 		failures = append(failures, err)
 	}
+	displaced, release, err := displacedConflictOwners(ctx, s, r, known)
+	if err != nil {
+		return nil, err
+	}
+	if len(release) > 0 {
+		if err := s.Unspend(ctx, release); err != nil {
+			failures = append(failures, err)
+		}
+	}
 	var restore []*Spend
 	for _, original := range r.OriginalSpends {
-		if original.SpendingData != nil {
+		if original.SpendingData != nil && !displaced.has(*original.SpendingData.TxID) {
 			restore = append(restore, original.Clone())
 		}
 	}
@@ -306,6 +325,9 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	mismatches := make([]error, len(r.OriginalSpends))
 	verifyErr := forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
 		original := r.OriginalSpends[i]
+		if original.SpendingData != nil && displaced.has(*original.SpendingData.TxID) {
+			return nil
+		}
 
 		owned, err := conflictOwnerMatches(ctx, s, original)
 		if err != nil {
@@ -334,7 +356,7 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	for _, value := range []bool{true, false} {
 		var hashes []chainhash.Hash
 		for _, tx := range r.Transactions {
-			if tx.Conflicting == value {
+			if (tx.Conflicting || displaced.has(tx.Hash)) == value {
 				hashes = append(hashes, tx.Hash)
 				if value {
 					endsConflicting[tx.Hash] = struct{}{}
@@ -370,6 +392,96 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 		}
 	}
 	return cascaded, s.SetConflictLocks(ctx, id, r.Parents, false)
+}
+
+// displacedConflictOwners finds the checklist transactions that cannot get their inputs back. The
+// operation freed the inputs of its losers, and the validator can give a freed input to a new
+// transaction before the rollback runs. That spend is legitimate, so the rollback leaves it. Its
+// recorded owner, and every checklist transaction that spends that owner's outputs, then ends
+// Conflicting and gets none of its inputs back. release lists their inputs that still point at them.
+//
+// Only an input that no winner spends counts, and only when its new owner is outside the checklist
+// and not Conflicting. Any other unexpected owner still fails the verification.
+func displacedConflictOwners(ctx context.Context, s Store, r *ConflictRecovery, members map[chainhash.Hash]struct{}) (displaced hashSet, release []*Spend, err error) {
+	type outpoint struct {
+		hash  chainhash.Hash
+		index uint32
+	}
+
+	winning := make(map[outpoint]struct{}, len(r.WinningSpends))
+	for _, sp := range r.WinningSpends {
+		winning[outpoint{*sp.TxID, sp.Vout}] = struct{}{}
+	}
+
+	owners := make([]*chainhash.Hash, len(r.OriginalSpends))
+	taken := make([]bool, len(r.OriginalSpends))
+
+	if err := forEachConflictRead(ctx, len(r.OriginalSpends), func(ctx context.Context, i int) error {
+		original := r.OriginalSpends[i]
+		if original.SpendingData == nil {
+			return nil
+		}
+
+		response, err := s.GetSpend(ctx, original)
+		if err != nil {
+			return err
+		}
+
+		if response == nil || response.SpendingData == nil || response.SpendingData.TxID == nil {
+			return nil
+		}
+
+		owner := *response.SpendingData.TxID
+		owners[i] = &owner
+
+		if _, ok := winning[outpoint{*original.TxID, original.Vout}]; ok || owner.IsEqual(original.SpendingData.TxID) {
+			return nil
+		}
+
+		if _, member := members[owner]; member {
+			return nil
+		}
+
+		m, err := s.Get(ctx, &owner, fields.Conflicting)
+		if err != nil {
+			return err
+		}
+
+		taken[i] = m != nil && !m.Conflicting
+
+		return nil
+	}); err != nil {
+		return displaced, nil, err
+	}
+
+	for i, original := range r.OriginalSpends {
+		if taken[i] {
+			displaced.add(*original.SpendingData.TxID)
+		}
+	}
+
+	if len(displaced.order) == 0 {
+		return displaced, nil, nil
+	}
+
+	for changed := true; changed; {
+		changed = false
+
+		for _, original := range r.OriginalSpends {
+			if original.SpendingData != nil && displaced.has(*original.TxID) && !displaced.has(*original.SpendingData.TxID) {
+				displaced.add(*original.SpendingData.TxID)
+				changed = true
+			}
+		}
+	}
+
+	for i, original := range r.OriginalSpends {
+		if original.SpendingData != nil && displaced.has(*original.SpendingData.TxID) && owners[i] != nil && owners[i].IsEqual(original.SpendingData.TxID) {
+			release = append(release, original.Clone())
+		}
+	}
+
+	return displaced, release, nil
 }
 
 func cloneConflictSpends(spends []*Spend) []*Spend {
@@ -446,10 +558,7 @@ func rollbackConflictIntent(ctx context.Context, s Store, intent ConflictIntent,
 		r.Phase = ConflictRecoveryRolledBack
 		return nil, s.SaveConflictRecovery(ctx, intent.IntentID(), r)
 	}
-	hashes := make([]chainhash.Hash, len(r.Transactions))
-	for i, tx := range r.Transactions {
-		hashes[i] = tx.Hash
-	}
+	hashes := conflictTransactionHashes(r)
 	for _, p := range protected {
 		if err := p.checkUnconfirmed(ctx, hashes); err != nil {
 			return nil, err
@@ -501,34 +610,17 @@ func CompleteConflictIntentsForBlock(ctx context.Context, s Store, blockHash cha
 }
 
 // CompleteConflictIntentsForBlocks completes the finished forward intents of all the given
-// blocks with one pending-intent scan. The same rules apply as for CompleteConflictIntentsForBlock.
+// blocks. A forward intent is keyed by its block, so this needs no scan of the WAL. The same rules
+// apply as for CompleteConflictIntentsForBlock.
 func CompleteConflictIntentsForBlocks(ctx context.Context, s Store, blockHashes []chainhash.Hash) error {
-	if len(blockHashes) == 0 {
-		return nil
-	}
-
-	blocks := make(map[chainhash.Hash]struct{}, len(blockHashes))
-	for _, h := range blockHashes {
-		blocks[h] = struct{}{}
-	}
-
-	intents, err := s.PendingConflictIntents(ctx)
-	if err != nil {
-		return err
-	}
-	for _, intent := range intents {
-		if intent.Kind != ConflictIntentForward {
-			continue
-		}
-		if _, ok := blocks[intent.BlockHash]; !ok {
-			continue
-		}
-		r, err := s.LoadConflictRecovery(ctx, intent.IntentID())
+	for _, blockHash := range blockHashes {
+		id := ForwardConflictIntentID(blockHash)
+		r, err := s.LoadConflictRecovery(ctx, id)
 		if err != nil {
 			return err
 		}
 		if r != nil && r.Phase == ConflictRecoveryFinished {
-			if err := CompleteConflictIntent(ctx, s, intent.IntentID()); err != nil {
+			if err := CompleteConflictIntent(ctx, s, id); err != nil {
 				return err
 			}
 		}

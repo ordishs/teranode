@@ -183,3 +183,24 @@ func TestAerospikeConflictRecoveryCancelledVerify(t *testing.T) {
 
 	tests.ConflictRecoveryCancelledVerify(t, store)
 }
+
+func TestAerospikeConflictRecoveryPartialReverseReadd(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryPartialReverseReadd(t, store)
+}
+
+func TestAerospikeConflictRecoveryFreedInputTaken(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryFreedInputTaken(t, store)
+}
+
+func TestAerospikeConflictRecoveryBlockKeyedIntent(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryBlockKeyedIntent(t, store)
+}

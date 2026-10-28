@@ -2,6 +2,7 @@ package blockassembly
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -622,9 +623,12 @@ func TestCheckConflictRecoveryReady_RefusesFailedReplay(t *testing.T) {
 	_, _, err := utxo.ProcessConflicting(ctx, store, 1, *blockHeader1.Hash(), winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
 	require.NoError(t, err)
 
-	// Something flipped the winner back before block assembly acknowledged the operation.
-	_, _, err = store.SetConflicting(ctx, winners, true)
+	// Something took the winner's input before block assembly acknowledged the operation, and left the
+	// winner not Conflicting. No reverse sets that state, so the replay cannot plan the winner again.
+	// (A Conflicting winner is what a reverse that stopped part way leaves; the replay heals that.)
+	winningSpends, err := utxo.GetSpends(txW)
 	require.NoError(t, err)
+	require.NoError(t, store.Unspend(ctx, winningSpends))
 
 	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 1, BlockHash: *blockHeader1.Hash(), TxHashes: winners}
 
@@ -759,4 +763,65 @@ func TestPrepareRecoveredConflictUpdates_WaitsForAssemblyTip(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, r)
 	requireConflictOwner(ctx, t, store, txW2, txL2)
+}
+
+// A stale forward intent of block X whose winner W1 the current chain confirms again, while W2 is
+// not confirmed. When block assembly reached X, its catch-up moves X back and reverses W2, so the heal
+// only retires the intent. When it did not reach X, no moveBack follows, so the heal reverses W2 itself.
+func TestHealStaleConflictIntent_PartialRemineReversesWhenAssemblyDidNotReachBlock(t *testing.T) {
+	for _, reached := range []bool{true, false} {
+		t.Run(fmt.Sprintf("reached=%t", reached), func(t *testing.T) {
+			ctx := t.Context()
+			items := setupBlockAssemblyTest(t)
+			store := items.utxoStore
+			require.NoError(t, store.SetBlockHeight(10))
+
+			parent := createStaleReverseParent(ctx, t, store, 2)
+			txL1 := createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+			txW1 := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+			txL2 := createStaleReverseSpender(ctx, t, store, parent, 1, 90000, true)
+			txW2 := createStaleReverseSpender(ctx, t, store, parent, 1, 80000, false)
+
+			addBlockWithMinedSet(ctx, t, items, blockHeader1)
+			side := *blockHeader1
+			side.Nonce++
+			addBlockWithMinedSet(ctx, t, items, &side)
+			addBlockWithMinedSet(ctx, t, items, blockHeader2)
+
+			winners := []chainhash.Hash{*txW1.TxIDChainHash(), *txW2.TxIDChainHash()}
+			_, _, err := utxo.ProcessConflicting(ctx, store, 1, *side.Hash(), winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			require.NoError(t, err)
+
+			_, mainMeta, err := items.blockchainClient.GetBlockHeader(ctx, blockHeader2.Hash())
+			require.NoError(t, err)
+			_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{txW1.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: mainMeta.ID, BlockHeight: 2})
+			require.NoError(t, err)
+
+			if reached {
+				items.blockAssembler.setBestBlockHeader(&side, 1)
+			} else {
+				items.blockAssembler.setBestBlockHeader(blockHeader1, 1)
+			}
+
+			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 1, BlockHash: *side.Hash(), TxHashes: winners}
+			require.NoError(t, items.blockAssembler.healStaleConflictIntent(ctx, intent))
+
+			r, err := store.LoadConflictRecovery(ctx, intent.IntentID())
+			require.NoError(t, err)
+			require.Nil(t, r, "the heal retires the intent")
+
+			requireConflictOwner(ctx, t, store, txW1, txL1)
+
+			if reached {
+				requireConflictOwner(ctx, t, store, txW2, txL2)
+				return
+			}
+
+			requireConflictOwner(ctx, t, store, txL2, txW2)
+
+			pending, err := store.PendingConflictIntents(ctx)
+			require.NoError(t, err)
+			require.Empty(t, pending, "the reverse completes its own intent")
+		})
+	}
 }

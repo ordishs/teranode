@@ -26,12 +26,22 @@ import (
 )
 
 // countPendingScans wraps a real store and counts the pending-intent scans. failComplete makes every
-// CompleteConflictIntent fail, and failPending makes every scan fail.
+// CompleteConflictIntent fail, failPending makes every scan fail, and failLoad makes every checklist
+// load fail.
 type countPendingScans struct {
 	utxo.Store
 	scans        atomic.Int32
 	failComplete atomic.Bool
 	failPending  atomic.Bool
+	failLoad     atomic.Bool
+}
+
+func (s *countPendingScans) LoadConflictRecovery(ctx context.Context, id chainhash.Hash) (*utxo.ConflictRecovery, error) {
+	if s.failLoad.Load() {
+		return nil, errors.NewStorageError("injected checklist load failure")
+	}
+
+	return s.Store.LoadConflictRecovery(ctx, id)
 }
 
 func (s *countPendingScans) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
@@ -145,8 +155,8 @@ func resetWALSpendTx(t *testing.T, parent *bt.Tx, satoshis uint64) *bt.Tx {
 	return tx
 }
 
-// A reset scans the pending intents once for all its moveForward blocks, not once per block.
-func TestReset_ScansPendingIntentsOnce(t *testing.T) {
+// A reset computes the forward intent ID of each moveForward block, so it never scans the pending intents.
+func TestReset_DoesNotScanPendingIntents(t *testing.T) {
 	stp, store, _, chain := newResetWALTestProcessor(t, true)
 	moveForward := chain.moveForward
 
@@ -154,7 +164,7 @@ func TestReset_ScansPendingIntentsOnce(t *testing.T) {
 	require.NoError(t, response.Err)
 	require.Equal(t, moveForward[1].Header.Hash(), stp.GetCurrentBlockHeader().Hash(), "reset must land on the last moveForward block")
 
-	require.Equal(t, int32(1), store.scans.Load(), "a reset must scan the pending intents exactly once")
+	require.Zero(t, store.scans.Load(), "a reset must not scan the pending intents")
 }
 
 // createResetWALConflict stores a parent, a loser that spends it and a conflicting winner that
@@ -216,7 +226,7 @@ func TestReset_FastForwardCompletesWALIntent(t *testing.T) {
 	require.Len(t, pending, 1, "the fast-forward reset must complete the intent of its moveForward block")
 	require.Equal(t, otherBlock, pending[0].BlockHash, "an intent for a block outside the reset must stay pending")
 
-	require.Equal(t, int32(1), scans, "a reset must scan the pending intents exactly once")
+	require.Zero(t, scans, "a reset must not scan the pending intents")
 }
 
 // A reset over a block with a conflicting node runs ProcessConflicting with deferred completion. The
@@ -386,7 +396,7 @@ func TestReset_AckFailureAfterCommitDoesNotFailReset(t *testing.T) {
 }
 
 // A reorg that moves back a block with conflicting nodes reverses its forward operation and retires
-// the forward checklist with one WAL scan. The reverse has committed, so a failed retirement is only
+// the forward checklist without a WAL scan. The reverse has committed, so a failed retirement is only
 // logged: the reorg succeeds, and a re-add of the block or the next startup retires the checklist.
 func TestReorgBlocks_RetiresReversedForwardChecklist(t *testing.T) {
 	for _, failRetire := range []bool{false, true} {
@@ -414,10 +424,10 @@ func TestReorgBlocks_RetiresReversedForwardChecklist(t *testing.T) {
 			require.NoError(t, stp.blockchainClient.AddBlock(ctx, side, "", blockchainoptions.WithMinedSet(true)))
 
 			store.scans.Store(0)
-			store.failPending.Store(failRetire)
+			store.failLoad.Store(failRetire)
 
 			require.NoError(t, stp.reorgBlocks(ctx, []*model.Block{block}, []*model.Block{side}), "the reverse committed, so the reorg must succeed")
-			require.Equal(t, int32(1), store.scans.Load(), "the reorg retires all reversed blocks with one scan")
+			require.Zero(t, store.scans.Load(), "the reorg retires the reversed blocks without a scan")
 
 			m, err := store.Get(ctx, winner.TxIDChainHash(), fields.Conflicting)
 			require.NoError(t, err)
@@ -426,7 +436,7 @@ func TestReorgBlocks_RetiresReversedForwardChecklist(t *testing.T) {
 			require.NoError(t, err)
 			require.False(t, m.Conflicting, "the reverse restores the loser")
 
-			store.failPending.Store(false)
+			store.failLoad.Store(false)
 
 			r, err = store.LoadConflictRecovery(ctx, forward.IntentID())
 			require.NoError(t, err)
@@ -479,7 +489,8 @@ func TestReorgBlocks_PartialRemineAfterAcceptedHeal(t *testing.T) {
 		return false, nil
 	})
 
-	mayBeMarked, err := utxo.HealStaleForwardIntent(ctx, store, forward, guard)
+	// Block assembly applied B, so its catch-up moves B back and the heal leaves W2 to that reverse.
+	mayBeMarked, err := utxo.HealStaleForwardIntent(ctx, store, forward, guard, func(context.Context) (bool, error) { return true, nil })
 	require.NoError(t, err)
 	require.Empty(t, mayBeMarked)
 
@@ -512,4 +523,50 @@ func TestReorgBlocks_PartialRemineAfterAcceptedHeal(t *testing.T) {
 	require.Equal(t, loser2.TxIDChainHash(), owner(winner2), "the reverse gives W2's input back to L2")
 	require.True(t, conflicting(winner2), "the reverse demotes W2")
 	require.False(t, conflicting(loser2))
+}
+
+// A reset does not reverse the blocks it moves back, but it retires their forward checklists, as
+// reorgBlocks does. Otherwise a checklist left by a failed acknowledgement would make the next startup
+// roll back an operation that has stayed live since. The applied state stays as it is.
+func TestReset_RetiresMovedBackForwardChecklist(t *testing.T) {
+	ctx := t.Context()
+	stp, store, subtreeStore, chain := newResetWALTestProcessor(t, false)
+
+	loser, winner := createResetWALConflict(t, store, 40)
+
+	block := chain.moveForward[0]
+	block.Subtrees = []*chainhash.Hash{storeConflictSubtree(t, subtreeStore, winner)}
+
+	// Leave the forward checklist pending, as a failed acknowledgement does.
+	store.failComplete.Store(true)
+	_, _, err := stp.moveForwardBlock(ctx, block, true, map[chainhash.Hash]struct{}{}, true, false)
+	require.NoError(t, err)
+	store.failComplete.Store(false)
+
+	id := utxo.ForwardConflictIntentID(*block.Hash())
+	r, err := store.LoadConflictRecovery(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase)
+
+	side := &model.Block{Height: 1, CoinbaseTx: coinbaseTx2, TransactionCount: 1, Subtrees: []*chainhash.Hash{}, Header: childHeader(chain.genesis, 403)}
+	require.NoError(t, stp.blockchainClient.AddBlock(ctx, side, "", blockchainoptions.WithMinedSet(true)))
+
+	store.scans.Store(0)
+
+	require.NoError(t, stp.reset(chain.genesis, []*model.Block{block}, []*model.Block{side}, false, func() error { return nil }))
+	require.Zero(t, store.scans.Load(), "the reset retires the moved-back blocks without a scan")
+
+	r, err = store.LoadConflictRecovery(ctx, id)
+	require.NoError(t, err)
+	require.Nil(t, r, "the reset retires the forward checklist of the moved-back block")
+
+	spends, err := utxo.GetSpends(winner)
+	require.NoError(t, err)
+	owner, err := store.GetSpend(ctx, spends[0])
+	require.NoError(t, err)
+	require.Equal(t, winner.TxIDChainHash(), owner.SpendingData.TxID, "a reset leaves the applied state as it is")
+
+	m, err := store.Get(ctx, loser.TxIDChainHash(), fields.Conflicting)
+	require.NoError(t, err)
+	require.True(t, m.Conflicting)
 }

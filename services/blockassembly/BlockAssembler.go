@@ -1481,14 +1481,14 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
 
-	// the unmined txs were added outside the processing loop, so the loop has not yet
-	// checked the resulting subtrees against blockmaxsize
-	b.subtreeProcessor.RequestBlockMaxSizeCheck()
-
 	recoveredIDs, recoveryErr := b.prepareRecoveredConflictUpdates(ctx)
 	if recoveryErr != nil {
 		return recoveryErr
 	}
+
+	// the unmined txs were added outside the processing loop, so the loop has not yet
+	// checked the resulting subtrees against blockmaxsize
+	b.subtreeProcessor.RequestBlockMaxSizeCheck()
 
 	// AddTx is already enqueueing on the gRPC side. If loadUnminedTransactions
 	// flagged any tx as conflicting (and cascaded its descendants), drain the
@@ -1842,14 +1842,9 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 		// says nothing about whether a losing transaction is confirmed on that
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
-		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, nil,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(b.currentChainGuard()))
-
-		return err
+		return b.processConflictingAndEvict(ctx, intent, intent.TxHashes)
 	case utxo.ConflictIntentReverse:
-		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, b.currentChainGuard())
-
-		return err
+		return b.reverseProcessConflictingAndEvict(ctx, intent)
 	default:
 		return errors.NewProcessingError("[replayConflictIntent] unknown conflict intent kind %q", intent.Kind)
 	}
@@ -1905,32 +1900,23 @@ func (b *BlockAssembler) reverseProcessConflictingAndEvict(ctx context.Context, 
 func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
 	switch intent.Kind {
 	case utxo.ConflictIntentForward:
-		mayBeMarked, err := utxo.HealStaleForwardIntent(ctx, b.utxoStore, intent, b.currentChainGuard())
+		mayBeMarked, err := utxo.HealStaleForwardIntent(ctx, b.utxoStore, intent, b.currentChainGuard(), func(ctx context.Context) (bool, error) {
+			return b.assemblyReachedBlock(ctx, intent.BlockHash)
+		})
 
 		b.txMetaEvictor.Evict(mayBeMarked)
 
 		return err
 	case utxo.ConflictIntentReverse:
-		// The reverse may have stopped before it reached some winners. Those are still applied and
-		// have no forward checklist, so ProcessConflicting would refuse them. Re-apply only the rest.
-		winners, err := utxo.UnappliedConflictWinners(ctx, b.utxoStore, intent.TxHashes)
-		if err != nil {
-			return err
-		}
-
-		if len(winners) == 0 {
-			return nil
-		}
-
+		// The reverse may have stopped before it reached some winners. ProcessConflicting skips the
+		// winners that are still applied and plans the rest.
+		//
 		// Replay is chain-authorised too. The isBlockOnLongestChain gate above
 		// only establishes that the intent's block is still on the main chain; it
 		// says nothing about whether a losing transaction is confirmed on that
 		// block's own ancestry. Without the guard, replaying an intent recorded by
 		// a pre-fix process would re-apply the very corruption this prevents.
-		_, _, err = utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, winners, nil,
-			utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash), utxo.WithDeferredConflictCompletion(), utxo.WithRecoveryChainGuard(b.currentChainGuard()))
-
-		return err
+		return b.processConflictingAndEvict(ctx, intent, intent.TxHashes)
 	default:
 		return errors.NewProcessingError("[healStaleConflictIntent] unknown conflict intent kind %q", intent.Kind)
 	}
@@ -4471,6 +4457,7 @@ func (b *BlockAssembler) prepareRecoveredConflictUpdates(ctx context.Context) ([
 }
 
 // assemblyReachedBlock reports whether block assembly's tip is the given block or a descendant of it.
+// A block that the blockchain does not know cannot be an ancestor of the tip.
 func (b *BlockAssembler) assemblyReachedBlock(ctx context.Context, blockHash chainhash.Hash) (bool, error) {
 	tip, _ := b.CurrentBlock()
 	if tip == nil {
@@ -4483,7 +4470,15 @@ func (b *BlockAssembler) assemblyReachedBlock(ctx context.Context, blockHash cha
 
 	_, meta, err := b.blockchainClient.GetBlockHeader(ctx, &blockHash)
 	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+			return false, nil
+		}
+
 		return false, err
+	}
+
+	if meta == nil {
+		return false, nil
 	}
 
 	return b.blockchainClient.CheckBlockIsAncestorOfBlock(ctx, []uint32{meta.ID}, tip.Hash())
@@ -4502,7 +4497,7 @@ func (b *BlockAssembler) currentChainGuard() utxo.CurrentChainGuard {
 	})
 }
 
-// staleTipGrace is how long block assembly may differ from one blockchain tip before the gap counts as a stall.
+// staleTipGrace is how long block assembly may remain on the same tip behind the blockchain before the gap counts as a stall.
 // A healthy node differs for the short delay between a block reaching the Blockchain service and block assembly
 // hearing about it.
 const staleTipGrace = 10 * time.Second
@@ -4513,14 +4508,13 @@ type staleTipTracker struct {
 	since time.Time
 }
 
-// sustained records that block assembly differs from chainTip at now. It reports whether the difference has
-// lasted longer than staleTipGrace for this same chain tip.
-func (s *staleTipTracker) sustained(chainTip chainhash.Hash, now time.Time) bool {
+// sustained records a gap at the same block assembly tip, even as the chain advances.
+func (s *staleTipTracker) sustained(assemblyTip chainhash.Hash, now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.since.IsZero() || s.tip != chainTip {
-		s.tip = chainTip
+	if s.since.IsZero() || s.tip != assemblyTip {
+		s.tip = assemblyTip
 		s.since = now
 	}
 
@@ -4543,5 +4537,5 @@ func (s *staleTipTracker) check(chainTip *chainhash.Hash, chainHeight uint32, ba
 		return false, false
 	}
 
-	return true, s.sustained(*chainTip, now)
+	return true, s.sustained(*baTip, now)
 }

@@ -2006,6 +2006,19 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		stp.logger.Errorf("[SubtreeProcessor][Reset] conflict WAL acknowledgement failed after commit; the intents stay pending: %v", ackErr)
 	}
 
+	// A reset does not reverse the conflict resolution of the blocks it moves back; their effects
+	// stay in the store. A forward checklist that one of them still holds, after a failed
+	// acknowledgement, no longer describes a pending operation. Retire it, as reorgBlocks does, so the
+	// next startup does not roll back an operation that has been live since.
+	moveBackHashes := make([]chainhash.Hash, len(moveBackBlocks))
+	for i, block := range moveBackBlocks {
+		moveBackHashes[i] = *block.Hash()
+	}
+
+	if retireErr := utxostore.RetireConflictIntentsForBlocks(ctx, stp.utxoStore, moveBackHashes); retireErr != nil {
+		stp.logger.Errorf("[SubtreeProcessor][Reset] could not retire the forward conflict checklists of the moved-back blocks: %v", retireErr)
+	}
+
 	return nil
 }
 

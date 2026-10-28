@@ -119,7 +119,7 @@ func TestStaleTipTracker(t *testing.T) {
 	require.False(t, tracker.sustained(tipA, start), "the first sighting is inside the grace period")
 	require.False(t, tracker.sustained(tipA, start.Add(staleTipGrace-time.Second)))
 	require.True(t, tracker.sustained(tipA, start.Add(staleTipGrace)), "the gap has lasted the grace period")
-	require.False(t, tracker.sustained(tipB, start.Add(2*staleTipGrace)), "a new chain tip restarts the clock")
+	require.False(t, tracker.sustained(tipB, start.Add(2*staleTipGrace)), "a new assembly tip restarts the clock")
 
 	tracker.clear()
 	require.False(t, tracker.sustained(tipB, start.Add(3*staleTipGrace)), "catching up clears the gap")
@@ -150,4 +150,20 @@ func TestStaleTipTrackerCheck(t *testing.T) {
 	behind, sustained = tracker.check(&chainTip, 5, &baTip, 4, now.Add(4*staleTipGrace))
 	require.True(t, behind)
 	require.False(t, sustained, "the ahead state restarted the clock")
+}
+
+func TestStaleTipTrackerAdvancingChain(t *testing.T) {
+	var tracker staleTipTracker
+	now := time.Unix(1_000_000, 0)
+	assembly := chainhash.HashH([]byte("stationary"))
+	for i := 0; i <= 12; i++ {
+		chain := chainhash.HashH([]byte{byte(i)})
+		behind, sustained := tracker.check(&chain, uint32(10+i), &assembly, 9, now.Add(time.Duration(i)*time.Second))
+		require.True(t, behind)
+		require.Equal(t, i >= 10, sustained, "advancing chain must not reset a stationary assembly's clock")
+	}
+	advanced := chainhash.HashH([]byte("advanced"))
+	chain := chainhash.HashH([]byte("chain"))
+	_, sustained := tracker.check(&chain, 25, &advanced, 10, now.Add(13*time.Second))
+	require.False(t, sustained, "assembly progress restarts the clock")
 }

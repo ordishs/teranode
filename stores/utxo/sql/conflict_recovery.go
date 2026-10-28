@@ -48,10 +48,13 @@ func (s *Store) RestoreConflictSpends(ctx context.Context, spends []*utxo.Spend,
 		if sp == nil || sp.SpendingData == nil {
 			return errors.NewProcessingError("invalid conflict restoration spend")
 		}
-		// Run the existing conditional spend writer synchronously. No queued write
-		// may arrive after a timeout and undo a later recovery phase.
+		// Run the existing conditional spend writer synchronously, in a transaction on ctx. No queued
+		// write may arrive after a timeout and undo a later recovery phase, and the caller's deadline
+		// also bounds a statement that blocks: cancelling ctx rolls the transaction back.
 		done := make(chan error, 1)
-		s.sendSpendBatch([]*batchSpend{{spend: sp, blockHeight: height, errCh: done, ignoreConflicting: true, ignoreLocked: true}})
+		s.retrySpendBatchContext(ctx, []*batchSpend{{spend: sp, blockHeight: height, errCh: done, ignoreConflicting: true, ignoreLocked: true}}, func(batch []*batchSpend) bool {
+			return s.trySendSpendBatch(ctx, batch)
+		})
 		if err := <-done; err != nil {
 			return err
 		}

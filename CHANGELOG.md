@@ -24,7 +24,11 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   available for diagnosis. A stale forward intent that was applied and has at least
   one winner confirmed on the current chain keeps the applied state and is completed
   without a rollback, as a reorg keeps a transaction of an orphaned block; this also
-  covers a partial re-mine. The parent locks it still holds are released. Failed
+  covers a partial re-mine. When BlockAssembly never reached that block, startup
+  reverses the winners that the current chain does not confirm. A confirmed winner
+  that no longer owns its inputs keeps the intent pending. The parent locks it still
+  holds are released. A rollback leaves an input that the operation freed with a
+  later owner outside the operation, and the loser that spent it stays conflicting. Failed
   WAL cleanup is now returned and counted in
   `teranode_utxo_conflict_wal_completion_failures_total`. Affected operators must
   resolve the pending recovery instead of clearing the WAL or restarting an old
@@ -36,7 +40,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `SaveConflictRecovery`, `LoadConflictRecovery`, `RestoreConflictSpends`,
   `SetConflictLocks`, and `ReleaseConflictLocks`. Upgrade BlockAssembly with its
   store implementation. Do not downgrade while new conflict intents are pending.
-  Legacy forward intents have no before-image and require operator repair;
+  A forward intent is now keyed by its block hash, so acknowledgement needs no WAL
+  scan. Legacy forward intents have no before-image and require operator repair;
   unresolved intents now prevent BlockAssembly startup, and so does an intent whose
   replay failed at startup, even when its checklist reads finished. Preserve the WAL
   and store backup for diagnosis instead of deleting the pending record. See
@@ -935,8 +940,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `GetMiningCandidate` now returns an empty candidate on the Blockchain service tip.
   Before, it returned a full candidate on the old tip, so a miner produced orphan
   blocks. The new counter `teranode_blockassembly_stale_tip_candidates_total` and
-  the Warn log fire only when the gap lasts more than 10 seconds for the same
-  Blockchain service tip. A shorter gap is the normal delay before block assembly
+  the Warn log fire only when the gap lasts more than 10 seconds at the same
+  block assembly tip. A shorter gap is the normal delay before block assembly
   hears of a new block. A block assembly tip that is ahead of the Blockchain service
   tip is not counted. Alert on a sustained non-zero rate. If the Blockchain service
   tip cannot be read, the candidate is built as before. (#2023, bitcoin-sv/teranode#4991)

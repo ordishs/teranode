@@ -45,13 +45,16 @@ func TestProcessConflicting_TxNotConflictingError(t *testing.T) {
 		Conflicting: false, // Not conflicting
 	}, nil)
 
+	// The parent records no spender, so the winner does not own its inputs and is not applied.
+	mockStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{}, nil)
+
 	// Execute test
 	result, _, err := ProcessConflicting(ctx, mockStore, 1, chainhash.Hash{}, conflictingTxHashes, map[chainhash.Hash]struct{}{}, NoAncestryGuard)
 
 	// Assertions
 	assert.Nil(t, result)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "tx is not conflicting")
+	assert.Contains(t, err.Error(), "tx is not conflicting and does not own its inputs")
 	mockStore.AssertExpectations(t)
 }
 

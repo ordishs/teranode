@@ -9,6 +9,11 @@ The operation owns this record. It has no process ID and no process lease. A new
 process can recover it after a restart. This design assumes that BlockAssembly
 serializes reorg operations. It does not support concurrent reorg writers.
 
+A forward intent is keyed by its block hash. Every caller and every retry of the
+block finds the same record, whatever subset of the winners it passes. The
+acknowledgement and the retirement of a block compute the ID, so they do not scan
+the WAL. A reverse intent is keyed by its block and its transactions.
+
 ## Recovery phases
 
 ```mermaid
@@ -32,6 +37,13 @@ spend links from the current UTXO graph. Rollback restores the recorded spend
 owners, checks them, and then restores the original flags. An unexpected spender
 causes an error; recovery does not overwrite it. This case retains the WAL for
 diagnosis and repair.
+
+There is one exception. The operation frees the inputs of its losers, and the
+validator can give a freed input to a new transaction before a rollback runs. That
+spend is legitimate. When the new owner is outside the checklist and not
+`Conflicting`, and no winner spends the input, the rollback leaves the input with
+that owner. The loser that spent it ends `Conflicting` and gets none of its inputs
+back. So does every checklist transaction that spends the loser's outputs.
 
 A child can attach to a checklist transaction after the checklist was saved. The
 rollback does not touch the inputs of that child, so it needs no before-image. When
@@ -57,13 +69,20 @@ accepts the applied winners from the finished checklist and acknowledges the rec
 
 After a successful reverse, its caller retires the applied or finished forward
 record of the block and releases any parent lock that the record still owns. A reorg
-does this with one WAL scan for all its moved-back blocks. The reverse has already
-committed, so a failed retirement is only logged. A later re-add of the block, or the
-next startup, retires a record whose winners are `Conflicting` again and no longer
-own their inputs. Then a re-add runs a new forward operation. At startup, replay runs
-reverse records first. A forward record whose block still has a pending reverse
-record is left as it is, because a rollback over a partial reverse could corrupt the
-store.
+does this for all its moved-back blocks. The reverse has already committed, so a
+failed retirement is only logged. A reset does not reverse the blocks that it moves
+back, so their effects stay in the store. It retires their forward records in the
+same way, so the next startup does not roll back an operation that has stayed live.
+
+A reverse can stop part way: it reversed some winners, or marked a winner
+`Conflicting` before it gave the winner's inputs back. A later re-add of the block,
+or the replay at startup, finds a winner that is `Conflicting` again. It retires the
+forward record and plans again. The new plan takes a new before-image and skips each
+winner that is not `Conflicting` and owns every input, because that winner is
+already applied. This also applies when no forward record is left. At startup,
+replay runs reverse records first. A forward record whose block still has a pending
+reverse record is left as it is, because a rollback over a partial reverse could
+corrupt the store.
 
 A failed acknowledgement after a block is committed is only logged. The finished
 record stays pending, and the next startup replays and acknowledges it.
@@ -84,8 +103,10 @@ identifies the complete checklist. The root record publishes its phase and chunk
 reference after the chunks are written. The checklist content does not change after
 publication, so a later phase change writes only the root phase. Cleanup retains the
 root until all chunks are deleted. These records do not expire automatically.
-Restored spends are written in synchronous Lua batches, so no write arrives after
-the rollback returns.
+Restored spends are written in synchronous Lua batches. Each batch uses the remaining
+compensation deadline as its client timeout; recovery waits for dispatch to finish
+before returning. SQL restore statements and deadlock backoff use that same
+compensation context.
 
 Aerospike conflict recovery does not acquire or release parent locks. This matches
 its existing `Unspend` behavior. Boolean validation locks must not be cleared by
@@ -132,13 +153,21 @@ current-chain block, and it still refuses every other transaction.
 
 A stale forward record can have winners that the new chain confirms again. When the
 operation was applied and at least one winner is confirmed on the current chain,
-startup keeps the applied state, as a reorg keeps a transaction of an orphaned block.
-It releases the parent locks that the record still owns and completes the record
-without a rollback. This includes a partial re-mine, where the new chain confirms
-only some winners. The other winners stay applied, like any other transaction of the
-orphaned block. When block assembly moves back that block, its reverse handles them.
-A stale forward record whose winners a reverse has already undone is retired in the
-same way. Otherwise the record is rolled back.
+startup keeps the applied state of the confirmed winners, as a reorg keeps a
+transaction of an orphaned block. Each confirmed winner must still own every input.
+If one does not, the store contradicts the record, and the record stays pending.
+This includes a partial re-mine, where the new chain confirms only some winners.
+For the other winners:
+
+- When block assembly reached the stale block, its catch-up moves the block back,
+  and that reverse handles them.
+- When block assembly never reached the block, no moveBack follows. Startup
+  reverses them itself. The reverse records its own intent, and the forward record
+  stays until the reverse succeeds.
+
+Then startup releases the parent locks that the record still owns and completes the
+record without a rollback. A stale forward record whose winners a reverse has
+already undone is retired in the same way. Otherwise the record is rolled back.
 
 The loser set that a forward operation returns, and the list of marked transactions,
 never contain a winner.
@@ -150,3 +179,14 @@ cleanup failures. These failures must not be treated as successful recovery.
 These checks prevent further damage. They do not repair a store corrupted by an
 older build. Invalidating a block alone does not establish that its node's UTXO
 state matches the other nodes.
+
+## Remaining concurrency and descendant behavior
+
+A reverse marks a winner's mempool descendants Conflicting. Re-adding the block
+restores the winner, but does not automatically clear those descendants: they must
+be resubmitted and validated before becoming eligible for mining again.
+
+SQL recovery leaves a foreign parent lock with its owner. That owner can release
+it during the operation, allowing a new spend to race recovery. Aerospike recovery
+also has no parent locks. Conditional ownership checks retain the checklist on an
+unexpected contested-input owner; recovery never overwrites that owner's spend.

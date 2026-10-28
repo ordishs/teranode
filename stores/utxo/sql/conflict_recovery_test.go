@@ -2,10 +2,12 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -304,4 +306,78 @@ func TestConflictRecoveryLegacyIntent(t *testing.T) {
 func TestConflictRecoveryCancelledVerify(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryCancelledVerify(t, store)
+}
+
+func TestConflictRecoveryPartialReverseReadd(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryPartialReverseReadd(t, store)
+}
+
+func TestConflictRecoveryFreedInputTaken(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryFreedInputTaken(t, store)
+}
+
+func TestConflictRecoveryBlockKeyedIntent(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryBlockKeyedIntent(t, store)
+}
+
+// The compensation deadline must also bound a restore write that blocks. Another transaction holds the
+// row lock of the output, so the restore statement waits. It must return when ctx ends, and its
+// transaction must roll back, so no write lands after the restore returns.
+func TestRestoreConflictSpendsHonoursDeadline_Postgres(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping Postgres integration test in short mode")
+	}
+
+	store, ctx := setupPostgresStore(t)
+
+	for outputs, bulk := range map[int]bool{1: false, 2: true} {
+		t.Run(fmt.Sprintf("bulk=%t", bulk), func(t *testing.T) {
+			store.settings.UtxoStore.BatchSQLOperations = bulk
+
+			parent := newExtendedTxWithOutputs(t, outputs)
+			_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+			require.NoError(t, err)
+
+			spends, err := utxo.GetSpends(newExtendedSpendingTx(t, parent, 0))
+			require.NoError(t, err)
+
+			holder, err := store.db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+
+			_, err = holder.ExecContext(ctx, `SELECT o.idx FROM outputs o JOIN transactions t ON t.id = o.transaction_id WHERE t.hash = $1 AND o.idx = 0 FOR UPDATE`, parent.TxIDChainHash()[:])
+			require.NoError(t, err)
+
+			// Release the lock in the end, so a restore that ignores ctx returns late instead of hanging.
+			released := make(chan struct{})
+			go func() {
+				defer close(released)
+				time.Sleep(10 * time.Second)
+				_ = holder.Rollback()
+			}()
+
+			deadline, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+
+			start := time.Now()
+			err = store.RestoreConflictSpends(deadline, spends, 2)
+			elapsed := time.Since(start)
+
+			require.Error(t, err)
+			require.Less(t, elapsed, 5*time.Second, "the restore must stop at the deadline, not when the lock is released")
+
+			<-released
+
+			res, err := store.GetSpend(ctx, spends[0])
+			require.NoError(t, err)
+			require.Nil(t, res.SpendingData, "the cancelled restore must not land later")
+
+			require.NoError(t, store.RestoreConflictSpends(ctx, spends, 2))
+			res, err = store.GetSpend(ctx, spends[0])
+			require.NoError(t, err)
+			require.NotNil(t, res.SpendingData)
+		})
+	}
 }
