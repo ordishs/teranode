@@ -108,14 +108,17 @@ Steps:
 If all pass:
 1. **Resolve the beta SHA**: `git rev-parse vX.Y.Z-beta-N`. This is what gets tagged — never the branch tip.
 2. **Verify nothing has landed on top of the beta**: `git rev-parse release/vX.Y` must equal the beta SHA. If they differ, **refuse to tag**: a hotfix landed after the beta soak and that commit hasn't been validated. Tell the user; require a fresh beta cut.
-3. **Write the release checklist.** Copy `docs/releases/checklist-template.md` to `docs/releases/vX.Y.Z-checklist.md` on a branch from `main`, and fill in every item with its evidence (see `docs/howto/releaseProcess.md`):
-   - the seven gate answers above, with the beta tag, the nodes and soak durations, and the sync-from-zero and mid-sync-upgrade nodes
-   - the `teranode_main_build.yaml` run URL at the beta SHA and the results of its `test_and_lint` jobs (Go test, smoketest, prunertest), from `gh run list --workflow teranode_main_build.yaml --commit <beta-sha>`
-   - the node-validation run in full mode against the beta SHA (or the immutable image digest built from it), for a release with consensus-affecting scope, or N/A and the reason. The stable tag does not exist yet, so never require a run against `vX.Y.Z`
-   - the open bug-labelled issues, from `gh issue list --label bug --state open`
-   - every open Critical or High finding, each closed or with a waiver (owner, date, reason, close-by date)
-   - the miner feedback register counts and location
-   - the security and architecture items, or "none" with the reason
+3. **Write the release records** (see `docs/howto/releaseProcess.md`). There are two:
+   - **The private release record**, readable only by the maintainers. Ask the user where it is. It holds the evidence that must not be published:
+     - the seven gate answers above, with the beta tag, the nodes and soak windows, and the sync-from-zero and mid-sync-upgrade nodes
+     - the security review or scan result
+     - every open Critical or High finding, each closed or with a waiver (owner, date, reason, close-by date). Security findings are draft repository security advisories; record their IDs only
+   - **The published checklist.** Copy `docs/releases/checklist-template.md` to `docs/releases/vX.Y.Z-checklist.md` on a branch from `main`, and mark each gate Yes, No or N/A with its public reference:
+     - the `teranode_main_build.yaml` run URL at the beta SHA and the results of its `test_and_lint` jobs (Go test, smoketest, prunertest), from `gh run list --workflow teranode_main_build.yaml --commit <beta-sha>`
+     - the node-validation verdict, tool version and mode for a full-mode run against the beta SHA (or the immutable image digest built from it), for a release with consensus-affecting scope, or N/A and the reason. The stable tag does not exist yet, so never require a run against `vX.Y.Z`
+     - the open bug-labelled issues, from `gh issue list --label bug --state open`
+     - the number of open, closed and waived Critical or High findings, and the miner feedback register counts
+   - **Never write** node names, peer identifiers, or the details of an unpublished security finding into the published checklist.
 4. **Record the decision.** Ask the user which maintainer approves, and the date. Set `**Decision:** Go` only when every item has evidence and every open Critical or High finding is closed or waived. Otherwise leave `**Decision:** No-Go`, name the failed criterion, and **refuse to tag**.
 5. **Merge the checklist to `main`** through a pull request, before the tag. The `release-checklist` job in `teranode_main_build.yaml` fails a stable tag build when the file is not on `main` or does not record `**Decision:** Go`.
 6. Build release notes from the range `<prev-stable-tag>..<beta-tag>` (never `..HEAD`). Link the checklist in the notes.

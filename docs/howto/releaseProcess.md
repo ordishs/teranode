@@ -19,10 +19,15 @@ The [Maintainers](https://github.com/bsv-blockchain/teranode/blob/main/GOVERNANC
 
 ## Release Checklist and Go/No-Go Record
 
-Each stable release has one file, `docs/releases/vX.Y.Z-checklist.md`, copied from [the template](https://github.com/bsv-blockchain/teranode/blob/main/docs/releases/checklist-template.md). It holds the release checklist and the go/no-go decision record together.
+Each stable release has two records:
 
-1. Copy the template to `docs/releases/vX.Y.Z-checklist.md`.
-2. Fill in each item with its evidence: a report title, a CI run URL, a peer identifier, an issue number. "Done" without evidence does not satisfy an item.
+- **The published checklist**, `docs/releases/vX.Y.Z-checklist.md`, copied from [the template](https://github.com/bsv-blockchain/teranode/blob/main/docs/releases/checklist-template.md). It is public. It records whether each gate passed, with references that are safe to publish, and the go/no-go decision.
+- **The private release record**, which only the maintainers can read. It holds the evidence that must not be published: the nodes that soaked the beta and their soak windows, the sync-from-zero and mid-sync-upgrade nodes, the security review result, and every Critical or High finding with its waiver. Record each security finding as a draft [repository security advisory](https://docs.github.com/en/code-security/security-advisories/working-with-repository-security-advisories/about-repository-security-advisories), and list its advisory ID in the private record. A draft advisory is visible only to admins, security managers and invited collaborators.
+
+The steps:
+
+1. Fill in the private release record. Each item needs its evidence: a report title, a CI run URL, a node identifier, an issue or advisory ID. "Done" without evidence does not satisfy an item.
+2. Copy the template to `docs/releases/vX.Y.Z-checklist.md`, and mark each gate Yes, No or N/A, with a public reference where the template asks for one.
 3. Record the decision, the approver and the date.
 4. Merge the file to `main` in a pull request.
 5. Tag `vX.Y.Z` on the beta SHA.
@@ -32,7 +37,7 @@ The `release-checklist` job in `teranode_main_build.yaml` enforces steps 4 and 5
 
 ### Checklist Items
 
-The checklist has one section per domain:
+The private release record holds this evidence for each domain. The published checklist has one gate per item, with the result and a public reference:
 
 | Domain | Required evidence |
 |---|---|
@@ -41,7 +46,7 @@ The checklist has one section per domain:
 | Consensus parity | For a release with consensus-affecting scope: a [node-validation](https://github.com/bsv-blockchain/node-validation) run in full mode against the beta SHA that the stable tag will target, or against the immutable image digest built from that SHA. The stable tag does not exist until the checklist merges, so the run cannot use it. Give the report, its verdict, the tool version, the mode and the SHA or digest. For a release without consensus-affecting scope, write N/A and the reason. |
 | Security | The security review or scan result for this release, or "none in scope" and the reason. |
 | Architecture | The architecture reviews or decision records that affect this release, or "none". |
-| Open findings | Every open bug-labelled issue that affects the build. Every open Critical or High finding from any source: miner feedback, security review, internal review, or the acceptance harness. Each one is closed or has a waiver. |
+| Open findings | Every open bug-labelled issue that affects the build. Every open Critical or High finding from any source: miner feedback, security review, internal review, or the acceptance harness. Each one is closed or has a waiver. The findings and waivers are in the private record; the published checklist gives only their counts. |
 | Miner feedback register | The number of open items, the number closed since the last release, and where the register is. |
 
 ### Waivers
@@ -54,7 +59,7 @@ A stable release does not ship while a Critical or High finding is open, unless 
 - the reason the risk is accepted
 - the date by which the finding will be closed
 
-Record each waiver in the checklist file. Disclose each one in the Known issues section of the release notes.
+Record each waiver in the private release record, and its count in the published checklist. Disclose each waiver in the Known issues section of the release notes, except a waiver for a security finding that is not yet published: disclose that one when its advisory is published.
 
 ### Forward Schedule for Consensus-Level Releases
 

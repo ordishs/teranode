@@ -9,10 +9,6 @@ on:
       - staging
       - release/*
 
-permissions:
-  contents: read
-  pull-requests: read
-
 jobs:
   # Tests and code lint
   test_and_lint:
@@ -26,6 +22,8 @@ jobs:
   # Go decision, is on main. Branches and beta tags pass. See docs/howto/releaseProcess.md.
   release-checklist:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
@@ -37,6 +35,8 @@ jobs:
   # Calculate version information
   calculate-version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       git_version: ${{ steps.version.outputs.git_version }}
       git_commit: ${{ steps.version.outputs.git_commit }}
