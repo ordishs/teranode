@@ -875,3 +875,113 @@ func TestConflictRecoveryStartupChecks_NilStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, ids)
 }
+
+// failingWALStore wraps a real store and fails one WAL read, so the startup checks report it.
+type failingWALStore struct {
+	utxo.Store
+	failPending   bool
+	failLoad      bool
+	pendingSeen   int
+	failPendingAt int
+}
+
+func (s *failingWALStore) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	s.pendingSeen++
+
+	if s.failPending || (s.failPendingAt > 0 && s.pendingSeen == s.failPendingAt) {
+		return nil, errors.NewStorageError("injected WAL read failure")
+	}
+
+	return s.Store.PendingConflictIntents(ctx)
+}
+
+func (s *failingWALStore) LoadConflictRecovery(ctx context.Context, id chainhash.Hash) (*utxo.ConflictRecovery, error) {
+	if s.failLoad {
+		return nil, errors.NewStorageError("injected checklist read failure")
+	}
+
+	return s.Store.LoadConflictRecovery(ctx, id)
+}
+
+// The startup checks refuse to start on every unresolved shape of the WAL, and report a store that
+// cannot be read instead of starting on a guess.
+func TestConflictRecoveryStartupChecks_Branches(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	b := items.blockAssembler
+	require.NoError(t, store.SetBlockHeight(10))
+
+	wrapped := &failingWALStore{Store: store}
+	b.utxoStore = wrapped
+
+	wrapped.failPending = true
+	require.ErrorContains(t, b.checkConflictRecoveryReady(ctx, nil), "injected WAL read failure")
+	_, err := b.prepareRecoveredConflictUpdates(ctx)
+	require.ErrorContains(t, err, "injected WAL read failure")
+	require.Empty(t, b.replayPendingConflictIntents(ctx), "a replay that cannot read the WAL reports no failed intent")
+	wrapped.failPending = false
+
+	// A reverse intent of a block that is not on the chain is unresolved, and the preparation
+	// skips it.
+	reverse := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 1, BlockHash: chainhash.HashH([]byte("off-chain")), StartedAt: 1}
+	require.NoError(t, store.BeginConflictIntent(ctx, reverse))
+	require.ErrorContains(t, b.checkConflictRecoveryReady(ctx, nil), "is unresolved")
+	ids, err := b.prepareRecoveredConflictUpdates(ctx)
+	require.NoError(t, err)
+	require.Empty(t, ids)
+	require.NoError(t, store.CompleteConflictIntent(ctx, reverse.IntentID()))
+
+	// A finished forward intent whose block is not on the chain is stale, and one whose checklist
+	// cannot be read is an error.
+	parent := createStaleReverseParent(ctx, t, store, 1)
+	createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+	winner := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+	staleBlock := chainhash.HashH([]byte("stale-block"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err = utxo.ProcessConflicting(ctx, store, 1, staleBlock, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+
+	require.ErrorContains(t, b.checkConflictRecoveryReady(ctx, nil), "is stale")
+	ids, err = b.prepareRecoveredConflictUpdates(ctx)
+	require.NoError(t, err)
+	require.Empty(t, ids, "a stale intent is left to the replay")
+
+	wrapped.failLoad = true
+	require.ErrorContains(t, b.checkConflictRecoveryReady(ctx, nil), "injected checklist read failure")
+	_, err = b.prepareRecoveredConflictUpdates(ctx)
+	require.ErrorContains(t, err, "injected checklist read failure")
+	require.ErrorContains(t, b.replayConflictIntent(ctx, utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHash: staleBlock}), "injected checklist read failure")
+	wrapped.failLoad = false
+
+	require.ErrorContains(t, b.replayConflictIntent(ctx, utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHash: chainhash.HashH([]byte("unknown"))}), "legacy forward conflict intent")
+	require.ErrorContains(t, b.replayConflictIntent(ctx, utxo.ConflictIntent{Kind: "bogus"}), "unknown conflict intent kind")
+	require.ErrorContains(t, b.healStaleConflictIntent(ctx, utxo.ConflictIntent{Kind: "bogus"}), "unknown conflict intent kind")
+
+	reached, err := b.assemblyReachedBlock(ctx, chainhash.HashH([]byte("unknown")))
+	require.NoError(t, err)
+	require.False(t, reached, "an unknown block was not reached")
+}
+
+// A WAL that cannot be re-read after the reverse intents marks every forward intent as failed.
+func TestReplayPendingConflictIntents_ReReadFailure(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	b := items.blockAssembler
+	require.NoError(t, store.SetBlockHeight(10))
+
+	addBlockWithMinedSet(ctx, t, items, blockHeader1)
+
+	// An empty stale reverse heals at once, and a forward intent of an unknown block stays.
+	reverse := utxo.ConflictIntent{Kind: utxo.ConflictIntentReverse, BlockHeight: 1, BlockHash: *blockHeader1.Hash(), StartedAt: 1}
+	require.NoError(t, store.BeginConflictIntent(ctx, reverse))
+	forward := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 1, BlockHash: chainhash.HashH([]byte("forward-block")), StartedAt: 1}
+	require.NoError(t, store.BeginConflictIntent(ctx, forward))
+
+	b.utxoStore = &failingWALStore{Store: store, failPendingAt: 2}
+
+	failed := b.replayPendingConflictIntents(ctx)
+	require.Contains(t, failed, forward.IntentID())
+	require.NotContains(t, failed, reverse.IntentID())
+}

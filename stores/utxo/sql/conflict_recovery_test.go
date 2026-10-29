@@ -401,3 +401,40 @@ func TestConflictRecoveryLegacyKey(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryLegacyKey(t, store)
 }
+
+// The SQL recovery methods report a missing intent, an invalid spend, and a store that is closed.
+func TestConflictRecovery_SQLErrorBranches(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := t.Context()
+	id := chainhash.Hash{0xee}
+	r := &utxo.ConflictRecovery{Version: 1, Phase: utxo.ConflictRecoveryPrepared}
+
+	require.ErrorContains(t, store.SaveConflictRecovery(ctx, id, r), "is missing")
+	require.ErrorContains(t, store.SaveConflictRecovery(ctx, id, &utxo.ConflictRecovery{Version: 2}), "unsupported")
+	require.ErrorContains(t, store.RestoreConflictSpends(ctx, []*utxo.Spend{{}}, 1), "invalid conflict restoration spend")
+
+	// A locked parent that this operation does not own is reported, and one that is already unlocked
+	// is skipped.
+	parent := newExtendedTxWithOutputs(t, 1)
+	_, _, err := store.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+	require.NoError(t, err)
+	require.NoError(t, store.SetConflictLocks(ctx, id, []chainhash.Hash{*parent.TxIDChainHash()}, false))
+	require.NoError(t, store.SetLocked(ctx, []chainhash.Hash{*parent.TxIDChainHash()}, true))
+	require.ErrorContains(t, store.SetConflictLocks(ctx, id, []chainhash.Hash{*parent.TxIDChainHash()}, false), "does not own parent lock")
+	require.NoError(t, store.ReleaseConflictLocks(ctx, id, []chainhash.Hash{*parent.TxIDChainHash()}), "a lock of another holder is left alone")
+
+	require.NoError(t, store.db.Close())
+
+	_, err = store.LoadConflictRecovery(ctx, id)
+	require.ErrorContains(t, err, "loading conflict recovery checklist")
+	require.ErrorContains(t, store.SaveConflictRecovery(ctx, id, r), "saving conflict recovery checklist")
+	require.Error(t, store.SetConflictLocks(ctx, id, []chainhash.Hash{{1}}, true))
+	require.Error(t, store.ReleaseConflictLocks(ctx, id, []chainhash.Hash{{1}}))
+	_, err = store.PendingConflictIntents(ctx)
+	require.Error(t, err)
+}
+
+func TestConflictRecoveryRollbackStepFailures(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryRollbackStepFailures(t, store)
+}

@@ -232,3 +232,10 @@ func TestAerospikeConflictRecoveryLegacyKey(t *testing.T) {
 
 	tests.ConflictRecoveryLegacyKey(t, store)
 }
+
+func TestAerospikeConflictRecoveryRollbackStepFailures(t *testing.T) {
+	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	tests.ConflictRecoveryRollbackStepFailures(t, store)
+}

@@ -12,6 +12,8 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	utxo "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1795,4 +1797,115 @@ func ConflictRecoveryLegacyKey(t *testing.T, db utxo.Store) {
 
 	require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
 	require.NoError(t, db.CompleteConflictIntent(ctx, legacyID))
+}
+
+// failRollbackStep wraps a real store and fails one step of a rollback. nth counts the calls of the
+// failing method, so a later call of a method can fail while the earlier ones succeed.
+type failRollbackStep struct {
+	utxo.Store
+	step  string
+	nth   int
+	calls map[string]int
+}
+
+func (s *failRollbackStep) hit(name string) bool {
+	if s.calls == nil {
+		s.calls = map[string]int{}
+	}
+
+	s.calls[name]++
+
+	return s.step == name && s.calls[name] == s.nth
+}
+
+func (s *failRollbackStep) SetConflicting(ctx context.Context, hashes []chainhash.Hash, value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
+	if s.hit("setConflicting") {
+		return nil, nil, errors.NewStorageError("injected setConflicting failure")
+	}
+
+	return s.Store.SetConflicting(ctx, hashes, value)
+}
+
+func (s *failRollbackStep) Unspend(ctx context.Context, spends []*utxo.Spend, locked ...bool) error {
+	if s.hit("unspend") {
+		return errors.NewStorageError("injected unspend failure")
+	}
+
+	return s.Store.Unspend(ctx, spends, locked...)
+}
+
+func (s *failRollbackStep) GetSpend(ctx context.Context, sp *utxo.Spend) (*utxo.SpendResponse, error) {
+	if s.hit("getSpend") {
+		return nil, errors.NewStorageError("injected getSpend failure")
+	}
+
+	return s.Store.GetSpend(ctx, sp)
+}
+
+func (s *failRollbackStep) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	if s.hit("get") {
+		return nil, errors.NewStorageError("injected get failure")
+	}
+
+	return s.Store.Get(ctx, hash, f...)
+}
+
+// ConflictRecoveryRollbackStepFailures fails each store step of a rollback in turn. A finished
+// operation has a loser L, a winner W and a mempool child C of W that attached after the checklist.
+// Every failure leaves the checklist pending; the rollback then succeeds on a clean retry.
+func ConflictRecoveryRollbackStepFailures(t *testing.T, db utxo.Store) {
+	cases := []struct {
+		name string
+		step string
+		nth  int
+		want string
+	}{
+		{"first mark fails", "setConflicting", 1, "injected setConflicting failure"},
+		{"unspend of the winning spends fails", "unspend", 1, "injected unspend failure"},
+		{"owner read before restore fails", "getSpend", 1, "injected getSpend failure"},
+		{"verification read fails", "getSpend", 2, "injected getSpend failure"},
+		{"flag restore fails", "setConflicting", 2, "injected setConflicting failure"},
+		{"winner spender read fails", "get", 1, "injected get failure"},
+		{"outside child read fails", "get", 2, "injected get failure"},
+	}
+
+	for index, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			parent := crashParentTx(0x22 + byte(index))
+			_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+			require.NoError(t, err)
+			loser := crashSpendTx(t, parent, 80000)
+			_, _, err = db.SpendAndCreate(ctx, loser, 2)
+			require.NoError(t, err)
+			winner := crashSpendTx(t, parent, 70000)
+			_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+			require.NoError(t, err)
+
+			block := chainhash.HashH([]byte("rollback-step-" + tc.name))
+			winners := []chainhash.Hash{*winner.TxIDChainHash()}
+			_, _, err = utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			require.NoError(t, err)
+
+			child := crashSpendTx(t, winner, 60000)
+			_, _, err = db.SpendAndCreate(ctx, child, 3)
+			require.NoError(t, err)
+
+			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: block, TxHashes: winners}
+			_, err = utxo.RollbackConflictIntent(ctx, &failRollbackStep{Store: db, step: tc.step, nth: tc.nth}, intent)
+			require.ErrorContains(t, err, tc.want)
+
+			r, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+			require.NoError(t, err)
+			require.NotEqual(t, utxo.ConflictRecoveryRolledBack, r.Phase, "a failed rollback keeps the checklist pending")
+
+			_, err = utxo.RollbackConflictIntent(ctx, db, intent)
+			require.NoError(t, err, "a clean retry finishes the rollback")
+			require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+			require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
+			require.True(t, crashConflicting(t, ctx, db, child.TxIDChainHash()))
+			require.False(t, crashConflicting(t, ctx, db, loser.TxIDChainHash()))
+			require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+		})
+	}
 }

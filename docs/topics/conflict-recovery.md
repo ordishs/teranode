@@ -52,7 +52,9 @@ checklist transaction that spends that loser's outputs.
 A child can attach to a checklist transaction after the checklist was saved. The
 rollback does not touch the inputs of that child, so it needs no before-image. When
 the child's parent ends `Conflicting`, the rollback marks the child and its
-descendants `Conflicting` too, and reports them for txmeta cache eviction.
+descendants `Conflicting` too, and reports them for txmeta cache eviction. The
+rollback finds such a child from the spenders of the winners' outputs, so a retry
+after a failed rollback still finds it when the winner is already `Conflicting`.
 
 A validator can also spend a free winning input after discovery and before the
 snapshot. The checklist then records an owner that is not in the discovered set.

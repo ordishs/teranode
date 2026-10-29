@@ -2,6 +2,8 @@ package aerospike
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -157,4 +160,82 @@ func TestConflictBatchPolicyDeadline(t *testing.T) {
 	expired, stop := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
 	defer stop()
 	require.ErrorIs(t, boundConflictBatchPolicy(expired, policy), context.DeadlineExceeded)
+}
+
+// LoadConflictRecovery refuses a root record whose checklist reference or chunks are damaged, and
+// SaveConflictRecovery refuses a checklist for an intent that does not exist.
+func TestConflictRecovery_DamagedRecords(t *testing.T) {
+	s, _ := setupStoreForLockTest(t)
+	ctx := t.Context()
+
+	missing := chainhash.Hash{0xaa}
+	require.Error(t, s.SaveConflictRecovery(ctx, missing, &utxo.ConflictRecovery{Version: 1, Phase: utxo.ConflictRecoveryPrepared}), "no root record")
+	require.ErrorContains(t, s.SaveConflictRecovery(ctx, missing, &utxo.ConflictRecovery{Version: 2}), "unsupported")
+	require.ErrorContains(t, s.RestoreConflictSpends(ctx, []*utxo.Spend{{}}, 1), "invalid conflict restoration spend")
+
+	intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 1, BlockHash: chainhash.HashH([]byte("damaged")), StartedAt: 1}
+	id := intent.IntentID()
+	require.NoError(t, s.BeginConflictIntent(ctx, intent))
+
+	key, err := aerospike.NewKey(s.namespace, s.conflictWALSet(), id[:])
+	require.NoError(t, err)
+	policy := util.GetAerospikeWritePolicy(s.settings, 0)
+
+	put := func(bins ...*aerospike.Bin) {
+		t.Helper()
+		require.NoError(t, s.client.PutBins(policy, key, bins...))
+	}
+	load := func(want string) {
+		t.Helper()
+		_, err := s.LoadConflictRecovery(ctx, id)
+		require.ErrorContains(t, err, want)
+	}
+
+	put(aerospike.NewBin("recovery", "abcd"))
+	load("invalid conflict recovery reference")
+
+	put(aerospike.NewBin("recovery", "abcd"), aerospike.NewBin("recoveryN", 1))
+	_, lerr := s.LoadConflictRecovery(ctx, id)
+	require.Error(t, lerr, "a chunk that does not exist")
+
+	chunkKey, kerr := s.recoveryChunkKey(id, "abcd", 0)
+	require.NoError(t, kerr)
+	require.NoError(t, s.client.PutBins(policy, chunkKey, aerospike.NewBin("data", "not bytes")))
+	load("invalid conflict recovery chunk")
+
+	require.NoError(t, s.client.PutBins(policy, chunkKey, aerospike.NewBin("data", []byte("{}"))))
+	load("conflict recovery checksum mismatch")
+
+	data := []byte(`{"Version":1,"Phase":"bogus"}`)
+	digest := fmt.Sprintf("%x", sha256.Sum256(data))
+	chunkKey, kerr = s.recoveryChunkKey(id, digest, 0)
+	require.NoError(t, kerr)
+	require.NoError(t, s.client.PutBins(policy, chunkKey, aerospike.NewBin("data", data)))
+	put(aerospike.NewBin("recovery", digest), aerospike.NewBin("recoveryN", 1))
+	load("unknown conflict recovery phase")
+
+	data = []byte(`{"Version":1,"Phase":"prepared"}`)
+	digest = fmt.Sprintf("%x", sha256.Sum256(data))
+	chunkKey, kerr = s.recoveryChunkKey(id, digest, 0)
+	require.NoError(t, kerr)
+	require.NoError(t, s.client.PutBins(policy, chunkKey, aerospike.NewBin("data", data)))
+	put(aerospike.NewBin("recovery", digest), aerospike.NewBin("recoveryN", 1), aerospike.NewBin("recoveryPhase", nil))
+	load("missing conflict recovery phase")
+
+	// Damaged cleanup references stop the deletion and keep the root.
+	put(aerospike.NewBin("recoveryRefs", []interface{}{7}))
+	require.ErrorContains(t, s.CompleteConflictIntent(ctx, id), "invalid conflict recovery cleanup reference")
+	put(aerospike.NewBin("recoveryRefs", []interface{}{"a:b:c"}))
+	require.ErrorContains(t, s.CompleteConflictIntent(ctx, id), "invalid conflict recovery cleanup reference")
+	put(aerospike.NewBin("recoveryRefs", []interface{}{"a:zero"}))
+	require.ErrorContains(t, s.CompleteConflictIntent(ctx, id), "invalid conflict recovery cleanup count")
+
+	// A root marked done is finished by the next load and by the next scan.
+	put(aerospike.NewBin("recoveryRefs", []interface{}{digest + ":1"}), aerospike.NewBin("recoveryDone", true))
+	r, lerr := s.LoadConflictRecovery(ctx, id)
+	require.NoError(t, lerr)
+	require.Nil(t, r)
+	r, lerr = s.LoadConflictRecovery(ctx, id)
+	require.NoError(t, lerr)
+	require.Nil(t, r, "the record is gone")
 }

@@ -288,7 +288,7 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	// output of a Conflicting transaction as CONFLICTING (ConflictRecoverySetConflictingChildren pins
 	// both). So collect the children outside the checklist from this first mark: it runs while the
 	// applied winners and restored losers are not Conflicting. A later mark can miss them on SQL.
-	var outside []chainhash.Hash
+	var outside hashSet
 
 	if len(hashes) > 0 {
 		_, children, err := s.SetConflicting(ctx, hashes, true)
@@ -297,9 +297,31 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 		}
 		for _, child := range children {
 			if _, ok := known[child]; !ok {
-				outside = append(outside, child)
+				outside.add(child)
 			}
 		}
+	}
+	// A retry after a failed rollback finds the winners already Conflicting, so on SQL the mark above
+	// reports none of their children. Read the winners' spenders directly: only a winner, applied and
+	// not Conflicting, can have gained a child outside the checklist.
+	if err := forEachConflictRead(ctx, len(r.Winners), func(ctx context.Context, i int) error {
+		m, err := s.Get(ctx, &r.Winners[i], fields.Utxos)
+		if err != nil {
+			return err
+		}
+		if m == nil {
+			return nil
+		}
+		for _, sd := range m.SpendingDatas {
+			if sd != nil && sd.TxID != nil {
+				if _, ok := known[*sd.TxID]; !ok {
+					outside.add(*sd.TxID)
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	var failures []error
 
@@ -383,7 +405,7 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	// A child of a transaction that ends Conflicting spends a conflicting output.
 	var spendsConflicting []chainhash.Hash
 
-	for _, child := range outside {
+	for _, child := range outside.order {
 		m, err := s.Get(ctx, &child, fields.TxInpoints)
 		if err != nil {
 			return nil, err
