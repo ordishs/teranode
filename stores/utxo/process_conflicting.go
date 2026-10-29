@@ -146,7 +146,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 	//
 	// earlier holds what the rollback of an earlier checklist may have changed. On success, marked is
 	// this run's loser set and can miss those transactions, so they go to the evictor instead.
-	var earlier, mayBeMarked []chainhash.Hash
+	var earlier, mayBeMarked, carried []chainhash.Hash
 	defer func() {
 		if err != nil {
 			losers = nil
@@ -218,6 +218,13 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			// partly reversed winner.
 			conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
 			intent.TxHashes = conflictingTxHashes
+			// The caller has not acknowledged the earlier result, so its losers still need their
+			// subtree updates. The new plan skips the winners that are applied and would not find
+			// them again. Keep the ones that are still Conflicting; a reverse restored the others and
+			// the new plan finds them through their winners.
+			if carried, e = conflictingSubset(ctx, s, recovery.Losers); e != nil {
+				return nil, nil, e
+			}
 			// A reverse of this block undid some winners, or stopped part way through one, and did
 			// not retire the checklist. The checklist no longer describes the store, so retire it and
 			// plan again. The new plan takes a new before-image and skips the winners that are applied.
@@ -285,7 +292,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		if e := CompleteConflictIntent(ctx, s, intent.IntentID()); e != nil {
 			return nil, nil, e
 		}
-		return txmap.NewSplitSwissMap(0), nil, nil
+		return loserMap(carried), carried, nil
 	}
 	conflictingTxHashes = pending
 
@@ -304,7 +311,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			if e := CompleteConflictIntent(ctx, s, intent.IntentID()); e != nil {
 				return nil, nil, e
 			}
-			return txmap.NewSplitSwissMap(0), nil, nil
+			return loserMap(carried), carried, nil
 		}
 	}
 	recovery, err = prepareConflictRecovery(ctx, s, affected.order, winningSpends)
@@ -317,6 +324,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			recovery.Losers = append(recovery.Losers, h)
 		}
 	}
+	recovery.Losers = appendNewHashes(recovery.Losers, carried)
 	if err = s.SaveConflictRecovery(ctx, intent.IntentID(), recovery); err != nil {
 		return nil, nil, err
 	}
@@ -952,6 +960,36 @@ func (h *hashSet) has(hash chainhash.Hash) bool {
 }
 
 // appendNewHashes appends the hashes of src that dst does not hold yet.
+// conflictingSubset returns the hashes that are Conflicting in the store, in the given order. A
+// hash the store does not know is left out.
+func conflictingSubset(ctx context.Context, s Store, hashes []chainhash.Hash) ([]chainhash.Hash, error) {
+	var out []chainhash.Hash
+
+	for _, h := range hashes {
+		m, err := s.Get(ctx, &h, fields.Conflicting)
+		if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, errors.NewProcessingError("[ProcessConflicting][%s] error getting tx", h.String(), err)
+		}
+		if m != nil && m.Conflicting {
+			out = append(out, h)
+		}
+	}
+
+	return out, nil
+}
+
+func loserMap(losers []chainhash.Hash) txmap.TxMap {
+	result := txmap.NewSplitSwissMap(len(losers))
+	for _, h := range losers {
+		_ = result.Put(h, 1)
+	}
+
+	return result
+}
+
 func appendNewHashes(dst, src []chainhash.Hash) []chainhash.Hash {
 	var seen hashSet
 	seen.add(dst...)
@@ -982,11 +1020,24 @@ func (h *hashSet) add(hashes ...chainhash.Hash) {
 // winnerIsApplied reports whether the store records the winner as the spender of every one of
 // its inputs, which is the end state of a completed ProcessConflicting run for that winner.
 func winnerIsApplied(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt.Tx) (bool, error) {
-	return winnerInputsOwned(ctx, s, txHash, tx, false)
+	return winnerInputsOwned(ctx, s, txHash, tx, absentParentIsError)
 }
 
-// Confirmed winners may have pruned parents. Other callers still require every input.
-func winnerInputsOwned(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt.Tx, allowPruned bool) (bool, error) {
+// absentParent says what winnerInputsOwned reports for an input whose parent is not in the store.
+type absentParent int
+
+const (
+	// absentParentIsError: an unconfirmed winner needs every parent, so a missing one is an error.
+	absentParentIsError absentParent = iota
+	// absentParentIsOwned: a confirmed winner can have a pruned parent, so the input counts as owned.
+	absentParentIsOwned
+	// absentParentIsNotOwned: a reversed winner cannot be the spender of a pruned parent, so the
+	// input counts as lost. The pruner removes a parent once a confirmed transaction spent every
+	// output, and a Conflicting winner is not confirmed.
+	absentParentIsNotOwned
+)
+
+func winnerInputsOwned(ctx context.Context, s Store, txHash chainhash.Hash, tx *bt.Tx, absent absentParent) (bool, error) {
 	if tx == nil || len(tx.Inputs) == 0 {
 		return false, nil
 	}
@@ -996,8 +1047,13 @@ func winnerInputsOwned(ctx context.Context, s Store, txHash chainhash.Hash, tx *
 		vout := input.PreviousTxOutIndex
 
 		parentMeta, err := s.Get(ctx, parentHash, fields.Utxos)
-		if allowPruned && (errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) || (err == nil && parentMeta == nil)) {
-			continue
+		if errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound) || (err == nil && parentMeta == nil) {
+			switch absent {
+			case absentParentIsOwned:
+				continue
+			case absentParentIsNotOwned:
+				return false, nil
+			}
 		}
 		if err != nil {
 			return false, errors.NewProcessingError("[ProcessConflicting][%s] error getting parent %s to check the winner is applied", txHash.String(), parentHash.String(), err)
@@ -1111,7 +1167,8 @@ func retireConflictIntent(ctx context.Context, s Store, id chainhash.Hash, r *Co
 
 // conflictWinnersReversed reports whether every winner exists, is Conflicting again and no longer
 // owns all its inputs. After an applied operation, only a reverse of its block sets that state: it
-// flags the winners and gives their inputs back. A flag change alone does not count.
+// flags the winners and gives their inputs back. A flag change alone does not count. A parent that
+// the pruner removed after the restored loser was confirmed counts as an input the winner lost.
 func conflictWinnersReversed(ctx context.Context, s Store, winners []chainhash.Hash) (bool, error) {
 	if len(winners) == 0 {
 		return false, nil
@@ -1127,7 +1184,7 @@ func conflictWinnersReversed(ctx context.Context, s Store, winners []chainhash.H
 			return false, nil
 		}
 
-		applied, err := winnerIsApplied(ctx, s, h, m.Tx)
+		applied, err := winnerInputsOwned(ctx, s, h, m.Tx, absentParentIsNotOwned)
 		if err != nil || applied {
 			return false, err
 		}
@@ -1167,7 +1224,7 @@ func splitConfirmedConflictWinners(ctx context.Context, s Store, winners []chain
 			continue
 		}
 
-		applied, err := winnerInputsOwned(ctx, s, h, m.Tx, true)
+		applied, err := winnerInputsOwned(ctx, s, h, m.Tx, absentParentIsOwned)
 		if err != nil {
 			return false, nil, err
 		}
@@ -1232,7 +1289,12 @@ func appliedWinnerOwnsInputs(ctx context.Context, s Store, h chainhash.Hash, m *
 		}
 	}
 
-	return winnerInputsOwned(ctx, s, h, m.Tx, confirmed)
+	absent := absentParentIsError
+	if confirmed {
+		absent = absentParentIsOwned
+	}
+
+	return winnerInputsOwned(ctx, s, h, m.Tx, absent)
 }
 
 // MarkConflictingRecursively marks the given transactions as conflicting, and iteratively marks all their spending

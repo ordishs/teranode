@@ -12,7 +12,9 @@ serializes reorg operations. It does not support concurrent reorg writers.
 A forward intent is keyed by its block hash. Every caller and every retry of the
 block finds the same record, whatever subset of the winners it passes. A caller
 that passes a winner the record does not know, and that is still `Conflicting`,
-makes the operation plan again. The acknowledgement and the retirement of a block
+makes the operation plan again. The new plan keeps the losers of the retired record
+that are still `Conflicting`, in its result and in its own record, because the
+caller has not yet acknowledged their subtree updates. The acknowledgement and the retirement of a block
 compute the ID, so they do not scan the WAL. A reverse intent is keyed by its block
 and its transactions. A record that an older build wrote keeps the key of that
 build; the WAL scan reports it under that key, and it still needs manual repair.
@@ -156,6 +158,11 @@ The winners of a forward operation are mined in the block being added. That bloc
 already on the current chain. The forward rollback therefore ignores that one block
 ID for the winners. It still refuses a winner that is confirmed in any other
 current-chain block, and it still refuses every other transaction.
+
+A stale forward record whose winners a reverse undid is retired. A winner counts as
+reversed when it is `Conflicting` again and no longer owns every input. A parent
+that the pruner removed, after the restored loser was confirmed, counts as a lost
+input; a storage failure keeps the record.
 
 A stale forward record can have winners that the new chain confirms again. When the
 operation was applied and at least one winner is confirmed on the current chain,

@@ -243,7 +243,7 @@ func TestRecoveryHelpers_StoreFailures(t *testing.T) {
 	}}, winners)
 	require.ErrorIs(t, err, errInjected)
 
-	owned, err := winnerInputsOwned(ctx, nilGet, h, bt.NewTx(), false)
+	owned, err := winnerInputsOwned(ctx, nilGet, h, bt.NewTx(), absentParentIsError)
 	require.NoError(t, err)
 	require.False(t, owned, "a transaction without inputs owns nothing")
 

@@ -865,6 +865,50 @@ func TestReplayPendingConflictIntents_ConfirmedPrunedParent(t *testing.T) {
 	}
 }
 
+// A reverse that succeeded but did not retire the finished forward checklist leaves it pending. By
+// the next startup the restored loser is confirmed and the pruner has removed the shared parent. The
+// replay must still see the reversed winner, retire the checklist and let block assembly start.
+func TestReplayPendingConflictIntents_ReversedPrunedParent(t *testing.T) {
+	ctx := t.Context()
+	items := setupBlockAssemblyTest(t)
+	store := items.utxoStore
+	require.NoError(t, store.SetBlockHeight(10))
+	parent := createStaleReverseParent(ctx, t, store, 1)
+	loser := createStaleReverseSpender(ctx, t, store, parent, 0, 90000, true)
+	winner := createStaleReverseSpender(ctx, t, store, parent, 0, 80000, false)
+	addBlockWithMinedSet(ctx, t, items, blockHeader1)
+
+	staleBlock := chainhash.HashH([]byte("reversed-pruned-parent"))
+	winners := []chainhash.Hash{*winner.TxIDChainHash()}
+	_, _, err := utxo.ProcessConflicting(ctx, store, 1, staleBlock, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	_, _, err = utxo.ReverseProcessConflicting(ctx, store, 1, staleBlock, winners)
+	require.NoError(t, err)
+
+	forwardID := utxo.ForwardConflictIntentID(staleBlock)
+	r, err := store.LoadConflictRecovery(ctx, forwardID)
+	require.NoError(t, err)
+	require.Equal(t, utxo.ConflictRecoveryFinished, r.Phase, "the reverse leaves the forward checklist for retirement")
+
+	_, blockMeta, err := items.blockchainClient.GetBlockHeader(ctx, blockHeader1.Hash())
+	require.NoError(t, err)
+	_, err = store.SetMinedMulti(ctx, []*chainhash.Hash{loser.TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: blockMeta.ID, BlockHeight: 1})
+	require.NoError(t, err)
+	require.NoError(t, store.Delete(ctx, parent.TxIDChainHash()))
+
+	failed := items.blockAssembler.replayPendingConflictIntents(ctx)
+	require.Empty(t, failed)
+	require.NoError(t, items.blockAssembler.checkConflictRecoveryReady(ctx, failed))
+
+	r, err = store.LoadConflictRecovery(ctx, forwardID)
+	require.NoError(t, err)
+	require.Nil(t, r, "the replay retires the reversed checklist")
+
+	m, err := store.Get(ctx, winner.TxIDChainHash(), utxofields.Conflicting)
+	require.NoError(t, err)
+	require.True(t, m.Conflicting, "the reversed winner stays reversed")
+}
+
 // An assembler without a UTXO store has no WAL. The startup checks must skip it, as the replay does.
 func TestConflictRecoveryStartupChecks_NilStore(t *testing.T) {
 	b := &BlockAssembler{}

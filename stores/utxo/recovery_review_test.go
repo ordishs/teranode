@@ -34,7 +34,7 @@ func TestRecoveryConfirmedPrunedParent(t *testing.T) {
 	tx.Inputs = []*bt.Input{input}
 	for _, lookupErr := range []error{nil, errors.ErrTxNotFound, errors.ErrNotFound, errors.NewStorageError("offline")} {
 		store := recoveryReadStore{lookupErr: lookupErr}
-		owned, err := winnerInputsOwned(t.Context(), store, winner, tx, true)
+		owned, err := winnerInputsOwned(t.Context(), store, winner, tx, absentParentIsOwned)
 		if lookupErr != nil && !errors.Is(lookupErr, errors.ErrTxNotFound) && !errors.Is(lookupErr, errors.ErrNotFound) {
 			require.Error(t, err)
 			require.False(t, owned)
@@ -44,6 +44,14 @@ func TestRecoveryConfirmedPrunedParent(t *testing.T) {
 		}
 		owned, _ = winnerIsApplied(t.Context(), store, winner, tx)
 		require.False(t, owned, "unconfirmed winners require input ownership")
+
+		owned, err = winnerInputsOwned(t.Context(), store, winner, tx, absentParentIsNotOwned)
+		require.False(t, owned, "a reversed winner does not own a pruned parent")
+		if lookupErr != nil && !errors.Is(lookupErr, errors.ErrTxNotFound) && !errors.Is(lookupErr, errors.ErrNotFound) {
+			require.Error(t, err, "a storage error is not a pruned parent")
+		} else {
+			require.NoError(t, err)
+		}
 	}
 }
 

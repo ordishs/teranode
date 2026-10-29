@@ -925,6 +925,7 @@ func ConflictRecoveryHealStaleForward(t *testing.T, db utxo.Store) {
 		minedW2      bool
 		notReached   bool
 		w1LostInput  bool
+		prunedParent bool
 		guardErr     bool
 		wantRetired  bool
 		wantRollback bool
@@ -937,6 +938,7 @@ func ConflictRecoveryHealStaleForward(t *testing.T, db utxo.Store) {
 		{name: "finished/partial re-mine/not reached", minedW1: true, notReached: true, wantRetired: true},
 		{name: "applied/partial re-mine/not reached", applied: true, minedW1: true, notReached: true, wantRetired: true},
 		{name: "finished/reversed", reverse: true, wantRetired: true},
+		{name: "finished/reversed/parent pruned", reverse: true, prunedParent: true, wantRetired: true},
 		{name: "finished/none confirmed", wantRollback: true},
 		{name: "finished/confirmed winner lost an input", minedW1: true, w1LostInput: true},
 		{name: "finished/guard error", minedW1: true, guardErr: true},
@@ -987,6 +989,14 @@ func ConflictRecoveryHealStaleForward(t *testing.T, db utxo.Store) {
 			if tc.reverse {
 				_, _, err = utxo.ReverseProcessConflicting(ctx, db, 3, block, winners)
 				require.NoError(t, err)
+			}
+
+			// The restored loser was confirmed and its parent, fully spent, was pruned. The heal must
+			// still see the reversed winner and retire the checklist instead of refusing to start.
+			if tc.prunedParent {
+				_, err = db.SetMinedMulti(ctx, []*chainhash.Hash{losers[0].TxIDChainHash()}, utxo.MinedBlockInfo{BlockID: currentBlockID, BlockHeight: 4})
+				require.NoError(t, err)
+				require.NoError(t, db.Delete(ctx, parents[0].TxIDChainHash()))
 			}
 
 			mined := []bool{tc.minedW1, tc.minedW2}
@@ -1046,6 +1056,9 @@ func ConflictRecoveryHealStaleForward(t *testing.T, db utxo.Store) {
 					}
 					require.Equal(t, reversed, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()), "winner %d", i)
 					require.Equal(t, reversed, !crashConflicting(t, ctx, db, losers[i].TxIDChainHash()), "loser %d", i)
+					if tc.prunedParent && i == 0 {
+						continue
+					}
 					want := winnerTxs[i].TxIDChainHash()
 					if reversed {
 						want = losers[i].TxIDChainHash()
@@ -1071,6 +1084,9 @@ func ConflictRecoveryHealStaleForward(t *testing.T, db utxo.Store) {
 
 			if !tc.guardErr && !tc.w1LostInput {
 				for i, parent := range parents {
+					if tc.prunedParent && i == 0 {
+						continue
+					}
 					require.False(t, crashLocked(t, ctx, db, parent.TxIDChainHash()), "parent %d must not stay locked", i)
 				}
 			}
@@ -1460,8 +1476,10 @@ func ConflictRecoveryPartialReverseReadd(t *testing.T, db utxo.Store) {
 			readded, _, err := utxo.ProcessConflicting(ctx, db, 3, block, retryWinners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
 			require.NoError(t, err, "the re-add must plan the reversed winner again")
 			// After a full reverse the loser owns the input again, so the re-add demotes it again. After a
-			// mark only, the loser is still Conflicting and owns nothing, so there is no counter to demote.
-			require.Equal(t, !tc.markOnly, readded.Exists(*losers[0].TxIDChainHash()))
+			// mark only, the loser is still Conflicting and owns nothing, so there is no counter to demote;
+			// the re-add still reports it while the earlier checklist, which recorded it, awaits its
+			// acknowledgement.
+			require.Equal(t, !tc.markOnly || !tc.acknowledged, readded.Exists(*losers[0].TxIDChainHash()))
 
 			for i := range winnerTxs {
 				require.False(t, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()), "winner %d", i)
@@ -1629,9 +1647,11 @@ func ConflictRecoverySupersetWinners(t *testing.T, db utxo.Store) {
 	require.NoError(t, err)
 	require.True(t, first.Exists(*losers[0].TxIDChainHash()))
 
-	second, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	second, secondMarked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
 	require.NoError(t, err)
 	require.True(t, second.Exists(*losers[1].TxIDChainHash()), "the second run must apply the winner the checklist did not know")
+	require.True(t, second.Exists(*losers[0].TxIDChainHash()), "the second run must keep the first run's loser; its subtree update is still pending")
+	require.ElementsMatch(t, []chainhash.Hash{*losers[0].TxIDChainHash(), *losers[1].TxIDChainHash()}, secondMarked)
 
 	for i := range parents {
 		require.Equal(t, winnerTxs[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]), "owner of parent %d", i)
@@ -1642,11 +1662,14 @@ func ConflictRecoverySupersetWinners(t *testing.T, db utxo.Store) {
 	r, err := db.LoadConflictRecovery(ctx, utxo.ForwardConflictIntentID(block))
 	require.NoError(t, err)
 	require.Equal(t, winners[1:], r.Winners, "the new checklist records the winner it applied")
+	require.ElementsMatch(t, []chainhash.Hash{*losers[0].TxIDChainHash(), *losers[1].TxIDChainHash()}, r.Losers, "the replacement checklist keeps the earlier loser until the acknowledgement")
 
 	// A third run with both winners finds every one applied and keeps the saved result.
-	third, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	third, thirdMarked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
 	require.NoError(t, err)
+	require.True(t, third.Exists(*losers[0].TxIDChainHash()))
 	require.True(t, third.Exists(*losers[1].TxIDChainHash()))
+	require.ElementsMatch(t, secondMarked, thirdMarked)
 	require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
 }
 
