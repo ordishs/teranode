@@ -12,9 +12,13 @@ serializes reorg operations. It does not support concurrent reorg writers.
 A forward intent is keyed by its block hash. Every caller and every retry of the
 block finds the same record, whatever subset of the winners it passes. A caller
 that passes a winner the record does not know, and that is still `Conflicting`,
-makes the operation plan again. The new plan keeps the losers of the retired record
-that are still `Conflicting`, in its result and in its own record, because the
-caller has not yet acknowledged their subtree updates. The acknowledgement and the retirement of a block
+makes the operation plan again under the same record. The new plan keeps the losers
+of the earlier checklist that are still `Conflicting`, in its result and in its own
+checklist, because the caller has not yet acknowledged their subtree updates. The
+record is never deleted on the way: the earlier checklist stays until the new plan
+saves its own, and a rollback of the new plan keeps the carried losers, so a crash at
+any point leaves them in the WAL. The checklist names every winner of the block,
+the applied ones included, so a replay with any subset plans them all. The acknowledgement and the retirement of a block
 compute the ID, so they do not scan the WAL. A reverse intent is keyed by its block
 and its transactions. A record that an older build wrote keeps the key of that
 build; the WAL scan reports it under that key, and it still needs manual repair.
@@ -84,8 +88,8 @@ same way, so the next startup does not roll back an operation that has stayed li
 
 A reverse can stop part way: it reversed some winners, or marked a winner
 `Conflicting` before it gave the winner's inputs back. A later re-add of the block,
-or the replay at startup, finds a winner that is `Conflicting` again. It retires the
-forward record and plans again. The new plan takes a new before-image and skips each
+or the replay at startup, finds a winner that is `Conflicting` again. It releases the
+record's locks and plans again under the same record. The new plan takes a new before-image and skips each
 winner that is not `Conflicting` and owns every input, because that winner is
 already applied. This also applies when no forward record is left. At startup,
 replay runs reverse records first. A forward record whose block still has a pending

@@ -438,3 +438,13 @@ func TestConflictRecoveryRollbackStepFailures(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryRollbackStepFailures(t, store)
 }
+
+func TestConflictRecoverySupersetReplanFailure(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoverySupersetReplanFailure(t, store)
+}
+
+func TestConflictRecoveryRollbackRetryTwoWinners(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryRollbackRetryTwoWinners(t, store)
+}

@@ -180,9 +180,20 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		if err = recovery.Validate(); err != nil {
 			return nil, nil, err
 		}
+		// The record's checklist names every winner of the block that an earlier run planned. A
+		// replay must plan them all, whatever subset this caller passes.
+		conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
+		intent.TxHashes = conflictingTxHashes
 		switch recovery.Phase {
-		case ConflictRecoveryPrepared, ConflictRecoveryMutating, ConflictRecoveryRollingBack:
-			if earlier, err = RollbackConflictIntent(ctx, s, intent, options.currentChainGuard); err != nil {
+		case ConflictRecoveryPrepared, ConflictRecoveryMutating, ConflictRecoveryRollingBack, ConflictRecoveryRolledBack:
+			if recovery.Phase != ConflictRecoveryRolledBack {
+				if earlier, err = RollbackConflictIntent(ctx, s, intent, options.currentChainGuard); err != nil {
+					return nil, nil, err
+				}
+			}
+			// The rollback restored this plan's own losers. The losers it carried from an earlier
+			// record of the block are still waiting for their acknowledgement, so carry them again.
+			if carried, err = conflictingSubset(ctx, s, carriedConflictLosers(recovery)); err != nil {
 				return nil, nil, err
 			}
 		case ConflictRecoveryApplied, ConflictRecoveryFinished:
@@ -214,10 +225,6 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			if settled {
 				return finishConflictRecovery(ctx, s, intent, recovery, options.deferCompletion)
 			}
-			// Re-plan every winner whose saved swap is being retired, so a subset cannot abandon a
-			// partly reversed winner.
-			conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
-			intent.TxHashes = conflictingTxHashes
 			// The caller has not acknowledged the earlier result, so its losers still need their
 			// subtree updates. The new plan skips the winners that are applied and would not find
 			// them again. Keep the ones that are still Conflicting; a reverse restored the others and
@@ -226,13 +233,14 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 				return nil, nil, e
 			}
 			// A reverse of this block undid some winners, or stopped part way through one, and did
-			// not retire the checklist. The checklist no longer describes the store, so retire it and
-			// plan again. The new plan takes a new before-image and skips the winners that are applied.
-			if e := retireConflictIntent(ctx, s, intent.IntentID(), recovery); e != nil {
+			// not retire the checklist. The checklist no longer describes the store, so release its
+			// locks and plan again under the same record. The record keeps the earlier checklist, and
+			// the losers it holds, until the new plan saves its own checklist over it: a crash before
+			// that finds the earlier checklist and replays it, a crash after it rolls the new plan
+			// back and keeps the carried losers. The new plan takes a new before-image and skips the
+			// winners that are applied.
+			if e := s.ReleaseConflictLocks(ctx, intent.IntentID(), recovery.Parents); e != nil {
 				return nil, nil, e
-			}
-			if e := s.BeginConflictIntent(ctx, intent); e != nil {
-				return nil, nil, errors.NewProcessingError("failed to record conflict WAL intent", e)
 			}
 		}
 	}
@@ -288,12 +296,11 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		affected.add(h)
 	}
 	if len(pending) == 0 {
-		// Every winner is applied. The intent records no change, so remove it.
-		if e := CompleteConflictIntent(ctx, s, intent.IntentID()); e != nil {
-			return nil, nil, e
-		}
-		return loserMap(carried), carried, nil
+		// Every winner is applied. The intent records no change, so remove it, unless it still has
+		// to hold carried losers until the caller acknowledges them.
+		return finishConflictRecoveryWithCarried(ctx, s, intent, conflictingTxHashes, carried, options.deferCompletion)
 	}
+	allWinners := conflictingTxHashes
 	conflictingTxHashes = pending
 
 	if guard.enabled() {
@@ -308,17 +315,16 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 					options.onRefused(h)
 				}
 			}
-			if e := CompleteConflictIntent(ctx, s, intent.IntentID()); e != nil {
-				return nil, nil, e
-			}
-			return loserMap(carried), carried, nil
+			return finishConflictRecoveryWithCarried(ctx, s, intent, nil, carried, options.deferCompletion)
 		}
 	}
 	recovery, err = prepareConflictRecovery(ctx, s, affected.order, winningSpends)
 	if err != nil {
 		return nil, nil, err
 	}
-	recovery.Winners = append([]chainhash.Hash(nil), conflictingTxHashes...)
+	// The checklist names every winner of the block, the applied ones included, so a replay with
+	// any subset plans them all. Its transactions and spends cover only the pending winners.
+	recovery.Winners = append([]chainhash.Hash(nil), allWinners...)
 	for _, h := range affected.order {
 		if _, isWinner := winnerSet[h]; !isWinner {
 			recovery.Losers = append(recovery.Losers, h)
@@ -959,7 +965,6 @@ func (h *hashSet) has(hash chainhash.Hash) bool {
 	return ok
 }
 
-// appendNewHashes appends the hashes of src that dst does not hold yet.
 // conflictingSubset returns the hashes that are Conflicting in the store, in the given order. A
 // hash the store does not know is left out.
 func conflictingSubset(ctx context.Context, s Store, hashes []chainhash.Hash) ([]chainhash.Hash, error) {
@@ -981,15 +986,45 @@ func conflictingSubset(ctx context.Context, s Store, hashes []chainhash.Hash) ([
 	return out, nil
 }
 
-func loserMap(losers []chainhash.Hash) txmap.TxMap {
-	result := txmap.NewSplitSwissMap(len(losers))
-	for _, h := range losers {
-		_ = result.Put(h, 1)
+// carriedConflictLosers returns the losers of a checklist that are not among its own transactions:
+// the ones it carried from an earlier checklist of the block. Its own losers are restored when it
+// is rolled back; the carried ones are not, because the earlier operation that demoted them stays.
+func carriedConflictLosers(r *ConflictRecovery) []chainhash.Hash {
+	var own hashSet
+	own.add(conflictTransactionHashes(r)...)
+
+	var carried []chainhash.Hash
+
+	for _, h := range r.Losers {
+		if !own.has(h) {
+			carried = append(carried, h)
+		}
 	}
 
-	return result
+	return carried
 }
 
+// finishConflictRecoveryWithCarried ends a run that changed nothing in the store. Without carried
+// losers the record is removed. With them, the record becomes a finished checklist that holds the
+// carried losers until the caller acknowledges their subtree updates, as a finished run does.
+func finishConflictRecoveryWithCarried(ctx context.Context, s Store, intent ConflictIntent, winners, carried []chainhash.Hash, deferCompletion bool) (txmap.TxMap, []chainhash.Hash, error) {
+	if len(carried) == 0 {
+		if err := CompleteConflictIntent(ctx, s, intent.IntentID()); err != nil {
+			return nil, nil, err
+		}
+
+		return txmap.NewSplitSwissMap(0), nil, nil
+	}
+
+	r := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryFinished, Winners: append([]chainhash.Hash(nil), winners...), Losers: append([]chainhash.Hash(nil), carried...)}
+	if err := s.SaveConflictRecovery(ctx, intent.IntentID(), r); err != nil {
+		return nil, nil, err
+	}
+
+	return finishConflictRecovery(ctx, s, intent, r, deferCompletion)
+}
+
+// appendNewHashes appends the hashes of src that dst does not hold yet.
 func appendNewHashes(dst, src []chainhash.Hash) []chainhash.Hash {
 	var seen hashSet
 	seen.add(dst...)

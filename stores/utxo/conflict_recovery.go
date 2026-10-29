@@ -303,8 +303,16 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 	}
 	// A retry after a failed rollback finds the winners already Conflicting, so on SQL the mark above
 	// reports none of their children. Read the winners' spenders directly: only a winner, applied and
-	// not Conflicting, can have gained a child outside the checklist.
+	// not Conflicting, can have gained a child outside the checklist. The reads run in parallel, so
+	// each one fills its own slot and the merge happens after they finish. A winner the checklist
+	// names but does not hold was applied by an earlier checklist of the block, and this rollback
+	// leaves it as it is, so its children stay too.
+	spenders := make([][]chainhash.Hash, len(r.Winners))
+
 	if err := forEachConflictRead(ctx, len(r.Winners), func(ctx context.Context, i int) error {
+		if _, ok := known[r.Winners[i]]; !ok {
+			return nil
+		}
 		m, err := s.Get(ctx, &r.Winners[i], fields.Utxos)
 		if err != nil {
 			return err
@@ -315,13 +323,16 @@ func rollbackConflictRecovery(ctx context.Context, s Store, r *ConflictRecovery,
 		for _, sd := range m.SpendingDatas {
 			if sd != nil && sd.TxID != nil {
 				if _, ok := known[*sd.TxID]; !ok {
-					outside.add(*sd.TxID)
+					spenders[i] = append(spenders[i], *sd.TxID)
 				}
 			}
 		}
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	for _, children := range spenders {
+		outside.add(children...)
 	}
 	var failures []error
 
