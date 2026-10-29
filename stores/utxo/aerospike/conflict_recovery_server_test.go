@@ -7,17 +7,68 @@ import (
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	teranode_aerospike "github.com/bsv-blockchain/teranode/stores/utxo/aerospike"
 	"github.com/bsv-blockchain/teranode/stores/utxo/tests"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/stretchr/testify/require"
 )
 
+// The conflict recovery cases share one Aerospike container. Every case starts from empty UTXO,
+// WAL and checklist sets, so the order of the cases does not matter.
+func TestAerospikeConflictRecovery(t *testing.T) {
+	client, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
+	t.Cleanup(deferFn)
+
+	cases := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"WALPendingScan", func(t *testing.T) { conflictWALPendingScan(t, client, store) }},
+		{"WideCascade", func(t *testing.T) { tests.ConflictRecoveryWideCascade(t, store) }},
+		{"LateLoserChild", func(t *testing.T) { tests.ConflictRecoveryLateLoserChild(t, store) }},
+		{"LateFreeInputSpender", func(t *testing.T) { tests.ConflictRecoveryLateFreeInputSpender(t, store) }},
+		{"OutsiderOwnedInput", func(t *testing.T) { tests.ConflictRecoveryOutsiderOwnedInput(t, store) }},
+		{"EarlyFailure", func(t *testing.T) { tests.ConflictRecoveryEarlyFailure(t, store) }},
+		{"RefusedAfterRollback", func(t *testing.T) { tests.ConflictRecoveryRefusedAfterRollback(t, store) }},
+		{"HealStaleForward", func(t *testing.T) { tests.ConflictRecoveryHealStaleForward(t, store) }},
+		{"SetConflictingChildren", func(t *testing.T) { tests.ConflictRecoverySetConflictingChildren(t, store, true) }},
+		{"ReverseCompletionFailure", func(t *testing.T) { tests.ConflictRecoveryReverseCompletionFailure(t, store) }},
+		{"WinnerWithConflictingChild", func(t *testing.T) { tests.ConflictRecoveryWinnerWithConflictingChild(t, store) }},
+		{"LateWinnerChild", func(t *testing.T) { tests.ConflictRecoveryLateWinnerChild(t, store) }},
+		{"ReverseThenReadd", func(t *testing.T) { tests.ConflictRecoveryReverseThenReadd(t, store) }},
+		{"LegacyIntent", func(t *testing.T) { tests.ConflictRecoveryLegacyIntent(t, store) }},
+		{"CancelledVerify", func(t *testing.T) { tests.ConflictRecoveryCancelledVerify(t, store) }},
+		{"PartialReverseReadd", func(t *testing.T) { tests.ConflictRecoveryPartialReverseReadd(t, store) }},
+		{"FreedInputTaken", func(t *testing.T) { tests.ConflictRecoveryFreedInputTaken(t, store) }},
+		{"BlockKeyedIntent", func(t *testing.T) { tests.ConflictRecoveryBlockKeyedIntent(t, store) }},
+		{"SupersetWinners", func(t *testing.T) { tests.ConflictRecoverySupersetWinners(t, store) }},
+		{"FreedWinningInputTaken", func(t *testing.T) { tests.ConflictRecoveryFreedWinningInputTaken(t, store) }},
+		{"AppliedWinnerPrunedParent", func(t *testing.T) { tests.ConflictRecoveryAppliedWinnerPrunedParent(t, store) }},
+		{"LegacyKey", func(t *testing.T) { tests.ConflictRecoveryLegacyKey(t, store) }},
+		{"RollbackStepFailures", func(t *testing.T) { tests.ConflictRecoveryRollbackStepFailures(t, store) }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanConflictSets(t, client)
+			tc.run(t)
+		})
+	}
+}
+
+// cleanConflictSets empties the UTXO set, the WAL root set and the WAL checklist chunk set.
+func cleanConflictSets(t *testing.T, client *uaerospike.Client) {
+	cleanDB(t, client)
+	cleanSet(t, client, aerospikeSet+"_conflictwal")
+	cleanSet(t, client, aerospikeSet+"_conflictwal_data")
+}
+
 // The pending scan reads only the WAL root. It must not load a checklist, and it must finish the
 // deletion of an intent whose chunk cleanup was interrupted instead of returning it.
-func TestAerospikeConflictWALPendingScan(t *testing.T) {
-	client, store, ctx, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
+func conflictWALPendingScan(t *testing.T, client *uaerospike.Client, store *teranode_aerospike.Store) {
+	ctx := t.Context()
 
 	intent := utxo.ConflictIntent{
 		Recovery:    &utxo.ConflictRecovery{Version: 1, Phase: utxo.ConflictRecoveryPlanning},
@@ -84,158 +135,4 @@ func TestAerospikeConflictWALPendingScan(t *testing.T) {
 	exists, err = client.Exists(nil, chunkKey)
 	require.NoError(t, err)
 	require.False(t, exists, "the scan must finish deleting the checklist chunks")
-}
-
-func TestAerospikeConflictRecoveryWideCascade(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryWideCascade(t, store)
-}
-
-func TestAerospikeConflictRecoveryLateLoserChild(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryLateLoserChild(t, store)
-}
-
-func TestAerospikeConflictRecoveryLateFreeInputSpender(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryLateFreeInputSpender(t, store)
-}
-
-func TestAerospikeConflictRecoveryOutsiderOwnedInput(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryOutsiderOwnedInput(t, store)
-}
-
-func TestAerospikeConflictRecoveryEarlyFailure(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryEarlyFailure(t, store)
-}
-
-func TestAerospikeConflictRecoveryRefusedAfterRollback(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryRefusedAfterRollback(t, store)
-}
-
-func TestAerospikeConflictRecoveryHealStaleForward(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryHealStaleForward(t, store)
-}
-
-func TestAerospikeConflictRecoverySetConflictingChildren(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoverySetConflictingChildren(t, store, true)
-}
-
-func TestAerospikeConflictRecoveryReverseCompletionFailure(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryReverseCompletionFailure(t, store)
-}
-
-func TestAerospikeConflictRecoveryWinnerWithConflictingChild(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryWinnerWithConflictingChild(t, store)
-}
-
-func TestAerospikeConflictRecoveryLateWinnerChild(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryLateWinnerChild(t, store)
-}
-
-func TestAerospikeConflictRecoveryReverseThenReadd(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryReverseThenReadd(t, store)
-}
-
-func TestAerospikeConflictRecoveryLegacyIntent(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryLegacyIntent(t, store)
-}
-
-func TestAerospikeConflictRecoveryCancelledVerify(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryCancelledVerify(t, store)
-}
-
-func TestAerospikeConflictRecoveryPartialReverseReadd(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryPartialReverseReadd(t, store)
-}
-
-func TestAerospikeConflictRecoveryFreedInputTaken(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryFreedInputTaken(t, store)
-}
-
-func TestAerospikeConflictRecoveryBlockKeyedIntent(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryBlockKeyedIntent(t, store)
-}
-
-func TestAerospikeConflictRecoverySupersetWinners(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoverySupersetWinners(t, store)
-}
-
-func TestAerospikeConflictRecoveryFreedWinningInputTaken(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryFreedWinningInputTaken(t, store)
-}
-
-func TestAerospikeConflictRecoveryAppliedWinnerPrunedParent(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryAppliedWinnerPrunedParent(t, store)
-}
-
-func TestAerospikeConflictRecoveryLegacyKey(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryLegacyKey(t, store)
-}
-
-func TestAerospikeConflictRecoveryRollbackStepFailures(t *testing.T) {
-	_, store, _, deferFn := initAerospike(t, test.CreateBaseTestSettings(t), ulogger.NewErrorTestLogger(t))
-	t.Cleanup(deferFn)
-
-	tests.ConflictRecoveryRollbackStepFailures(t, store)
 }
