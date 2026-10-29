@@ -114,9 +114,9 @@ const compensationTimeout = 2 * time.Minute
 // A failure after step 2 restores the recorded owners and flags (RollbackConflictIntent). The
 // intent is keyed by the block, so every caller and retry finds the same checklist. A retry of a run
 // that reached applied or finished skips the mutation and returns the saved result. When a reverse of
-// the block has since made a winner Conflicting again, the retry retires the checklist and plans
-// again. A winner that is not Conflicting and owns every input is already applied, and the plan skips
-// it.
+// the block has since made a winner Conflicting again, or the caller brings a winner the checklist
+// does not know, the retry rolls the checklist back and plans again under the same record. A winner
+// that is not Conflicting and owns every input is already applied, and the plan skips it.
 //
 // ProcessConflicting returns:
 //   - losers: the transactions displaced by the winners, with their descendants. It never contains
@@ -184,19 +184,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		// replay must plan them all, whatever subset this caller passes.
 		conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
 		intent.TxHashes = conflictingTxHashes
-		switch recovery.Phase {
-		case ConflictRecoveryPrepared, ConflictRecoveryMutating, ConflictRecoveryRollingBack, ConflictRecoveryRolledBack:
-			if recovery.Phase != ConflictRecoveryRolledBack {
-				if earlier, err = RollbackConflictIntent(ctx, s, intent, options.currentChainGuard); err != nil {
-					return nil, nil, err
-				}
-			}
-			// The rollback restored this plan's own losers. The losers it carried from an earlier
-			// record of the block are still waiting for their acknowledgement, so carry them again.
-			if carried, err = conflictingSubset(ctx, s, carriedConflictLosers(recovery)); err != nil {
-				return nil, nil, err
-			}
-		case ConflictRecoveryApplied, ConflictRecoveryFinished:
+		if recovery.Phase == ConflictRecoveryApplied || recovery.Phase == ConflictRecoveryFinished {
 			settled, e := conflictWinnersSettled(ctx, s, recovery.Winners, options.currentChainGuard)
 			if e != nil {
 				return nil, nil, e
@@ -225,23 +213,27 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			if settled {
 				return finishConflictRecovery(ctx, s, intent, recovery, options.deferCompletion)
 			}
-			// The caller has not acknowledged the earlier result, so its losers still need their
-			// subtree updates. The new plan skips the winners that are applied and would not find
-			// them again. Keep the ones that are still Conflicting; a reverse restored the others and
-			// the new plan finds them through their winners.
-			if carried, e = conflictingSubset(ctx, s, recovery.Losers); e != nil {
-				return nil, nil, e
+		}
+		// The record describes an operation this run cannot keep: it stopped before it applied, a
+		// reverse of the block undid some of its winners, or the caller brought a winner it does not
+		// know. Roll it back before planning again. The checklist is the only before-image of the
+		// winners it applied, and a new plan skips a winner that is applied, so a new checklist saved
+		// over this one would hold no way to undo them. The rollback restores every recorded owner and
+		// flag under this record, and only then does the new plan take its own before-image. A failure
+		// or crash anywhere before the new checklist saves leaves this record, and the losers it
+		// holds, for the next replay. A planning record holds no before-image and no lock.
+		if recovery.Phase != ConflictRecoveryPlanning && recovery.Phase != ConflictRecoveryRolledBack {
+			if earlier, err = RollbackConflictIntent(ctx, s, intent, options.currentChainGuard); err != nil {
+				return nil, nil, err
 			}
-			// A reverse of this block undid some winners, or stopped part way through one, and did
-			// not retire the checklist. The checklist no longer describes the store, so release its
-			// locks and plan again under the same record. The record keeps the earlier checklist, and
-			// the losers it holds, until the new plan saves its own checklist over it: a crash before
-			// that finds the earlier checklist and replays it, a crash after it rolls the new plan
-			// back and keeps the carried losers. The new plan takes a new before-image and skips the
-			// winners that are applied.
-			if e := s.ReleaseConflictLocks(ctx, intent.IntentID(), recovery.Parents); e != nil {
-				return nil, nil, e
-			}
+		}
+		// The caller has not acknowledged the record's losers. The rollback restored the ones this
+		// record demoted, and the new plan finds them again through their winners. A loser that is
+		// still Conflicting after the rollback was Conflicting before the record, or lost an input to
+		// a new transaction, so the new plan does not find it: carry it into the result and the new
+		// checklist, so the caller gets it again.
+		if carried, err = conflictingSubset(ctx, s, recovery.Losers); err != nil {
+			return nil, nil, err
 		}
 	}
 	winnerSet := make(map[chainhash.Hash]struct{}, len(conflictingTxHashes))
@@ -323,7 +315,9 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		return nil, nil, err
 	}
 	// The checklist names every winner of the block, the applied ones included, so a replay with
-	// any subset plans them all. Its transactions and spends cover only the pending winners.
+	// any subset plans them all. Its transactions and spends cover only the pending winners: an
+	// earlier checklist of the block was rolled back above, so a winner this plan skips was applied
+	// by an operation that is acknowledged or retired, and this record does not answer for it.
 	recovery.Winners = append([]chainhash.Hash(nil), allWinners...)
 	for _, h := range affected.order {
 		if _, isWinner := winnerSet[h]; !isWinner {
@@ -917,7 +911,7 @@ func UnmarkConflictingRecursively(ctx context.Context, s Store, hashes []chainha
 }
 
 // maxRollbackErrors bounds how many individual rollback failures are kept. A failed rollback
-// can produce one error per cascaded transaction, which reached 1.4 MB in issue 4991 and was
+// can produce one error per cascaded transaction, which reached 1.4 MB on a wedged node and was
 // truncated by log pipelines before the MANUAL INTERVENTION REQUIRED marker could be read.
 const maxRollbackErrors = 20
 
@@ -984,24 +978,6 @@ func conflictingSubset(ctx context.Context, s Store, hashes []chainhash.Hash) ([
 	}
 
 	return out, nil
-}
-
-// carriedConflictLosers returns the losers of a checklist that are not among its own transactions:
-// the ones it carried from an earlier checklist of the block. Its own losers are restored when it
-// is rolled back; the carried ones are not, because the earlier operation that demoted them stays.
-func carriedConflictLosers(r *ConflictRecovery) []chainhash.Hash {
-	var own hashSet
-	own.add(conflictTransactionHashes(r)...)
-
-	var carried []chainhash.Hash
-
-	for _, h := range r.Losers {
-		if !own.has(h) {
-			carried = append(carried, h)
-		}
-	}
-
-	return carried
 }
 
 // finishConflictRecoveryWithCarried ends a run that changed nothing in the store. Without carried

@@ -62,7 +62,7 @@ func TestGetMiningCandidate_BlockProcessingStatesBuildOnChainTip(t *testing.T) {
 	}
 }
 
-// TestGetMiningCandidate_StaleTipWhileRunningBuildsOnChainTip covers issue 4991: block assembly
+// TestGetMiningCandidate_StaleTipWhileRunningBuildsOnChainTip covers a block assembly that
 // failed to advance (a ProcessConflicting wedge) and sits idle in StateRunning on an old tip.
 // A candidate built on that tip is an orphan, so the candidate must be an empty block on the
 // Blockchain service tip.

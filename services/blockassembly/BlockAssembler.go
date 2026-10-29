@@ -2251,7 +2251,7 @@ func (b *BlockAssembler) GetMiningCandidate(ctx context.Context) (*model.MiningC
 	}
 
 	// Block assembly is idle but behind the chain: a failed catch-up or move-forward left it on an
-	// older tip, and nothing is moving it forward (issue 4991). A candidate built on that tip is an
+	// older tip, and nothing is moving it forward. A candidate built on that tip is an
 	// orphan, and its transaction set grows without bound because mined transactions are never
 	// removed. Hand out an empty block on the chain tip instead, as for the in-motion states. If
 	// the chain tip cannot be read, fall through: a transient error must not stop mining.

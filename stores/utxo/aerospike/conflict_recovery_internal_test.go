@@ -50,7 +50,7 @@ func restoreTestTxs(t *testing.T, s *Store, outputs int) (parent, child *bt.Tx) 
 }
 
 // RestoreConflictSpends writes the recorded spends with one Lua batch, not one round trip per
-// outpoint: a cascade the size of issue 4991 restores thousands of outpoints.
+// outpoint: a wide cascade restores thousands of outpoints.
 func TestRestoreConflictSpends_OneRoundTripPerBatch(t *testing.T) {
 	s, _ := setupStoreForLockTest(t)
 	ctx := t.Context()

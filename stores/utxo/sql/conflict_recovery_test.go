@@ -444,6 +444,11 @@ func TestConflictRecoverySupersetReplanFailure(t *testing.T) {
 	tests.ConflictRecoverySupersetReplanFailure(t, store)
 }
 
+func TestConflictRecoveryReplanThenHeal(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoveryReplanThenHeal(t, store)
+}
+
 func TestConflictRecoveryRollbackRetryTwoWinners(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryRollbackRetryTwoWinners(t, store)

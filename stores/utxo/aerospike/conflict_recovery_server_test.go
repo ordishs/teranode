@@ -50,6 +50,7 @@ func TestAerospikeConflictRecovery(t *testing.T) {
 		{"RollbackStepFailures", func(t *testing.T) { tests.ConflictRecoveryRollbackStepFailures(t, store) }},
 		{"SupersetReplanFailure", func(t *testing.T) { tests.ConflictRecoverySupersetReplanFailure(t, store) }},
 		{"RollbackRetryTwoWinners", func(t *testing.T) { tests.ConflictRecoveryRollbackRetryTwoWinners(t, store) }},
+		{"ReplanThenHeal", func(t *testing.T) { tests.ConflictRecoveryReplanThenHeal(t, store) }},
 	}
 
 	for _, tc := range cases {

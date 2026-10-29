@@ -935,7 +935,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `MANUAL INTERVENTION REQUIRED` error lists the first 20 rollback failures and a
   count of the rest, instead of one entry per transaction. Log searches that counted
   `rollback step 2 (re-spend` entries find no such entry now. Nodes that are already
-  wedged are not repaired by this change. (#2023, bitcoin-sv/teranode#4991)
+  wedged are not repaired by this change. (#2023)
 
 - **Mining candidates no longer build on a stale block assembly tip.** When block
   assembly is idle but its tip differs from the Blockchain service tip,
@@ -946,7 +946,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   block assembly tip. A shorter gap is the normal delay before block assembly
   hears of a new block. A block assembly tip that is ahead of the Blockchain service
   tip is not counted. Alert on a sustained non-zero rate. If the Blockchain service
-  tip cannot be read, the candidate is built as before. (#2023, bitcoin-sv/teranode#4991)
+  tip cannot be read, the candidate is built as before. (#2023)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
