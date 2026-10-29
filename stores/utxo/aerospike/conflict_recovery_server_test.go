@@ -44,11 +44,11 @@ func TestAerospikeConflictRecovery(t *testing.T) {
 		{"FreedInputTaken", func(t *testing.T) { tests.ConflictRecoveryFreedInputTaken(t, store) }},
 		{"BlockKeyedIntent", func(t *testing.T) { tests.ConflictRecoveryBlockKeyedIntent(t, store) }},
 		{"SupersetWinners", func(t *testing.T) { tests.ConflictRecoverySupersetWinners(t, store) }},
+		{"SupersetRefusedPhases", func(t *testing.T) { tests.ConflictRecoverySupersetRefusedPhases(t, store) }},
 		{"FreedWinningInputTaken", func(t *testing.T) { tests.ConflictRecoveryFreedWinningInputTaken(t, store) }},
 		{"AppliedWinnerPrunedParent", func(t *testing.T) { tests.ConflictRecoveryAppliedWinnerPrunedParent(t, store) }},
 		{"LegacyKey", func(t *testing.T) { tests.ConflictRecoveryLegacyKey(t, store) }},
 		{"RollbackStepFailures", func(t *testing.T) { tests.ConflictRecoveryRollbackStepFailures(t, store) }},
-		{"SupersetReplanFailure", func(t *testing.T) { tests.ConflictRecoverySupersetReplanFailure(t, store) }},
 		{"RollbackRetryTwoWinners", func(t *testing.T) { tests.ConflictRecoveryRollbackRetryTwoWinners(t, store) }},
 		{"ReplanThenHeal", func(t *testing.T) { tests.ConflictRecoveryReplanThenHeal(t, store) }},
 	}

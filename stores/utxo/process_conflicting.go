@@ -113,10 +113,11 @@ const compensationTimeout = 2 * time.Minute
 //
 // A failure after step 2 restores the recorded owners and flags (RollbackConflictIntent). The
 // intent is keyed by the block, so every caller and retry finds the same checklist. A retry of a run
-// that reached applied or finished skips the mutation and returns the saved result. When a reverse of
-// the block has since made a winner Conflicting again, or the caller brings a winner the checklist
-// does not know, the retry rolls the checklist back and plans again under the same record. A winner
-// that is not Conflicting and owns every input is already applied, and the plan skips it.
+// that reached applied or finished skips the mutation and returns the saved result. Additional winners
+// are refused until the caller acknowledges the existing intent after its subtree and queue updates.
+// When a reverse of the block has since made a winner Conflicting again, the retry rolls the checklist
+// back and plans again under the same record. A winner that is not Conflicting and owns every input
+// is already applied, and the plan skips it.
 //
 // ProcessConflicting returns:
 //   - losers: the transactions displaced by the winners, with their descendants. It never contains
@@ -158,15 +159,15 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		}
 	}()
 
-	intent := ConflictIntent{Recovery: &ConflictRecovery{Version: 1, Phase: ConflictRecoveryPlanning}, Kind: ConflictIntentForward, BlockHeight: blockHeight, BlockHash: blockHash, TxHashes: conflictingTxHashes, StartedAt: time.Now().UnixNano()}
+	intent := ConflictIntent{Recovery: &ConflictRecovery{Version: 1, Phase: ConflictRecoveryPlanning, Winners: append([]chainhash.Hash(nil), conflictingTxHashes...)}, Kind: ConflictIntentForward, BlockHeight: blockHeight, BlockHash: blockHash, TxHashes: conflictingTxHashes, StartedAt: time.Now().UnixNano()}
 	recovery, err := s.LoadConflictRecovery(ctx, intent.IntentID())
 	if err != nil {
 		return nil, nil, err
 	}
-	if err = s.BeginConflictIntent(ctx, intent); err != nil {
-		return nil, nil, errors.NewProcessingError("failed to record conflict WAL intent", err)
-	}
 	if recovery == nil {
+		if err = s.BeginConflictIntent(ctx, intent); err != nil {
+			return nil, nil, errors.NewProcessingError("failed to record conflict WAL intent", err)
+		}
 		// Begin gives a new intent a planning checklist and leaves an existing record as it is, so a
 		// record that still has no checklist is a legacy intent. This avoids a scan of the whole WAL.
 		if recovery, err = s.LoadConflictRecovery(ctx, intent.IntentID()); err != nil {
@@ -180,8 +181,20 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		if err = recovery.Validate(); err != nil {
 			return nil, nil, err
 		}
-		// The record's checklist names every winner of the block that an earlier run planned. A
-		// replay must plan them all, whatever subset this caller passes.
+		// Do not roll an unacknowledged operation back merely to add winners. Besides replacing
+		// its pending result, rollback can demote children accepted since its snapshot. The caller
+		// must finish the saved subtree and queue updates and acknowledge this intent first.
+		// Older planning records have no Winners and no before-image or mutations to preserve.
+		if recovery.Phase != ConflictRecoveryPlanning || len(recovery.Winners) > 0 {
+			var known hashSet
+			known.add(recovery.Winners...)
+			for _, h := range conflictingTxHashes {
+				if !known.has(h) {
+					return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] acknowledge the existing conflict intent before adding winners", blockHash.String())
+				}
+			}
+		}
+		// A replay must plan every recorded winner, whatever subset this caller passes.
 		conflictingTxHashes = appendNewHashes(conflictingTxHashes, recovery.Winners)
 		intent.TxHashes = conflictingTxHashes
 		if recovery.Phase == ConflictRecoveryApplied || recovery.Phase == ConflictRecoveryFinished {
@@ -189,35 +202,14 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			if e != nil {
 				return nil, nil, e
 			}
-			// A caller may have filtered its winners differently. The intent is keyed by the block, so
-			// a caller with a winner that the checklist does not know finds this record too. When that
-			// winner is still Conflicting, the saved result does not cover it: plan again. An applied
-			// one was skipped by the run that wrote the checklist, and the plan below checks it again.
-			known := make(map[chainhash.Hash]struct{}, len(recovery.Winners))
-			for _, h := range recovery.Winners {
-				known[h] = struct{}{}
-			}
-			for _, h := range conflictingTxHashes {
-				if _, ok := known[h]; ok {
-					continue
-				}
-				m, e := s.Get(ctx, &h, fields.Conflicting)
-				if e != nil {
-					return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] error getting tx", h.String(), e)
-				}
-				if m != nil && m.Conflicting {
-					settled = false
-					break
-				}
-			}
 			if settled {
 				return finishConflictRecovery(ctx, s, intent, recovery, options.deferCompletion)
 			}
 		}
-		// The record describes an operation this run cannot keep: it stopped before it applied, a
-		// reverse of the block undid some of its winners, or the caller brought a winner it does not
-		// know. Roll it back before planning again. The checklist is the only before-image of the
-		// winners it applied, and a new plan skips a winner that is applied, so a new checklist saved
+		// The record describes an operation this run cannot keep: it stopped before it applied, or a
+		// reverse of the block undid some of its winners. Roll it back before planning again.
+		// The checklist is the only before-image of the winners it applied, and a new plan skips a
+		// winner that is applied, so a new checklist saved
 		// over this one would hold no way to undo them. The rollback restores every recorded owner and
 		// flag under this record, and only then does the new plan take its own before-image. A failure
 		// or crash anywhere before the new checklist saves leaves this record, and the losers it
@@ -307,7 +299,9 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 					options.onRefused(h)
 				}
 			}
-			return finishConflictRecoveryWithCarried(ctx, s, intent, nil, carried, options.deferCompletion)
+			// Retain the admitted winner set even though the guard refused promotion. A
+			// carried result still needs acknowledgement, and replay uses the WAL's input.
+			return finishConflictRecoveryWithCarried(ctx, s, intent, allWinners, carried, options.deferCompletion)
 		}
 	}
 	recovery, err = prepareConflictRecovery(ctx, s, affected.order, winningSpends)

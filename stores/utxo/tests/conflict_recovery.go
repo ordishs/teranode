@@ -855,6 +855,14 @@ func ConflictRecoveryRefusedAfterRollback(t *testing.T, db utxo.Store) {
 			_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
 			require.NoError(t, err)
 
+			// This loser was already flagged before the failed run, so rollback must carry
+			// its still-pending result even when the ancestry guard refuses promotion.
+			preflagged := crashSpendTx(t, loser, 50000)
+			_, _, err = db.SpendAndCreate(ctx, preflagged, 2)
+			require.NoError(t, err)
+			_, _, err = db.SetConflicting(ctx, []chainhash.Hash{*preflagged.TxIDChainHash()}, true)
+			require.NoError(t, err)
+
 			winners := []chainhash.Hash{*winner.TxIDChainHash()}
 			crashed := &failConflictPhase{Store: db, stage: "publish_applied", crash: true}
 			_, _, err = utxo.ProcessConflicting(ctx, crashed, 3, chainhash.Hash{}, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
@@ -881,10 +889,16 @@ func ConflictRecoveryRefusedAfterRollback(t *testing.T, db utxo.Store) {
 			require.Contains(t, evicted, *winner.TxIDChainHash(), "the rollback flagged the winner")
 
 			if refused {
-				require.Zero(t, losers.Length())
-				require.Empty(t, marked, "marked is the loser set of this run, and the guard refused every loser")
+				require.True(t, losers.Exists(*preflagged.TxIDChainHash()), "the pre-existing pending loser is still returned")
+				require.ElementsMatch(t, []chainhash.Hash{*preflagged.TxIDChainHash()}, marked)
+				// Startup passes the WAL's original input. Refusal must keep those identities
+				// so an ordinary replay is not mistaken for adding winners.
+				replayed, _, err := utxo.ProcessConflicting(ctx, db, 3, chainhash.Hash{}, winners, nil, guard, utxo.WithDeferredConflictCompletion())
+				require.NoError(t, err)
+				require.True(t, replayed.Exists(*preflagged.TxIDChainHash()))
 				require.True(t, crashConflicting(t, ctx, db, winner.TxIDChainHash()))
 				require.Equal(t, loser.TxIDChainHash(), crashSpender(t, ctx, db, parent))
+				require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, chainhash.Hash{}))
 				return
 			}
 
@@ -1621,9 +1635,9 @@ func ConflictRecoveryBlockKeyedIntent(t *testing.T, db utxo.Store) {
 	}
 }
 
-// ConflictRecoverySupersetWinners finishes a block with winner W1 and then runs the block again with
-// W1 and W2. The intent is keyed by the block, so the second run finds the finished checklist. W2 is
-// not in it, so the run must plan again and apply W2 instead of returning the saved result.
+// ConflictRecoverySupersetWinners refuses additional winners until the caller acknowledges the
+// first result. A child accepted after W1 was applied must stay valid throughout refusal, retry,
+// acknowledgement and the next operation that applies W2.
 func ConflictRecoverySupersetWinners(t *testing.T, db utxo.Store) {
 	ctx := t.Context()
 	var parents, losers, winnerTxs []*bt.Tx
@@ -1643,35 +1657,101 @@ func ConflictRecoverySupersetWinners(t *testing.T, db utxo.Store) {
 	}
 
 	block := chainhash.HashH([]byte("superset-winners"))
+	id := utxo.ForwardConflictIntentID(block)
 	winners := []chainhash.Hash{*winnerTxs[0].TxIDChainHash(), *winnerTxs[1].TxIDChainHash()}
-	first, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners[:1], nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	first, firstMarked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners[:1], nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
 	require.NoError(t, err)
 	require.True(t, first.Exists(*losers[0].TxIDChainHash()))
+	before, err := db.LoadConflictRecovery(ctx, id)
+	require.NoError(t, err)
+
+	child := crashSpendTx(t, winnerTxs[0], 60000)
+	_, _, err = db.SpendAndCreate(ctx, child, 3)
+	require.NoError(t, err)
+
+	// Both completion modes must refuse. A caller cannot bypass acknowledgement by asking the
+	// superset operation to complete its WAL immediately.
+	for _, deferred := range []bool{false, true} {
+		var evicted []chainhash.Hash
+		opts := []utxo.ProcessConflictingOption{utxo.WithConflictEvictor(func(h []chainhash.Hash) { evicted = append(evicted, h...) })}
+		if deferred {
+			opts = append(opts, utxo.WithDeferredConflictCompletion())
+		}
+		result, marked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, opts...)
+		require.ErrorContains(t, err, "acknowledge the existing conflict intent before adding winners")
+		require.Nil(t, result)
+		require.Empty(t, marked, "refusal must not evict valid transactions")
+		require.Empty(t, evicted)
+		after, err := db.LoadConflictRecovery(ctx, id)
+		require.NoError(t, err)
+		require.Equal(t, before, after, "refusal preserves the before-image and pending losers")
+		require.Equal(t, winnerTxs[0].TxIDChainHash(), crashSpender(t, ctx, db, parents[0]))
+		require.Equal(t, losers[1].TxIDChainHash(), crashSpender(t, ctx, db, parents[1]))
+		require.False(t, crashConflicting(t, ctx, db, child.TxIDChainHash()))
+		require.False(t, crashConflicting(t, ctx, db, winnerTxs[0].TxIDChainHash()))
+		require.True(t, crashConflicting(t, ctx, db, winnerTxs[1].TxIDChainHash()))
+	}
+
+	// The caller can still recover the original result and finish its subtree and queue updates.
+	again, marked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners[:1], nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+	require.NoError(t, err)
+	require.True(t, again.Exists(*losers[0].TxIDChainHash()))
+	require.ElementsMatch(t, firstMarked, marked)
+	require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
 
 	second, secondMarked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
 	require.NoError(t, err)
-	require.True(t, second.Exists(*losers[1].TxIDChainHash()), "the second run must apply the winner the checklist did not know")
-	require.True(t, second.Exists(*losers[0].TxIDChainHash()), "the second run must keep the first run's loser; its subtree update is still pending")
-	require.ElementsMatch(t, []chainhash.Hash{*losers[0].TxIDChainHash(), *losers[1].TxIDChainHash()}, secondMarked)
-
+	require.True(t, second.Exists(*losers[1].TxIDChainHash()))
+	require.False(t, second.Exists(*losers[0].TxIDChainHash()), "the earlier loser was acknowledged")
+	require.ElementsMatch(t, []chainhash.Hash{*losers[1].TxIDChainHash()}, secondMarked)
 	for i := range parents {
-		require.Equal(t, winnerTxs[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]), "owner of parent %d", i)
-		require.False(t, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()), "winner %d", i)
-		require.True(t, crashConflicting(t, ctx, db, losers[i].TxIDChainHash()), "loser %d", i)
+		require.Equal(t, winnerTxs[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]))
+		require.False(t, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()))
+		require.True(t, crashConflicting(t, ctx, db, losers[i].TxIDChainHash()))
 	}
-
-	r, err := db.LoadConflictRecovery(ctx, utxo.ForwardConflictIntentID(block))
-	require.NoError(t, err)
-	require.ElementsMatch(t, winners, r.Winners, "the replacement checklist records every winner of the block, so a replay plans them all")
-	require.ElementsMatch(t, []chainhash.Hash{*losers[0].TxIDChainHash(), *losers[1].TxIDChainHash()}, r.Losers, "the replacement checklist keeps the earlier loser until the acknowledgement")
-
-	// A third run with both winners finds every one applied and keeps the saved result.
-	third, thirdMarked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
-	require.NoError(t, err)
-	require.True(t, third.Exists(*losers[0].TxIDChainHash()))
-	require.True(t, third.Exists(*losers[1].TxIDChainHash()))
-	require.ElementsMatch(t, secondMarked, thirdMarked)
 	require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
+	require.False(t, crashConflicting(t, ctx, db, child.TxIDChainHash()), "the accepted child stays valid after WAL completion")
+	require.Equal(t, child.TxIDChainHash(), crashSpender(t, ctx, db, winnerTxs[0]))
+}
+
+// ConflictRecoverySupersetRefusedPhases checks the admission rule for every durable phase. The
+// new winner need not exist: refusal must precede transaction reads as well as recovery writes.
+func ConflictRecoverySupersetRefusedPhases(t *testing.T, db utxo.Store) {
+	ctx := t.Context()
+	for _, phase := range []string{utxo.ConflictRecoveryPlanning, utxo.ConflictRecoveryPrepared,
+		utxo.ConflictRecoveryMutating, utxo.ConflictRecoveryRollingBack, utxo.ConflictRecoveryRolledBack,
+		utxo.ConflictRecoveryApplied, utxo.ConflictRecoveryFinished} {
+		t.Run(phase, func(t *testing.T) {
+			block := chainhash.HashH([]byte("superset-refused-" + phase))
+			winner := chainhash.HashH([]byte("recorded-winner-" + phase))
+			extra := chainhash.HashH([]byte("unknown-winner-" + phase))
+			r := &utxo.ConflictRecovery{Version: 1, Phase: phase, Winners: []chainhash.Hash{winner}}
+			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHash: block, TxHashes: r.Winners,
+				Recovery: &utxo.ConflictRecovery{Version: 1, Phase: utxo.ConflictRecoveryPlanning, Winners: r.Winners}}
+			if phase == utxo.ConflictRecoveryPlanning {
+				// Exercise the production Begin path: discovery fails because the winner is
+				// absent, but its identity must already be durable for the admission check.
+				_, _, err := utxo.ProcessConflicting(ctx, db, 3, block, r.Winners, nil, utxo.NoAncestryGuard)
+				require.ErrorContains(t, err, "error getting tx")
+				loaded, err := db.LoadConflictRecovery(ctx, intent.IntentID())
+				require.NoError(t, err)
+				require.Equal(t, r, loaded)
+			} else {
+				require.NoError(t, db.BeginConflictIntent(ctx, intent))
+				require.NoError(t, db.SaveConflictRecovery(ctx, intent.IntentID(), r))
+			}
+			before, err := db.PendingConflictIntents(ctx)
+			require.NoError(t, err)
+			result, marked, err := utxo.ProcessConflicting(ctx, db, 3, block, []chainhash.Hash{winner, extra}, nil, utxo.NoAncestryGuard)
+			require.ErrorContains(t, err, "acknowledge the existing conflict intent before adding winners")
+			require.Nil(t, result)
+			require.Empty(t, marked)
+			after, err := db.PendingConflictIntents(ctx)
+			require.NoError(t, err)
+			require.Equal(t, before, after, "the intent and recovery checklist must be unchanged")
+			require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
+		})
+	}
 }
 
 // ConflictRecoveryFreedWinningInputTaken rolls back a finished forward operation after a new
@@ -1939,198 +2019,18 @@ func ConflictRecoveryRollbackStepFailures(t *testing.T, db utxo.Store) {
 	}
 }
 
-// failReplanStep fails one store step of a re-plan over an earlier checklist of the block. The
-// re-plan rolls that checklist back, saves a replacement checklist and then mutates. The steps
-// before the replacement save are "rollback mark", "rollback unspend", "rolled back save" and
-// "replacement save". The steps after it are "lock", "mutating save", "mark" and "unspend". The
-// replacement save arms the later steps, so a step name is not confused with the same store call
-// inside the rollback. With crash set, the deferred rollback of the replacement stops before it
-// changes anything, as a process that dies after the failure does.
-type failReplanStep struct {
-	utxo.Store
-	stage string
-	crash bool
-	armed bool
-	fired bool
-}
-
-func (s *failReplanStep) fail(stage string) error {
-	if s.stage == stage && !s.fired {
-		s.fired = true
-		return errors.NewStorageError("injected replan failure at %s", stage)
-	}
-
-	return nil
-}
-
-func (s *failReplanStep) SaveConflictRecovery(ctx context.Context, id chainhash.Hash, r *utxo.ConflictRecovery) error {
-	switch r.Phase {
-	case utxo.ConflictRecoveryRollingBack:
-		if s.crash && s.fired {
-			return errors.NewStorageError("process stopped before compensation")
-		}
-	case utxo.ConflictRecoveryRolledBack:
-		if err := s.fail("rolled back save"); err != nil {
-			return err
-		}
-	case utxo.ConflictRecoveryPrepared:
-		if err := s.fail("replacement save"); err != nil {
-			return err
-		}
-
-		s.armed = true
-	case utxo.ConflictRecoveryMutating:
-		if err := s.fail("mutating save"); err != nil {
-			return err
-		}
-	}
-
-	return s.Store.SaveConflictRecovery(ctx, id, r)
-}
-
-func (s *failReplanStep) SetConflictLocks(ctx context.Context, id chainhash.Hash, parents []chainhash.Hash, value bool) error {
-	if value && s.armed {
-		if err := s.fail("lock"); err != nil {
-			return err
-		}
-	}
-
-	return s.Store.SetConflictLocks(ctx, id, parents, value)
-}
-
-func (s *failReplanStep) SetConflicting(ctx context.Context, hashes []chainhash.Hash, value bool) ([]*utxo.Spend, []chainhash.Hash, error) {
-	spends, children, err := s.Store.SetConflicting(ctx, hashes, value)
-	if err != nil || !value {
-		return spends, children, err
-	}
-
-	if s.armed {
-		return spends, children, s.fail("mark")
-	}
-
-	return spends, children, s.fail("rollback mark")
-}
-
-func (s *failReplanStep) Unspend(ctx context.Context, spends []*utxo.Spend, locked ...bool) error {
-	if err := s.Store.Unspend(ctx, spends, locked...); err != nil {
-		return err
-	}
-
-	if s.armed {
-		return s.fail("unspend")
-	}
-
-	return s.fail("rollback unspend")
-}
-
-// ConflictRecoverySupersetReplanFailure runs a block with W1, then again with W1 and W2, and fails
-// the second run at each store step: in the rollback of the first checklist, at the saves around
-// it, at the replacement save, and in the mutation after it. L1's subtree update is not yet
-// acknowledged, so the WAL must name L1 at every point, and it must hold enough to undo every
-// applied winner: after the crash replay rolls the record back, L1 and L2 own their inputs again.
-// A clean retry then applies both winners and reports both losers.
-func ConflictRecoverySupersetReplanFailure(t *testing.T, db utxo.Store) {
-	cases := []struct {
-		name  string
-		crash bool
-		phase string
-	}{
-		{name: "rollback mark", phase: utxo.ConflictRecoveryRollingBack},
-		{name: "rollback unspend", phase: utxo.ConflictRecoveryRollingBack},
-		{name: "rolled back save", phase: utxo.ConflictRecoveryRollingBack},
-		{name: "replacement save", phase: utxo.ConflictRecoveryRolledBack},
-		{name: "lock", phase: utxo.ConflictRecoveryRolledBack},
-		{name: "mutating save", phase: utxo.ConflictRecoveryRolledBack},
-		{name: "mark", phase: utxo.ConflictRecoveryRolledBack},
-		{name: "unspend", crash: true, phase: utxo.ConflictRecoveryMutating},
-	}
-
-	for index, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := t.Context()
-			var parents, losers, winnerTxs []*bt.Tx
-			for i := 0; i < 2; i++ {
-				parent := crashParentTx(0x90 + byte(index)*2 + byte(i))
-				_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
-				require.NoError(t, err)
-				loser := crashSpendTx(t, parent, 80000)
-				_, _, err = db.SpendAndCreate(ctx, loser, 2)
-				require.NoError(t, err)
-				winner := crashSpendTx(t, parent, 70000)
-				_, _, err = db.SpendAndCreate(ctx, winner, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
-				require.NoError(t, err)
-				parents = append(parents, parent)
-				losers = append(losers, loser)
-				winnerTxs = append(winnerTxs, winner)
-			}
-
-			block := chainhash.HashH([]byte("superset-replan-failure-" + tc.name))
-			id := utxo.ForwardConflictIntentID(block)
-			winners := []chainhash.Hash{*winnerTxs[0].TxIDChainHash(), *winnerTxs[1].TxIDChainHash()}
-			l1, l2 := *losers[0].TxIDChainHash(), *losers[1].TxIDChainHash()
-			_, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners[:1], nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
-			require.NoError(t, err)
-
-			step := &failReplanStep{Store: db, stage: tc.name, crash: tc.crash}
-			_, _, err = utxo.ProcessConflicting(ctx, step, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
-			require.ErrorContains(t, err, "injected replan failure at "+tc.name)
-			require.True(t, step.fired, "the step must fire where the case says")
-
-			r, err := db.LoadConflictRecovery(ctx, id)
-			require.NoError(t, err)
-			require.NotNil(t, r, "the block keeps its record")
-			require.Equal(t, tc.phase, r.Phase, "the failure, or the deferred rollback after it, leaves the record in this phase")
-			require.Contains(t, r.Losers, l1, "the record keeps L1 after the failure")
-			require.Contains(t, r.Winners, winners[0], "the record keeps W1 after the failure")
-
-			// A crash replay rolls the record back. Whichever checklist the record holds, it must undo
-			// every winner that is applied: both losers own their inputs again.
-			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: block, TxHashes: winners}
-			_, err = utxo.RollbackConflictIntent(ctx, db, intent)
-			require.NoError(t, err)
-			r, err = db.LoadConflictRecovery(ctx, id)
-			require.NoError(t, err)
-			require.Equal(t, utxo.ConflictRecoveryRolledBack, r.Phase)
-			require.Contains(t, r.Losers, l1, "the rolled-back record keeps L1")
-			for i := range parents {
-				require.Equal(t, losers[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]), "the rollback restores the owner of parent %d", i)
-				require.True(t, crashConflicting(t, ctx, db, winnerTxs[i].TxIDChainHash()), "winner %d is undone", i)
-				require.False(t, crashConflicting(t, ctx, db, losers[i].TxIDChainHash()), "loser %d is restored", i)
-			}
-
-			result, marked, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
-			require.NoError(t, err, "a clean retry applies both winners")
-			require.True(t, result.Exists(l1), "the retry reports L1")
-			require.True(t, result.Exists(l2), "the retry reports L2")
-			require.ElementsMatch(t, []chainhash.Hash{l1, l2}, marked)
-
-			r, err = db.LoadConflictRecovery(ctx, id)
-			require.NoError(t, err)
-			require.ElementsMatch(t, []chainhash.Hash{l1, l2}, r.Losers)
-			require.ElementsMatch(t, winners, r.Winners)
-			for i := range parents {
-				require.Equal(t, winnerTxs[i].TxIDChainHash(), crashSpender(t, ctx, db, parents[i]), "owner of parent %d", i)
-				require.False(t, crashLocked(t, ctx, db, parents[i].TxIDChainHash()), "parent %d must not stay locked", i)
-			}
-			require.NoError(t, utxo.CompleteConflictIntentsForBlock(ctx, db, block))
-		})
-	}
-}
-
 // ConflictRecoveryReplanThenHeal plans a block again over an earlier checklist that applied W1,
-// and then heals the block as stale. The re-plan happens for a caller that brings W2, for a reverse
-// that undid W1, and for a mark that left W1 Conflicting but still the spender. After each re-plan
+// and then heals the block as stale. The re-plan happens for a reverse that undid W1, and for a
+// mark that left W1 Conflicting but still the spender. After each re-plan
 // the record must hold the before-image of every applied winner, so the heal restores L1 and L2 as
 // the owners of their inputs. A record that kept only W2's before-image would leave W1 applied and
 // L1 Conflicting with no record to undo them.
 func ConflictRecoveryReplanThenHeal(t *testing.T, db utxo.Store) {
 	cases := []struct {
 		name     string
-		superset bool
 		reverse  bool
 		markOnly bool
 	}{
-		{name: "superset", superset: true},
 		{name: "W1 reversed", reverse: true},
 		{name: "W1 marked only", markOnly: true},
 	}
@@ -2157,11 +2057,7 @@ func ConflictRecoveryReplanThenHeal(t *testing.T, db utxo.Store) {
 			block := chainhash.HashH([]byte("replan-then-heal-" + tc.name))
 			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHeight: 3, BlockHash: block}
 			winners := []chainhash.Hash{*winnerTxs[0].TxIDChainHash(), *winnerTxs[1].TxIDChainHash()}
-			first := winners
-			if tc.superset {
-				first = winners[:1]
-			}
-			_, _, err := utxo.ProcessConflicting(ctx, db, 3, block, first, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
+			_, _, err := utxo.ProcessConflicting(ctx, db, 3, block, winners, nil, utxo.NoAncestryGuard, utxo.WithDeferredConflictCompletion())
 			require.NoError(t, err)
 
 			if tc.reverse {

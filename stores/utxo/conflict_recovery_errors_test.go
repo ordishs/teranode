@@ -276,7 +276,7 @@ func TestProcessConflicting_EntryFailures(t *testing.T) {
 	_, _, err := ProcessConflicting(ctx, errStore{load: func(chainhash.Hash) (*ConflictRecovery, error) { return nil, errInjected }}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard)
 	require.ErrorIs(t, err, errInjected)
 
-	_, _, err = ProcessConflicting(ctx, errStore{load: loadPlanning, begin: func(ConflictIntent) error { return errInjected }}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard)
+	_, _, err = ProcessConflicting(ctx, errStore{load: func(chainhash.Hash) (*ConflictRecovery, error) { return nil, nil }, begin: func(ConflictIntent) error { return errInjected }}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard)
 	require.ErrorContains(t, err, "failed to record conflict WAL intent")
 
 	_, _, err = ProcessConflicting(ctx, errStore{load: loadPlanning, begin: beginOK, get: func(*chainhash.Hash, ...fields.FieldName) (*meta.Data, error) { return nil, nil }}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard)
@@ -297,7 +297,7 @@ func TestProcessConflicting_EntryFailures(t *testing.T) {
 		counter: func(chainhash.Hash) ([]chainhash.Hash, error) { return nil, errInjected }}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard)
 	require.ErrorContains(t, err, "error getting counter conflicting txs")
 
-	// A finished checklist whose unknown winner cannot be read.
+	// A finished checklist refuses an unknown winner without reading transaction state.
 	finished := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryFinished, Winners: []chainhash.Hash{{5}}}
 	calls := 0
 	_, _, err = ProcessConflicting(ctx, errStore{load: func(chainhash.Hash) (*ConflictRecovery, error) { return finished, nil }, begin: beginOK,
@@ -308,6 +308,6 @@ func TestProcessConflicting_EntryFailures(t *testing.T) {
 			}
 			return nil, errInjected
 		}}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard, WithRecoveryChainGuard(NewCurrentChainGuard(func(context.Context, []uint32) (bool, error) { return true, nil })))
-	require.ErrorIs(t, err, errInjected)
-	require.Positive(t, calls)
+	require.ErrorContains(t, err, "acknowledge the existing conflict intent before adding winners")
+	require.Zero(t, calls)
 }

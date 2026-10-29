@@ -144,7 +144,7 @@ func (s *Store) LoadConflictRecovery(ctx context.Context, id chainhash.Hash) (*u
 	if err != nil {
 		return nil, err
 	}
-	record, err := s.client.Get(nil, key, "recovery", "recoveryN", "recoveryPhase", "recoveryDone")
+	record, err := s.client.Get(nil, key, "recovery", "recoveryN", "recoveryPhase", "recoveryDone", walBinTxHashes)
 	if err != nil {
 		if err.Matches(types.KEY_NOT_FOUND_ERROR) {
 			return nil, nil
@@ -158,7 +158,17 @@ func (s *Store) LoadConflictRecovery(ctx context.Context, id chainhash.Hash) (*u
 		return nil, nil
 	}
 	if record != nil && record.Bins["recoveryPhase"] == utxo.ConflictRecoveryPlanning {
-		return &utxo.ConflictRecovery{Version: 1, Phase: utxo.ConflictRecoveryPlanning}, nil
+		// Begin already persists the requested winners in the root. Keep them on planning
+		// retries too, so a failed discovery cannot admit additional winners under this intent.
+		data, ok := record.Bins[walBinTxHashes].([]byte)
+		if !ok {
+			return nil, errors.NewStorageError("invalid planning conflict winners")
+		}
+		winners, err := decodeIntentHashes(data)
+		if err != nil {
+			return nil, err
+		}
+		return &utxo.ConflictRecovery{Version: 1, Phase: utxo.ConflictRecoveryPlanning, Winners: winners}, nil
 	}
 	if record == nil || record.Bins["recovery"] == nil {
 		return nil, nil

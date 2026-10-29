@@ -387,6 +387,11 @@ func TestConflictRecoverySupersetWinners(t *testing.T) {
 	tests.ConflictRecoverySupersetWinners(t, store)
 }
 
+func TestConflictRecoverySupersetRefusedPhases(t *testing.T) {
+	store, _ := newTestStore(t)
+	tests.ConflictRecoverySupersetRefusedPhases(t, store)
+}
+
 func TestConflictRecoveryFreedWinningInputTaken(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryFreedWinningInputTaken(t, store)
@@ -437,11 +442,6 @@ func TestConflictRecovery_SQLErrorBranches(t *testing.T) {
 func TestConflictRecoveryRollbackStepFailures(t *testing.T) {
 	store, _ := newTestStore(t)
 	tests.ConflictRecoveryRollbackStepFailures(t, store)
-}
-
-func TestConflictRecoverySupersetReplanFailure(t *testing.T) {
-	store, _ := newTestStore(t)
-	tests.ConflictRecoverySupersetReplanFailure(t, store)
 }
 
 func TestConflictRecoveryReplanThenHeal(t *testing.T) {

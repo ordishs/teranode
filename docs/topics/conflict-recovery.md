@@ -13,15 +13,22 @@ A forward intent is keyed by its block hash. Every caller and every retry of the
 block finds the same record, whatever subset of the winners it passes. The record
 keeps one invariant at every durable step: its checklist holds the before-image of
 every winner it applied, and it names every loser that the caller has not yet
-acknowledged. A caller that passes a winner the record does not know, and that is
-still `Conflicting`, makes the operation plan again. The operation first rolls the
-earlier checklist back under the same record, so no applied winner is left without a
-before-image, and only then takes a new before-image of every winner. A loser of the
-earlier checklist that is still `Conflicting` after the rollback goes into the new
-result and the new checklist, because the caller has not yet acknowledged its subtree
-update. The record is never deleted on the way: a crash before the new checklist saves
-leaves the earlier one, rolled back or not, for the next replay. The checklist names
-every winner of the block, so a replay with any subset plans them all. The
+acknowledged. A caller that passes any additional winner receives an error before
+transaction reads or state changes, even if that winner is already applied. The
+caller must first recover the saved result using the recorded winners (or a subset),
+finish its subtree and queue updates, and acknowledge the existing intent with
+`CompleteConflictIntentsForBlock`. Only then may it submit additional winners as a
+new operation. Do not delete an unfinished record to bypass this check. Superset
+replanning is not supported: rolling back an applied winner just to add another
+winner can incorrectly demote a child accepted since the original snapshot.
+
+New planning records also save their requested winners, so the same admission rule
+applies if discovery or snapshotting fails. Older planning records without winners
+can still be planned because they hold no before-image and have changed no state.
+A retry after failure or partial reverse retains the original winner set and rolls
+the earlier checklist back before taking a new before-image. Its still-conflicting
+losers carry into the new result until acknowledged. The record is never deleted
+between rollback and saving the replacement checklist. The
 acknowledgement and the retirement of a block compute the ID, so they do not scan
 the WAL. A reverse intent is keyed by its block
 and its transactions. A record that an older build wrote keeps the key of that
