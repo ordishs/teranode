@@ -43,9 +43,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   store implementation. Do not downgrade while new conflict intents are pending.
   A forward intent is now keyed by its block hash, so acknowledgement needs no WAL
   scan; a record written by an older build keeps its old key. Store callers that add
-  winners to a block with a pending forward intent now receive an error. Finish the
+  a winner that is still Conflicting to a block with a pending forward intent now
+  receive an error. A winner that is already applied is dropped. Finish the
   saved result's subtree and queue updates and acknowledge the intent with
-  `CompleteConflictIntentsForBlock` before submitting additional winners. Legacy
+  `CompleteConflictIntentsForBlock` before submitting additional Conflicting winners. Legacy
   forward intents have no before-image and require operator repair;
   unresolved intents now prevent BlockAssembly startup, and so does an intent whose
   replay failed at startup, even when its checklist reads finished. Preserve the WAL

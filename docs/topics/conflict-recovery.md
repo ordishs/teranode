@@ -13,8 +13,12 @@ A forward intent is keyed by its block hash. Every caller and every retry of the
 block finds the same record, whatever subset of the winners it passes. The record
 keeps one invariant at every durable step: its checklist holds the before-image of
 every winner it applied, and it names every loser that the caller has not yet
-acknowledged. A caller that passes any additional winner receives an error before
-transaction reads or state changes, even if that winner is already applied. The
+acknowledged. A caller that passes an additional winner that is still Conflicting
+receives an error before any state change. An additional winner that is already
+applied (not Conflicting, and the spender of every input) is dropped, because
+`reorgBlocks` can record a subset of a block's winners and a later reset or catch-up
+passes the full list. An additional winner that is not Conflicting but lost an input
+is an error. To add a Conflicting winner, the
 caller must first recover the saved result using the recorded winners (or a subset),
 finish its subtree and queue updates, and acknowledge the existing intent with
 `CompleteConflictIntentsForBlock`. Only then may it submit additional winners as a
