@@ -297,17 +297,68 @@ func TestProcessConflicting_EntryFailures(t *testing.T) {
 		counter: func(chainhash.Hash) ([]chainhash.Hash, error) { return nil, errInjected }}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard)
 	require.ErrorContains(t, err, "error getting counter conflicting txs")
 
-	// A finished checklist refuses an unknown winner without reading transaction state.
+	// A finished checklist refuses an unknown winner that is still Conflicting, before it reads
+	// the recorded winners.
 	finished := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryFinished, Winners: []chainhash.Hash{{5}}}
+	loadFinished := func(chainhash.Hash) (*ConflictRecovery, error) { return finished, nil }
+	confirmed := WithRecoveryChainGuard(NewCurrentChainGuard(func(context.Context, []uint32) (bool, error) { return true, nil }))
 	calls := 0
-	_, _, err = ProcessConflicting(ctx, errStore{load: func(chainhash.Hash) (*ConflictRecovery, error) { return finished, nil }, begin: beginOK,
+	_, _, err = ProcessConflicting(ctx, errStore{load: loadFinished, begin: beginOK,
 		get: func(hh *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
 			calls++
-			if hh.IsEqual(&chainhash.Hash{5}) {
-				return &meta.Data{Tx: tx, Conflicting: false}, nil
+			if hh.IsEqual(&h) {
+				return &meta.Data{Tx: tx, Conflicting: true}, nil
 			}
 			return nil, errInjected
-		}}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard, WithRecoveryChainGuard(NewCurrentChainGuard(func(context.Context, []uint32) (bool, error) { return true, nil })))
+		}}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard, confirmed)
 	require.ErrorContains(t, err, "acknowledge the existing conflict intent before adding winners")
-	require.Zero(t, calls)
+	require.Equal(t, 1, calls)
+
+	// An unknown winner that is not Conflicting and does not own its inputs is an error.
+	parent := chainhash.Hash{2}
+	_, _, err = ProcessConflicting(ctx, errStore{load: loadFinished, begin: beginOK,
+		get: func(hh *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
+			if hh.IsEqual(&parent) {
+				return &meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&chainhash.Hash{5}, 0)}}, nil
+			}
+			return &meta.Data{Tx: tx, Conflicting: false}, nil
+		}}, 1, chainhash.Hash{}, winners, nil, NoAncestryGuard)
+	require.ErrorContains(t, err, "tx is not conflicting and does not own its inputs")
+}
+
+// TestProcessConflicting_FinishedRecordAcceptsAppliedExtraWinner pins the reset and catch-up
+// paths: reorgBlocks filters the winners a moveBack already promoted, so the finished record holds a
+// subset. A later retry passes the full list. An extra winner that is already applied needs no
+// rollback, so the retry returns the saved result instead of refusing on every attempt.
+func TestProcessConflicting_FinishedRecordAcceptsAppliedExtraWinner(t *testing.T) {
+	ctx := t.Context()
+	y, z, parentY, parentZ := chainhash.Hash{1}, chainhash.Hash{5}, chainhash.Hash{2}, chainhash.Hash{3}
+	txY, txZ := oneInputTx(t, parentY), oneInputTx(t, parentZ)
+	loser := chainhash.Hash{9}
+	finished := &ConflictRecovery{Version: 1, Phase: ConflictRecoveryFinished, Winners: []chainhash.Hash{z}, Losers: []chainhash.Hash{loser}}
+	completed := 0
+	store := errStore{
+		load:  func(chainhash.Hash) (*ConflictRecovery, error) { return finished, nil },
+		begin: func(ConflictIntent) error { return nil },
+		get: func(hh *chainhash.Hash, _ ...fields.FieldName) (*meta.Data, error) {
+			switch *hh {
+			case y:
+				return &meta.Data{Tx: txY, Conflicting: false}, nil
+			case z:
+				return &meta.Data{Tx: txZ, Conflicting: false}, nil
+			case parentY:
+				return &meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&y, 0)}}, nil
+			case parentZ:
+				return &meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&z, 0)}}, nil
+			}
+			return nil, errInjected
+		},
+		complete: func(chainhash.Hash) error { completed++; return nil },
+	}
+
+	losers, marked, err := ProcessConflicting(ctx, store, 1, chainhash.Hash{}, []chainhash.Hash{y, z}, nil, NoAncestryGuard)
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{loser}, marked)
+	require.True(t, losers.Exists(loser))
+	require.Equal(t, 1, completed)
 }

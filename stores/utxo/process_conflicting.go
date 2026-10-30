@@ -113,8 +113,9 @@ const compensationTimeout = 2 * time.Minute
 //
 // A failure after step 2 restores the recorded owners and flags (RollbackConflictIntent). The
 // intent is keyed by the block, so every caller and retry finds the same checklist. A retry of a run
-// that reached applied or finished skips the mutation and returns the saved result. Additional winners
-// are refused until the caller acknowledges the existing intent after its subtree and queue updates.
+// that reached applied or finished skips the mutation and returns the saved result. An additional
+// winner that is already applied is dropped. One that is still Conflicting is refused until the
+// caller acknowledges the existing intent after its subtree and queue updates.
 // When a reverse of the block has since made a winner Conflicting again, the retry rolls the checklist
 // back and plans again under the same record. A winner that is not Conflicting and owns every input
 // is already applied, and the plan skips it.
@@ -185,13 +186,15 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 		// its pending result, rollback can demote children accepted since its snapshot. The caller
 		// must finish the saved subtree and queue updates and acknowledge this intent first.
 		// Older planning records have no Winners and no before-image or mutations to preserve.
+		//
+		// The callers do not all pass the same list for a block. reorgBlocks leaves out the winners
+		// a moveBack already promoted, so the record can hold a subset; a reset or a startup
+		// catch-up then passes the full list and never acknowledges first. An extra winner that is
+		// already applied needs no rollback and nothing from this run, so drop it. Only an extra
+		// winner that is still Conflicting asks for a new plan, and that is refused.
 		if recovery.Phase != ConflictRecoveryPlanning || len(recovery.Winners) > 0 {
-			var known hashSet
-			known.add(recovery.Winners...)
-			for _, h := range conflictingTxHashes {
-				if !known.has(h) {
-					return nil, nil, errors.NewProcessingError("[ProcessConflicting][%s] acknowledge the existing conflict intent before adding winners", blockHash.String())
-				}
+			if conflictingTxHashes, err = dropAppliedExtraWinners(ctx, s, blockHash, conflictingTxHashes, recovery.Winners, options.currentChainGuard); err != nil {
+				return nil, nil, err
 			}
 		}
 		// A replay must plan every recorded winner, whatever subset this caller passes.
@@ -951,6 +954,48 @@ type hashSet struct {
 func (h *hashSet) has(hash chainhash.Hash) bool {
 	_, ok := h.seen[hash]
 	return ok
+}
+
+// dropAppliedExtraWinners returns the given winners without the ones that the record does not
+// hold and that are already applied: not Conflicting, and the spender of every input. An extra
+// winner that is Conflicting is refused, because adding it means a rollback of the unacknowledged
+// record. An extra winner that is not Conflicting and lost an input is an error.
+func dropAppliedExtraWinners(ctx context.Context, s Store, blockHash chainhash.Hash, winners, recorded []chainhash.Hash, guard CurrentChainGuard) ([]chainhash.Hash, error) {
+	var known hashSet
+	known.add(recorded...)
+
+	kept := winners[:0:0]
+
+	for _, h := range winners {
+		if known.has(h) {
+			kept = append(kept, h)
+			continue
+		}
+
+		m, err := s.Get(ctx, &h, fields.Tx, fields.Conflicting, fields.BlockIDs)
+		if err != nil {
+			return nil, errors.NewProcessingError("[ProcessConflicting][%s] error getting tx", h.String(), err)
+		}
+
+		if m == nil {
+			return nil, errors.NewTxNotFoundError("[ProcessConflicting][%s] winning tx not found", h.String())
+		}
+
+		if m.Conflicting {
+			return nil, errors.NewProcessingError("[ProcessConflicting][%s] acknowledge the existing conflict intent before adding winners", blockHash.String())
+		}
+
+		applied, err := appliedWinnerOwnsInputs(ctx, s, h, m, guard)
+		if err != nil {
+			return nil, err
+		}
+
+		if !applied {
+			return nil, errors.NewProcessingError("[ProcessConflicting][%s] tx is not conflicting and does not own its inputs", h.String())
+		}
+	}
+
+	return kept, nil
 }
 
 // conflictingSubset returns the hashes that are Conflicting in the store, in the given order. A

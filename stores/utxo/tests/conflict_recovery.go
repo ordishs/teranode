@@ -1715,16 +1715,23 @@ func ConflictRecoverySupersetWinners(t *testing.T, db utxo.Store) {
 }
 
 // ConflictRecoverySupersetRefusedPhases checks the admission rule for every durable phase. The
-// new winner need not exist: refusal must precede transaction reads as well as recovery writes.
+// new winner is still Conflicting, so it asks for a plan: refusal must precede the reads of the
+// recorded winner as well as recovery writes.
 func ConflictRecoverySupersetRefusedPhases(t *testing.T, db utxo.Store) {
 	ctx := t.Context()
-	for _, phase := range []string{utxo.ConflictRecoveryPlanning, utxo.ConflictRecoveryPrepared,
+	for i, phase := range []string{utxo.ConflictRecoveryPlanning, utxo.ConflictRecoveryPrepared,
 		utxo.ConflictRecoveryMutating, utxo.ConflictRecoveryRollingBack, utxo.ConflictRecoveryRolledBack,
 		utxo.ConflictRecoveryApplied, utxo.ConflictRecoveryFinished} {
 		t.Run(phase, func(t *testing.T) {
 			block := chainhash.HashH([]byte("superset-refused-" + phase))
 			winner := chainhash.HashH([]byte("recorded-winner-" + phase))
-			extra := chainhash.HashH([]byte("unknown-winner-" + phase))
+			parent := crashParentTx(byte(0x40 + i))
+			_, _, err := db.SpendAndCreate(ctx, parent, 1, utxo.WithCreateOnly())
+			require.NoError(t, err)
+			extraTx := crashSpendTx(t, parent, 70000)
+			_, _, err = db.SpendAndCreate(ctx, extraTx, 2, utxo.WithCreateOnly(), utxo.WithConflicting(true))
+			require.NoError(t, err)
+			extra := *extraTx.TxIDChainHash()
 			r := &utxo.ConflictRecovery{Version: 1, Phase: phase, Winners: []chainhash.Hash{winner}}
 			intent := utxo.ConflictIntent{Kind: utxo.ConflictIntentForward, BlockHash: block, TxHashes: r.Winners,
 				Recovery: &utxo.ConflictRecovery{Version: 1, Phase: utxo.ConflictRecoveryPlanning, Winners: r.Winners}}
