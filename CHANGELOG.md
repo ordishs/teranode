@@ -18,6 +18,41 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — action required before upgrading
 
+- **Conflict undo now checks current-chain confirmation.** BlockAssembly stops
+  recovery if a transaction affected by rollback or reverse processing is still
+  confirmed in any current-chain block, or if that check fails. The WAL remains
+  available for diagnosis. A stale forward intent that was applied and has at least
+  one winner confirmed on the current chain keeps the applied state and is completed
+  without a rollback, as a reorg keeps a transaction of an orphaned block; this also
+  covers a partial re-mine. When BlockAssembly never reached that block, startup
+  reverses the winners that the current chain does not confirm. A confirmed winner
+  that no longer owns its inputs keeps the intent pending. Pruned parents of confirmed
+  winners no longer block startup; current-chain confirmation authorizes those inputs. The parent locks it still
+  holds are released. A rollback leaves an input that the operation freed with a
+  later owner outside the operation, and the loser that spent it stays conflicting. Failed
+  WAL cleanup is now returned and counted in
+  `teranode_utxo_conflict_wal_completion_failures_total`. Affected operators must
+  resolve the pending recovery instead of clearing the WAL or restarting an old
+  build. This does not repair previously corrupted UTXO state. (#2023)
+
+- **Conflict recovery extends the UTXO WAL format and store interface.** SQL stores
+  add recovery and lock-owner columns; Aerospike stores add durable checklist
+  records. External `utxo.Store` implementations must implement
+  `SaveConflictRecovery`, `LoadConflictRecovery`, `RestoreConflictSpends`,
+  `SetConflictLocks`, and `ReleaseConflictLocks`. Upgrade BlockAssembly with its
+  store implementation. Do not downgrade while new conflict intents are pending.
+  A forward intent is now keyed by its block hash, so acknowledgement needs no WAL
+  scan; a record written by an older build keeps its old key. Store callers that add
+  a winner that is still Conflicting to a block with a pending forward intent now
+  receive an error. A winner that is already applied is dropped. Finish the
+  saved result's subtree and queue updates and acknowledge the intent with
+  `CompleteConflictIntentsForBlock` before submitting additional Conflicting winners. Legacy
+  forward intents have no before-image and require operator repair;
+  unresolved intents now prevent BlockAssembly startup, and so does an intent whose
+  replay failed at startup, even when its checklist reads finished. Preserve the WAL
+  and store backup for diagnosis instead of deleting the pending record. See
+  [recovery guidance](docs/topics/conflict-recovery.md). (#2023)
+
 - **`CheckBlockSubtrees` gRPC errors keep Teranode error codes.** Storage and
   consensus errors include gRPC status metadata. Invalid URLs give `InvalidArgument`
   status. External clients must use `errors.UnwrapGRPC` to read the error chain
@@ -890,6 +925,32 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `teranode_subtreevalidation_skipped_peer_subtrees_total{outcome}` (recorded,
   evicted, expired, requeued, dropped, replayed, replay_failed). Set the key to `0` for the previous
   behaviour. (#2055)
+
+- **A failed `ProcessConflicting` no longer wedges block assembly, and its error is
+  capped.** The old rollback cleared `Conflicting` on every transaction the cascade
+  visited, including winners that were already flagged. Every retry then failed with
+  `tx is not conflicting`. The operation now saves a recovery checklist before it
+  changes any state. Rollback restores the recorded spend owners and flags. A retry
+  of a run that already applied returns the saved result. The returned loser set
+  never contains a winner. The forward rollback accepts the winners' own block as
+  confirmation, and still refuses a winner that is confirmed in any other
+  current-chain block. A parent locked by another holder is no longer a reason to
+  fail the operation: the operation neither takes nor releases that lock. The
+  `MANUAL INTERVENTION REQUIRED` error lists the first 20 rollback failures and a
+  count of the rest, instead of one entry per transaction. Log searches that counted
+  `rollback step 2 (re-spend` entries find no such entry now. Nodes that are already
+  wedged are not repaired by this change. (#2023)
+
+- **Mining candidates no longer build on a stale block assembly tip.** When block
+  assembly is idle but its tip differs from the Blockchain service tip,
+  `GetMiningCandidate` now returns an empty candidate on the Blockchain service tip.
+  Before, it returned a full candidate on the old tip, so a miner produced orphan
+  blocks. The new counter `teranode_blockassembly_stale_tip_candidates_total` and
+  the Warn log fire only when the gap lasts more than 10 seconds at the same
+  block assembly tip. A shorter gap is the normal delay before block assembly
+  hears of a new block. A block assembly tip that is ahead of the Blockchain service
+  tip is not counted. Alert on a sustained non-zero rate. If the Blockchain service
+  tip cannot be read, the candidate is built as before. (#2023)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
