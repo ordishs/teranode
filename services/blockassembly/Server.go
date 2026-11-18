@@ -15,6 +15,7 @@
 package blockassembly
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -1262,15 +1263,12 @@ func (ba *BlockAssembly) AddTx(ctx context.Context, req *blockassembly_api.AddTx
 
 	ba.logger.Debugf("[AddTx] added tx %s to block assembler", chainhash.Hash(req.Txid).String())
 
-	var txInpoints subtreepkg.TxInpoints
-	if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
-		txInpoints, err = subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
-		if err != nil {
-			return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
-		}
-	} else {
-		// Create empty TxInpoints if not storing for subtree meta
-		txInpoints = subtreepkg.TxInpoints{}
+	// the parent links are kept whatever blockassembly_storeTxInpointsForSubtreeMeta says: the
+	// descendant cascades read them to take a removed tx's children out of block assembly. The
+	// setting only decides whether subtree meta files are written.
+	txInpoints, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
 	}
 
 	if !ba.settings.BlockAssembly.Disabled {
@@ -1546,8 +1544,6 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 	txInpointsArr := make([]subtreepkg.TxInpoints, len(requests))
 	txInpointsList := make([]*subtreepkg.TxInpoints, len(requests))
 
-	storeTxInpoints := ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta
-
 	for i, req := range requests {
 		if len(req.Txid) != 32 {
 			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("invalid txid length at index %d: %d", i, len(req.Txid)))
@@ -1559,16 +1555,13 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 			SizeInBytes: req.Size,
 		}
 
-		if storeTxInpoints {
-			ti, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
-			if err != nil {
-				return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
-			}
-
-			txInpointsArr[i] = ti
+		// kept in every mode, as in AddTx
+		ti, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
+		if err != nil {
+			return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
 		}
-		// else: txInpointsArr[i] stays zero-valued — the empty TxInpoints
-		// behaviour for callers that do not need parent inpoints stored.
+
+		txInpointsArr[i] = ti
 
 		txInpointsList[i] = &txInpointsArr[i]
 	}
@@ -1732,8 +1725,6 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 		)
 	}
 
-	storeTxInpoints := ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta
-
 	for i := 0; i < txCount; i++ {
 		// Extract TXID (32 bytes) — no allocation, copy into the Node.
 		txidStart := i * 32
@@ -1743,16 +1734,12 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 			SizeInBytes: req.Sizes[i],
 		}
 
-		if storeTxInpoints {
-			// Two slice operations per tx: parent hashes and packed voutIdxs.
-			// Bounds are guaranteed by the offset-array validation above, so
-			// these slice expressions cannot panic.
-			parentSlice := parents[req.ParentTxOffsets[i]:req.ParentTxOffsets[i+1]]
-			voutSlice := req.VoutIdxsPacked[req.VoutIdxsTxOffsets[i]:req.VoutIdxsTxOffsets[i+1]]
-			txInpointsArr[i] = subtreepkg.NewTxInpointsFromPacked(parentSlice, voutSlice)
-		}
-		// else: txInpointsArr[i] is the zero-value TxInpoints, which is the
-		// desired behaviour when not storing inpoints for subtree meta.
+		// Kept in every mode, as in AddTx. Two slice operations per tx: parent
+		// hashes and packed voutIdxs. Bounds are guaranteed by the offset-array
+		// validation above, so these slice expressions cannot panic.
+		parentSlice := parents[req.ParentTxOffsets[i]:req.ParentTxOffsets[i+1]]
+		voutSlice := req.VoutIdxsPacked[req.VoutIdxsTxOffsets[i]:req.VoutIdxsTxOffsets[i+1]]
+		txInpointsArr[i] = subtreepkg.NewTxInpointsFromPacked(parentSlice, voutSlice)
 
 		txInpointsList[i] = &txInpointsArr[i]
 	}
@@ -2086,6 +2073,41 @@ func (ba *BlockAssembly) checkCoinbaseTimeLockFinality(ctx context.Context, jobI
 	return nil
 }
 
+// checkSubmittedTimeMedianTimePast applies the median-time-past rule to the block's timestamp:
+// it must be strictly after the median time of the 11 headers ending at the parent, or every
+// peer rejects the block. block.Valid is called here without the parent chain, so it skips
+// this rule, and the memo-only nTime guard in submitMiningSolution has nothing to enforce when
+// no floor is memoized for the parent (the candidate was served on the wall-clock path because
+// the floor lookup failed, or the memo entry has since been evicted). This check closes that
+// gap by fetching the median on a memo miss.
+//
+// It fails closed: a failed lookup refuses the submission. AddBlock goes to the same blockchain
+// service, so a lookup that fails would most likely see AddBlock fail too, and the job is kept
+// so the miner can resubmit. A lookup failure is this node's problem and stays a processing
+// error; a timestamp at or below the median is a consensus verdict on the miner's data, the
+// class block.Valid gives it. Neither resets block assembly.
+//
+// On a chain with GenerateSupported the rule is advisory, as in Block.checkHeaderContextual,
+// so nothing is enforced.
+func (ba *BlockAssembly) checkSubmittedTimeMedianTimePast(ctx context.Context, jobID string, block *model.Block) error {
+	if ba.blockAssembler.generateSupported() {
+		return nil
+	}
+
+	parentMedianTimePast, err := ba.blockAssembler.ParentMedianTimePast(ctx, block.Header.HashPrevBlock)
+	if err != nil {
+		return errors.NewProcessingError("[BlockAssembly][%s][%s] cannot check the block timestamp against the parent's median time past", jobID, block.Hash().String(), err)
+	}
+
+	if block.Header.Timestamp <= parentMedianTimePast {
+		ba.logger.Warnf("[BlockAssembly][%s][%s] rejected mining solution, block timestamp %d is not after the parent's median time past %d", jobID, block.Hash().String(), block.Header.Timestamp, parentMedianTimePast)
+
+		return errors.NewBlockInvalidError("[BlockAssembly][%s][%s] block timestamp %d is not after the parent's median time past %d, so every peer would reject the block", jobID, block.Hash().String(), block.Header.Timestamp, parentMedianTimePast)
+	}
+
+	return nil
+}
+
 func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSubmissionRequest) (*blockassembly_api.OKResponse, error) {
 	jobID := util.ReverseAndHexEncodeSlice(req.SubmitMiningSolutionRequest.Id)
 
@@ -2140,7 +2162,8 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	// back a few seconds within a job is normal pool behaviour and must stay
 	// legal. The
 	// floor is the memoized value the candidate was built from, so this costs no
-	// round-trip, and when it is unknown there is nothing to enforce.
+	// round-trip. When it is unknown, checkSubmittedTimeMedianTimePast fetches
+	// the median once the proof of work has been checked.
 	if minTime, ok := ba.blockAssembler.MinCandidateTime(hashPrevBlock); ok && int64(nTime) < minTime {
 		// Distinguish the two ways to arrive here, because they are different
 		// operator problems. Usually the miner replaced the timestamp and the
@@ -2156,6 +2179,10 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		}
 
 		return nil, errors.NewProcessingError("[BlockAssembly][%s] submitted nTime %d is below the parent chain's median-time-past floor %d, so every peer would reject the block", jobID, nTime, minTime)
+	}
+
+	if err = ba.checkSubmittedTimeDifficulty(ctx, jobID, job.MiningCandidate, hashPrevBlock, nTime); err != nil {
+		return nil, err
 	}
 
 	var coinbaseTx *bt.Tx
@@ -2338,6 +2365,12 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		return nil, errors.NewProcessingError("[BlockAssembly][%s][%s] rejected mining solution, block hash does not meet the target", jobID, block.Hash().String())
 	}
 
+	// Only after the proof of work, so a solution without valid work cannot make this node read
+	// the blockchain service, and before block.Valid, so a doomed timestamp does not load subtrees.
+	if err = ba.checkSubmittedTimeMedianTimePast(ctx, jobID, block); err != nil {
+		return nil, err
+	}
+
 	// check fully valid
 	// TODO add more checks to the Valid function, like whether the parent/child relationships are OK
 	if ok, err := block.Valid(ctx, ba.logger, ba.subtreeStore, nil, nil, nil, nil, ba.settings, nil); !ok {
@@ -2438,6 +2471,23 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 	return &blockassembly_api.OKResponse{
 		Ok: true,
 	}, nil
+}
+
+func (ba *BlockAssembly) checkSubmittedTimeDifficulty(ctx context.Context, jobID string, candidate *model.MiningCandidate, parent *chainhash.Hash, nTime uint32) error {
+	if !minDifficultyRule(ba.blockAssembler.settings.ChainCfgParams) || nTime == candidate.Time {
+		return nil
+	}
+
+	requiredBits, err := ba.blockchainClient.GetNextWorkRequired(ctx, parent, int64(nTime))
+	if err != nil {
+		return errors.NewProcessingError("[BlockAssembly][%s] cannot check the difficulty required at submitted nTime %d", jobID, nTime, err)
+	}
+
+	if !bytes.Equal(requiredBits.CloneBytes(), candidate.NBits) {
+		return errors.NewProcessingError("[BlockAssembly][%s] the candidate nBits %x are not the nBits %x required at submitted nTime %d, so every peer would reject the block; submit with the candidate time", jobID, candidate.NBits, requiredBits.CloneBytes(), nTime)
+	}
+
+	return nil
 }
 
 func (ba *BlockAssembly) createMerkleTreeFromSubtrees(jobID string, subtreesInJob []*subtreepkg.Subtree, subtreeHashes []chainhash.Hash, coinbaseTxIDHash *chainhash.Hash) (*chainhash.Hash, error) {
@@ -2882,6 +2932,13 @@ func (ba *BlockAssembly) GetBlockAssemblyTxs(ctx context.Context, _ *blockassemb
 			default:
 			}
 		}
+		// The coinbase placeholder is block assembly's own marker for the coinbase
+		// slot at the head of the first subtree. It is not a transaction, so it is
+		// not reported, and TxCount counts only real transactions.
+		if hash.IsEqual(subtreepkg.CoinbasePlaceholderHash) {
+			continue
+		}
+
 		txHashesStrings = append(txHashesStrings, hash.String())
 	}
 
@@ -2913,7 +2970,7 @@ func (ba *BlockAssembly) GetBlockAssemblyTxs(ctx context.Context, _ *blockassemb
 func (ba *BlockAssembly) GetCurrentDifficulty(_ context.Context, _ *blockassembly_api.EmptyMessage) (resp *blockassembly_api.GetCurrentDifficultyResponse, err error) {
 	blockHeader, _ := ba.blockAssembler.CurrentBlock()
 
-	nBits, err := ba.blockAssembler.getNextNbits(blockHeader, time.Now().Unix())
+	nBits, err := ba.blockAssembler.getNextNbits(blockHeader, ba.blockAssembler.currentDifficultyTime(blockHeader))
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewProcessingError("error getting next nbits", err))
 	}

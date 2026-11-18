@@ -653,56 +653,6 @@ func (c *Client) GetHashOfAncestorBlock(ctx context.Context, blockHash *chainhas
 	return hash, nil
 }
 
-// GetLatestBlockHeaderFromBlockLocator retrieves the latest block header from a block locator.
-func (c *Client) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestBlockHash *chainhash.Hash, blockLocator []chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
-	if len(blockLocator) == 0 {
-		return nil, nil, errors.NewProcessingError("blockLocator cannot be empty")
-	}
-
-	blockLocatorBytes := make([][]byte, len(blockLocator))
-	for i, h := range blockLocator {
-		blockLocatorBytes[i] = h[:]
-	}
-
-	resp, err := c.client.GetLatestBlockHeaderFromBlockLocator(ctx, &blockchain_api.GetLatestBlockHeaderFromBlockLocatorRequest{
-		BestBlockHash:      bestBlockHash[:],
-		BlockLocatorHashes: blockLocatorBytes,
-	})
-	if err != nil {
-		return nil, nil, errors.UnwrapGRPC(err)
-	}
-
-	header, err := model.NewBlockHeaderFromBytes(resp.BlockHeader)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	meta := &model.BlockHeaderMeta{
-		Height:      resp.Height,
-		TxCount:     resp.TxCount,
-		SizeInBytes: resp.SizeInBytes,
-		Miner:       resp.Miner,
-		BlockTime:   resp.BlockTime,
-		Timestamp:   resp.Timestamp,
-	}
-
-	return header, meta, nil
-}
-
-// GetBlockHeadersFromOldest retrieves block headers starting from the oldest block.
-func (c *Client) GetBlockHeadersFromOldest(ctx context.Context, chainTipHash, targetHash *chainhash.Hash, numberOfHeaders uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
-	resp, err := c.client.GetBlockHeadersFromOldest(ctx, &blockchain_api.GetBlockHeadersFromOldestRequest{
-		ChainTipHash:    chainTipHash.CloneBytes(),
-		TargetHash:      targetHash.CloneBytes(),
-		NumberOfHeaders: numberOfHeaders,
-	})
-	if err != nil {
-		return nil, nil, errors.UnwrapGRPC(err)
-	}
-
-	return c.returnBlockHeaders(resp)
-}
-
 // GetNextWorkRequired calculates the required proof of work for the next block.
 func (c *Client) GetNextWorkRequired(ctx context.Context, previousBlockHash *chainhash.Hash, currentBlockTime int64) (*model.NBit, error) {
 	if currentBlockTime == 0 {
@@ -877,6 +827,8 @@ func (c *Client) GetBlockHeader(ctx context.Context, blockHash *chainhash.Hash) 
 		SubtreesSet:    resp.SubtreesSet,
 		Invalid:        resp.Invalid,
 		MedianTimePast: resp.MedianTimePast,
+
+		MinedSetGeneration: resp.MinedSetGeneration,
 	}
 
 	if resp.ProcessedAt != nil {
@@ -1001,19 +953,6 @@ func (c *Client) GetBlockHeadersFromCommonAncestor(ctx context.Context, hashTarg
 		TargetHash:         hashTarget.CloneBytes(),
 		BlockLocatorHashes: locatorBytes,
 		MaxHeaders:         maxHeaders,
-	})
-	if err != nil {
-		return nil, nil, errors.UnwrapGRPC(err)
-	}
-
-	return c.returnBlockHeaders(resp)
-}
-
-// GetBlockHeadersFromTill retrieves block headers between two specified blocks.
-func (c *Client) GetBlockHeadersFromTill(ctx context.Context, blockHashFrom *chainhash.Hash, blockHashTill *chainhash.Hash) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
-	resp, err := c.client.GetBlockHeadersFromTill(ctx, &blockchain_api.GetBlockHeadersFromTillRequest{
-		StartHash: blockHashFrom.CloneBytes(),
-		EndHash:   blockHashTill.CloneBytes(),
 	})
 	if err != nil {
 		return nil, nil, errors.UnwrapGRPC(err)
@@ -1785,12 +1724,15 @@ func (c *Client) GetBlockIsMined(ctx context.Context, blockHash *chainhash.Hash)
 // Parameters:
 //   - ctx: Context for the operation with timeout and cancellation support
 //   - blockHash: Hash of the block to mark as mined
+//   - minedSetGeneration: The block's mined_set generation when the caller's tagging run started
 //
 // Returns:
-//   - error: Any error encountered during the mining status update operation
-func (c *Client) SetBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash) error {
+//   - error: errors.ErrStateError if the block's mined_set generation has moved, or any
+//     other error encountered during the mining status update operation
+func (c *Client) SetBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash, minedSetGeneration uint64) error {
 	_, err := c.client.SetBlockMinedSet(ctx, &blockchain_api.SetBlockMinedSetRequest{
-		BlockHash: blockHash[:],
+		BlockHash:          blockHash[:],
+		MinedSetGeneration: &minedSetGeneration,
 	})
 	if err != nil {
 		return errors.UnwrapGRPC(err)

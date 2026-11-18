@@ -31,6 +31,34 @@ read every section between yours and the target.
 
 ### Breaking
 
+- **The limited RPC credential can no longer call `freeze`, `unfreeze` or `reassign`.** A call with
+  `rpc_limit_user`/`rpc_limit_pass` now answers "limited user not authorized for this method". Tools
+  that call these methods, such as an alert-system client, must use `rpc_user`/`rpc_pass`. (#2095)
+- **Between two blocks of equal chain work, the node now keeps the one it stored first.** It used
+  to switch to the block relayed by the lowest-sorting peer id, and a block this node mined, stored
+  with an empty peer id, won every tie. Until the blockchain service and block assembly both run
+  this version, block assembly follows the best header instead of replaying best-tip changes, so
+  upgrade them close together. Startup replaces the chain-work indexes on `blocks`, and every move
+  to or from an older version rebuilds them. (#2193)
+- **`ProcessBlock` refuses a `block_id` that is not the block's reservation on the quick route.**
+  An external caller that sends a non-zero ID other than what `AssignBlockID` returns for the hash
+  now gets an error before any UTXO is written, including an ID whose reservation was swept and a
+  coinbase-only block that used to be stored under the reservation instead. Send 0, or call
+  `AssignBlockID` again and send its answer. (#2191)
+- **Three unused blockchain gRPC methods and five metrics are gone.** An external client calling
+  `GetBlockHeadersFromTill`, `GetLatestBlockHeaderFromBlockLocator` or `GetBlockHeadersFromOldest`
+  now gets `Unimplemented`. Dashboards lose `teranode_blockvalidation_fork_resolved_total`,
+  `_fork_resolution_depth_blocks` and `_fork_orphaned_total`, which nothing ever updated, and
+  `teranode_blockchain_get_latest_block_header_from_block_locator` and
+  `_get_block_headers_from_oldest`, which recorded only calls to the two removed RPCs; drop any
+  panel or alert on them. (#2185)
+- **A block whose transaction spends an output mined only outside the block's own history is now
+  invalid.** Earlier versions accepted it when that output's block was on the main chain, so
+  upgrade every block validation pod together; a mixed fleet can disagree on such a fork block. (#2174)
+- **`blockassembly_storeTxInpointsForSubtreeMeta=false` now only skips the subtree meta files.**
+  Block assembly keeps every unmined tx's parent links in memory in both modes. With it off, the
+  restart reload and a block move-back now read each tx's inputs from the UTXO store (an external tx
+  from the blob store), and memory per unmined tx rises; nothing to change. (#2128)
 - **Upgrade every validator and subtree-validation pod before you set
   `blockassembly_maxTransactionsInMemory`, and keep the default 0 until then.** An old validator
   never sends `inBlock`, so a new block assembly with the limit set refuses its block transactions
@@ -78,10 +106,20 @@ read every section between yours and the target.
   rejects, so they stop validating. Upgrade Blockchain last or raise the cap above chain height. (#1776)
 - **Conflict recovery adds five `utxo.Store` methods and changes the UTXO WAL.** Upgrade block
   assembly together with the UTXO store and don't downgrade while conflict-recovery records are
-  pending; they block startup. Follow [conflict recovery](docs/topics/conflict-recovery.md). (#2023)
+  pending; they block startup. Follow [conflict recovery](docs/topics/conflict-recovery.md).
+  Before upgrading from v0.16.0, stop block assembly and [check the conflict WAL is
+  empty](docs/topics/conflict-recovery.md#upgrading-from-v0160): a v0.16.0 forward intent left in
+  it keeps block assembly from starting until it is repaired. The v0.16.0 `conflict_intents_pending`
+  gauge can't tell you; it only counts at startup. (#2023)
 - **PostgreSQL UTXO store: stop previous-release processes before upgrading.** One that starts while
   the new `px_transactions_conflicting` index builds blocks all `transactions` reads and writes until
   the build ends. Out-of-tree `utxo.Store` implementations add `ConflictingTxHashes`. (#2110)
+- **`SetBlockMinedSet` takes a mined-set generation and can refuse a write with `ERR_STATE_ERROR`.**
+  Out-of-tree blockchain store and client implementations add the parameter; a caller that sets
+  `mined_set_generation` must handle the refusal. Mixed versions keep working, in any order. (#2018)
+- **The Aerospike UTXO store adds a `<set>_conflictwal_startedAt` index, at least 16 MiB per node.**
+  Check `indexes-memory-budget` has room first, or the namespace can stop writes. Without
+  index-create rights, create it by hand ([conflict recovery](docs/topics/conflict-recovery.md)). (#2151)
 - **Script-number overflow is a consensus failure.** Earlier builds accept transactions and blocks
   this one rejects: upgrade all your nodes together. These transactions are no longer published to
   the `kafka_txPolicyRejectedConfig` topic. (#1911)
@@ -156,6 +194,9 @@ read every section between yours and the target.
 - **Asset block-list endpoints honour `fromHeight` with `includeOrphans`.** They now page down
   instead of returning the chain's top; clients passing both get the blocks at or below
   `fromHeight`. (#2065)
+- **`blockassembly_maxBlockReorgCatchup` is removed.** It never capped a reorg; it only sized two
+  unused maps. A config that still sets it starts as before and the value is ignored, so no
+  action is needed beyond deleting the line. (#2163)
 
 ## [0.16.0] - 2026-10-05
 

@@ -63,12 +63,6 @@ service BlockchainAPI {
   // GetHashOfAncestorBlock retrieves the hash of an ancestor block at a specified depth.
   rpc GetHashOfAncestorBlock (GetHashOfAncestorBlockRequest) returns (GetHashOfAncestorBlockResponse) {}
 
-  // GetLatestBlockHeaderFromBlockLocator retrieves the latest block header using a block locator.
-  rpc GetLatestBlockHeaderFromBlockLocator (GetLatestBlockHeaderFromBlockLocatorRequest) returns (GetBlockHeaderResponse) {}
-
-  // GetBlockHeadersFromOldest retrieves block headers starting from the oldest block.
-  rpc GetBlockHeadersFromOldest (GetBlockHeadersFromOldestRequest) returns (GetBlockHeadersResponse) {}
-
   // GetNextWorkRequired calculates the required proof of work for the next block.
   rpc GetNextWorkRequired (GetNextWorkRequiredRequest) returns (GetNextWorkRequiredResponse) {}
 
@@ -94,9 +88,6 @@ service BlockchainAPI {
 
   // GetBlockHeadersFromCommonAncestor retrieves headers from a common ancestor to a target block.
   rpc GetBlockHeadersFromCommonAncestor(GetBlockHeadersFromCommonAncestorRequest) returns (GetBlockHeadersResponse) {}
-
-  // GetBlockHeadersFromTill retrieves block headers between two specified blocks.
-  rpc GetBlockHeadersFromTill(GetBlockHeadersFromTillRequest) returns (GetBlockHeadersResponse) {}
 
   // GetBlockHeadersFromHeight retrieves block headers starting from a specific height.
   rpc GetBlockHeadersFromHeight(GetBlockHeadersFromHeightRequest) returns (GetBlockHeadersFromHeightResponse) {}
@@ -384,12 +375,6 @@ message GetBlockHeadersResponse {
   repeated bytes metas = 2;         // List of serialized metadata
 }
 
-// GetBlockHeadersFromTillRequest requests headers between two blocks.
-message GetBlockHeadersFromTillRequest {
-  bytes startHash = 1;  // Starting block hash
-  bytes endHash = 2;    // Ending block hash
-}
-
 // GetBlockHeadersFromHeightRequest requests headers starting from a height.
 message GetBlockHeadersFromHeightRequest {
   uint32 startHeight = 1;  // Starting height
@@ -518,6 +503,7 @@ message GetBlockHeaderResponse {
   bool invalid = 13;          // Validity status
   google.protobuf.Timestamp processed_at = 14; // Timestamp when block was processed
   uint32 median_time_past = 15; // Median Time Past (MTP) - median of last 11 block timestamps (BIP113)
+  uint64 mined_set_generation = 16; // Bumped by every write that clears mined_set; SetBlockMinedSet compares against it
 }
 
 // CheckBlockIsCurrentChainResponse indicates if blocks are in the main chain.
@@ -623,19 +609,6 @@ message GetHashOfAncestorBlockRequest {
   uint32 depth = 2;   // Number of generations to go back
 }
 
-// GetLatestBlockHeaderFromBlockLocatorRequest
-message GetLatestBlockHeaderFromBlockLocatorRequest {
-  bytes bestBlockHash = 1;                // Best block hash
-  repeated bytes blockLocatorHashes = 2;  // Block locator hashes
-}
-
-// GetBlockHeadersFromOldestRequest retrieves block headers starting from the oldest block.
-message GetBlockHeadersFromOldestRequest {
-  bytes chainTipHash = 1;     // Chain tip hash
-  bytes targetHash = 2;       // Target block hash
-  uint64 numberOfHeaders = 3; // Maximum number of hashes to return
-}
-
 // GetHashOfAncestorBlockResponse contains an ancestor block hash.
 message GetHashOfAncestorBlockResponse {
   bytes hash = 1;  // Ancestor block hash
@@ -655,6 +628,12 @@ message GetNextWorkRequiredResponse {
 // SetBlockMinedSetRequest marks a block as mined.
 message SetBlockMinedSetRequest {
   bytes blockHash = 1;  // Hash of the mined block
+  // The block's mined_set generation (GetBlockHeaderResponse.mined_set_generation)
+  // when the caller's tagging run started. Every writer that clears mined_set bumps
+  // it, so the write is refused with ERR_STATE_ERROR if it has changed since.
+  // Absent means a caller that predates the field: the write is unconditional, as
+  // it was before.
+  optional uint64 mined_set_generation = 2;
 }
 
 message ClearBlockMinedSetRequest {
