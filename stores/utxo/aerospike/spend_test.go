@@ -2,6 +2,7 @@ package aerospike_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -639,4 +640,188 @@ func TestStore_SpendNilTxPanicRecovery(t *testing.T) {
 	require.Error(t, err, "Spend must surface panic as error, not return (nil, nil)")
 	require.Nil(t, spends)
 	require.Contains(t, err.Error(), "panic")
+}
+
+// TestStore_PartialSpendSpenderRecordState pins how the state of the spending tx's own record
+// changes a spend whose second input has a parent that is gone. Every case spends output 0 of
+// a live parent and of a parent that was never created, so the spend of the live one succeeds
+// and the other answers ErrTxNotFound.
+func TestStore_PartialSpendSpenderRecordState(t *testing.T) {
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	client, store, ctx, deferFn := initAerospike(t, tSettings, logger)
+
+	t.Cleanup(deferFn)
+
+	newTx := func(t *testing.T, seed byte, parents ...*bt.Tx) *bt.Tx {
+		t.Helper()
+
+		out := bt.NewTx()
+
+		if len(parents) == 0 {
+			prev := chainhash.HashH([]byte{seed})
+			require.NoError(t, out.From(prev.String(), 0, "76a914000000000000000000000000000000000000000088ac", 100_000))
+		}
+
+		for _, parent := range parents {
+			require.NoError(t, out.From(parent.TxIDChainHash().String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+		}
+
+		require.NoError(t, out.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 90_000+uint64(seed)))
+
+		return out
+	}
+
+	type setup func(t *testing.T, child *bt.Tx, key *aerospike.Key)
+
+	putBins := func(t *testing.T, key *aerospike.Key, bins aerospike.BinMap) {
+		t.Helper()
+
+		policy := aerospike.NewWritePolicy(0, 0)
+		policy.RecordExistsAction = aerospike.UPDATE
+
+		require.NoError(t, client.Put(policy, key, bins))
+	}
+
+	liveSpender := func(t *testing.T, child *bt.Tx, _ *aerospike.Key) {
+		_, err := store.Create(ctx, child, 101)
+		require.NoError(t, err)
+	}
+
+	tests := []struct {
+		name          string
+		setup         setup
+		wantSpendErr  bool
+		wantLiveSpent bool
+	}{
+		{name: "no spender record reverts the live spend", setup: func(*testing.T, *bt.Tx, *aerospike.Key) {}, wantSpendErr: true, wantLiveSpent: false},
+		{name: "final spender record is already blessed", setup: liveSpender, wantSpendErr: false, wantLiveSpent: true},
+		{name: "creating spender record is no evidence and keeps the live spend", setup: func(t *testing.T, child *bt.Tx, key *aerospike.Key) {
+			liveSpender(t, child, key)
+			putBins(t, key, aerospike.BinMap{fields.Creating.String(): true})
+		}, wantSpendErr: true, wantLiveSpent: true},
+		{name: "rolling back spender record is no evidence and keeps the live spend", setup: func(t *testing.T, child *bt.Tx, key *aerospike.Key) {
+			liveSpender(t, child, key)
+			putBins(t, key, aerospike.BinMap{fields.Creating.String(): true, fields.RollingBack.String(): true})
+		}, wantSpendErr: true, wantLiveSpent: true},
+		{name: "hold with no transaction is no evidence and keeps the live spend", setup: func(t *testing.T, child *bt.Tx, key *aerospike.Key) {
+			putBins(t, key, aerospike.BinMap{fields.Creating.String(): true, fields.RollingBack.String(): true, fields.Hold.String(): true})
+		}, wantSpendErr: true, wantLiveSpent: true},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanDB(t, client)
+
+			live := newTx(t, byte(10+i))
+			_, err := store.Create(ctx, live, 101)
+			require.NoError(t, err)
+
+			gone := newTx(t, byte(60+i))
+			child := newTx(t, byte(110+i), live, gone)
+
+			key, err := aerospike.NewKey(store.GetNamespace(), store.GetName(), uaerospike.CalculateKeySourceInternal(child.TxIDChainHash(), 0))
+			require.NoError(t, err)
+
+			tc.setup(t, child, key)
+
+			spends, err := store.Spend(ctx, child, store.GetBlockHeight()+1)
+
+			if tc.wantSpendErr {
+				require.Error(t, err)
+				require.ErrorIs(t, err, errors.ErrTxNotFound)
+			} else {
+				require.NoError(t, err)
+				require.Len(t, spends, 2)
+			}
+
+			utxoHash, err := util.UTXOHashFromOutput(live.TxIDChainHash(), live.Outputs[0], 0)
+			require.NoError(t, err)
+
+			resp, err := store.GetSpend(ctx, &utxo.Spend{TxID: live.TxIDChainHash(), Vout: 0, UTXOHash: utxoHash})
+			require.NoError(t, err)
+
+			if tc.wantLiveSpent {
+				require.NotNil(t, resp.SpendingData, "the spend of the live parent must stand")
+				require.Equal(t, child.TxIDChainHash().String(), resp.SpendingData.TxID.String())
+			} else {
+				require.Nil(t, resp.SpendingData, "the spend of the live parent must be reverted")
+			}
+		})
+	}
+}
+
+// BenchmarkStore_SpendPartialFailure times a spend whose second input has a parent that is gone,
+// for each state of the spending tx's own record. The setup of each iteration is not timed.
+func BenchmarkStore_SpendPartialFailure(b *testing.B) {
+	logger := ulogger.NewErrorTestLogger(b)
+	tSettings := test.CreateBaseTestSettings(b)
+
+	client, store, ctx, deferFn := initAerospike(b, tSettings, logger)
+
+	b.Cleanup(deferFn)
+
+	newTx := func(seed uint64, parents ...*bt.Tx) *bt.Tx {
+		out := bt.NewTx()
+
+		if len(parents) == 0 {
+			prev := chainhash.HashH([]byte(fmt.Sprintf("prev-%d", seed)))
+			require.NoError(b, out.From(prev.String(), 0, "76a914000000000000000000000000000000000000000088ac", 100_000))
+		}
+
+		for _, parent := range parents {
+			require.NoError(b, out.From(parent.TxIDChainHash().String(), 0, parent.Outputs[0].LockingScript.String(), parent.Outputs[0].Satoshis))
+		}
+
+		require.NoError(b, out.PayToAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 50_000+seed))
+
+		return out
+	}
+
+	cases := []struct {
+		name  string
+		bins  aerospike.BinMap
+		final bool
+	}{
+		{name: "no_spender_record_rolls_back"},
+		{name: "final_spender_record_blessed", final: true},
+		{name: "rolling_back_spender_record_skips", final: true, bins: aerospike.BinMap{fields.Creating.String(): true, fields.RollingBack.String(): true}},
+	}
+
+	var seed uint64
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+
+				seed++
+
+				live := newTx(seed * 3)
+				_, err := store.Create(ctx, live, 101)
+				require.NoError(b, err)
+
+				child := newTx(seed*3+1, live, newTx(seed*3+2))
+
+				if tc.final {
+					_, err = store.Create(ctx, child, 101)
+					require.NoError(b, err)
+				}
+
+				if tc.bins != nil {
+					key, kErr := aerospike.NewKey(store.GetNamespace(), store.GetName(), uaerospike.CalculateKeySourceInternal(child.TxIDChainHash(), 0))
+					require.NoError(b, kErr)
+
+					policy := aerospike.NewWritePolicy(0, 0)
+					policy.RecordExistsAction = aerospike.UPDATE
+					require.NoError(b, client.Put(policy, key, tc.bins))
+				}
+
+				b.StartTimer()
+
+				_, _ = store.Spend(ctx, child, store.GetBlockHeight()+1)
+			}
+		})
+	}
 }

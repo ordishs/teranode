@@ -883,9 +883,19 @@ func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, 
 	rbCtx, cancel := context.WithTimeout(context.Background(), rbTimeout)
 	defer cancel()
 
-	_, getErr := s.Get(rbCtx, tx.TxIDChainHash(), fields.Fee)
+	spender, getErr := s.Get(rbCtx, tx.TxIDChainHash(), fields.Fee, fields.Creating, fields.RollingBack)
 
 	decision := decideRollback(getErr)
+
+	// A rolling back record is not a spender: its own rollback reverses the inputs of the txid
+	// once and the record then goes. Bare existence must not be read as "the spends are owned".
+	// Reverting here needs the hold of the attempt, so that no create adopts the record and no
+	// other actor reverses meanwhile (the PR 1355 TakeRollbackHold), which this store does not
+	// have. The spends stay and the outcome is counted as indeterminate.
+	if decision == rollbackSkipSpenderExists && spender != nil && spender.RollingBack {
+		decision = rollbackSkipIndeterminate
+		getErr = errors.NewProcessingError("the spender record is rolling back and no hold is available to revert under")
+	}
 
 	if prometheusUtxoPartialSpendRollbacks != nil {
 		prometheusUtxoPartialSpendRollbacks.WithLabelValues(decision.String()).Inc()
@@ -996,12 +1006,22 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 			// NOT memoized — result.spenderChecked stays false — so it is retried
 			// on the next ErrTxNotFound item in this batch. rollbackPartialSpends
 			// does not read this memo at all; it always probes fresh.
+			//
+			// A parent is pruned only once every output is spent, so a final spender record
+			// whose parent is gone has had that input taken, by this tx or by a rival. A record
+			// that is still creating or rolling back is not that evidence: it is the tentative
+			// record of an attempt whose spends are not yet proven, so ErrTxNotFound stays.
 			if !result.spenderChecked {
-				if _, getErr := s.Get(ctx, tx.TxIDChainHash(), fields.Fee); getErr == nil {
-					s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
-
-					result.spenderExists = true
+				if md, getErr := s.Get(ctx, tx.TxIDChainHash(), fields.Fee, fields.Creating, fields.RollingBack); getErr == nil {
 					result.spenderChecked = true
+
+					if md != nil && (md.Creating || md.RollingBack) {
+						s.logger.Debugf("[Validate][%s] parent tx not found and the tx record is still creating or rolling back, which is no evidence of this tx's spend", tx.TxID())
+					} else {
+						s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
+
+						result.spenderExists = true
+					}
 				} else if errors.Is(getErr, errors.ErrTxNotFound) {
 					result.spenderChecked = true
 				}

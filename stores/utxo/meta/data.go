@@ -116,6 +116,19 @@ type Data struct {
 	// When true, the transaction is incomplete and should trigger re-processing for auto-recovery
 	Creating bool `json:"creating"`
 
+	// RollingBack marks a creating record whose create-first transition is being undone: its
+	// spends are being reversed and the record deleted. Only the rollback owner may complete
+	// it, so finalize and roll-forward refuse a record in this state. Always accompanies Creating.
+	RollingBack bool `json:"rollingBack"`
+
+	// Hold marks the placeholder a rolled-back create-first attempt leaves for its txid. It carries no
+	// transaction data. Always accompanies Creating and RollingBack. Not part of the serialized form.
+	Hold bool `json:"hold,omitempty"`
+
+	// Reversed marks a rolling back record whose spends have all been reversed, so the rollback can
+	// be finished without the transaction data. Not part of the serialized form.
+	Reversed bool `json:"reversed,omitempty"`
+
 	// ConflictingChildren contains the transaction IDs of all transactions that tried to spend this conflicting transaction
 	ConflictingChildren []chainhash.Hash `json:"conflictingChildren"`
 

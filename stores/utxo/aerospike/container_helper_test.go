@@ -148,13 +148,13 @@ var (
 	spendTxRemaining = utxo2.GetSpendingTx(tx, 1, 2, 3, 4)
 )
 
-func initAerospike(t *testing.T, settings *settings.Settings, logger ulogger.Logger) (*uaerospike.Client, *teranode_aerospike.Store, context.Context, func()) {
+func initAerospike(t testing.TB, settings *settings.Settings, logger ulogger.Logger) (*uaerospike.Client, *teranode_aerospike.Store, context.Context, func()) {
 	return initAerospikeWith(t, settings, logger, nil)
 }
 
 // initAerospikeWith is initAerospike with beforeStore run on the raw client once
 // the namespace accepts writes and before the store is constructed.
-func initAerospikeWith(t *testing.T, settings *settings.Settings, logger ulogger.Logger, beforeStore func(*uaerospike.Client)) (*uaerospike.Client, *teranode_aerospike.Store, context.Context, func()) {
+func initAerospikeWith(t testing.TB, settings *settings.Settings, logger ulogger.Logger, beforeStore func(*uaerospike.Client)) (*uaerospike.Client, *teranode_aerospike.Store, context.Context, func()) {
 	client, db, ctx, cleanup, _ := initAerospikeWithURL(t, settings, logger, beforeStore)
 
 	return client, db, ctx, cleanup
@@ -162,7 +162,7 @@ func initAerospikeWith(t *testing.T, settings *settings.Settings, logger ulogger
 
 // initAerospikeWithURL is initAerospikeWith, also returning the URL the store
 // was built from.
-func initAerospikeWithURL(t *testing.T, settings *settings.Settings, logger ulogger.Logger, beforeStore func(*uaerospike.Client)) (*uaerospike.Client, *teranode_aerospike.Store, context.Context, func(), *url.URL) {
+func initAerospikeWithURL(t testing.TB, settings *settings.Settings, logger ulogger.Logger, beforeStore func(*uaerospike.Client)) (*uaerospike.Client, *teranode_aerospike.Store, context.Context, func(), *url.URL) {
 	teranode_aerospike.InitPrometheusMetrics()
 
 	ctx := context.Background()
@@ -278,11 +278,11 @@ func initAerospikeWithURL(t *testing.T, settings *settings.Settings, logger ulog
 	}, aeroURL
 }
 
-func cleanDB(t *testing.T, client *uaerospike.Client) {
+func cleanDB(t testing.TB, client *uaerospike.Client) {
 	cleanSet(t, client, aerospikeSet)
 }
 
-func cleanSet(t *testing.T, client *uaerospike.Client, set string) {
+func cleanSet(t testing.TB, client *uaerospike.Client, set string) {
 	tSettings := test.CreateBaseTestSettings(t)
 
 	policy := util.GetAerospikeWritePolicy(tSettings, 0)
