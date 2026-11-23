@@ -1007,10 +1007,16 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 			// on the next ErrTxNotFound item in this batch. rollbackPartialSpends
 			// does not read this memo at all; it always probes fresh.
 			//
-			// A parent is pruned only once every output is spent, so a final spender record
-			// whose parent is gone has had that input taken, by this tx or by a rival. A record
-			// that is still creating or rolling back is not that evidence: it is the tentative
-			// record of an attempt whose spends are not yet proven, so ErrTxNotFound stays.
+			// A final record for the spender is evidence its spend settled. A record still
+			// creating or rolling back is not: it is a tentative attempt whose spends are not
+			// yet proven, so ErrTxNotFound stays. The validator already withholds this bless from
+			// a creating record and names this check as the looser one that owes it a fix
+			// (services/validator/Validator.go, the grace needs "not creating", and "the stores'
+			// own not-found-parent check (resolveSpendCompletions ...) is looser than this grace;
+			// issue 2252 tracks it"). This addresses the Aerospike half of 2252; the SQL and
+			// Pebble mirrors named there are still looser. A wrong bless writes outputs backed by
+			// an unspent parent and cannot be undone, while a wrong reject here is recovered by
+			// resubmission.
 			if !result.spenderChecked {
 				if md, getErr := s.Get(ctx, tx.TxIDChainHash(), fields.Fee, fields.Creating, fields.RollingBack); getErr == nil {
 					result.spenderChecked = true
